@@ -3416,8 +3416,8 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
     assert!(!home.root.join("sandboxes/lab").exists());
 }
 
-/// `sandbox create --template autonomous` says first, on standard error,
-/// that the sandbox may change or remove the user's own files (ADR 0058),
+/// `sandbox create --template autonomous` says, on standard error, that
+/// the sandbox may change or remove the user's own files (ADR 0058),
 /// and `policy show` names the whole filesystem, the read-only paths and
 /// every port.
 #[cfg(target_os = "macos")]

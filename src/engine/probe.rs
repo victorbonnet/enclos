@@ -24,7 +24,7 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::model::unenforced::NotEnforced;
-use crate::policy::paths::{FsPaths, PathContext};
+use crate::policy::paths::{FsPaths, Kept, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
     TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, set_aside_notices,
@@ -42,6 +42,9 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
+    /// What else the policy opens, so the probes leave it out, each as the
+    /// report's sentence (ADR 0058).
+    pub open_by_policy: Vec<&'static str>,
     /// What the report says of the backend's probes, the baseline they ran
     /// on included.
     pub notes: ReportNotes,
@@ -307,6 +310,7 @@ impl Engine {
                 host_services,
                 not_here: not_here(&inputs, own.as_ref()),
                 listens: inputs.listen,
+                open_by_policy: crate::probes::open_by_policy(&inputs),
                 notes: own.notes(),
                 notices,
                 not_enforced,
@@ -334,24 +338,15 @@ impl Engine {
         };
         // Every stored policy was validated, so each entry expands; one that
         // does not is an error, never a path silently left out. The compiler
-        // starts from the same paths, so the probes check what it denies.
-        let fs = FsPaths::of(&policy.fs, &paths).map_err(|reason| Error::Session {
+        // starts from the same paths, with the same protected folders and
+        // program, so the probes check what it denies.
+        let kept = Kept {
+            protected: &ctx.protected,
+            program: ctx.program.as_deref().unwrap_or(&[]),
+        };
+        let fs = FsPaths::of(&policy.fs, &paths, kept).map_err(|reason| Error::Session {
             what: format!("the policy of sandbox {name} has a path enclos cannot expand: {reason}"),
         })?;
-        // enclos's program, where a grant covers it, as the compiler keeps it
-        // (ADR 0058).
-        let program: Vec<PathBuf> = ctx
-            .program
-            .iter()
-            .filter(|p| {
-                fs.writes
-                    .iter()
-                    .any(|w| crate::policy::paths::is_within(p, w))
-            })
-            .cloned()
-            .collect();
-        let protected: Vec<PathBuf> = ctx.protected.iter().chain(&program).cloned().collect();
-        let fs = fs.protecting(&protected);
         let unmovable = fs.unmovable();
         let home = fs.home.clone();
         let mut workspaces: Vec<PathBuf> = Vec::new();
@@ -385,9 +380,8 @@ impl Engine {
                 .collect(),
             read_deny: fs.read_deny,
             read_only: fs.read_only,
-            program,
-            every_port: policy.net.mode == crate::model::policy::NetMode::Public
-                && policy.net.public_ports == crate::model::policy::PublicPorts::Any,
+            program: fs.program,
+            every_port: policy.net.public_reach() == Some(crate::model::policy::PublicPorts::Any),
             home,
             workspaces,
             unmovable,
@@ -698,6 +692,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            open_by_policy: Vec::new(),
             notes: notes_on(Baseline::DenyDefault),
             notices: Vec::new(),
             not_enforced: Vec::new(),

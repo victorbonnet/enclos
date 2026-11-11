@@ -473,9 +473,9 @@ fn clone_probe(folder: &Path, tag: u32) -> Probe {
 /// to open the port there too, so the proxy listens there; whatever the
 /// sandbox reaches at that address must be the proxy.
 ///
-/// The proxy refuses an unlisted port, unless the policy opens every port
-/// (ADR 0058): then it asks for loopback, which the proxy refuses in every
-/// mode.
+/// The probe asks for an unlisted port, which the proxy refuses; where the
+/// policy opens every port (ADR 0058), it asks for 127.0.0.1 instead, which
+/// the proxy refuses in every mode.
 fn ipv6_loopback_probe(port: u16, every_port: bool) -> Probe {
     let target = match every_port {
         false => "https://probe.enclos.invalid:8443/",
@@ -794,6 +794,29 @@ fn login_keychain(i: &ProbeInputs) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPv6 loopback probe asks for an unlisted port, which the proxy
+    /// refuses, or for loopback where the policy opens every port, which it
+    /// refuses in every mode (ADR 0058).
+    #[test]
+    fn the_ipv6_loopback_probe_asks_for_what_the_proxy_refuses() {
+        let usual = ipv6_loopback_probe(41001, false);
+        assert!(
+            usual
+                .script
+                .contains("--proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/"),
+            "{}",
+            usual.script
+        );
+        let every = ipv6_loopback_probe(41001, true);
+        assert!(
+            every
+                .script
+                .contains("--proxy 'http://[::1]:41001' https://127.0.0.1:8443/"),
+            "{}",
+            every.script
+        );
+    }
     use crate::probes::{Run, outcome};
     use std::process::Command;
 

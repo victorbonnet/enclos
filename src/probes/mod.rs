@@ -400,8 +400,8 @@ pub struct ProbeInputs {
     pub read_deny: Vec<PathBuf>,
     /// The policy's read-only paths, expanded (ADR 0058).
     pub read_only: Vec<PathBuf>,
-    /// enclos's own program, where a write grant covers it: it must stay
-    /// unchanged all the same (ADR 0058).
+    /// enclos's own program where a write grant holds it, by every path
+    /// that leads to it: it must stay unchanged all the same (ADR 0058).
     pub program: Vec<PathBuf>,
     /// Whether the policy opens every port to any public address (ADR
     /// 0058), so no port is refused for being unlisted.
@@ -569,27 +569,28 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
         list.push(denied_under_grant_probe(path, i.tag));
     }
     // A read-only path a grant covers is still never changed (ADR 0058): a
-    // new file in it when it is a folder, the file itself, unchanged, when
-    // it is a file, and creating it when it is missing.
-    for path in i
-        .read_only
-        .iter()
-        .filter(|p| i.writes.iter().any(|w| is_within(p, w)))
-    {
+    // new file in it when it is a folder; the file itself, opened and left
+    // unchanged, when it is a file; and making it when nothing is there,
+    // which the host checks and removes if the rule did not hold. Anything
+    // else there, such as a FIFO a write would wait on, is not probed and
+    // is named in the report.
+    for path in read_only_under_a_grant(i) {
         let name = format!("change {}, read-only under a write grant", path.display());
-        list.push(match (path.is_dir(), path.is_file()) {
-            (true, _) => write_probe(
+        if path.is_dir() {
+            list.push(write_probe(
                 "read-only paths",
                 &name,
                 path.join(format!("enclos-probe-{}", i.tag)),
-            ),
-            (false, true) => open_for_writing_probe("read-only paths", &name, path),
-            (false, false) => write_probe(
+            ));
+        } else if path.is_file() {
+            list.push(open_for_writing_probe("read-only paths", &name, path));
+        } else if path.symlink_metadata().is_err() {
+            list.push(write_probe(
                 "read-only paths",
                 &format!("create {}, read-only under a write grant", path.display()),
                 path.clone(),
-            ),
-        });
+            ));
+        }
     }
     for program in i.program.iter().filter(|p| p.is_file()) {
         list.push(open_for_writing_probe(
@@ -642,17 +643,17 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
             .join("compiled")
             .join(format!("enclos-probe-{}", i.tag)),
     ));
-    // Only where no grant covers it: a grant of the whole filesystem lets
-    // the sandbox write there, as its policy says (ADR 0058).
-    let outside = i.user_home.join(format!("enclos-probe-{}", i.tag));
-    if !i.writes.iter().any(|w| is_within(&outside, w)) {
+    // Only where no grant covers it: a grant that holds the user's home
+    // lets the sandbox write there, and [`open_by_policy`] says so instead.
+    let outside = outside_the_home(i);
+    if !writes_outside_the_home(i) {
         list.push(write_probe("writes", "write outside the home", outside));
     }
     list.extend(own.folders(i));
 
-    // Refused in either network mode (ADR 0025): a port public mode does not
-    // open, and addresses no mode reaches, asked for by name through the proxy.
-    // Unless the policy opens every port (ADR 0058).
+    // Addresses no mode reaches, asked for by name through the proxy, and a
+    // port public mode does not open (ADR 0025), unless the policy opens
+    // every port (ADR 0058), which [`open_by_policy`] then says.
     if !i.every_port {
         list.push(proxy_probe(
             "an unlisted port through the proxy",
@@ -745,6 +746,43 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
 
 /// What [`probes`] leaves out because it is not on this host, so that the
 /// report says so instead of leaving those routes out silently.
+/// The file the "write outside the home" probe would make.
+fn outside_the_home(i: &ProbeInputs) -> PathBuf {
+    i.user_home.join(format!("enclos-probe-{}", i.tag))
+}
+
+/// Whether a write grant holds the user's home, outside the sandbox home,
+/// so that writing there is the policy's to allow, not a probe's to refuse.
+fn writes_outside_the_home(i: &ProbeInputs) -> bool {
+    let outside = outside_the_home(i);
+    i.writes.iter().any(|w| is_within(&outside, w))
+}
+
+/// The read-only paths a write grant holds, which only the rules keep.
+fn read_only_under_a_grant(i: &ProbeInputs) -> impl Iterator<Item = &PathBuf> {
+    i.read_only
+        .iter()
+        .filter(|p| i.writes.iter().any(|w| is_within(p, w)))
+}
+
+/// What the policy opens that the probes therefore leave out, each as a
+/// sentence of the report (ADR 0058), so that a report with fewer probes is
+/// not read as covering more.
+pub fn open_by_policy(i: &ProbeInputs) -> Vec<&'static str> {
+    let mut open = Vec::new();
+    if writes_outside_the_home(i) {
+        open.push(
+            "Open by the policy: writing outside the sandbox home, the user's own files included; the deny list, read-only paths and enclos's own files and program are probed instead.",
+        );
+    }
+    if i.every_port {
+        open.push(
+            "Open by the policy: every port of any public address; loopback, link-local, metadata and private addresses are probed instead.",
+        );
+    }
+    open
+}
+
 pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
     let mut absent = Vec::new();
     let missing = i.read_deny.iter().filter(|p| !p.exists()).count();
@@ -779,6 +817,28 @@ pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
     }
     if i.host_sockets.is_empty() {
         absent.push("host sockets (no SSH agent or Docker socket here)".to_owned());
+    }
+    let strange: Vec<String> = read_only_under_a_grant(i)
+        .filter(|p| p.symlink_metadata().is_ok() && !probeable(p))
+        .map(|p| p.display().to_string())
+        .collect();
+    if !strange.is_empty() {
+        absent.push(format!(
+            "read-only paths that are neither a file nor a folder, which a probe could wait on: {}",
+            strange.join(", ")
+        ));
+    }
+    let gone: Vec<String> = i
+        .program
+        .iter()
+        .filter(|p| !p.is_file())
+        .map(|p| p.display().to_string())
+        .collect();
+    if !gone.is_empty() {
+        absent.push(format!(
+            "enclos's own program at {} (not a file here)",
+            gone.join(", ")
+        ));
     }
     absent.extend(own.not_here(i));
     absent
@@ -1067,6 +1127,92 @@ mod tests {
 
     fn probes(i: &ProbeInputs) -> Vec<Probe> {
         super::probes(i, &seatbelt())
+    }
+
+    /// Under a grant of the whole filesystem (ADR 0058): each read-only
+    /// path is probed without changing it (a new file in a folder, the file
+    /// opened and left as it is, making a missing one), a FIFO not at all
+    /// and named instead, enclos's program opened and left as it is; the
+    /// write outside the home and the unlisted port are left out, and the
+    /// report says the policy opens them.
+    #[test]
+    fn a_grant_of_the_whole_filesystem_probes_what_it_keeps_and_says_what_it_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let mut i = inputs(&base);
+        std::fs::create_dir(base.join("fish")).unwrap();
+        std::fs::write(base.join(".zshrc"), "rc").unwrap();
+        std::fs::write(base.join("enclos-bin"), "p").unwrap();
+        let fifo = base.join(".fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        i.writes.push(PathBuf::from("/"));
+        i.read_only = vec![
+            base.join("fish"),
+            base.join(".zshrc"),
+            base.join(".zlogin"),
+            fifo.clone(),
+        ];
+        i.program = vec![base.join("enclos-bin"), base.join("gone")];
+        i.every_port = true;
+        let list = probes(&i);
+        let folder = named(&list, "fish, read-only").unwrap();
+        assert_eq!(
+            folder.host,
+            Some(HostCheck::File(base.join("fish/enclos-probe-7")))
+        );
+        let file = named(&list, ".zshrc, read-only").unwrap();
+        assert_eq!(
+            file.script,
+            format!("true >> {}", sh_quote(&base.join(".zshrc")))
+        );
+        assert_eq!(file.host, None);
+        let missing = named(&list, "create").unwrap();
+        assert!(missing.name.contains(".zlogin"), "{}", missing.name);
+        assert_eq!(missing.host, Some(HostCheck::File(base.join(".zlogin"))));
+        assert!(named(&list, ".fifo").is_none());
+        let program = named(&list, "enclos's own program").unwrap();
+        assert_eq!(
+            program.script,
+            format!("true >> {}", sh_quote(&base.join("enclos-bin")))
+        );
+        assert!(named(&list, "gone").is_none());
+        assert!(named(&list, "write outside the home").is_none());
+        assert!(named(&list, "an unlisted port").is_none());
+        for kept in ["loopback", "metadata", "private address"] {
+            assert!(named(&list, kept).is_some(), "{kept}");
+        }
+        let open = open_by_policy(&i);
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(open[0].contains("writing outside the sandbox home"));
+        assert!(open[1].contains("every port"));
+        let absent = not_here(&i, &seatbelt());
+        assert!(
+            absent
+                .iter()
+                .any(|a| a.contains("read-only paths") && a.contains(".fifo")),
+            "{absent:?}"
+        );
+        assert!(
+            absent
+                .iter()
+                .any(|a| a.contains("enclos's own program") && a.contains("gone")),
+            "{absent:?}"
+        );
+
+        // Without such a grant, nothing of it: the usual probes, no
+        // read-only or program probe, nothing said open.
+        let i = inputs(&base);
+        let list = probes(&i);
+        assert!(named(&list, "write outside the home").is_some());
+        assert!(named(&list, "an unlisted port").is_some());
+        assert!(named(&list, "read-only").is_none());
+        assert!(open_by_policy(&i).is_empty());
     }
 
     fn all(dir: &Path) -> Vec<Probe> {

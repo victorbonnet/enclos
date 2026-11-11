@@ -1,22 +1,28 @@
 //! Checking a resolved policy before it is stored (design §5, §7).
 //!
 //! Refused: a write to enclos's own folders except the sandbox's own home,
-//! also through a broad path or a symlink; a workspace inside the home or
-//! inside another workspace, or one reached through a symlink the sandbox
-//! can change; a workspace that would put the host's back over a place the
-//! backend gives each session of its own, as written or through a symlink;
-//! a dropped built-in read-deny entry; a path the compiled policy cannot
-//! hold; a destination the proxy never lets a sandbox reach.
+//! also through a broad path or a symlink, short of the whole filesystem on
+//! a backend that keeps paths unchanged inside a grant (ADR 0058); the
+//! whole filesystem, a read-only path inside a folder the sandbox writes,
+//! and a grant holding enclos's own program on any other backend; a
+//! workspace inside the home or inside another workspace, or one reached
+//! through a symlink the sandbox can change; a workspace that would put the
+//! host's back over a place the backend gives each session of its own, as
+//! written or through a symlink; a dropped built-in read-deny entry; a path
+//! the compiled policy cannot hold; a destination the proxy never lets a
+//! sandbox reach.
 //! Malformed: a path or destination that does not parse, a
 //! `network.private` opt-in for a host not in `network.allow`, or a write
-//! grant at or inside a deny-list path. A policy exits 2 only when every
-//! problem is a refusal (design §10).
+//! grant at or inside a deny-list or read-only path. A policy exits 2 only
+//! when every problem is a refusal (design §10).
 
 use std::path::{Path, PathBuf};
 
 use super::file::PolicyFile;
 use super::own_places::OwnPlaces;
-use super::paths::{PathContext, is_within, links_on_the_way, real_path};
+use super::paths::{
+    PathContext, is_whole_filesystem, is_within, links_on_the_way, program_paths, real_path,
+};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
@@ -32,9 +38,13 @@ pub struct ValidationContext {
     pub protected: Vec<PathBuf>,
     /// The places the sandbox's backend gives each session of its own.
     pub own_places: OwnPlaces,
-    /// The sandbox's backend: a write grant of `/` and read-only paths
-    /// under a grant are built on Seatbelt only (ADR 0058).
+    /// The sandbox's backend: whether it keeps a path unchanged inside a
+    /// folder the sandbox writes (ADR 0058).
     pub backend: BackendKind,
+    /// enclos's own program, as it was started; `None` when enclos cannot
+    /// tell where it is. A backend that cannot keep it unchanged inside a
+    /// folder the sandbox writes refuses a grant holding it.
+    pub program: Option<Vec<PathBuf>>,
 }
 
 pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyError> {
@@ -295,7 +305,8 @@ fn refusals(
     refused
 }
 
-/// The write checks of [`validate`] alone, on the paths as they are now: run
+/// The write checks of [`validate`] alone (read-only paths and enclos's
+/// program against the grants included), on the paths as they are now: run
 /// again each time a stored policy is compiled, since a symlink on the way
 /// to a workspace may have changed since the policy was stored. The other
 /// checks are not repeated there: the active policy is used as stored
@@ -330,9 +341,9 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
         check_holdable_in_a_compiled_policy("write", entry, &path, problems);
         // The whole filesystem (ADR 0058): the compiled policy denies
         // enclos's own files after every write allow, so the grant holds
-        // them without reaching them. Only Seatbelt compiles it so far.
-        if path == Path::new("/") {
-            if ctx.backend != BackendKind::Seatbelt {
+        // them without reaching them, on a backend that can.
+        if is_whole_filesystem(&path) {
+            if !ctx.backend.keeps_paths_under_a_grant() {
                 problems.push(Problem::Refused(format!(
                     "filesystem.write: `{entry}` (the whole filesystem, as the `autonomous` template grants) is not built on the {} backend yet; list the folders the sandbox may write instead",
                     ctx.backend
@@ -365,36 +376,92 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     check_nesting(&granted, &own_home, problems);
     check_links(&granted, &own_home, problems);
     check_hidden(&granted, policy, ctx, &own_home, problems);
-    let whole = |g: &&Granted| g.path != Path::new("/");
-    let elsewhere: Vec<&Granted> = granted.iter().filter(whole).collect();
-    check_own_places(&elsewhere, ctx.own_places, &own_home, problems);
-    check_read_only_held(&granted, policy, ctx, &own_home, problems);
+    // The whole filesystem holds every place of the backend's own; only a
+    // backend without any takes it.
+    let not_whole: Vec<&Granted> = granted
+        .iter()
+        .filter(|g| !is_whole_filesystem(&g.path))
+        .collect();
+    check_own_places(&not_whole, ctx.own_places, &own_home, problems);
+    check_read_only(&granted, policy, ctx, &own_home, problems);
+    check_program(&granted, ctx, &own_home, problems);
 }
 
-/// A read-only path the sandbox could write (ADR 0058): Seatbelt denies its
-/// writes after every allow; bubblewrap would need a read-only bind of it
-/// inside a writable one, which is not built yet, so there it is refused.
-/// One no grant covers is read-only already.
-fn check_read_only_held(
+/// Read-only paths and the grants (ADR 0058). A grant at or inside a
+/// read-only path is malformed, as one inside a deny-list path is: the
+/// sandbox could change nothing there. A read-only path inside a folder the
+/// sandbox writes needs a backend that keeps it unchanged there; elsewhere
+/// it is refused. One no grant covers is read-only already. An entry that
+/// does not expand is said by `validate`, and refused by the compiler.
+fn check_read_only(
     granted: &[Granted],
     policy: &Policy,
     ctx: &ValidationContext,
     own_home: &Path,
     problems: &mut Vec<Problem>,
 ) {
-    if ctx.backend != BackendKind::Bubblewrap {
-        return;
-    }
     for entry in &policy.fs.read_only {
         let Ok(expanded) = ctx.paths.expand(entry) else {
             continue;
         };
         let path = real_path(&expanded);
+        for g in granted.iter().filter(|g| g.path != own_home) {
+            if is_within(&g.path, &path) {
+                problems.push(Problem::Malformed(format!(
+                    "filesystem.write: `{}` ({}) is `{entry}` or inside it, which is read-only, so the sandbox could change nothing there; take it out of read_only, or grant a folder outside it",
+                    g.entry,
+                    g.path.display()
+                )));
+            }
+        }
+        if ctx.backend.keeps_paths_under_a_grant() {
+            continue;
+        }
         if let Some(outer) = writable_folder_holding(&path, own_home, granted, |_| false) {
             problems.push(Problem::Refused(format!(
-                "filesystem.read_only: `{entry}` ({}) is inside {outer}, and the bubblewrap backend cannot keep a path read-only inside a folder the sandbox writes yet; take it out of read_only, or the folder out of write",
-                path.display()
+                "filesystem.read_only: `{entry}` ({}) is inside {outer}, and the {} backend cannot keep a path read-only inside a folder the sandbox writes yet; take it out of read_only, or the folder out of write",
+                path.display(),
+                ctx.backend
             )));
+        }
+    }
+}
+
+/// enclos's own program, which the services run outside every sandbox
+/// (ADR 0058): a backend that cannot keep it unchanged inside a folder the
+/// sandbox writes refuses a grant holding it, by any path that leads to
+/// it, and every grant beyond the home when enclos cannot tell where it
+/// is. Seatbelt's compiler denies writes to it instead.
+fn check_program(
+    granted: &[Granted],
+    ctx: &ValidationContext,
+    own_home: &Path,
+    problems: &mut Vec<Problem>,
+) {
+    if ctx.backend.keeps_paths_under_a_grant() {
+        return;
+    }
+    let beyond_home = || granted.iter().filter(move |g| g.path != own_home);
+    let Some(program) = &ctx.program else {
+        if let Some(g) = beyond_home().next() {
+            problems.push(Problem::Refused(format!(
+                "filesystem.write: `{}` ({}) could hold enclos's own program, which the services run outside every sandbox, and enclos cannot tell where that program is; run enclos from where it is installed",
+                g.entry,
+                g.path.display()
+            )));
+        }
+        return;
+    };
+    for path in program.iter().flat_map(|p| program_paths(p)) {
+        if let Some(g) = beyond_home().find(|g| is_within(&path, &g.path)) {
+            problems.push(Problem::Refused(format!(
+                "filesystem.write: `{}` ({}) holds enclos's own program, {}, which the services run outside every sandbox, and the {} backend cannot keep it unchanged there; grant another folder",
+                g.entry,
+                g.path.display(),
+                path.display(),
+                ctx.backend
+            )));
+            return;
         }
     }
 }
@@ -403,7 +470,8 @@ fn check_read_only_held(
 /// of its own, as written or where a symlink the user made leads: its bind
 /// comes after that place is made, so the host's would replace the
 /// sandbox's (`~/alias -> ../../run`). The sandbox home is left out, as the
-/// compiler binds it as its own.
+/// compiler binds it as its own, and so is the whole filesystem, which only
+/// a backend without places of its own takes.
 fn check_own_places(
     granted: &[&Granted],
     own_places: OwnPlaces,
@@ -839,6 +907,7 @@ mod tests {
             protected: vec![enclos],
             own_places: OwnPlaces::NONE,
             backend: BackendKind::Seatbelt,
+            program: Some(Vec::new()),
         };
         Fixture { _dir: dir, ctx }
     }
@@ -1145,10 +1214,15 @@ mod tests {
 
         f.ctx.backend = BackendKind::Bubblewrap;
         let found = problems(&p, &f);
+        assert_eq!(found.len(), 2, "{found:?}");
         assert!(
-            found
-                .iter()
-                .any(|e| e.contains("not built on the bubblewrap backend")),
+            found[0].contains("`/` (the whole filesystem")
+                && found[0].contains("not built on the bubblewrap backend"),
+            "{found:?}"
+        );
+        assert!(
+            found[1].contains("filesystem.read_only: `~/.zshrc`")
+                && found[1].contains("inside `/`"),
             "{found:?}"
         );
         let mut inside = policy(&["~/work"], &[], &[]);
@@ -1164,6 +1238,70 @@ mod tests {
                 .iter()
                 .all(|e| matches!(e, Problem::Refused(_)))
         );
+    }
+
+    /// A grant at or inside a read-only path could change nothing there,
+    /// on every backend, as one inside a deny-list path (ADR 0058).
+    #[test]
+    fn a_grant_inside_a_read_only_path_is_malformed() {
+        let mut f = fixture();
+        for backend in [BackendKind::Seatbelt, BackendKind::Bubblewrap] {
+            f.ctx.backend = backend;
+            let mut p = policy(&["~/work"], &[], &[]);
+            p.fs.read_only = vec!["~".into()];
+            let found = checked(&p, &f);
+            assert!(
+                found.iter().any(|e| matches!(e, Problem::Malformed(m)
+                    if m.contains("`~/work`") && m.contains("which is read-only"))),
+                "{backend}: {found:?}"
+            );
+        }
+        // Read-only entries are held to what a compiled policy can hold.
+        let mut p = policy(&["{home}"], &[], &[]);
+        p.fs.read_only = vec!["~/\"rc\"".into(), "work".into()];
+        let found = problems(&p, &f);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.contains("filesystem.read_only: `~/\"rc\"`")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|e| e.starts_with("filesystem.read_only:") && e.contains("work")),
+            "{found:?}"
+        );
+    }
+
+    /// enclos's program, which the services run outside every sandbox: a
+    /// backend that cannot keep it unchanged under a grant refuses a grant
+    /// holding it, by any path, and any grant beyond the home when enclos
+    /// cannot tell where it is; Seatbelt denies writes to it instead.
+    #[test]
+    fn a_grant_holding_enclos_program_is_refused_where_it_cannot_be_kept() {
+        let mut f = fixture();
+        let bin = f.ctx.paths.user_home.join("work/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("enclos"), "p").unwrap();
+        f.ctx.program = Some(vec![bin.join("enclos")]);
+        let p = policy(&["{home}", "~/work"], &[], &[]);
+        assert!(problems(&p, &f).is_empty());
+        f.ctx.backend = BackendKind::Bubblewrap;
+        let found = problems(&p, &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("holds enclos's own program"), "{found:?}");
+        // Only the home: nothing to hold it.
+        assert!(problems(&policy(&["{home}"], &[], &[]), &f).is_empty());
+
+        f.ctx.program = None;
+        let found = problems(&p, &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("cannot tell where that program is"),
+            "{found:?}"
+        );
+        assert!(problems(&policy(&["{home}"], &[], &[]), &f).is_empty());
     }
 
     #[test]

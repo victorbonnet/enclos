@@ -6,9 +6,10 @@
 #
 # What stays closed whatever this says: the sensitive deny list (keys,
 # credentials, keychains, browsers, password managers), enclos's own files
-# and other sandboxes, and the host services (opening apps or URLs, Apple
-# Events, launchd jobs). The shell's startup files below may be read but not
-# changed, since your next terminal would run what is written there.
+# and other sandboxes, enclos's own program, and the host services (opening
+# apps or URLs, Apple Events, launchd jobs). The shell's startup and logout
+# files below may be read but not changed, since your shells would run what
+# is written there; files they source stay writable unless you add them.
 #
 # The agent reaches any public address on any port, through the sandbox's
 # proxy, which logs every connection. Narrow any of this in the sandbox's

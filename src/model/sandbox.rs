@@ -128,6 +128,18 @@ impl BackendKind {
             BackendKind::Seatbelt | BackendKind::OpenShell | BackendKind::Libkrun => false,
         }
     }
+
+    /// Whether the backend keeps a path unchanged inside a folder the
+    /// sandbox writes (ADR 0058): a read-only path, enclos's own program,
+    /// or anything a grant of the whole filesystem holds. Seatbelt denies
+    /// writes to it after the grant's allow; bubblewrap would need a
+    /// read-only bind inside a writable one, not built yet.
+    pub fn keeps_paths_under_a_grant(self) -> bool {
+        match self {
+            BackendKind::Seatbelt => true,
+            BackendKind::Bubblewrap | BackendKind::OpenShell | BackendKind::Libkrun => false,
+        }
+    }
 }
 
 /// A backend name enclos does not know.

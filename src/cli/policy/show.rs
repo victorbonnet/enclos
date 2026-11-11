@@ -152,6 +152,10 @@ fn print_rules(policy: &Policy) {
         for path in &policy.fs.read_only {
             println!("    {path}");
         }
+    } else if policy.fs.write.iter().any(|w| w == "/") {
+        // Under the whole filesystem, none is worth saying: the shell's
+        // startup files are writable then (ADR 0058).
+        println!("  read-only:  none, so the shell's startup files are writable too");
     }
     match policy.net.mode {
         NetMode::Public => {

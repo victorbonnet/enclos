@@ -56,14 +56,7 @@ impl Engine {
     /// What the backend needs to know about the sandbox.
     pub(crate) fn sandbox_context(&self, name: &SandboxName, proxy_port: u16) -> SandboxContext {
         let mut ctx = SandboxContext::new(&self.layout, name, proxy_port);
-        if let Some(exe) = &self.exe {
-            let real = crate::policy::paths::real_path(exe);
-            ctx.program = if real == *exe {
-                vec![exe.clone()]
-            } else {
-                vec![exe.clone(), real]
-            };
-        }
+        ctx.program = self.exe.clone().map(|exe| vec![exe]);
         ctx
     }
 

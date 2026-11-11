@@ -149,60 +149,134 @@ pub struct FsPaths {
     pub read_deny: Vec<PathBuf>,
     /// The policy's read-only paths (ADR 0058).
     pub read_only: Vec<PathBuf>,
-    /// enclos's protected folders, as [`FsPaths::protecting`] sets them:
-    /// a folder the sandbox writes that holds one cannot move either, as
-    /// one holding a deny-list entry cannot.
+    /// enclos's protected folders, resolved: a folder the sandbox writes
+    /// that holds one cannot move, as one holding a deny-list entry cannot.
     pub protected: Vec<PathBuf>,
+    /// enclos's own program where a folder the sandbox writes holds it,
+    /// by every path that leads to it ([`program_paths`]): the services
+    /// run it outside every sandbox, so it is never changed (ADR 0058).
+    pub program: Vec<PathBuf>,
+    /// Every symlink a folder the sandbox writes holds on the way to a
+    /// deny-list entry, a read-only path, a protected folder or the
+    /// program, as the link itself: removing or replacing one would carry
+    /// the name to a file no rule names, so each is never changed.
+    pub links: Vec<PathBuf>,
+}
+
+/// What a sandbox must keep beside its policy's own paths: enclos's
+/// protected folders and its program, which the compiler and `policy test`
+/// take from the sandbox's context.
+#[derive(Debug, Clone, Copy)]
+pub struct Kept<'a> {
+    pub protected: &'a [PathBuf],
+    pub program: &'a [PathBuf],
+}
+
+impl Kept<'_> {
+    /// Nothing beyond the policy, for tests of the policy's paths alone.
+    pub const NONE: Kept<'static> = Kept {
+        protected: &[],
+        program: &[],
+    };
+}
+
+/// Every path that names `program`, as a service unit or a shell may: as
+/// written with its folder resolved, each symlink on the way, and the file
+/// it really is. Replacing any of them would change what runs.
+pub fn program_paths(program: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let (Some(folder), Some(name)) = (program.parent(), program.file_name()) {
+        paths.push(real_path(folder).join(name));
+    }
+    paths.extend(links_on_the_way(program));
+    paths.push(real_path(program));
+    let mut seen = Vec::new();
+    paths.retain(|p| {
+        let new = !seen.contains(p);
+        seen.push(p.clone());
+        new
+    });
+    paths
+}
+
+/// Whether a write grant at `path` is the whole filesystem (ADR 0058): the
+/// compilers leave `/dev` out of it, nothing moves it, and only Seatbelt
+/// builds it.
+pub fn is_whole_filesystem(path: &Path) -> bool {
+    path == Path::new("/")
 }
 
 impl FsPaths {
     /// Expands and resolves every entry; one that does not expand is an
-    /// error, never a path silently left out.
-    pub fn of(fs: &FsPolicy, ctx: &PathContext) -> Result<FsPaths, String> {
-        let expand = |entries: &[String]| -> Result<Vec<PathBuf>, String> {
-            entries
-                .iter()
-                .map(|e| ctx.expand(e).map(|p| real_path(&p)))
-                .collect()
+    /// error, never a path silently left out. `kept` adds enclos's own
+    /// folders and program, so no caller can leave them out of what cannot
+    /// move.
+    pub fn of(fs: &FsPolicy, ctx: &PathContext, kept: Kept<'_>) -> Result<FsPaths, String> {
+        let expanded = |entries: &[String]| -> Result<Vec<PathBuf>, String> {
+            entries.iter().map(|e| ctx.expand(e)).collect()
         };
+        let real = |paths: &[PathBuf]| paths.iter().map(|p| real_path(p)).collect::<Vec<_>>();
+        let home = real_path(&ctx.sandbox_home);
+        let writes = real(&expanded(&fs.write)?);
+        let read_deny_written = expanded(&fs.read_deny)?;
+        let read_only_written = expanded(&fs.read_only)?;
+        let writable: Vec<&Path> = std::iter::once(home.as_path())
+            .chain(writes.iter().map(PathBuf::as_path))
+            .collect();
+        let held = |p: &Path| writable.iter().any(|w| is_within(p, w));
+        let program: Vec<PathBuf> = kept
+            .program
+            .iter()
+            .flat_map(|p| program_paths(p))
+            .filter(|p| held(p))
+            .collect();
+        let mut links: Vec<PathBuf> = read_deny_written
+            .iter()
+            .chain(&read_only_written)
+            .chain(kept.protected)
+            .chain(kept.program)
+            .flat_map(|p| links_on_the_way(p))
+            .filter(|l| held(l))
+            .collect();
+        links.sort();
+        links.dedup();
         Ok(FsPaths {
-            home: real_path(&ctx.sandbox_home),
-            writes: expand(&fs.write)?,
-            read_deny: expand(&fs.read_deny)?,
-            read_only: expand(&fs.read_only)?,
-            protected: Vec::new(),
+            read_deny: real(&read_deny_written),
+            read_only: real(&read_only_written),
+            protected: real(kept.protected),
+            program,
+            links,
+            home,
+            writes,
         })
-    }
-
-    /// The same paths, with enclos's protected folders kept in place too.
-    pub fn protecting(mut self, protected: &[PathBuf]) -> FsPaths {
-        self.protected = protected.iter().map(|p| real_path(p)).collect();
-        self
     }
 
     /// The folders the sandbox may write in but must not move (design §5):
     /// the sandbox home, every workspace, and every folder inside them that
-    /// holds a deny-list entry, a read-only path or a protected folder.
-    /// Moving one of them would carry what it holds to a path no rule
-    /// names. `/`, which a grant of the whole filesystem writes, is left
-    /// out: nothing moves it. Sorted, without repeats.
+    /// holds a deny-list entry, a read-only path, a protected folder,
+    /// enclos's program or a link on the way to one of them. Moving one
+    /// would carry what it holds to a path no rule names. The whole
+    /// filesystem, `/`, is left out: nothing moves it. Sorted, without
+    /// repeats.
     pub fn unmovable(&self) -> Vec<PathBuf> {
         let writable: Vec<&Path> = std::iter::once(self.home.as_path())
             .chain(self.writes.iter().map(PathBuf::as_path))
             .collect();
         let inside_writable = |p: &Path| writable.iter().any(|w| is_within(p, w));
-        let holding_denied = self
+        let holding_kept = self
             .read_deny
             .iter()
             .chain(&self.read_only)
             .chain(&self.protected)
+            .chain(&self.program)
+            .chain(&self.links)
             .flat_map(|entry| entry.ancestors().skip(1))
             .filter(|a| inside_writable(a));
         let mut folders: Vec<PathBuf> = writable
             .iter()
             .copied()
-            .chain(holding_denied)
-            .filter(|f| *f != Path::new("/"))
+            .chain(holding_kept)
+            .filter(|f| !is_whole_filesystem(f))
             .map(Path::to_path_buf)
             .collect();
         folders.sort();
@@ -214,6 +288,95 @@ impl FsPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under a grant of the whole filesystem, every folder holding a
+    /// read-only path, a protected folder, enclos's program or a link on
+    /// the way to one of them stays in place, `/` aside (ADR 0058).
+    #[test]
+    fn the_whole_filesystem_keeps_in_place_what_holds_a_kept_path_or_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let u = base.join("u");
+        for d in ["u/dotfiles/config/fish", "opt/x/bin", "cellar"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink(u.join("dotfiles/config"), u.join(".config")).unwrap();
+        std::fs::write(base.join("cellar/enclos"), "p").unwrap();
+        std::os::unix::fs::symlink(base.join("cellar/enclos"), base.join("opt/x/bin/enclos"))
+            .unwrap();
+        let ctx = PathContext {
+            user_home: u.clone(),
+            sandbox_home: u.join(".enclos/sandboxes/s/home"),
+        };
+        let s = |v: &[&str]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        let fs = FsPolicy {
+            write: s(&["/"]),
+            read_deny: s(&["~/.ssh"]),
+            read_only: s(&["~/.config/fish"]),
+        };
+        let kept = Kept {
+            protected: &[u.join(".enclos")],
+            program: &[base.join("opt/x/bin/enclos")],
+        };
+        let paths = FsPaths::of(&fs, &ctx, kept).unwrap();
+        assert_eq!(paths.read_only, [u.join("dotfiles/config/fish")]);
+        // The program's own link too: it is a name the services run.
+        assert_eq!(
+            paths.links,
+            [base.join("opt/x/bin/enclos"), u.join(".config")]
+        );
+        assert_eq!(
+            paths.program,
+            [base.join("opt/x/bin/enclos"), base.join("cellar/enclos")]
+        );
+        let unmovable = paths.unmovable();
+        for folder in [
+            u.clone(),
+            u.join("dotfiles"),
+            u.join("dotfiles/config"),
+            base.join("opt/x/bin"),
+            base.join("opt/x"),
+            base.join("cellar"),
+        ] {
+            assert!(unmovable.contains(&folder), "{folder:?}: {unmovable:?}");
+        }
+        assert!(!unmovable.contains(&PathBuf::from("/")), "{unmovable:?}");
+
+        // Without a grant holding them, the program is not named and no
+        // link is kept beyond the policy's own folders.
+        let narrow = FsPolicy {
+            write: s(&["{home}"]),
+            ..fs.clone()
+        };
+        let paths = FsPaths::of(&narrow, &ctx, kept).unwrap();
+        assert!(paths.program.is_empty(), "{:?}", paths.program);
+        assert!(paths.links.is_empty(), "{:?}", paths.links);
+        assert!(!paths.unmovable().contains(&base.join("opt/x/bin")));
+    }
+
+    #[test]
+    fn a_program_is_named_by_every_path_that_leads_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for d in ["a", "b", "c"] {
+            std::fs::create_dir(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("c/enclos"), "p").unwrap();
+        std::os::unix::fs::symlink(base.join("c/enclos"), base.join("b/enclos")).unwrap();
+        std::os::unix::fs::symlink(base.join("b/enclos"), base.join("a/enclos")).unwrap();
+        assert_eq!(
+            program_paths(&base.join("a/enclos")),
+            [
+                base.join("a/enclos"),
+                base.join("b/enclos"),
+                base.join("c/enclos")
+            ]
+        );
+        assert_eq!(
+            program_paths(&base.join("c/enclos")),
+            [base.join("c/enclos")]
+        );
+    }
 
     fn ctx() -> PathContext {
         PathContext {
@@ -340,7 +503,7 @@ mod tests {
             ]),
             read_only: Vec::new(),
         };
-        let paths = FsPaths::of(&fs, &ctx).unwrap();
+        let paths = FsPaths::of(&fs, &ctx, Kept::NONE).unwrap();
         assert_eq!(paths.home, ctx.sandbox_home);
         let p = |s: &str| PathBuf::from(format!("{u}{s}"));
         assert_eq!(
@@ -360,7 +523,11 @@ mod tests {
             read_deny: Vec::new(),
             read_only: Vec::new(),
         };
-        assert!(FsPaths::of(&bad, &ctx).unwrap_err().contains("`work`"));
+        assert!(
+            FsPaths::of(&bad, &ctx, Kept::NONE)
+                .unwrap_err()
+                .contains("`work`")
+        );
     }
 
     #[test]

@@ -223,6 +223,12 @@ fn normalize(policy: &mut Policy) {
         *entry = canonical_private(entry)
             .unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_ascii_lowercase());
     }
+    // Ports matter only in public mode: `allowlist` keeps the web ports, so
+    // a template's `any` narrowed by `mode = "allowlist"` is not stored to
+    // come back unseen.
+    if policy.net.mode != crate::model::policy::NetMode::Public {
+        policy.net.public_ports = crate::model::policy::PublicPorts::Web;
+    }
     for list in [
         &mut policy.fs.write,
         &mut policy.fs.read_deny,
@@ -332,6 +338,32 @@ mod tests {
         assert!(policy.fs.read_only.contains(&"~/.gitconfig".to_owned()));
         assert!(policy.fs.read_only.contains(&"~/.zshrc".to_owned()));
         assert_eq!(policy.net.public_ports, PublicPorts::Web);
+    }
+
+    /// Ports matter only in public mode: `autonomous` narrowed to the
+    /// allowlist stores the web ports, so `any` does not come back unseen.
+    #[test]
+    fn the_ports_outside_public_mode_are_the_web_ports() {
+        use crate::model::policy::{NetMode, PublicPorts};
+        let template: TemplateName = "autonomous".parse().unwrap();
+        let text = initial_overrides("home", &template)
+            .replace("allow_add = []", "allow_add = []\nmode = \"allowlist\"");
+        let policy = resolve(&text, None).unwrap().policy;
+        assert_eq!(policy.net.mode, NetMode::Allowlist);
+        assert_eq!(policy.net.public_ports, PublicPorts::Web);
+        assert_eq!(policy.net.public_reach(), None);
+    }
+
+    /// A snapshot stored before these fields reads as the web ports and no
+    /// read-only path.
+    #[test]
+    fn a_snapshot_stored_before_read_only_and_public_ports_reads_as_before() {
+        use crate::model::policy::PublicPorts;
+        let stored = r#"{"fs":{"write":["{home}"],"read_deny":["~/.ssh"]},"net":{"mode":"public","allow":[],"private":[],"log":"metadata","listen":false}}"#;
+        let policy: crate::model::policy::Policy = serde_json::from_str(stored).unwrap();
+        assert!(policy.fs.read_only.is_empty());
+        assert_eq!(policy.net.public_ports, PublicPorts::Web);
+        assert_eq!(serde_json::to_string(&policy).unwrap(), stored);
     }
 
     /// The new fields stay out of a snapshot at their defaults, so the

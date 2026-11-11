@@ -453,3 +453,92 @@ fn a_protected_file_behind_a_link_is_probed_at_its_real_path_for_bubblewrap_alon
         );
     }
 }
+
+/// An `autonomous` sandbox (ADR 0058), as the engine builds what its probes
+/// and compiler start from: enclos's program by every path that leads to
+/// it, the whole filesystem granted, every port open, and what the policy
+/// opens said in the report.
+#[test]
+fn an_autonomous_sandbox_keeps_enclos_program_by_every_path_and_opens_every_port() {
+    let (dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
+        BackendKind::Seatbelt,
+    ))]);
+    let base = dir.path().canonicalize().unwrap();
+    for d in ["bin", "cellar"] {
+        std::fs::create_dir(base.join(d)).unwrap();
+    }
+    std::fs::write(base.join("cellar/enclos"), "p").unwrap();
+    std::os::unix::fs::symlink(base.join("cellar/enclos"), base.join("bin/enclos")).unwrap();
+    let engine = engine.with_exe(base.join("bin/enclos"));
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "keeper".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "autonomous".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    let ctx = engine.sandbox_context(&name, 41001);
+    assert_eq!(ctx.program, Some(vec![base.join("bin/enclos")]));
+    let inputs = engine
+        .probe_inputs(&name, &ctx, None, None, Default::default())
+        .unwrap();
+    assert_eq!(
+        inputs.program,
+        [base.join("bin/enclos"), base.join("cellar/enclos")]
+    );
+    assert!(inputs.writes.contains(&std::path::PathBuf::from("/")));
+    assert!(inputs.every_port);
+    assert!(inputs.unmovable.contains(&base.join("bin")));
+    assert!(inputs.unmovable.contains(&base.join("cellar")));
+    assert!(!inputs.unmovable.contains(&std::path::PathBuf::from("/")));
+    assert_eq!(crate::probes::open_by_policy(&inputs).len(), 2);
+}
+
+/// On bubblewrap, which cannot keep a path unchanged inside a folder the
+/// sandbox writes yet, an `autonomous` sandbox is refused and nothing is
+/// left, and so is a workspace holding enclos's program (ADR 0058).
+#[test]
+fn bubblewrap_refuses_the_whole_filesystem_and_a_workspace_holding_enclos_program() {
+    let (dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
+        BackendKind::Bubblewrap,
+    ))]);
+    let base = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(base.join("bin")).unwrap();
+    std::fs::write(base.join("bin/enclos"), "p").unwrap();
+    let engine = engine.with_exe(base.join("bin/enclos"));
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let spec = |name: &str, template: &str| crate::engine::SandboxSpec {
+        name: name.parse().unwrap(),
+        backend: BackendKind::Bubblewrap,
+        template: template.parse().unwrap(),
+    };
+    let err = engine
+        .create_sandbox(&alice(), spec("keeper", "autonomous"), Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not built on the bubblewrap backend"),
+        "{err}"
+    );
+    assert!(!engine.layout.sandbox_dir("keeper").exists());
+
+    done(
+        engine
+            .create_sandbox(&alice(), spec("lab", "assistant"), Confirm::Yes)
+            .unwrap(),
+    );
+    let name: SandboxName = "lab".parse().unwrap();
+    let file = engine.layout.policy_file("lab");
+    let text = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace("write_add = []", "write_add = [\"~/bin\"]");
+    std::fs::write(&file, text).unwrap();
+    let err = engine
+        .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("holds enclos's own program"),
+        "{err}"
+    );
+}

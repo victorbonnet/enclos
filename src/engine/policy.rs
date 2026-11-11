@@ -12,7 +12,9 @@ use crate::backend::LaunchLimits;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
+use crate::model::policy::{
+    NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion, PublicPorts,
+};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::unenforced::{NotEnforced, UnenforcedField};
@@ -478,6 +480,7 @@ impl Engine {
                 .find(|b| b.kind() == backend)
                 .map_or(OwnPlaces::NONE, |b| b.own_places()),
             backend,
+            program: self.exe.clone().map(|exe| vec![exe]),
         }
     }
 
@@ -598,11 +601,15 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             ),
             NetMode::Allowlist => "limit its network to the allowlist".to_owned(),
         });
-    } else if old.net.public_ports != new.net.public_ports && new.net.mode == NetMode::Public {
-        found.push(format!(
-            "let it reach any public address {}",
-            new.net.public_ports.described()
-        ));
+    } else if let (Some(was), Some(ports)) = (old.net.public_reach(), new.net.public_reach())
+        && was != ports
+    {
+        found.push(match ports {
+            PublicPorts::Any => "open every port to it: any public address on any port".to_owned(),
+            PublicPorts::Web => {
+                "limit the public web to ports 80 and 443: other ports only if listed".to_owned()
+            }
+        });
     }
     if old.net.listen != new.net.listen {
         found.push(listen_change(new.net.listen));
@@ -844,6 +851,44 @@ mod tests {
                 "stop limiting a process's CPU time (sessions started from now on)",
             ]
         );
+    }
+
+    /// What a change of read-only paths or of the ports public mode opens
+    /// says, as the user confirms it (ADR 0058).
+    #[test]
+    fn differences_name_read_only_paths_and_the_ports_public_mode_opens() {
+        let mut old = Policy::default();
+        old.fs.read_only = vec!["~/.zshrc".into()];
+        old.net.mode = NetMode::Public;
+        let mut new = old.clone();
+        new.fs.read_only = vec!["~/.gitconfig".into()];
+        assert_eq!(
+            differences(&old, &new, &[]),
+            [
+                "keep ~/.gitconfig unchanged (sessions started from now on)",
+                "let it change ~/.zshrc where it writes (sessions started from now on)",
+            ]
+        );
+        let mut any = old.clone();
+        any.net.public_ports = PublicPorts::Any;
+        assert_eq!(
+            differences(&old, &any, &[]),
+            ["open every port to it: any public address on any port"]
+        );
+        assert_eq!(
+            differences(&any, &old, &[]),
+            ["limit the public web to ports 80 and 443: other ports only if listed"]
+        );
+        let mut closed = any.clone();
+        closed.net.mode = NetMode::Allowlist;
+        assert_eq!(
+            differences(&closed, &any, &[]),
+            ["open the public web to it: any public address on any port"]
+        );
+        // In allowlist mode the ports open nothing, so a change says nothing.
+        let mut closed_web = closed.clone();
+        closed_web.net.public_ports = PublicPorts::Web;
+        assert!(differences(&closed, &closed_web, &[]).is_empty());
     }
 
     #[test]

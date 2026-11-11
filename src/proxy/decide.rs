@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 
 use crate::model::net::Reason;
-use crate::model::policy::{NetMode, Policy};
+use crate::model::policy::Policy;
 use crate::net::addr::AddrClass;
 use crate::net::host::{AllowEntry, normalize_host};
 
@@ -42,7 +42,10 @@ impl Destination {
 /// (ADR 0058), and in either mode what the allowlist lists. Its addresses
 /// are checked after this, the same way in both modes.
 pub fn allowed(policy: &Policy, dest: &Destination) -> bool {
-    let public = policy.net.mode == NetMode::Public && policy.net.public_ports.open(dest.port);
+    let public = policy
+        .net
+        .public_reach()
+        .is_some_and(|ports| ports.open(dest.port));
     public
         || policy
             .net
@@ -85,6 +88,7 @@ pub fn validated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::policy::NetMode;
     use crate::net::addr::classify;
 
     fn policy(allow: &[&str], private: &[&str]) -> Policy {
@@ -157,6 +161,14 @@ mod tests {
         assert_eq!(
             validated(&p, &any, &ips(&["192.168.1.20"]), classify),
             Err(Reason::PrivateAddress)
+        );
+        // An address literal too: what the IPv6 loopback probe asks for when
+        // every port is open, which the proxy still refuses.
+        let literal = dest("127.0.0.1", 8443);
+        assert!(allowed(&p, &literal));
+        assert_eq!(
+            validated(&p, &literal, &ips(&["127.0.0.1"]), classify),
+            Err(Reason::BlockedAddress)
         );
         // In allowlist mode the setting opens nothing.
         p.net.mode = NetMode::Allowlist;
