@@ -326,9 +326,9 @@ fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
     let (guest_tx, guest_rx) = channel();
     {
         let mut devices = hub.devices.lock().unwrap();
-        devices.insert("phone".into(), (owner.into(), first_tx));
-        devices.insert("tablet".into(), (owner.into(), second_tx));
-        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx));
+        devices.insert("phone".into(), (owner.into(), first_tx, 101));
+        devices.insert("tablet".into(), (owner.into(), second_tx, 102));
+        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx, 103));
     }
     let missing = archive_conversation(&hub, &store, owner, "missing", true).unwrap_err();
     assert_eq!(
@@ -379,8 +379,8 @@ fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
     let (guest_tx, guest_rx) = channel();
     {
         let mut devices = hub.devices.lock().unwrap();
-        devices.insert("phone".into(), (owner.into(), phone_tx));
-        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx));
+        devices.insert("phone".into(), (owner.into(), phone_tx, 104));
+        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx, 105));
     }
     // Not archived: nothing changes and nothing is sent.
     assert!(!hub.unarchive_for_request(&store, "c-asks").unwrap());
@@ -478,7 +478,7 @@ fn delayed_archive_read_and_rename_snapshots_keep_their_revision() {
     hub.devices
         .lock()
         .unwrap()
-        .insert("phone".into(), (owner.into(), tx));
+        .insert("phone".into(), (owner.into(), tx, 200));
     // Queued broadcasts can arrive after a direct sync, in another writer's order.
     for snapshot in [&synced, &archive, &renamed, &restore] {
         hub.deliver(owner, ToDevice::Conversation(snapshot.clone()));
