@@ -1095,7 +1095,60 @@ fn diagnostic_provenance_missing_or_corrupt_metadata_preserves_the_log_and_appro
     std::fs::write(&path, []).unwrap();
     store.record_probe(&event, Some(&"a".repeat(64))).unwrap();
     assert_eq!(store.denied_for_approval(&name).unwrap()[0].count, 1);
-    std::fs::write(path, b"not a sqlite database").unwrap();
+    std::fs::write(&path, b"not a sqlite database").unwrap();
     store.record_probe(&event, Some(&"a".repeat(64))).unwrap();
     assert_eq!(store.denied_for_approval(&name).unwrap()[0].count, 2);
+    // Not writable: `policy test` runs its probes untagged.
+    assert!(store.begin_probe(&name, &"a".repeat(64)).is_err());
+    // The tables are there but not as written: it attaches, and cannot be
+    // queried; the unfiltered list, not an error every collection.
+    std::fs::remove_file(&path).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE runs (x); CREATE TABLE events (x);")
+        .unwrap();
+    assert_eq!(store.denied_for_approval(&name).unwrap()[0].count, 2);
+}
+
+#[test]
+fn diagnostic_provenance_of_removed_log_rows_is_removed() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&name, &tag).unwrap();
+    let event = NetEvent {
+        at: now(),
+        sandbox: name.clone(),
+        host: "10.0.0.1".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict: Verdict::Denied,
+        reason: Some(Reason::PrivateAddress),
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    store.record_probe(&event, Some(&tag)).unwrap();
+    let sources = Connection::open(dir.path().join("probe-sources.db")).unwrap();
+    let count = || -> i64 {
+        sources
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(), 1);
+    // Still in the log: kept by the next run.
+    store.begin_probe(&name, &"b".repeat(64)).unwrap();
+    assert_eq!(count(), 1);
+    Connection::open(dir.path().join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM net_events", [])
+        .unwrap();
+    store.begin_probe(&name, &"c".repeat(64)).unwrap();
+    assert_eq!(count(), 0);
 }

@@ -1,4 +1,5 @@
 //! Owner-authorized, bounded, live requests to the runtime that owns a routine.
+use super::avatars::PhotoError;
 use super::*;
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -188,6 +189,13 @@ impl Hub {
             return Err("Only the host's person can manage routines.".into());
         }
         self.avatar_authority(store, device, person, agent, false)
+            .map_err(|e| match e {
+                PhotoError::NotAllowed(why)
+                | PhotoError::UnknownAgent(why)
+                | PhotoError::Invalid(why)
+                | PhotoError::Conflict(why)
+                | PhotoError::Internal(why) => why,
+            })
     }
 
     /// Where a routine of `agent` may deliver for `person`: their direct
@@ -277,7 +285,12 @@ impl Hub {
         self.plugin(agent)
             .map_err(|e| failure(original.clone(), ErrorCode::AgentUnavailable, e))?;
         let mut plugins = self.plugins.lock().expect("not poisoned");
-        let Some((writer, capabilities)) = plugins.get_mut(agent) else {
+        let Some(Plugin {
+            writer,
+            capabilities,
+            ..
+        }) = plugins.get_mut(agent)
+        else {
             return Err(failure(
                 original,
                 ErrorCode::AgentUnavailable,
@@ -396,7 +409,7 @@ impl Hub {
                 })
             }
         };
-        if let Some((owner, sender)) = self.devices.lock().expect("not poisoned").get(device)
+        if let Some((owner, sender, _)) = self.devices.lock().expect("not poisoned").get(device)
             && owner == person
         {
             let _ = sender.send(response);
@@ -600,25 +613,21 @@ mod tests {
         Receiver<ToDevice>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let hub = Arc::new(Hub {
-            transport: Transport::Tailscale,
-            store_path: dir.path().join("app.db"),
-            layout: crate::layout::Layout::at(dir.path().join("enclos")),
-            bridge_private: vec![],
-            agents: vec![AgentEndpoint {
+        let hub = Arc::new(Hub::new(
+            Transport::Tailscale,
+            Arc::new(|_: &str| Err("no transport in this test".to_owned())),
+            dir.path().join("app.db"),
+            crate::layout::Layout::at(dir.path().join("enclos")),
+            vec![],
+            vec![AgentEndpoint {
                 name: AGENT.into(),
                 runtime: "hermes".into(),
                 socket: dir.path().join("plugin.sock"),
                 token: "secret".into(),
             }],
-            host: Some(OWNER.into()),
-            plugins: Mutex::new(HashMap::new()),
-            routines: Mutex::new(Default::default()),
-            commands: Mutex::new(HashMap::new()),
-            groups: Mutex::new(HashMap::new()),
-            stops: Mutex::new(Default::default()),
-            devices: Mutex::new(HashMap::new()),
-        });
+            Some(OWNER.into()),
+            SILENCE,
+        ));
         let store = hub.store().unwrap();
         let device = Device {
             id: "phone".into(),
@@ -630,6 +639,7 @@ mod tests {
             push_token: None,
             paired: now(),
             seen: None,
+            node: None,
         };
         store.add_device(&device).unwrap();
         store.ensure_home(AGENT, OWNER).unwrap();
@@ -647,7 +657,7 @@ mod tests {
         hub.devices
             .lock()
             .unwrap()
-            .insert(device.id.clone(), (OWNER.into(), tx));
+            .insert(device.id.clone(), (OWNER.into(), tx, 1));
         (dir, hub, store, device, rx)
     }
 
@@ -730,7 +740,7 @@ mod tests {
         hub.devices
             .lock()
             .unwrap()
-            .insert("another-phone".into(), (OWNER.into(), other_tx));
+            .insert("another-phone".into(), (OWNER.into(), other_tx, 2));
         let request = RoutineRequest::List { cursor: None };
         let rpc = claim(&hub, &device, "connection", request.clone());
         let reply = RoutineReply {
@@ -1268,8 +1278,8 @@ mod tests {
     #[test]
     fn only_the_hosts_person_is_told_they_may_manage_routines() {
         let (_dir, hub, store, _device, _rx) = fixture();
-        let host = hub.agent_list(&store, OWNER).unwrap();
-        let guest = hub.agent_list(&store, "guest@example.com").unwrap();
+        let host = hub.agent_infos(&store, OWNER).unwrap();
+        let guest = hub.agent_infos(&store, "guest@example.com").unwrap();
         assert!(host.iter().all(|a| a.can_manage_routines));
         assert!(guest.iter().all(|a| !a.can_manage_routines));
         let sent = serde_json::to_value(&guest[0]).unwrap();
