@@ -455,11 +455,15 @@ impl Hub {
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
-        self.question_connected(agent, &routine_connection);
-        if hello.capabilities.contains(&Capability::Questions)
-            && let Ok(store) = self.store()
-        {
-            self.sync_questions(&store, agent, &mut writer)?;
+        let origin = questions::Origin {
+            agent,
+            connection: &routine_connection,
+        };
+        let capable = hello.capabilities.contains(&Capability::Questions);
+        let store = self.store().ok();
+        self.question_connected(store.as_ref(), origin, capable);
+        if capable && let Some(store) = &store {
+            self.sync_questions(store, agent, &mut writer)?;
         }
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
@@ -470,6 +474,10 @@ impl Hub {
             let store = match hub.store() {
                 Ok(store) => store,
                 Err(e) => return eprintln!("enclos app: {e}"),
+            };
+            let origin = || questions::Origin {
+                agent: &agent,
+                connection: &routine_connection,
             };
             loop {
                 let message = match reader.receive() {
@@ -485,7 +493,7 @@ impl Hub {
                         hub.routine_response(&store, &agent, &routine_connection, reply);
                     }
                     FromPlugin::Error(error) => {
-                        hub.question_error(&store, &agent, &routine_connection, error.clone());
+                        hub.question_error(&store, origin(), error.clone());
                         hub.routine_error(&store, &agent, &routine_connection, error);
                     }
                     FromPlugin::QuestionAsk {
@@ -494,8 +502,7 @@ impl Hub {
                     } => {
                         let result = hub.question_ask(
                             &store,
-                            &agent,
-                            &routine_connection,
+                            origin(),
                             &conversation,
                             &question,
                             &message.id,
@@ -508,16 +515,13 @@ impl Hub {
                         answer,
                         of,
                     } => {
-                        let result = hub.question_update(
-                            &store,
-                            &agent,
-                            &routine_connection,
-                            &question,
+                        let update = questions::Update {
+                            question,
                             state,
                             answer,
-                            of.as_ref(),
-                            &message.id,
-                        );
+                            of,
+                        };
+                        let result = hub.question_update(&store, origin(), update, &message.id);
                         questions::acknowledge_question(&mut acks, &message.id, result);
                     }
                     FromPlugin::MessageOut {
@@ -718,7 +722,7 @@ impl Hub {
                 }
             }
             // Closed: the next message to this agent opens it again.
-            hub.question_disconnected(&store, &agent, &routine_connection);
+            hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
             hub.plugins.lock().expect("not poisoned").remove(&agent);
         });
@@ -1191,9 +1195,13 @@ fn run_session(
                 revision,
                 answer,
             } => {
-                if let Err(error) = hub.question_answer(
-                    store, device, person, message.id, question, revision, answer,
-                ) {
+                let request = questions::AnswerRequest {
+                    question,
+                    revision,
+                    answer,
+                };
+                if let Err(error) = hub.question_answer(store, device, person, message.id, request)
+                {
                     link.send(ToDevice::Error(error))?;
                 }
             }

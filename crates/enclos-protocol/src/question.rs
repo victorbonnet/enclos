@@ -59,15 +59,14 @@ pub struct QuestionInfo {
     pub answer: Option<QuestionAnswer>,
 }
 
-fn text(value: &str, field: &str) -> Result<(), String> {
+/// Nonblank text without hidden characters ([`crate::visible`]); `lines`
+/// allows newlines, and nothing else that is not seen (no tab or CR).
+fn text(value: &str, field: &str, lines: bool) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} must not be blank."));
     }
-    if value
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-    {
-        return Err(format!("{field} holds a control character."));
+    if crate::visible::has_hidden(value, lines) {
+        return Err(format!("{field} holds a hidden or control character."));
     }
     Ok(())
 }
@@ -82,7 +81,7 @@ fn bounded(value: &impl Serialize, limit: usize, field: &str) -> Result<(), Stri
 
 impl QuestionDefinition {
     pub fn validate(&self) -> Result<(), String> {
-        text(&self.text, "Question")?;
+        text(&self.text, "Question", true)?;
         if self.choices.len() > MAX_CHOICES {
             return Err(format!(
                 "A question supports at most {MAX_CHOICES} choices."
@@ -91,13 +90,21 @@ impl QuestionDefinition {
         if self.multiple && self.choices.is_empty() {
             return Err("Multiple selection requires choices.".into());
         }
-        for label in &self.choices {
-            text(label, "Choice label")?;
+        for (index, label) in self.choices.iter().enumerate() {
+            text(label, "Choice label", false)?;
+            if self.choices[..index].contains(label) {
+                return Err("Choice labels must be distinct.".into());
+            }
         }
         bounded(self, MAX_QUESTION_BYTES, "Question")
     }
 
-    /// Old apps display ordinary text and answer through the runtime's text interceptor.
+    /// The readable question, for an app without question controls. Its
+    /// reply goes through the runtime's text interceptor (Hermes: an
+    /// option's number or text, or "skip"; other text on a choice question
+    /// cancels it and reaches the agent as a message). A runtime's channel
+    /// without a bridge for questions sends its runtime's own text instead.
+    /// `tests/fixtures/question/fallback.json` holds the wording.
     pub fn fallback_text(&self) -> String {
         let mut result = self.text.clone();
         for (index, label) in self.choices.iter().enumerate() {
@@ -106,9 +113,9 @@ impl QuestionDefinition {
         result.push_str(if self.choices.is_empty() {
             "\nReply with your answer, or reply \"skip\" to skip this question."
         } else if self.multiple {
-            "\nChoose one or more options. Reply with their numbers separated by commas, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with the numbers or texts of one or more options, separated by commas, or reply \"skip\" to skip this question. Another message cancels it."
         } else {
-            "\nReply with an option's number, its text, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with an option's number or text, or reply \"skip\" to skip this question. Another message cancels it."
         });
         result
     }
@@ -133,7 +140,7 @@ impl QuestionAnswer {
                     }
                 }
             }
-            Self::Text { text: value } => text(value, "Answer")?,
+            Self::Text { text: value } => text(value, "Answer", true)?,
             Self::Skip => {}
         }
         bounded(self, MAX_ANSWER_BYTES, "Answer")
@@ -198,6 +205,61 @@ mod tests {
             state: QuestionState::Pending,
             revision: 0,
             answer: None,
+        }
+    }
+
+    #[test]
+    fn hidden_characters_and_duplicate_labels_are_refused() {
+        let original = definition(false);
+        // A label that reads as another, or two that read alike: the person
+        // could not tell what they choose.
+        for choices in [
+            vec!["Deny\u{202E}wolla".to_owned(), "Allow".into()],
+            vec!["Allow\u{200B}".to_owned(), "Allow".into()],
+            vec!["Allow".to_owned(), "Allow".into()],
+            vec!["Two\nlines".to_owned()],
+            vec!["Tab\there".to_owned()],
+        ] {
+            let invalid = QuestionDefinition {
+                choices,
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{:?}", invalid.choices);
+        }
+        for text in ["Which\u{2066}?", "Which\r\n?", "Which\t?", "\u{FEFF}Which?"] {
+            let invalid = QuestionDefinition {
+                text: text.into(),
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{text:?}");
+        }
+        assert!(
+            QuestionDefinition {
+                text: "Which one?\nPick carefully.".into(),
+                ..original.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        for text in ["ok\u{200D}", "a\tb", "a\r\nb", "\u{00AD}"] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_err(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_text_matches_the_shared_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/question/fallback.json")).unwrap();
+        for case in fixture.as_array().unwrap() {
+            let definition: QuestionDefinition =
+                serde_json::from_value(case["definition"].clone()).unwrap();
+            assert!(definition.validate().is_ok());
+            assert_eq!(definition.fallback_text(), case["text"].as_str().unwrap());
         }
     }
 

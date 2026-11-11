@@ -75,7 +75,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
-        self._questions = questions.Manager(self)
+        self._questions = questions.Manager(self._outbox, self._write, self.send)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -220,6 +220,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._write(protocol.error(error.code, str(error), message["id"]))
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
+            # A question the bridge refused would wait unseen: it goes as text.
+            await self._questions.refused(message.get("of"))
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 

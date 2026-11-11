@@ -1,3 +1,4 @@
+use super::super::super::store::{MAX_PENDING_PER_AGENT, MAX_PENDING_PER_CONVERSATION};
 use super::*;
 use enclos_protocol::plugin::decode_from_bridge;
 use std::io::{BufRead, BufReader, Write};
@@ -184,9 +185,11 @@ fn native_socket_answer_requires_exact_receipt_and_keeps_history_in_order() {
         &device,
         OWNER,
         original.clone(),
-        definition.id.clone(),
-        0,
-        answer.clone(),
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: answer.clone(),
+        },
     )
     .unwrap();
     let request = native.receive();
@@ -240,9 +243,11 @@ fn native_socket_answer_requires_exact_receipt_and_keeps_history_in_order() {
         &device,
         OWNER,
         original,
-        definition.id.clone(),
-        0,
-        answer,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: answer,
+        },
     )
     .unwrap();
     assert_eq!(next(&rx), receipt);
@@ -267,9 +272,11 @@ fn two_phones_first_native_answer_wins_and_other_people_cannot_control_it() {
                 &guest,
                 "guest@example.com",
                 MessageId::new("foreign").unwrap(),
-                question,
-                0,
-                QuestionAnswer::Skip,
+                AnswerRequest {
+                    question: question,
+                    revision: 0,
+                    answer: QuestionAnswer::Skip,
+                },
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::NotFound);
@@ -280,9 +287,11 @@ fn two_phones_first_native_answer_wins_and_other_people_cannot_control_it() {
         &device,
         OWNER,
         MessageId::new("first").unwrap(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Choices { indices: vec![0] },
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Choices { indices: vec![0] },
+        },
     )
     .unwrap();
     let first = native.receive();
@@ -291,9 +300,11 @@ fn two_phones_first_native_answer_wins_and_other_people_cannot_control_it() {
         &second,
         OWNER,
         MessageId::new("second").unwrap(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     let second_request = native.receive();
@@ -350,9 +361,11 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
             &device,
             OWNER,
             MessageId::new("stale").unwrap(),
-            definition.id.clone(),
-            10,
-            QuestionAnswer::Skip,
+            AnswerRequest {
+                question: definition.id.clone(),
+                revision: 10,
+                answer: QuestionAnswer::Skip,
+            },
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
@@ -363,9 +376,11 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
         &device,
         OWNER,
         original.clone(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     let request = native.receive();
@@ -373,12 +388,16 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
     let update = |of| {
         hub.question_update(
             &store,
-            AGENT,
-            "old-connection",
-            &definition.id,
-            QuestionState::Skipped,
-            None,
-            Some(of),
+            Origin {
+                agent: AGENT,
+                connection: "old-connection",
+            },
+            Update {
+                question: definition.id.clone(),
+                state: QuestionState::Skipped,
+                answer: None,
+                of: Some(MessageId::clone(of)),
+            },
             &MessageId::new("stale-update").unwrap(),
         )
     };
@@ -386,8 +405,10 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
     assert!(rx.try_recv().is_err());
     hub.question_error(
         &store,
-        "lab/helper",
-        &epoch,
+        Origin {
+            agent: "lab/helper",
+            connection: &epoch,
+        },
         failure(request.id.clone(), ErrorCode::NotFound, "not yours"),
     );
     assert!(rx.try_recv().is_err());
@@ -411,9 +432,11 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
         &device,
         OWNER,
         original.clone(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     assert!(matches!(next(&rx), ToDevice::Error(error) if error.of == Some(original)));
@@ -423,9 +446,11 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
         &device,
         OWNER,
         timeout.clone(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     let timed = native.receive();
@@ -438,7 +463,7 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
         .started = Instant::now() - TIMEOUT;
     hub.expire_questions(&store);
     assert!(
-        matches!(next(&rx), ToDevice::Error(error) if error.of == Some(timeout.clone()) && error.message.contains("unknown"))
+        matches!(next(&rx), ToDevice::Error(error) if error.of == Some(timeout.clone()) && error.message.contains("unknown") && error.code == ErrorCode::Unconfirmed)
     );
     native.send(
         "late-timeout",
@@ -461,9 +486,11 @@ fn stale_revisions_errors_timeout_and_connection_fencing_never_resend_or_fabrica
         &device,
         OWNER,
         timeout.clone(),
-        definition.id,
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id,
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     assert!(matches!(next(&rx), ToDevice::Error(error) if error.of == Some(timeout)));
@@ -481,9 +508,11 @@ fn revoked_devices_and_wrong_request_payloads_cannot_reuse_an_answer_receipt() {
         &device,
         OWNER,
         original.clone(),
-        definition.id.clone(),
-        0,
-        QuestionAnswer::Skip,
+        AnswerRequest {
+            question: definition.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
     )
     .unwrap();
     let request = native.receive();
@@ -493,10 +522,12 @@ fn revoked_devices_and_wrong_request_payloads_cannot_reuse_an_answer_receipt() {
             &device,
             OWNER,
             original.clone(),
-            definition.id.clone(),
-            0,
-            QuestionAnswer::Text {
-                text: "different".into(),
+            AnswerRequest {
+                question: definition.id.clone(),
+                revision: 0,
+                answer: QuestionAnswer::Text {
+                    text: "different".into(),
+                },
             },
         )
         .unwrap_err();
@@ -519,9 +550,11 @@ fn revoked_devices_and_wrong_request_payloads_cannot_reuse_an_answer_receipt() {
             &device,
             OWNER,
             original,
-            definition.id,
-            0,
-            QuestionAnswer::Skip
+            AnswerRequest {
+                question: definition.id,
+                revision: 0,
+                answer: QuestionAnswer::Skip
+            }
         )
         .unwrap_err()
         .code,
@@ -532,13 +565,18 @@ fn revoked_devices_and_wrong_request_payloads_cannot_reuse_an_answer_receipt() {
 #[test]
 fn reconnect_reconciles_only_this_agents_pending_questions_in_bounded_batches() {
     let (_dir, hub, store, _device, _rx) = fixture();
-    for index in 0..130 {
-        let definition = definition(&format!("q-{index}"));
+    // An agent's pending questions fit one sync batch.
+    const { assert!(MAX_PENDING_PER_AGENT as usize <= MAX_SYNC_QUESTIONS) };
+    for index in 0..MAX_PENDING_PER_AGENT {
+        let conversation = format!("c-{}", index / MAX_PENDING_PER_CONVERSATION);
+        store
+            .conversation(&conversation, "lab", "coder", OWNER)
+            .unwrap();
         store
             .ask_question(
                 AGENT,
-                &ConversationId::new("owned").unwrap(),
-                &definition,
+                &ConversationId::new(conversation).unwrap(),
+                &definition(&format!("q-{index}")),
                 &format!("ask-{index}"),
             )
             .unwrap();
@@ -553,17 +591,24 @@ fn reconnect_reconciles_only_this_agents_pending_questions_in_bounded_batches() 
         )
         .unwrap();
     let mut native = native(&hub, vec![Capability::Questions]);
-    let first = native.receive();
-    let second = native.receive();
-    let FromBridge::QuestionSync { questions: first } = first.body else {
+    let FromBridge::QuestionSync { questions: first } = native.receive().body else {
         panic!("sync")
     };
-    let FromBridge::QuestionSync { questions: second } = second.body else {
-        panic!("sync")
-    };
-    assert_eq!(first.len(), 128);
-    assert_eq!(second.len(), 2);
+    assert_eq!(first.len() as i64, MAX_PENDING_PER_AGENT);
     assert!(!first.contains(&other.id));
+    // One more is refused, with an error the channel turns into text.
+    native.send(
+        "over",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("over"),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::Error(error) if error.of.as_ref().map(MessageId::as_str) == Some("over") && error.code == ErrorCode::BadMessage)
+    );
+    native.ack("over");
+    assert!(store.question(&definition("over").id).unwrap().is_none());
     native.send(
         "restart-expiry",
         FromPlugin::QuestionUpdate {
@@ -578,7 +623,252 @@ fn reconnect_reconciles_only_this_agents_pending_questions_in_bounded_batches() 
         store.question(&first[0]).unwrap().unwrap().info.state,
         QuestionState::Expired
     );
-    assert_eq!(store.pending_questions(AGENT).unwrap().len(), 129);
+    assert_eq!(
+        store.pending_questions(AGENT).unwrap().len() as i64,
+        MAX_PENDING_PER_AGENT - 1
+    );
+}
+
+#[test]
+fn a_channel_without_questions_expires_the_cards_it_left() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut channel = native(&hub, vec![Capability::Questions]);
+    let definition = definition("q-1");
+    ask(&mut channel, &rx, &definition);
+    drop(channel);
+    let closed = Instant::now();
+    while hub.plugins.lock().unwrap().contains_key(AGENT) {
+        assert!(
+            closed.elapsed() < Duration::from_secs(2),
+            "the bridge saw the close"
+        );
+        std::thread::yield_now();
+    }
+    // The channel comes back without the capability (its runtime lost the
+    // native API, say): nothing could answer the card any more.
+    std::fs::remove_file(&hub.agents[0].socket).unwrap();
+    let _native = native(&hub, vec![]);
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.definition.id == definition.id && question.state == QuestionState::Expired)
+    );
+    assert!(
+        matches!(next(&rx), ToDevice::Message(message) if message.kind == "status" && message.text == "Question expired.")
+    );
+    assert!(store.pending_questions(AGENT).unwrap().is_empty());
+}
+
+#[test]
+fn questions_no_channel_can_answer_expire_on_the_bridge() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let owned = ConversationId::new("owned").unwrap();
+    let old = definition("old");
+    let recent = definition("recent");
+    store.ask_question(AGENT, &owned, &old, "old-ask").unwrap();
+    store
+        .ask_question(AGENT, &owned, &recent, "recent-ask")
+        .unwrap();
+    // An agent enclos no longer serves: no channel will ever answer.
+    let gone = definition("gone");
+    store
+        .ask_question(
+            "lab/helper",
+            &ConversationId::new("other-agent").unwrap(),
+            &gone,
+            "gone-ask",
+        )
+        .unwrap();
+    store
+        .backdate_message("old-ask", now() - UNCONNECTED_LIFETIME_SECONDS - 1)
+        .unwrap();
+    hub.expire_questions(&store);
+    let state = |q: &QuestionDefinition| store.question(&q.id).unwrap().unwrap().info.state;
+    assert_eq!(state(&old), QuestionState::Expired);
+    assert_eq!(state(&recent), QuestionState::Pending);
+    assert_eq!(state(&gone), QuestionState::Expired);
+    let mut seen = vec![];
+    while let Ok(message) = rx.try_recv() {
+        seen.push(message);
+    }
+    assert!(seen.iter().any(|m| matches!(m, ToDevice::Question { question } if question.definition.id == old.id && question.state == QuestionState::Expired)));
+    // A connected channel is trusted to say: its old question stays.
+    let mut native = native(&hub, vec![Capability::Questions]);
+    let _sync = native.receive();
+    store
+        .backdate_message("recent-ask", now() - UNCONNECTED_LIFETIME_SECONDS - 1)
+        .unwrap();
+    hub.questions.lock().unwrap().swept = None;
+    hub.expire_questions(&store);
+    assert_eq!(state(&recent), QuestionState::Pending);
+    // The sweep runs once a minute, not every second.
+    store
+        .ask_question(AGENT, &owned, &definition("later"), "later-ask")
+        .unwrap();
+    hub.questions.lock().unwrap().connections.clear();
+    store
+        .backdate_message("later-ask", now() - UNCONNECTED_LIFETIME_SECONDS - 1)
+        .unwrap();
+    hub.expire_questions(&store);
+    assert_eq!(state(&definition("later")), QuestionState::Pending);
+    let _ = device;
+}
+
+#[test]
+fn not_sent_and_unconfirmed_answers_have_distinct_codes_and_one_person_cannot_starve_another() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let question = definition("q-1");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &question,
+            "ask",
+        )
+        .unwrap();
+    let request = |id: &str| {
+        hub.question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new(id).unwrap(),
+            AnswerRequest {
+                question: question.id.clone(),
+                revision: 0,
+                answer: QuestionAnswer::Skip,
+            },
+        )
+    };
+    // No channel: nothing was sent, answering again is safe.
+    assert_eq!(
+        request("offline").unwrap_err().code,
+        ErrorCode::AgentUnavailable
+    );
+    let mut native = native(&hub, vec![Capability::Questions]);
+    let _sync = native.receive();
+    // This person's answers in flight are capped; it says nothing was sent.
+    let connection = hub.questions.lock().unwrap().connections[AGENT].clone();
+    for index in 0..MAX_PENDING_PER_PERSON {
+        hub.questions.lock().unwrap().pending.insert(
+            format!("busy-{index}"),
+            Pending {
+                device: device.id.clone(),
+                person: OWNER.into(),
+                agent: AGENT.into(),
+                connection: connection.clone(),
+                original: MessageId::new(format!("busy-{index}")).unwrap(),
+                request: AnswerRequest {
+                    question: QuestionId::new(format!("busy-{index}")).unwrap(),
+                    revision: 0,
+                    answer: QuestionAnswer::Skip,
+                },
+                started: Instant::now(),
+            },
+        );
+    }
+    let busy = request("busy").unwrap_err();
+    assert_eq!(busy.code, ErrorCode::AgentUnavailable);
+    assert!(busy.message.contains("Nothing was sent"));
+    // Another person's answer still goes through.
+    store
+        .conversation("guest-c", "lab", "coder", "guest@example.com")
+        .unwrap();
+    let theirs = definition("theirs");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("guest-c").unwrap(),
+            &theirs,
+            "theirs-ask",
+        )
+        .unwrap();
+    let (guest, _guest_rx) = phone(&hub, &store, "guest", "guest@example.com");
+    hub.question_answer(
+        &store,
+        &guest,
+        "guest@example.com",
+        MessageId::new("guest-answer").unwrap(),
+        AnswerRequest {
+            question: theirs.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Skip,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(native.receive().body, FromBridge::QuestionAnswer { question, .. } if question == theirs.id)
+    );
+    // Sent, then the channel goes: the outcome is unknown.
+    hub.questions
+        .lock()
+        .unwrap()
+        .pending
+        .retain(|key, _| !key.starts_with("busy-"));
+    request("sent").unwrap();
+    let _sent = native.receive();
+    drop(native);
+    assert!(
+        matches!(next(&rx), ToDevice::Error(error) if error.of.as_ref().map(MessageId::as_str) == Some("sent") && error.code == ErrorCode::Unconfirmed)
+    );
+}
+
+#[test]
+fn only_a_matched_device_answer_reads_as_the_persons_in_history() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::Questions]);
+    let first = definition("q-1");
+    ask(&mut native, &rx, &first);
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        MessageId::new("answer").unwrap(),
+        AnswerRequest {
+            question: first.id.clone(),
+            revision: 0,
+            answer: QuestionAnswer::Choices { indices: vec![1] },
+        },
+    )
+    .unwrap();
+    let request = native.receive();
+    native.send(
+        "answered",
+        FromPlugin::QuestionUpdate {
+            question: first.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(QuestionAnswer::Choices { indices: vec![1] }),
+            of: Some(request.id),
+        },
+    );
+    native.ack("answered");
+    next(&rx);
+    assert!(matches!(next(&rx), ToDevice::Message(m) if m.text == "Answered: Classement"));
+    assert!(matches!(next(&rx), ToDevice::QuestionResult { .. }));
+    // The agent claims an answer nobody sent: the history says whose claim it is.
+    native.send(
+        "ask-2",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("q-2"),
+        },
+    );
+    native.ack("ask-2");
+    next(&rx);
+    next(&rx);
+    native.send(
+        "claimed",
+        FromPlugin::QuestionUpdate {
+            question: definition("q-2").id,
+            state: QuestionState::Answered,
+            answer: Some(QuestionAnswer::Text {
+                text: "Delete everything".into(),
+            }),
+            of: None,
+        },
+    );
+    native.ack("claimed");
+    next(&rx);
+    assert!(
+        matches!(next(&rx), ToDevice::Message(m) if m.text == "Answered, as the agent reports: Delete everything")
+    );
 }
 
 #[test]
@@ -729,10 +1019,12 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
         .settle_question(
             AGENT,
             &definition.id,
-            QuestionState::Answered,
-            Some(QuestionAnswer::Text {
-                text: "Gégé Commit".into(),
-            }),
+            Settlement::reported(
+                QuestionState::Answered,
+                Some(QuestionAnswer::Text {
+                    text: "Gégé Commit".into(),
+                }),
+            ),
             "settled-offline",
         )
         .unwrap();

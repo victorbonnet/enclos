@@ -421,9 +421,38 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 -I -m unittest discover -s channels/hermes/tests -v
 
+  # The same tests against the latest Hermes, its default branch, never
+  # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`),
+  # and one that skips for want of it fails the job, so a Hermes change the
+  # plugin relies on shows here rather than in a gateway.
+  hermes-latest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+          persist-credentials: false
+      - run: git -C hermes-agent log -1 --format='Hermes %H, %cI'
+      # The Python Hermes itself names, with the dependencies it pins.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: hermes-agent/.python-version
+      - run: python -m pip install ./hermes-agent
+      - name: Run every test, the real-Hermes ones included
+        env:
+          ENCLOS_HERMES_SOURCE: ${{ github.workspace }}/hermes-agent
+        run: |
+          python -I -m unittest discover -s channels/hermes/tests -v 2>&1 | tee unittest.log
+          if grep -n "skipped 'optional real Hermes" unittest.log; then
+            echo "::error::a real-Hermes test skipped although Hermes is checked out"
+            exit 1
+          fi
+
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, hermes-latest]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

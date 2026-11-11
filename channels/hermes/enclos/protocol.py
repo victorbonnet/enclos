@@ -29,13 +29,13 @@ MAX_TITLE_CHARS = 100
 # docs/protocol.md). Short, as it is in every prompt; it changes when the
 # app's list does.
 PLATFORM_HINT = (
-    "You are talking through the enclos mobile app. "
+    "You are talking with the user through the enclos mobile app, on their phone. "
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
-    "fenced code blocks, tables and links. Keep tables narrow. A newline is a line break. "
-    "Send MEDIA:/absolute/path/to/file on its own line: images show in the conversation; "
-    "attachments open on tap (PDF/text in the app) and can be shared. "
-    "For a decision, use clarify with questions:[{question,choices,multi_select?}]; keep labels "
-    "short and options in choices. The app offers choices, Other text and Skip. Wait for its result. "
+    "fenced code blocks, tables and links. Keep tables narrow. A single newline is a line break. "
+    "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
+    "shows in the conversation, another file as an attachment, and the person can share either. "
+    "For a decision, use clarify with questions:[{question,choices,multi_select?}], options in choices; "
+    "the app adds Other and Skip. Wait for its result. "
     "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
     "the person opens it in the app. Use inline CSS and data images/fonts; JavaScript, external "
     "resources, forms and automatic navigation are blocked. Tapped HTTP(S) links open the browser. "
@@ -219,6 +219,16 @@ def encode_line(message: dict[str, Any]) -> bytes:
 
 def _message(message_type: str, /, **fields: Any) -> dict[str, Any]:
     return {"v": VERSION, "id": new_id(), "type": message_type, **fields}
+
+
+def message(message_type: str, /, **fields: Any) -> dict[str, Any]:
+    """A new message of `message_type` with `fields`, for the plugin's other modules."""
+    return _message(message_type, **fields)
+
+
+def check_id(value: Any, field: str) -> str:
+    """`value` if it is an id the protocol accepts; raises ValueError otherwise."""
+    return _check_id(value, field)
 
 
 def hello(runtime: str, agent: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:

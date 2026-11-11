@@ -43,6 +43,14 @@ const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/qu
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+/// How long Hermes's `clarify` waits for the person's answer before the
+/// agent goes on without one. Hermes's own default (90 s on main of
+/// 2026-11-10, `tools/clarify_gateway.py`, `resolve_clarify_timeout`) frees
+/// a turn quickly at a desk; a question on a phone is often seen later, so
+/// the app's agents wait an hour, Hermes's earlier default. A reply typed
+/// instead still cancels the question at once. The bridge's own backstop
+/// for a channel that stays away is twice this (`bridge/questions.rs`).
+pub const CLARIFY_TIMEOUT_SECONDS: u32 = 3600;
 
 /// Hermes's built-in profile, the root of its home.
 const DEFAULT_PROFILE: BuiltinAgent = BuiltinAgent::new("default");
@@ -310,6 +318,11 @@ impl RuntimeAdapter for Hermes {
                 // the start, so Hermes never asks for one. Overwrites what
                 // a `/sethome` left.
                 ("MOBILE_APP_HOME_CHANNEL".to_owned(), home.to_owned()),
+                // A question asked in the app waits for a phone, not a desk.
+                (
+                    "agent.clarify_timeout".to_owned(),
+                    CLARIFY_TIMEOUT_SECONDS.to_string(),
+                ),
             ],
         })
     }
@@ -1097,6 +1110,7 @@ mod tests {
                     "MOBILE_APP_HOME_CHANNEL".to_owned(),
                     "home.lab.main".to_owned()
                 ),
+                ("agent.clarify_timeout".to_owned(), "3600".to_owned()),
             ]
         );
         let default = RuntimeAgentName::new("default").unwrap();

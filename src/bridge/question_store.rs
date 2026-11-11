@@ -26,6 +26,35 @@ pub struct QuestionChange {
     pub message: Option<Message>,
 }
 
+/// A question's new state, as its agent's channel or the bridge reports it.
+pub struct Settlement {
+    pub state: QuestionState,
+    pub answer: Option<QuestionAnswer>,
+    /// Whether the answer is the one a paired device submitted, matched by
+    /// its request: only then does the history say the person answered.
+    /// Otherwise it is what the agent reports (a reply in the conversation,
+    /// or a plugin that says so), and the history says that.
+    pub confirmed: bool,
+}
+
+impl Settlement {
+    /// A state the agent's channel reports, matched to no device request.
+    pub fn reported(state: QuestionState, answer: Option<QuestionAnswer>) -> Self {
+        Self {
+            state,
+            answer,
+            confirmed: false,
+        }
+    }
+}
+
+/// At most this many pending questions in one conversation: a runtime asks
+/// one at a time there (Hermes presents a batch one by one).
+pub const MAX_PENDING_PER_CONVERSATION: i64 = 4;
+/// At most this many pending questions of one agent, across its
+/// conversations: each is sent to the person's devices at every sync.
+pub const MAX_PENDING_PER_AGENT: i64 = 32;
+
 fn json_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
@@ -117,17 +146,22 @@ fn state_text(state: &QuestionState) -> String {
     .into()
 }
 
-fn settlement(info: &QuestionInfo) -> String {
+fn settlement_text(info: &QuestionInfo, confirmed: bool) -> String {
+    let lead = if confirmed {
+        "Answered"
+    } else {
+        "Answered, as the agent reports"
+    };
     match &info.answer {
         Some(QuestionAnswer::Choices { indices }) => format!(
-            "Answered: {}",
+            "{lead}: {}",
             indices
                 .iter()
                 .map(|i| info.definition.choices[*i as usize].as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Some(QuestionAnswer::Text { text }) => format!("Answered: {text}"),
+        Some(QuestionAnswer::Text { text }) => format!("{lead}: {text}"),
         _ => match info.state {
             QuestionState::Skipped => "Question skipped.",
             QuestionState::Expired => "Question expired.",
@@ -149,6 +183,32 @@ impl Store {
             .prepare(sql)?
             .query_map([person], read_question)?
             .collect()
+    }
+
+    /// Every pending question: its agent, id, and when it was asked
+    /// (seconds since the epoch), oldest first.
+    pub fn pending_questions_by_age(&self) -> rusqlite::Result<Vec<(String, QuestionId, i64)>> {
+        let mut query = self.db.prepare(
+            "SELECT q.agent, q.id, m.at FROM questions q JOIN messages m ON m.id=q.ask_message
+             WHERE q.state='pending' ORDER BY m.at, q.rowid",
+        )?;
+        query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    QuestionId::new(row.get::<_, String>(1)?).map_err(json_error)?,
+                    row.get(2)?,
+                ))
+            })?
+            .collect()
+    }
+
+    /// Tests: message `id` as said at `at`.
+    #[cfg(test)]
+    pub fn backdate_message(&self, id: &str, at: i64) -> rusqlite::Result<()> {
+        self.db
+            .execute("UPDATE messages SET at=?2 WHERE id=?1", params![id, at])
+            .map(drop)
     }
 
     pub fn pending_questions(&self, agent: &str) -> rusqlite::Result<Vec<QuestionId>> {
@@ -207,6 +267,22 @@ impl Store {
         {
             return Err(QuestionStoreError::Conflict);
         }
+        let pending = |sql: &str, key: &str| -> rusqlite::Result<i64> {
+            tx.query_row(sql, [key], |r| r.get(0))
+        };
+        if pending(
+            "SELECT COUNT(*) FROM questions WHERE conversation=?1 AND state='pending'",
+            conversation.as_str(),
+        )? >= MAX_PENDING_PER_CONVERSATION
+            || pending(
+                "SELECT COUNT(*) FROM questions WHERE agent=?1 AND state='pending'",
+                origin,
+            )? >= MAX_PENDING_PER_AGENT
+        {
+            return Err(QuestionStoreError::Invalid(
+                "Too many questions are waiting for an answer.".into(),
+            ));
+        }
         let encoded = serde_json::to_string(definition)
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO questions(id,conversation,agent,owner,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,?5,'pending',0,NULL,?6)", params![definition.id.as_str(),conversation.as_str(),origin,owner,encoded,message_id])?;
@@ -223,10 +299,14 @@ impl Store {
         &self,
         origin: &str,
         id: &QuestionId,
-        state: QuestionState,
-        answer: Option<QuestionAnswer>,
+        settlement: Settlement,
         message_id: &str,
     ) -> Result<QuestionChange, QuestionStoreError> {
+        let Settlement {
+            state,
+            answer,
+            confirmed,
+        } = settlement;
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -282,7 +362,7 @@ impl Store {
             ],
         )?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
-        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'status',?4,?5,?6)",params![message_id,next.info.conversation.as_str(),settlement(&next.info),now(),speaker,id.as_str()])?;
+        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'status',?4,?5,?6)",params![message_id,next.info.conversation.as_str(),settlement_text(&next.info, confirmed),now(),speaker,id.as_str()])?;
         let message = history_message(&tx, id.as_str(), "status")?;
         tx.commit()?;
         Ok(QuestionChange {
@@ -340,10 +420,12 @@ mod tests {
             .settle_question(
                 "lab/coder",
                 &definition.id,
-                QuestionState::Answered,
-                Some(QuestionAnswer::Choices {
-                    indices: vec![1, 0],
-                }),
+                Settlement::reported(
+                    QuestionState::Answered,
+                    Some(QuestionAnswer::Choices {
+                        indices: vec![1, 0],
+                    }),
+                ),
                 "settle-1",
             )
             .unwrap();
@@ -359,10 +441,12 @@ mod tests {
             .settle_question(
                 "lab/coder",
                 &definition.id,
-                QuestionState::Answered,
-                Some(QuestionAnswer::Choices {
-                    indices: vec![0, 1],
-                }),
+                Settlement::reported(
+                    QuestionState::Answered,
+                    Some(QuestionAnswer::Choices {
+                        indices: vec![0, 1],
+                    }),
+                ),
                 "settle-replayed",
             )
             .unwrap();
@@ -371,8 +455,7 @@ mod tests {
             store.settle_question(
                 "lab/coder",
                 &definition.id,
-                QuestionState::Pending,
-                None,
+                Settlement::reported(QuestionState::Pending, None),
                 "reopen"
             ),
             Err(QuestionStoreError::Conflict)
@@ -381,8 +464,7 @@ mod tests {
             store.settle_question(
                 "lab/coder",
                 &definition.id,
-                QuestionState::Skipped,
-                None,
+                Settlement::reported(QuestionState::Skipped, None),
                 "replace"
             ),
             Err(QuestionStoreError::Conflict)
@@ -426,8 +508,7 @@ mod tests {
             store.settle_question(
                 "lab/helper",
                 &definition.id,
-                QuestionState::Expired,
-                None,
+                Settlement::reported(QuestionState::Expired, None),
                 "forged"
             ),
             Err(QuestionStoreError::Unknown)
@@ -501,8 +582,10 @@ mod tests {
                 .settle_question(
                     "lab/coder",
                     &definition.id,
-                    QuestionState::Answered,
-                    Some(QuestionAnswer::Choices { indices: vec![999] }),
+                    Settlement::reported(
+                        QuestionState::Answered,
+                        Some(QuestionAnswer::Choices { indices: vec![999] })
+                    ),
                     "invalid"
                 )
                 .is_err()
@@ -519,8 +602,7 @@ mod tests {
                 .settle_question(
                     "lab/coder",
                     &definition.id,
-                    QuestionState::Expired,
-                    None,
+                    Settlement::reported(QuestionState::Expired, None),
                     "overflow"
                 )
                 .is_err()
@@ -549,5 +631,136 @@ mod tests {
             .unwrap();
         assert_eq!(store.messages_after("owned", 0).unwrap()[0].question, None);
         assert_eq!(store.since("owner", 0).unwrap()[0].text, "unchanged");
+    }
+
+    #[test]
+    fn pending_questions_are_capped_per_conversation_and_per_agent() {
+        let (_dir, store, conversation) = fixture();
+        for index in 0..MAX_PENDING_PER_CONVERSATION {
+            store
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &definition(&format!("q-{index}")),
+                    &format!("ask-{index}"),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.ask_question("lab/coder", &conversation, &definition("q-over"), "over"),
+            Err(QuestionStoreError::Invalid(_))
+        ));
+        assert!(store.question(&definition("q-over").id).unwrap().is_none());
+        // A replayed ask is not a new question; a settled one no longer counts.
+        store
+            .ask_question("lab/coder", &conversation, &definition("q-0"), "ask-0")
+            .unwrap();
+        store
+            .settle_question(
+                "lab/coder",
+                &definition("q-0").id,
+                Settlement::reported(QuestionState::Expired, None),
+                "expired-0",
+            )
+            .unwrap();
+        store
+            .ask_question("lab/coder", &conversation, &definition("q-next"), "next")
+            .unwrap();
+        // Across conversations, the agent's own cap.
+        let mut asked = MAX_PENDING_PER_CONVERSATION;
+        for index in 0.. {
+            let id = format!("c-{index}");
+            store.conversation(&id, "lab", "coder", "owner").unwrap();
+            let conversation = ConversationId::new(id.clone()).unwrap();
+            let result = store.ask_question(
+                "lab/coder",
+                &conversation,
+                &definition(&format!("{id}-q")),
+                &format!("{id}-ask"),
+            );
+            if asked == MAX_PENDING_PER_AGENT {
+                assert!(matches!(result, Err(QuestionStoreError::Invalid(_))));
+                break;
+            }
+            result.unwrap();
+            asked += 1;
+        }
+        assert_eq!(
+            store.pending_questions("lab/coder").unwrap().len() as i64,
+            MAX_PENDING_PER_AGENT
+        );
+        // Another agent has its own.
+        store
+            .conversation("helper-c", "lab", "helper", "owner")
+            .unwrap();
+        store
+            .ask_question(
+                "lab/helper",
+                &ConversationId::new("helper-c").unwrap(),
+                &definition("helper-q"),
+                "helper-ask",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn old_pending_questions_are_found_by_when_they_were_asked() {
+        let (_dir, store, conversation) = fixture();
+        let old = definition("old");
+        store
+            .ask_question("lab/coder", &conversation, &old, "old-ask")
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE messages SET at=100 WHERE id='old-ask'", [])
+            .unwrap();
+        store
+            .ask_question("lab/coder", &conversation, &definition("new"), "new-ask")
+            .unwrap();
+        let pending = store.pending_questions_by_age().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0], ("lab/coder".to_owned(), old.id.clone(), 100));
+        assert!(pending[1].2 > 1000);
+        store
+            .settle_question(
+                "lab/coder",
+                &old.id,
+                Settlement::reported(QuestionState::Expired, None),
+                "old-expired",
+            )
+            .unwrap();
+        assert_eq!(store.pending_questions_by_age().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_confirmed_answer_reads_as_the_persons_in_history() {
+        let (_dir, store, conversation) = fixture();
+        for (id, confirmed, text) in [
+            ("confirmed", true, "Answered: Classement"),
+            (
+                "reported",
+                false,
+                "Answered, as the agent reports: Classement",
+            ),
+        ] {
+            let mut question = definition(id);
+            question.multiple = false;
+            store
+                .ask_question("lab/coder", &conversation, &question, &format!("{id}-ask"))
+                .unwrap();
+            let change = store
+                .settle_question(
+                    "lab/coder",
+                    &question.id,
+                    Settlement {
+                        state: QuestionState::Answered,
+                        answer: Some(QuestionAnswer::Choices { indices: vec![1] }),
+                        confirmed,
+                    },
+                    &format!("{id}-settled"),
+                )
+                .unwrap();
+            assert_eq!(change.message.unwrap().text, text);
+        }
     }
 }

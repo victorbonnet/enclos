@@ -151,7 +151,6 @@ class Hint(unittest.TestCase):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
         self.assertIn("message HTML shows as literal text", protocol.PLATFORM_HINT)
-        self.assertIn("attachments open on tap (PDF/text in the app)", protocol.PLATFORM_HINT)
         self.assertIn("clarify with questions", protocol.PLATFORM_HINT)
 
     def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):

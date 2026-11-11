@@ -10,7 +10,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 #[path = "question_store.rs"]
 mod question_store;
-pub use question_store::{QuestionChange, QuestionStoreError, StoredQuestion};
+pub use question_store::{
+    MAX_PENDING_PER_AGENT, MAX_PENDING_PER_CONVERSATION, QuestionChange, QuestionStoreError,
+    Settlement, StoredQuestion,
+};
 
 /// Who wrote a message.
 #[derive(Debug, Clone, PartialEq, Eq)]

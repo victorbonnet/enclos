@@ -7,7 +7,7 @@ description: Use when asking a person for a choice or missing information throug
 
 Use this skill when a decision or missing detail needs the person's answer in the enclos app. Choose routine, low-stakes details yourself.
 
-1. Ask through the native `clarify` tool. Put the question in `question` and short option labels only in `choices`. The app shows tappable rows, an Other text field and Skip; the person can also answer in the conversation composer.
+1. Ask through the native `clarify` tool. Put the question in `question` and short option labels only in `choices`. The app shows tappable rows, an Other text field and Skip. In a one-to-one conversation the person can also reply in the composer with an option's number or text, or "skip"; any other message cancels the question and reaches you as a message. In a group, a message waits for your turn to end, so the person answers on the card.
 2. Put your recommendation first. Hermes adds the recommendation label; the person selects their own answer.
 3. Put up to five independent questions in one `questions` array. Hermes delivers them sequentially in this channel. Ask dependent questions after the earlier answer arrives.
 4. Wait for the actual tool result. Continue from `user_response` only when its status is `answered`. A skipped or unanswered question supplies no decision. For `cancelled`, `timed_out` or `undelivered`, use the result and notice to decide whether to proceed with a safe assumption or explain the missing answer.
@@ -30,6 +30,6 @@ For a free-text question, omit `choices`:
 clarify({"questions":[{"question":"What name should the report use?"}]})
 ```
 
-Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer.
+Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer. An unanswered question times out after an hour; continue from the result Hermes returns.
 
 Use policy request tools for sandbox access; answering a question does not change policy. Request a concrete scope through `enclos_request_access` and wait for the person's decision in the policy inbox.

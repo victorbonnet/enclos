@@ -280,6 +280,9 @@ pub enum ErrorCode {
     Conflict,
     Unsupported,
     NotFound,
+    /// A request that may have reached the agent, whose outcome was not
+    /// confirmed: unlike `agent_unavailable`, retrying is not known to be safe.
+    Unconfirmed,
     #[serde(other)]
     Unknown,
 }
