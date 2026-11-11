@@ -530,12 +530,18 @@ impl Store {
         rows.collect()
     }
 
-    /// The turn sent to a member as plugin message `sent`: `(id, status, seen)`.
-    pub fn turn_sent(&self, sent: &str) -> rusqlite::Result<Option<(String, String, Option<i64>)>> {
+    /// The turn of member `agent` in group `conversation` sent to it as
+    /// plugin message `sent`: `(id, status, seen)`.
+    pub fn turn_sent(
+        &self,
+        sent: &str,
+        conversation: &str,
+        agent: &str,
+    ) -> rusqlite::Result<Option<(String, String, Option<i64>)>> {
         self.db
             .query_row(
-                "SELECT id, status, seen FROM turns WHERE sent = ?1",
-                params![sent],
+                "SELECT id, status, seen FROM turns WHERE sent = ?1 AND conversation = ?2 AND agent = ?3",
+                params![sent, conversation, agent],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -848,10 +854,13 @@ mod tests {
             .unwrap();
         assert!(store.running_turns().unwrap().is_empty());
         assert_eq!(
-            store.turn_sent("sent-1").unwrap(),
+            store.turn_sent("sent-1", "g-1", "main").unwrap(),
             Some(("t-1".to_owned(), "failed".to_owned(), Some(4)))
         );
-        assert_eq!(store.turn_sent("sent-2").unwrap(), None);
+        assert_eq!(store.turn_sent("sent-2", "g-1", "main").unwrap(), None);
+        // Another member's turn, or another group's, is not this one.
+        assert_eq!(store.turn_sent("sent-1", "g-1", "coder").unwrap(), None);
+        assert_eq!(store.turn_sent("sent-1", "g-2", "main").unwrap(), None);
     }
 
     #[test]

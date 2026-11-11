@@ -25,7 +25,7 @@ from gateway.platforms._shared import get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
-from . import protocol
+from . import lines, protocol
 from .outbox import Outbox
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,10 @@ class EnclosAdapter(BasePlatformAdapter):
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
             if os.path.exists(self._path):
                 os.unlink(self._path)
-            self._server = await asyncio.start_unix_server(self._on_connection, path=self._path)
+            # A line as long as the protocol allows, not asyncio's 64 KiB.
+            self._server = await asyncio.start_unix_server(
+                self._on_connection, path=self._path, limit=lines.LIMIT
+            )
             os.chmod(self._path, 0o600)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
@@ -110,7 +113,7 @@ class EnclosAdapter(BasePlatformAdapter):
         try:
             first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_SECONDS)
             hello = protocol.decode_from_bridge(first)
-        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError):
+        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError, ValueError):
             writer.close()
             return
         if hello["type"] != "hello" or not protocol.token_matches(hello.get("token"), self._token):
@@ -127,7 +130,16 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._write(protocol.commands(listed))
             for message in self._outbox.pending():
                 await self._write(message)
-            while line := await reader.readline():
+            while True:
+                try:
+                    line = await lines.read_line(reader)
+                except lines.TooLong as e:
+                    # Said at once: the bridge does not wait for an answer
+                    # to a message that never arrived.
+                    await self._write(protocol.error("bad_message", str(e), e.message_id))
+                    continue
+                if not line:
+                    break
                 await self._on_line(line)
         except ConnectionError:
             pass
