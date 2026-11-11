@@ -55,7 +55,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Session | A single use of a sandbox from start to end (an interactive `connect`, an `exec`, or a runtime service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
 | Audit entry | One record per state-changing command: time, user, host, command, state before and after, result. Append-only, hash-chained. | `enclos policy allow home api.telegram.org` |
 
-Templates are reusable policies: `minimal`, `assistant`, `coding`.
+Templates are reusable policies: `minimal` and `assistant`. A coding agent uses one of them with its project folder as a workspace (§7).
 
 **The sandbox is the permission boundary, the agent is not** ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)). Agents in one sandbox can read each other's files, because they share one policy. Agents that need different permissions go in different sandboxes.
 
@@ -296,7 +296,8 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 | --- | --- | --- | --- | --- |
 | `minimal` | own home | the runtime only, once program rules come; for now any, since a policy with `[exec]` is refused until a backend enforces it | what is listed: from `runtime install` on, the runtime adapter's endpoints (for Hermes: its install sources, and `chatgpt.com` and `auth.openai.com` for a ChatGPT subscription), and what `policy allow` adds, such as another provider's hosts | a starting point |
 | `assistant` | own home | any, including what the agent installs in its home | the public web (any public address on ports 80 and 443), plus the runtime's endpoints and listed APIs | personal agents such as Hermes |
-| `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
+
+A coding agent, such as Claude Code or Codex, needs no template of its own: its project folder is a workspace (`write_add`, or `--workspace` when the sandbox is created), written in place under either template. Use `assistant` when it may search the web and read documentation, and `minimal` for code that should reach only what is listed, adding the Git host and package registries it uses with `policy allow`. A planned `coding` template differed from these only by an allowlist of Git hosts and package registries, so it is dropped: workspaces work under every template, and the runtime adapter brings its model provider's endpoints under any of them.
 
 `mcp-only`, in 0.1.0, had the same rules as `minimal`, so it is gone: a sandbox for remote MCP servers starts from `minimal`, adds each endpoint's host with `policy allow`, and tells the runtime of it with its own commands through `enclos connect`, until `runtime configure --mcp-add` does both. A template for it can return when program rules make it differ.
 
@@ -706,7 +707,7 @@ enclos policy edit home   # [secrets.agents.default] env = { TELEGRAM_BOT_TOKEN 
 enclos runtime configure home --channel telegram --allow-user 123456789        # the built-in agent's bot
 enclos runtime configure home/main --channel telegram --allow-user 123456789   # main's own (ADR 0036)
 
-enclos sandbox create dev --backend seatbelt --template coding --workspace ~/dev/app
+enclos sandbox create dev --backend seatbelt --template assistant --workspace ~/dev/app
 enclos runtime install claude-code --sandbox dev
 
 enclos sandbox create community --backend seatbelt --template minimal
@@ -808,7 +809,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    Done when the acceptance scenario for milestone 3 below passes.
 4. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
-   2. Runtimes: an OpenClaw adapter, then the coding agents, Claude Code and Codex adapters (interactive) with the `coding` template writing in place to the selected project folder, then DeepSeek Harness.
+   2. Runtimes: an OpenClaw adapter, then the coding agents, Claude Code and Codex adapters (interactive), each writing in place to its project folder granted as a workspace, then DeepSeek Harness.
    3. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
    4. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
 
