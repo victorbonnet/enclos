@@ -34,6 +34,8 @@ A Noise transport message holds at most 65,535 bytes, its 16-byte tag included, 
 
 ### Names
 
+Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a plugin `hello`'s `runtime` and `agent`) is not empty, at most 128 bytes, and holds no control character; an `error`'s `message` holds no control character either. A message that breaks this is a bad message. The host prints some of them, so text from the sandbox can neither move a terminal's cursor nor break a log's line.
+
 - **An agent** is `<sandbox>/<agent>` on one host, as enclos names it. The app adds the host it reached.
 - **A conversation** is a UUID the app makes. The plugin gives it to the runtime as the chat's id, so a new conversation is a new chat for the runtime, and a cron job created in it remembers it as its origin.
 - **A person** is a tailnet login, as Tailscale's WhoIs gives it (`alice@example.com`). In version 1 the only person is the host's user; the field is there from the start so sharing (ADR 0043) changes no stored history.
