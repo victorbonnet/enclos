@@ -93,7 +93,10 @@ impl SqliteStateStore {
         match netlog::denied_from(&conn, sandbox, attached) {
             // Attached but not readable: no row counts as diagnostic (ADR 0059).
             Err(e) if attached => {
-                eprintln!("enclos: diagnostic run metadata cannot be read: {e}");
+                eprintln!(
+                    "enclos: diagnostic run metadata cannot be read: {}",
+                    self.read_err(e)
+                );
                 netlog::denied_from(&conn, sandbox, false)
             }
             read => read,
