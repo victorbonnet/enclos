@@ -89,6 +89,21 @@ fn a_strange_media_type_is_a_plain_file() {
     );
 }
 
+#[test]
+fn an_attachment_name_loses_its_hidden_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inbox, media) = (dir.path().join("media"), dir.path().join("app-media"));
+    std::fs::create_dir(&inbox).unwrap();
+    std::fs::write(inbox.join("a3.bin"), b"x").unwrap();
+    let mut a = out("a3.bin");
+    a.mime = "text/html".to_owned();
+    a.name = "report\u{202E}lmth.txt\nsecond line".to_owned();
+    assert_eq!(
+        take_attachment(&inbox, &media, "c-1", &a).unwrap().name,
+        "reportlmth.txtsecond line"
+    );
+}
+
 fn approval_sample() -> enclos_protocol::approval::Approval {
     use enclos_protocol::approval::*;
     Approval {

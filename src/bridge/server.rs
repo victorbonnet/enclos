@@ -1427,7 +1427,14 @@ fn take_attachment(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
     });
-    let name = a.name.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    // The name titles the artefact card, the viewer and the Share sheet: a
+    // bidirectional override or a line break in it would make the file read
+    // as another type or another line, so hidden characters are dropped.
+    let name = enclos_protocol::visible::stripped(
+        a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
+        false,
+    );
+    let name = name.trim();
     Ok(StoredAttachment {
         id,
         conversation: conversation.to_owned(),
