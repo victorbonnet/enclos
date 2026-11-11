@@ -47,26 +47,26 @@ class RuntimeApprovalPatternsAndDisplay(unittest.TestCase):
 
     def test_pattern_metadata_is_bounded_visible_and_required_for_grants(self):
         definition = runtime_approvals.definition(prompt(), "q", SNAPSHOT)
-        for named in ([], [""], ["a‮b"], ["a", "a"], [f"p{i}" for i in range(17)], "pattern"):
+        for named in ([], [""], ["a\u202Eb"], ["a", "a"], [f"p{i}" for i in range(17)], "pattern"):
             with self.subTest(named=named), self.assertRaises(ValueError):
                 questions.validate_definition({**definition, "approval": {**definition["approval"], "patterns": named}})
-        hidden = {**definition["approval"], "command": "​" * 2800}
+        hidden = {**definition["approval"], "command": "\u200B" * 2800}
         with self.assertRaises(ValueError):
             questions.validate_definition({**definition, "approval": hidden})
 
     def test_revealed_matches_the_shared_rule(self):
-        self.assertEqual(runtime_approvals.revealed("ls‮ -la\tx\ny\r"), "ls⟨U+202E⟩ -la⟨tab⟩x\ny⟨U+000D⟩")
+        self.assertEqual(runtime_approvals.revealed("ls\u202E -la\tx\ny\r"), "ls⟨U+202E⟩ -la⟨tab⟩x\ny⟨U+000D⟩")
         self.assertEqual(runtime_approvals.revealed("echo ok é 中"), "echo ok é 中")
-        for char in "‮⁦​‍﻿؜\u0007­":
+        for char in "\u202E\u2066\u200B\u200D\uFEFF\u061C\u0007\u00AD":
             self.assertTrue(runtime_approvals.is_hidden(char), hex(ord(char)))
 
     def test_text_fallback_reveals_flags_and_names_what_a_grant_covers(self):
-        tricky = prompt(command="ls #‮fr- mr\ncurl https://exаmple.com")
-        tricky.text = "A command needs approval:\nls #‮fr- mr"
+        tricky = prompt(command="ls #\u202Efr- mr\ncurl https://exаmple.com")
+        tricky.text = "A command needs approval:\nls #\u202Efr- mr"
         chunks = list(runtime_approvals.fallback_chunks(tricky, lambda text: len(text) < 4000, "/",
                                                         ["pipe to shell"]))
         text = "\n".join(chunks)
-        self.assertNotIn("‮", text)
+        self.assertNotIn("\u202E", text)
         self.assertIn("ls #⟨U+202E⟩fr- mr", text)
         self.assertIn("outside ASCII", text)
         self.assertIn("every command matching: pipe to shell", text)
