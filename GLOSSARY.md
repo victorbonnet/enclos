@@ -26,11 +26,11 @@ _Avoid_: rules, permissions, config
 
 **Policy request**:
 A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
-_Avoid_: tool approval (a runtime's own decision), command approval
+_Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision)
 
 **Runtime approval**:
 A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
-_Avoid_: policy request, question (a request for information)
+_Avoid_: policy request, question (a request for information), command approval
 
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.

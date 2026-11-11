@@ -26,9 +26,130 @@ def prompt(command="echo test", actions=("once", "session", "always", "deny"), *
         actions=[(a.title(), a, "") for a in actions], **fields)
 
 
+SNAPSHOT = {"request_id": "request-1", "command": "echo test", "description": "Native test reason",
+            "pattern_key": "package install scripts", "pattern_keys": ["package install scripts", "pipe to shell"]}
+
+
+class RuntimeApprovalPatternsAndDisplay(unittest.TestCase):
+    def test_session_and_always_name_the_native_patterns_or_are_not_offered(self):
+        definition = runtime_approvals.definition(prompt(), "q", SNAPSHOT)
+        questions.validate_definition(definition)
+        self.assertEqual(definition["approval"]["patterns"], ["package install scripts", "pipe to shell"])
+        self.assertEqual(definition["approval"]["actions"], list(runtime_approvals.ACTIONS))
+        self.assertEqual(runtime_approvals.patterns({"pattern_key": "recursive delete"}), ["recursive delete"])
+        for snapshot in (None, {}, {"pattern_keys": [], "pattern_key": ""}):
+            narrowed = runtime_approvals.definition(prompt(), "q", snapshot)
+            questions.validate_definition(narrowed)
+            self.assertEqual(narrowed["approval"]["actions"], ["once", "deny"])
+            self.assertNotIn("patterns", narrowed["approval"])
+        deny_only = runtime_approvals.definition(prompt(actions=("deny",)), "q", SNAPSHOT)
+        self.assertNotIn("patterns", deny_only["approval"])
+
+    def test_pattern_metadata_is_bounded_visible_and_required_for_grants(self):
+        definition = runtime_approvals.definition(prompt(), "q", SNAPSHOT)
+        for named in ([], [""], ["a‮b"], ["a", "a"], [f"p{i}" for i in range(17)], "pattern"):
+            with self.subTest(named=named), self.assertRaises(ValueError):
+                questions.validate_definition({**definition, "approval": {**definition["approval"], "patterns": named}})
+        hidden = {**definition["approval"], "command": "​" * 2800}
+        with self.assertRaises(ValueError):
+            questions.validate_definition({**definition, "approval": hidden})
+
+    def test_revealed_matches_the_shared_rule(self):
+        self.assertEqual(runtime_approvals.revealed("ls‮ -la\tx\ny\r"), "ls⟨U+202E⟩ -la⟨tab⟩x\ny⟨U+000D⟩")
+        self.assertEqual(runtime_approvals.revealed("echo ok é 中"), "echo ok é 中")
+        for char in "‮⁦​‍﻿؜\u0007­":
+            self.assertTrue(runtime_approvals.is_hidden(char), hex(ord(char)))
+
+    def test_text_fallback_reveals_flags_and_names_what_a_grant_covers(self):
+        tricky = prompt(command="ls #‮fr- mr\ncurl https://exаmple.com")
+        tricky.text = "A command needs approval:\nls #‮fr- mr"
+        chunks = list(runtime_approvals.fallback_chunks(tricky, lambda text: len(text) < 4000, "/",
+                                                        ["pipe to shell"]))
+        text = "\n".join(chunks)
+        self.assertNotIn("‮", text)
+        self.assertIn("ls #⟨U+202E⟩fr- mr", text)
+        self.assertIn("outside ASCII", text)
+        self.assertIn("every command matching: pipe to shell", text)
+        self.assertIn("command_allowlist", text)
+        plain = "\n".join(runtime_approvals.fallback_chunks(prompt(actions=("once", "deny")),
+                                                            lambda text: True, "/", ["pipe to shell"]))
+        self.assertNotIn("outside ASCII", plain)
+        self.assertNotIn("every command matching", plain)
+
+
+class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
+    def binding(self, rows):
+        native = types.SimpleNamespace(list_gateway_approvals=Mock(side_effect=lambda session: rows))
+        return runtime_approvals.Binding(native, prompt(), "request-1", "session", dict(SNAPSHOT))
+
+    def test_bookkeeping_added_to_the_native_entry_keeps_the_card_live(self):
+        rows = [{**SNAPSHOT, "timeout_s": 300, "acknowledged": True}]
+        self.assertTrue(self.binding(rows).pending())
+        self.assertFalse(self.binding([{**SNAPSHOT, "command": "rm -rf /"}]).pending())
+        self.assertFalse(self.binding([{**SNAPSHOT, "pattern_keys": ["other"]}]).pending())
+
+    def test_a_request_gone_without_an_observation_expires_only_after_the_grace(self):
+        rows = []
+        binding = self.binding(rows)
+        clock = iter([100.0, 100.0, 103.0, 106.0])
+        now = lambda: next(clock)
+        self.assertIsNone(binding.observed(now))
+        self.assertIsNone(binding.observed(now))
+        self.assertEqual(binding.observed(now), ("expired", None))
+        # An observation that does arrive always wins over the guess.
+        late = self.binding([])
+        late.reason = "resolved"
+        self.assertEqual(late.observed(), ("resolved", None))
+
+    async def test_an_unbindable_request_is_sent_as_text_not_reported_delivered(self):
+        for rows in ([], [dict(SNAPSHOT), dict(SNAPSHOT)]):
+            adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
+                                            _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
+            native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=rows))
+            manager = questions.Manager(adapter, approvals_native=lambda: native)
+            manager.bridge_runtime_supports = True
+            self.assertEqual(await manager.ask_approval(prompt()), (True, None))
+            text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
+            self.assertIn("echo test", text)
+            self.assertIn("/deny", text)
+            self.assertFalse(manager.cards)
+
+    async def test_an_unobservable_request_is_sent_as_text_not_reported_delivered(self):
+        adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
+                                        _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
+        native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
+                                       observe_gateway_settle=Mock(return_value=False))
+        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager.bridge_runtime_supports = True
+        self.assertEqual(await manager.ask_approval(prompt()), (True, None))
+        self.assertTrue(adapter.send.await_args_list)
+        self.assertFalse(manager.cards)
+
+    async def test_an_answer_to_a_closed_card_replays_its_state_against_that_request(self):
+        adapter = types.SimpleNamespace(send=AsyncMock(), _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
+        native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
+                                       observe_gateway_settle=Mock(return_value=True),
+                                       resolve_gateway_approval_card=Mock(return_value=1))
+        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager.bridge_runtime_supports = True
+        saved, question = await manager.ask_approval(prompt())
+        self.assertTrue(saved)
+        card = manager.cards[question]
+        card.entry.reason = "timeout"
+        await manager._settle(card, *card.entry.observed())
+        request = protocol._message("question.answer", question=question, conversation="c",
+                                    answer={"kind": "approval", "action": "once"})
+        await manager.answer(request)
+        native.resolve_gateway_approval_card.assert_not_called()
+        update = adapter._write.call_args.args[0]
+        self.assertEqual((update["type"], update["state"], update["of"]), ("question.update", "expired", request["id"]))
+        self.assertNotIn("answer", update)
+        await manager.close()
+
+
 class RuntimeApprovalProtocol(unittest.TestCase):
     def test_approval_definitions_and_answers_are_separate_from_questions(self):
-        definition = runtime_approvals.definition(prompt(), "q")
+        definition = runtime_approvals.definition(prompt(), "q", SNAPSHOT)
         self.assertEqual(questions.validate_definition(definition), definition)
         answer = {"kind": "approval", "action": "once"}
         self.assertEqual(questions.validate_answer(answer, definition), answer)
@@ -43,13 +164,13 @@ class RuntimeApprovalProtocol(unittest.TestCase):
 
     def test_action_order_flags_and_deny_only_are_preserved(self):
         for actions in (("deny",), ("once", "deny"), ("once", "session", "deny"), runtime_approvals.ACTIONS):
-            definition = runtime_approvals.definition(prompt(actions=actions), "q")
+            definition = runtime_approvals.definition(prompt(actions=actions), "q", SNAPSHOT)
             questions.validate_definition(definition)
             self.assertEqual(definition["approval"]["actions"], list(actions))
         for actions in (("once",), ("once", "always", "deny"), ("deny", "once"), ("once", "once", "deny"), ("wat", "deny")):
             with self.subTest(actions=actions), self.assertRaises(ValueError):
-                questions.validate_definition(runtime_approvals.definition(prompt(actions=actions), "q"))
-        definition = runtime_approvals.definition(prompt(actions=("deny",)), "q")
+                questions.validate_definition(runtime_approvals.definition(prompt(actions=actions), "q", SNAPSHOT))
+        definition = runtime_approvals.definition(prompt(actions=("deny",)), "q", SNAPSHOT)
         with self.assertRaises(ValueError):
             questions.validate_answer({"kind": "approval", "action": "once"}, definition)
         definition["approval"]["smart_denied"] = True
@@ -59,7 +180,7 @@ class RuntimeApprovalProtocol(unittest.TestCase):
             questions.validate_definition(definition)
 
     def test_controls_and_mixed_choice_metadata_are_rejected(self):
-        definition = runtime_approvals.definition(prompt(), "q")
+        definition = runtime_approvals.definition(prompt(), "q", SNAPSHOT)
         definition["approval"]["command"] = "a\r\nb\tc"
         questions.validate_definition(definition)
         for changes in ({"choices": ["allow"]}, {"multiple": True},
@@ -248,9 +369,10 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("answer", self.updates()[-1])
         request = self.answer(card, "always")
         await self.manager.answer(request)
-        self.assertEqual(self.adapter._write.call_args.args[0]["type"], "error")
-        self.assertEqual(self.adapter._write.call_args.args[0]["of"], request["id"])
-        self.assertNotIn("of", self.updates()[-1])
+        # The closed card's own state answers that request; it never names an action.
+        self.assertEqual(self.updates()[-1]["of"], request["id"])
+        self.assertEqual(self.updates()[-1]["state"], "resolved")
+        self.assertNotIn("answer", self.updates()[-1])
 
     async def test_external_answer_during_publication_still_closes_the_published_exact_card(self):
         async def delivered(message):

@@ -2,6 +2,8 @@
 
 import inspect
 import re
+import time
+import unicodedata
 from dataclasses import dataclass
 
 
@@ -22,10 +24,48 @@ def native_api():
     return None
 
 
-def definition(prompt, question_id):
-    return {"id": question_id, "text": "Hermes requests command approval", "choices": [], "multiple": False,
-            "approval": {"command": prompt.command, "reason": prompt.description,
-                         "actions": [row[1] for row in prompt.actions], "smart_denied": bool(prompt.smart_denied)}}
+MAX_PATTERNS = 16
+PATTERN_GRANTS = ("session", "always")
+# What a pending native request is: an entry still matching these is the one shown.
+IDENTITY = ("request_id", "command", "description", "pattern_key", "pattern_keys")
+# How long a request may be missing from Hermes before its card closes as expired.
+MISSING_GRACE_SECONDS = 5.0
+
+
+def is_hidden(char):
+    """Whether `char` changes how the text around it reads without being seen; the
+    same rule as enclos-protocol's `visible` module."""
+    code = ord(char)
+    return (unicodedata.category(char) == "Cc" or code in (0x00AD, 0x061C, 0x180E, 0xFEFF)
+            or 0x200B <= code <= 0x200F or 0x202A <= code <= 0x202E
+            or 0x2060 <= code <= 0x2064 or 0x2066 <= code <= 0x2069)
+
+
+def revealed(text):
+    """`text` with each hidden character but a newline written as ⟨U+XXXX⟩ and each tab
+    as ⟨tab⟩: what is shown is what runs."""
+    return "".join(c if c == "\n" else "⟨tab⟩" if c == "\t" else f"⟨U+{ord(c):04X}⟩" if is_hidden(c) else c
+                   for c in text)
+
+
+def patterns(snapshot):
+    """The native pattern keys a session or always grant of this request records."""
+    keys = list((snapshot or {}).get("pattern_keys") or [(snapshot or {}).get("pattern_key")])
+    return list(dict.fromkeys(key for key in keys if isinstance(key, str) and key.strip()))
+
+
+def definition(prompt, question_id, snapshot=None):
+    named = patterns(snapshot)
+    actions = [row[1] for row in prompt.actions]
+    if not named:
+        # A grant whose reach cannot be shown is not offered; Once and Deny stay.
+        actions = [action for action in actions if action not in PATTERN_GRANTS]
+    approval = {"command": prompt.command, "reason": prompt.description,
+                "actions": actions, "smart_denied": bool(prompt.smart_denied)}
+    if named and any(action in PATTERN_GRANTS for action in actions):
+        approval["patterns"] = named
+    return {"id": question_id, "text": "Hermes requests runtime approval", "choices": [], "multiple": False,
+            "approval": approval}
 
 
 def _fenced(text):
@@ -51,17 +91,26 @@ def _bounded(text, render, fits):
         text = text[lo:]
 
 
-def fallback_chunks(prompt, fits, prefix="/"):
+def fallback_chunks(prompt, fits, prefix="/", named=()):
     # Every command part is a complete literal Markdown block, including when a
     # long backtick/tilde run or JSON escapes changes the available byte budget.
-    if fits(prompt.text):
-        yield prompt.text
+    # Hidden characters are written out, so what is shown is what runs.
+    text = revealed(prompt.text)
+    if fits(text):
+        yield text
     else:
-        yield from _bounded(prompt.text, _fenced, fits)
-    yield from _bounded(prompt.command, lambda part: "Complete command:\n" + _fenced(part), fits)
+        yield from _bounded(text, _fenced, fits)
+    yield from _bounded(revealed(prompt.command), lambda part: "Complete command:\n" + _fenced(part), fits)
+    if not prompt.command.isascii():
+        yield "The command holds characters outside ASCII, some of which look like others. Check each one."
+    offered = [row[1] for row in prompt.actions]
+    if named and any(action in PATTERN_GRANTS for action in offered):
+        yield from _bounded("; ".join(named), lambda part: (
+            "A session or always grant covers every command matching: " + part
+            + ". An always grant persists in the Hermes profile until removed from its command_allowlist."), fits)
     commands = {"once": f"{prefix}approve", "session": f"{prefix}approve session",
                 "always": f"{prefix}approve always", "deny": f"{prefix}deny"}
-    choices = " · ".join(commands[row[1]] for row in prompt.actions if row[1] in commands)
+    choices = " · ".join(commands[action] for action in offered if action in commands)
     yield f"Reply with {choices}."
 
 
@@ -73,17 +122,32 @@ class Binding:
     session_key: str
     snapshot: dict
     reason: str | None = None
+    missing_since: float | None = None
+
+    def _matching(self):
+        return [row for row in self.native.list_gateway_approvals(self.session_key)
+                if row.get("request_id") == self.request_id]
 
     def pending(self):
-        matching = [row for row in self.native.list_gateway_approvals(self.session_key)
-                    if row.get("request_id") == self.request_id]
+        matching = self._matching()
         # The ID was supplied by the native prompt; the snapshot only verifies it
-        # remains the same immutable request. It never supplies a replacement ID.
-        return len(matching) == 1 and matching[0] == self.snapshot and self.reason is None
+        # remains the same request, by the fields that say what it would allow.
+        # Bookkeeping Hermes may add to its entry later never makes a card dead.
+        return (len(matching) == 1 and self.reason is None
+                and all(matching[0].get(key) == self.snapshot.get(key) for key in IDENTITY))
 
-    def observed(self):
+    def observed(self, now=time.monotonic):
         if self.reason is None:
-            return None
+            # Hermes removes an entry before it calls its observers, so a missing
+            # entry is only taken as gone (a teardown path that skips observers)
+            # once it has stayed missing past the grace period: never a guess
+            # standing in for a decision that is about to be reported.
+            if self._matching():
+                self.missing_since = None
+                return None
+            if self.missing_since is None:
+                self.missing_since = now()
+            return ("expired", None) if now() - self.missing_since >= MISSING_GRACE_SECONDS else None
         if self.reason == "resolved":
             return "resolved", None
         return ("expired" if self.reason == "timeout" else "cancelled"), None

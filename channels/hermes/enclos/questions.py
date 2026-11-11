@@ -58,6 +58,19 @@ def validate_definition(value):
             raise ValueError("smart_denied must be a boolean")
         if approval.get("smart_denied", False) and actions not in (["deny"], ["once", "deny"]):
             raise ValueError("smart deny only offers a one-operation override")
+        # Shown with its hidden characters written out, the command must still fit.
+        if len(runtime_approvals.revealed(approval["command"]).encode("utf-8")) > MAX_DEFINITION_BYTES:
+            raise ValueError("approval.command is too long to show in full")
+        named = approval.get("patterns", [])
+        if (not isinstance(named, list) or len(named) > runtime_approvals.MAX_PATTERNS
+                or len(set(map(str, named))) != len(named)):
+            raise ValueError("an approval names at most 16 distinct patterns")
+        for pattern in named:
+            _text(pattern, "approval.patterns")
+            if any(runtime_approvals.is_hidden(c) for c in pattern):
+                raise ValueError("approval.patterns holds a hidden character")
+        if any(a in runtime_approvals.PATTERN_GRANTS for a in actions) and not named:
+            raise ValueError("a session or always grant must name the patterns it covers")
     if _size(value) > MAX_DEFINITION_BYTES:
         raise ValueError("question exceeds 24 KiB")
     return value
@@ -194,11 +207,11 @@ class Manager:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    async def approval_text_fallback(self, prompt):
+    async def approval_text_fallback(self, prompt, named=()):
         def fits(text):
             return len(protocol.encode_line(protocol.message_out(prompt.chat_id, text))) <= MAX_APPROVAL_FRAME_BYTES
         for chunk in runtime_approvals.fallback_chunks(
-                prompt, fits, getattr(self.adapter, "typed_command_prefix", "/")):
+                prompt, fits, getattr(self.adapter, "typed_command_prefix", "/"), named):
             result = await self.adapter.send(prompt.chat_id, chunk,
                 metadata={**(prompt.metadata or {}), "is_approval_prompt": True})
             if not result.success:
@@ -212,15 +225,23 @@ class Manager:
         matching = [row for row in native.list_gateway_approvals(prompt.session_key)
                     if row.get("request_id") == prompt.request_id]
         if len(matching) != 1:
-            return True, None  # Already withdrawn; never bind to another pending request.
-        definition = runtime_approvals.definition(prompt, protocol.new_id())
+            # Never bind to another pending request, and never report a card nobody
+            # sees as delivered: Hermes believes the whole command was shown.
+            logger.warning("Runtime approval %s has %d native matches; sending it as text",
+                           prompt.request_id, len(matching))
+            return await self.approval_text_fallback(prompt), None
+        named = runtime_approvals.patterns(matching[0])
+        definition = runtime_approvals.definition(prompt, protocol.new_id(), matching[0])
         try:
             validate_definition(definition)
-        except ValueError:
-            return await self.approval_text_fallback(prompt), None
+        except ValueError as error:
+            logger.warning("Runtime approval %s cannot be a card (%s); sending it as text", prompt.request_id, error)
+            return await self.approval_text_fallback(prompt, named), None
         binding = runtime_approvals.Binding(native, prompt, prompt.request_id, prompt.session_key, matching[0])
         if not binding.observe(asyncio.get_running_loop()):
-            return True, None
+            logger.warning("Runtime approval %s settled before it could be observed; sending it as text",
+                           prompt.request_id)
+            return await self.approval_text_fallback(prompt, named), None
         card = Card(definition, prompt.chat_id, prompt.request_id, prompt.session_key, binding, native)
         self.cards[definition["id"]] = card
         self.approval_ids.add(definition["id"])
@@ -382,16 +403,19 @@ class Manager:
             await self._settle(card, *self._observed(card), of=message["id"])
 
     async def _answer_approval(self, card, answer, request_id):
-        if card.state == "answered":
+        if card.state != "pending":
+            # A known outcome is replayed against this request: the bridge answers
+            # the device with the card's state instead of leaving it uncertain.
             await self._settle(card, card.state, card.answer, of=request_id)
             return
-        if card.state == "pending" and self._live(card) and card.entry.resolve(answer["action"]):
+        if self._live(card) and card.entry.resolve(answer["action"]):
             # No await separates the exact resolver from durable correlated settlement.
             await self._settle(card, "answered", answer, of=request_id)
             return
         observed = self._observed(card)
-        if card.state == "pending" and observed is not None:
-            await self._settle(card, *observed)
+        if observed is not None:
+            await self._settle(card, *observed, of=request_id)
+            return
         await self.adapter._write(protocol.error("agent_unavailable",
             "The runtime approval was already resolved or is no longer available.", request_id))
 
@@ -443,7 +467,8 @@ class Manager:
             if card.state == "pending" and self._live(card):
                 if card.definition.get("approval"):
                     if not self.approvals_available:
-                        await self.approval_text_fallback(card.entry.prompt)
+                        await self.approval_text_fallback(card.entry.prompt,
+                                                          card.definition["approval"].get("patterns", ()))
                 elif not self.available:
                     await self.text_fallback(card.conversation, card.entry.question, card.entry.choices,
                                              card.native_id)
@@ -454,6 +479,8 @@ class Manager:
         for question_id, card in list(self.cards.items()):
             if card.state != "pending" and card.update and card.update["id"] == message_id:
                 self.cards.pop(question_id)
+                # Its terminal update is stored: nothing of this approval is sent again.
+                self.approval_ids.discard(question_id)
 
     async def retire(self, native_id):
         for card in self.cards.values():
