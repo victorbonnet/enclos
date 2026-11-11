@@ -27,7 +27,8 @@ PLATFORM_HINT = (
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
     "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
     "on a phone screen, and keep tables narrow. A single newline is a line break. "
-    "Images are not shown (an image link shows as its alt text) and HTML shows as literal text."
+    "Images are not shown (an image shows as its alt text, a link to it) and HTML shows as "
+    "literal text."
 )
 
 

@@ -95,6 +95,10 @@ class Hint(unittest.TestCase):
         self.assertIn("Images are not shown", protocol.PLATFORM_HINT)
         self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
 
+    def test_it_says_what_an_image_shows_as_the_protocol_does(self):
+        # docs/protocol.md, "What the agent says is markdown", and the app's spec
+        self.assertIn("an image shows as its alt text, a link to it", protocol.PLATFORM_HINT)
+
     def test_it_stays_short_for_every_prompt(self):
         self.assertLess(len(protocol.PLATFORM_HINT), 600)
 
