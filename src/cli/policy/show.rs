@@ -144,10 +144,26 @@ fn print_rules(policy: &Policy, backend: BackendKind) {
     for path in &policy.fs.read_deny {
         println!("    {path}");
     }
+    if !policy.fs.read_only.is_empty() {
+        println!(
+            "  read-only:  {} paths, readable but never changed",
+            policy.fs.read_only.len()
+        );
+        for path in &policy.fs.read_only {
+            println!("    {path}");
+        }
+    } else if policy.fs.write.iter().any(|w| w == "/") {
+        // Under the whole filesystem, none is worth saying: the shell's
+        // startup files are writable then (ADR 0058).
+        println!("  read-only:  none, so the shell's startup files are writable too");
+    }
     match policy.net.mode {
         NetMode::Public => {
             println!("\nNetwork: public web (every connection is logged)");
-            println!("  mode:    public: any public address on ports 80 and 443");
+            println!(
+                "  mode:    public: any public address {}",
+                policy.net.public_ports.described()
+            );
             println!(
                 "           never loopback, link-local or metadata addresses, nor private ones unless listed below"
             );

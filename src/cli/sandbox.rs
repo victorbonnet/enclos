@@ -37,8 +37,10 @@ enum SandboxVerb {
         backend: Option<BackendKind>,
         /// The policy it starts from, required so the widest is never
         /// picked by leaving it out: minimal (only what is listed; from
-        /// `runtime install` on, the runtime's hosts) or assistant (the
-        /// public web) (design §7).
+        /// `runtime install` on, the runtime's hosts), assistant (the
+        /// public web) or autonomous (Seatbelt only, proposed: writes
+        /// everywhere but keys, enclos's files and program and the shell's
+        /// startup files, any port; higher risk) (design §7, ADR 0058).
         #[arg(long)]
         template: TemplateName,
     },
@@ -98,6 +100,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Some(kind) => kind,
                 None => engine.default_backend()?,
             };
+            let autonomous = template.to_string() == "autonomous";
+            if autonomous {
+                eprintln!("{AUTONOMOUS_WARNING}");
+            }
             let planned = engine.create_sandbox(
                 by,
                 SandboxSpec {
@@ -328,8 +334,14 @@ fn show_json(v: &SandboxView) -> Value {
     })
 }
 
+/// What `sandbox create --template autonomous` says first (ADR 0058), on
+/// standard error so that it reaches a person whatever the output format.
+const AUTONOMOUS_WARNING: &str = "warning: the autonomous template lets the sandbox write wherever you can, your own files included: nothing stops it changing or removing them, and commands are not filtered, so keep backups. Anything the host later runs from a file it wrote, such as a program on your PATH, a Git hook or an app, runs outside the sandbox. It reaches any public address on any port. It still cannot read or write the sensitive paths (keys, credentials, browsers, password managers), enclos's own files or program, change your shell's startup files, or use host services. Only the Seatbelt backend builds it. Narrow it in the sandbox's policy.toml.";
+
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {
+        // `autonomous` left out on purpose: the hint should not lead a new
+        // user to the template that may change their files (ADR 0058).
         println!(
             "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|assistant`."
         );
