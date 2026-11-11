@@ -91,14 +91,39 @@ impl Hub {
         self.agents.iter().any(|a| a.name == agent)
     }
 
-    /// Another listed agent whose handle `name` reads as, ignoring case: a
-    /// display name must not pass one agent off as another.
-    fn handle_taken(&self, agent: &str, name: &str) -> Option<&str> {
+    /// Another listed agent whose handle or address `name` reads as: a
+    /// display name must not pass one agent off as another. Compared
+    /// ignoring case, joiners ([`enclos_protocol::visible::bare`]: "main"
+    /// with an emoji selector is "main"), a leading `@`, and whatever comes
+    /// before a last `/`, so neither "lab/main" nor "prod/main" may name
+    /// another agent than `main`.
+    pub(super) fn handle_taken(&self, agent: &str, name: &str) -> Option<&str> {
+        let bare = enclos_protocol::visible::bare(name);
+        let read = bare
+            .rsplit('/')
+            .next()
+            .unwrap_or(&bare)
+            .trim()
+            .trim_start_matches('@');
         self.agents
             .iter()
             .filter(|a| a.name != agent)
             .map(|a| a.name.rsplit('/').next().unwrap_or(&a.name))
-            .find(|handle| handle.eq_ignore_ascii_case(name.trim_start_matches('@')))
+            .find(|handle| handle.eq_ignore_ascii_case(read))
+    }
+
+    /// `metadata` as `person` is shown it: a saved name that reads as an
+    /// agent listed since it was set is left out, so the agent shows as its
+    /// stable address until its name is changed.
+    pub(super) fn shown_name(&self, agent: &str, mut metadata: NameMetadata) -> NameMetadata {
+        if metadata
+            .display_name
+            .as_deref()
+            .is_some_and(|name| self.handle_taken(agent, name).is_some())
+        {
+            metadata.display_name = None;
+        }
+        metadata
     }
 
     fn name_authority(
@@ -130,7 +155,7 @@ impl Hub {
         self.name_authority(store, device, person, agent, false)
             .map_err(|e| name_error(&of, ErrorCode::NotAllowed, e))?;
         let metadata = store.agent_name(agent).map_err(|e| storage_error(&of, e))?;
-        Ok(name_message(agent, metadata, of))
+        Ok(name_message(agent, self.shown_name(agent, metadata), of))
     }
 
     pub(super) fn set_agent_name(

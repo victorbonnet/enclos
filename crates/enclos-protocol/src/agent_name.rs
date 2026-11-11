@@ -31,17 +31,18 @@ fn required_name<'de, D: Deserializer<'de>>(value: D) -> Result<Option<String>, 
     Option::<String>::deserialize(value)
 }
 
-/// Names may contain accented characters and emoji, but never invisible line/control syntax.
+/// Names may contain accented characters and emoji, joined ones too, but
+/// never a character that does not show itself ([`crate::visible`]).
 pub fn normalize(value: Option<&str>) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
     // Check before trimming so a newline is not silently accepted at an edge.
-    // A bidirectional override or a zero-width character would let a name
-    // read as another agent's (`"\u{202E}niam"` shows as "main").
-    if crate::visible::has_hidden(value, false)
-        || value.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}'))
-    {
+    // A bidirectional override, a zero-width character, a tag or a
+    // variation selector after a letter would let a name read as another
+    // agent's (`"\u{202E}niam"` shows as "main"), and a blank filler would
+    // make an empty-looking one.
+    if crate::visible::has_hidden(value, false) {
         return Err(
             "An agent name cannot contain control characters, invisible characters or line breaks."
                 .into(),
@@ -109,6 +110,16 @@ mod tests {
         );
         assert_eq!(normalize(None).unwrap(), None);
         assert!(normalize(Some(&"🦀".repeat(100))).is_ok());
+        // Joined emoji, an emoji's presentation selector and Persian's
+        // non-joiner are ordinary text.
+        for valid in [
+            "Coder \u{1F469}\u{200D}\u{1F4BB}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} family",
+            "Love \u{2764}\u{FE0F}",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}",
+        ] {
+            assert_eq!(normalize(Some(valid)).unwrap().as_deref(), Some(valid));
+        }
         for invalid in [
             "".into(),
             "  ".into(),
@@ -122,6 +133,29 @@ mod tests {
             "ma\u{200B}in".into(),
             "\u{FEFF}main".into(),
             "ma\u{00AD}in".into(),
+            // Variation selectors and joiners next to a letter.
+            "main\u{FE0F}".into(),
+            "main\u{FE00}".into(),
+            "main\u{E0100}".into(),
+            "ma\u{200D}in".into(),
+            "ma\u{200C}in".into(),
+            // Tags, the combining grapheme joiner, format characters.
+            "main\u{E007F}".into(),
+            "main\u{E0041}".into(),
+            "ma\u{034F}in".into(),
+            "ma\u{206A}in".into(),
+            "ma\u{206F}in".into(),
+            "main\u{FFF9}".into(),
+            "main\u{FFFB}".into(),
+            // Blank-looking fillers, alone or beside a name.
+            "\u{3164}".into(),
+            "\u{115F}".into(),
+            "\u{1160}main".into(),
+            "main\u{FFA0}".into(),
+            "\u{2800}".into(),
+            // A joiner at an edge, or between emoji and a letter.
+            "\u{200D}\u{1F4BB}".into(),
+            "\u{1F469}\u{200D}".into(),
             "x".repeat(101),
             "🦀".repeat(101),
         ] {

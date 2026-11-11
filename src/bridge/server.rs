@@ -1254,9 +1254,14 @@ fn run_session(
                     .agents
                     .iter()
                     .filter(|a| hub.can_see_agent(person, &a.name))
-                    .map(|a| AgentInfo {
-                        display_name: names.get(&a.name).and_then(|n| n.display_name.clone()),
-                        name_revision: names.get(&a.name).map(|n| n.revision).unwrap_or(0),
+                    .map(|a| {
+                        let name = hub
+                            .shown_name(&a.name, names.get(&a.name).cloned().unwrap_or_default());
+                        (a, name)
+                    })
+                    .map(|(a, name)| AgentInfo {
+                        display_name: name.display_name,
+                        name_revision: name.revision,
                         can_edit_name: hub.host.as_deref() == Some(person),
                         avatar: photos.get(&a.name).cloned().unwrap_or_default(),
                         can_edit_avatar: hub.host.as_deref() == Some(person),

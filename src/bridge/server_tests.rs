@@ -955,6 +955,55 @@ fn who_sees_an_agent_is_one_rule_for_its_list_its_name_and_its_name_changes() {
 }
 
 #[test]
+fn a_name_that_an_agent_added_later_reads_as_is_not_shown() {
+    use enclos_protocol::agent_name::NameSet;
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    let endpoint = |name: &str| AgentEndpoint {
+        name: name.into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("not-connected.sock"),
+        token: "fixture".into(),
+    };
+    Arc::get_mut(&mut hub)
+        .unwrap()
+        .agents
+        .push(endpoint("lab/main"));
+    let owner = avatar_device("phone", "owner@example.com");
+    store.add_device(&owner).unwrap();
+    let edit = NameSet {
+        agent: "lab/main".into(),
+        revision: 0,
+        display_name: Some("gege".into()),
+    };
+    hub.set_agent_name(&store, &owner, &owner.person, &edit, "set".into())
+        .unwrap();
+    // An agent with that handle is listed after the name was set.
+    Arc::get_mut(&mut hub)
+        .unwrap()
+        .agents
+        .push(endpoint("lab/gege"));
+    let ToDevice::AgentName(shown) = hub
+        .get_agent_name(&store, &owner, &owner.person, "lab/main", "read".into())
+        .unwrap()
+    else {
+        panic!("not a name reply");
+    };
+    assert_eq!(shown.display_name, None, "shown as its stable address");
+    assert_eq!(shown.revision, 1, "the revision still allows an edit");
+    assert_eq!(
+        store
+            .agent_name("lab/main")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("gege"),
+        "kept, and shown again once the other agent is gone"
+    );
+    let named = hub.shown_name("lab/main", store.agent_name("lab/main").unwrap());
+    assert_eq!(named.display_name, None);
+}
+
+#[test]
 fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices() {
     use enclos_protocol::agent_name::NameSet;
     use enclos_protocol::plugin::ErrorCode;
@@ -1077,7 +1126,17 @@ fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices()
         "equal handles on other sandboxes retain their names"
     );
     // Another listed agent's handle would pass this agent off as that one.
-    for taken in ["Geg", "geg", "@GEG"] {
+    // Its address too, or any `<sandbox>/` before its handle.
+    for taken in [
+        "Geg",
+        "geg",
+        "@GEG",
+        "lab/Geg",
+        "prod/geg",
+        "@lab/GEG",
+        "lab / Geg",
+        "other/comptoir-dev",
+    ] {
         let collision = NameSet {
             revision: 1,
             display_name: Some(taken.into()),
