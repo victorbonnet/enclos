@@ -199,6 +199,53 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
 }
 
 #[test]
+fn accepted_access_labels_the_entry_the_engine_wrote() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let net = |target: &str, private| Access {
+        kind: AccessKind::Network,
+        target: target.into(),
+        private,
+    };
+    assert!(policy::accepted_entry(
+        "allow",
+        "api.example.com",
+        &net("API.Example.com:443", false)
+    ));
+    assert!(policy::accepted_entry(
+        "allow",
+        "api.example.com:8443",
+        &net("api.example.com:8443", false)
+    ));
+    assert!(!policy::accepted_entry(
+        "allow",
+        "api.example.com",
+        &net("api.example.com:8443", false)
+    ));
+    assert!(policy::accepted_entry(
+        "private",
+        "nas.local",
+        &net("NAS.local:8443", true)
+    ));
+    assert!(!policy::accepted_entry(
+        "private",
+        "nas.local",
+        &net("nas.local:8443", false)
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+    let write = Access {
+        kind: AccessKind::Write,
+        target: dir.path().join("alias").display().to_string(),
+        private: false,
+    };
+    let stored = crate::policy::paths::real_path(&real).display().to_string();
+    assert!(policy::accepted_entry("write", &stored, &write));
+    assert!(!policy::accepted_entry("allow", &stored, &write));
+}
+
+#[test]
 fn accepted_access_is_not_limited_to_the_inbox_history_window() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("app.db")).unwrap();

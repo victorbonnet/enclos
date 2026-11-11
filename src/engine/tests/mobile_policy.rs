@@ -168,3 +168,89 @@ fn mobile_policy_restart_requirement_is_reviewed_and_pending_edits_block_new_cha
     );
     assert!(!e.mobile_policy(&name).unwrap().editable);
 }
+
+/// A phone edit adds to the sandbox's own lists and never copies what it
+/// inherits into its file: the template's, the adapter's and the built-in
+/// defaults' entries stay inherited, so a later enclos or runtime still
+/// reaches this sandbox.
+#[test]
+fn mobile_policy_edits_keep_inherited_entries_inherited() {
+    let (_dir, e, name) = with_sandbox();
+    save(&e, &name, &edit("allow", None, Some("one.example.com")));
+    save(&e, &name, &edit("read_deny", None, Some("~/private-notes")));
+    let file = e.layout.read_policy(name.as_str()).unwrap();
+    let layer = crate::policy::file::PolicyFile::parse("policy.toml", &file).unwrap();
+    assert_eq!(layer.network.allow, None, "{file}");
+    assert_eq!(layer.network.allow_add, ["one.example.com"]);
+    assert_eq!(layer.filesystem.read_deny, None, "{file}");
+    assert_eq!(layer.filesystem.read_deny_add, ["~/private-notes"]);
+    // Removing the entry it added takes it out of its own list.
+    save(&e, &name, &edit("allow", Some("one.example.com"), None));
+    let layer = crate::policy::file::PolicyFile::parse(
+        "policy.toml",
+        &e.layout.read_policy(name.as_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(layer.network.allow_add.is_empty());
+    assert!(layer.network.allow_remove.is_empty());
+    assert!(
+        e.policy(&name)
+            .unwrap()
+            .snapshot
+            .policy
+            .fs
+            .read_deny
+            .contains(&"~/.ssh".to_owned())
+    );
+}
+
+/// Widening edits say what they widen before they are saved.
+#[test]
+fn mobile_policy_previews_mode_and_listening_changes() {
+    let (_dir, e, name) = with_sandbox();
+    let state = e.mobile_policy(&name).unwrap();
+    let mode = &state
+        .fields
+        .iter()
+        .find(|f| f.key == "mode")
+        .unwrap()
+        .values[0]
+        .value;
+    let other = if mode == "public" {
+        "allowlist"
+    } else {
+        "public"
+    };
+    let p = e
+        .mobile_policy_preview(&name, &state.base, &edit("mode", Some(mode), Some(other)))
+        .unwrap();
+    assert!(!p.changes.is_empty());
+    let listen = &state
+        .fields
+        .iter()
+        .find(|f| f.key == "listen")
+        .unwrap()
+        .values[0]
+        .value;
+    let flipped = if listen == "true" { "false" } else { "true" };
+    let p = e
+        .mobile_policy_preview(
+            &name,
+            &state.base,
+            &edit("listen", Some(listen), Some(flipped)),
+        )
+        .unwrap();
+    assert!(!p.changes.is_empty());
+}
+
+#[test]
+fn mobile_policy_edit_is_audited_with_what_changed() {
+    let (_dir, e, name) = with_sandbox();
+    save(&e, &name, &edit("allow", None, Some("one.example.com")));
+    let entry = e.audit(None).unwrap().pop().unwrap();
+    assert_eq!(entry.intent.command, "app policy edit");
+    assert_eq!(
+        entry.intent.target.as_deref(),
+        Some("home allow: (none) -> one.example.com")
+    );
+}
