@@ -16,7 +16,7 @@ The words used here:
 
 ## Linux requirements
 
-enclos's Linux support is in development and is not in a release yet. Once a release has Linux archives, the installer below installs them on Linux on x86_64 or arm64 (aarch64), as on a Mac; until then, build from a clone. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
+The installer below installs enclos on Linux on x86_64 or arm64 (aarch64), as on a Mac, from 0.3.0 on. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
 
 A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`), 0.9.0 or later, and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
 
@@ -75,12 +75,14 @@ The sandbox reaches the public web through its proxy, on ports 80 and 443, so an
 Hermes already has one agent once it is installed: its built-in `default`, the root of its home, which `hermes` uses when you name no agent, unless `hermes profile use` picked another. Once the setup above has picked a provider and a model, `enclos agent add` adds more, each starting on them:
 
 ```bash
-enclos agent add lab/main
-enclos agent add lab/scout
+enclos --yes agent add lab/main   # --yes: the setup's `connect` started the Hermes gateway, which restarts
+enclos --yes agent add lab/scout
 enclos agent list lab        # lab/default  built in, then lab/main and lab/scout
 ```
 
 enclos lists `default` but neither adds nor removes it: it exists as long as Hermes is installed in the sandbox.
+
+The Hermes gateway serves only the agents that existed when it started, so while the sandbox's services run, `enclos agent add` stops the gateway once Hermes has made the agent and starts it again; that ends a chat in progress, so it asks you to confirm first (`--yes`), and `--dry-run` lists the stop and the start. If the gateway cannot start again, the agent stays added and `enclos sandbox start lab` starts it. In a stopped sandbox, nothing restarts and nothing is asked.
 
 An agent added before the setup picked a provider has none of its own (Hermes's `auto`), and Hermes then says it is not connected to any AI provider: `enclos agent add` says so when it adds one, and `enclos status` while it lasts. Give it one with `enclos connect lab -- hermes -p main model`; it uses the sandbox's login.
 
@@ -110,7 +112,7 @@ You can also create an agent with Hermes's own commands, from a shell in the san
 lab/scout: Hermes has this agent; enclos does not track it. Track it with `enclos agent add lab/scout`.
 ```
 
-`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record.
+`enclos agent add lab/scout` then adopts it as it is, without creating it again, and restarts the gateway the same way, so that it serves the agent. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record.
 
 `enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`). While the sandbox's services run, enclos stops the Hermes gateway for the delete, since it holds every agent's files, and starts it again after; when Hermes says its delete is not finished and names `hermes profile purge-identity`, enclos runs that too. `--keep-data` removes only enclos's record and says what it leaves: usually the files, so Hermes still has the agent and enclos reports it as one it does not track. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
 
@@ -121,7 +123,7 @@ To test an agent that already runs on your Mac, export it there with Hermes's ow
 ```bash
 mkdir -p ~/exports                                        # Hermes needs the folder to exist
 hermes profile export default -o ~/exports/main.tar.gz   # on your Mac, with your own Hermes
-enclos agent add lab/main --from ~/exports/main.tar.gz   # Hermes imports it inside the sandbox
+enclos agent add lab/main --from ~/exports/main.tar.gz   # Hermes imports it inside the sandbox; --yes while the gateway runs
 enclos connect lab -- hermes -p main
 ```
 
@@ -129,7 +131,7 @@ Hermes's export of `default` carries the agent's configuration, personality, ski
 
 Three things do not come in with the archive. Your login: enclos copies none in, so the agent should use the sandbox's, made with `enclos connect lab -- hermes -p default setup`. If its configuration names another provider, it asks for that login inside the sandbox; values it needs, such as a bot token, are granted to it with `enclos policy edit lab` under `[secrets.agents.main]` and set with `enclos runtime configure lab/main --set KEY='${VAR}'`, never kept in its files. Network grants: nothing in the archive widens the sandbox's policy, so what the agent reaches shows in `enclos net log lab` and what was refused in `enclos net denied lab`, where you decide. Your own Hermes: enclos never runs it, and never reads `~/.hermes` on its own.
 
-Its cron jobs come along and start acting as soon as the sandbox's gateway runs, at once if `lab` is already started (`enclos sandbox start lab`). That they run there, and that the imported agent uses the sandbox's login, is still to verify (design §14). To take an agent back out, run the export inside the sandbox, where `connect` starts in the sandbox's home: `enclos connect lab -- hermes profile export main -o main.tar.gz` writes `~/.enclos/sandboxes/lab/home/main.tar.gz` on your Mac. Copy it to a folder of your own before importing it elsewhere: enclos refuses an archive under a sandbox's folder.
+Its cron jobs come along and start acting as soon as the sandbox's gateway runs, at once if `lab` is already started (`enclos sandbox start lab`), since the import restarts the gateway like any `agent add`. That they run there, and that the imported agent uses the sandbox's login, is still to verify (design §14). To take an agent back out, run the export inside the sandbox, where `connect` starts in the sandbox's home: `enclos connect lab -- hermes profile export main -o main.tar.gz` writes `~/.enclos/sandboxes/lab/home/main.tar.gz` on your Mac. Copy it to a folder of your own before importing it elsewhere: enclos refuses an archive under a sandbox's folder.
 
 ## Check the sandbox
 

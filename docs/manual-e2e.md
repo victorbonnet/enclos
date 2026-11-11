@@ -88,19 +88,22 @@ enclos doctor
 ## 4. Agents
 
 ```bash
-enclos agent add lab/main
-enclos agent add lab/scout
+enclos agent add lab/main; echo "exit $?"           # the setup started the gateway: needs confirmation
+enclos --yes agent add lab/main
+enclos connect lab -- hermes -p main chat -q 'Say hi'
+enclos --yes agent add lab/scout
 enclos agent add lab/Bad_Name; echo "exit $?"
 enclos agent list lab
 enclos connect lab -- hermes profile create helper   # made inside, not through enclos
 enclos agent list lab
-enclos agent add lab/helper
+enclos --yes agent add lab/helper
 enclos agent rm lab/scout; echo "exit $?"           # needs confirmation
 enclos --yes agent rm lab/scout
 enclos agent rm lab/helper --keep-data --yes
 enclos agent list lab
 ```
 
+- [ ] `agent add lab/main` without `--yes` exits 3, saying it restarts the sandbox's service gateway and ends a chat in progress; with it, `enclos logs lab` shows the gateway starting again, and `main` answers the chat rather than `Gateway connection failed`.
 - [ ] `agent list`: `lab/default  built in`, `lab/main`, `lab/scout`. `Bad_Name` is refused before anything runs (exit 1), with the naming rule.
 - [ ] After `profile create`, both the end of the `connect` session (on stderr) and `agent list` say `lab/helper: Hermes has this agent; enclos does not track it`, with the command to track it.
 - [ ] `agent add lab/helper` says `Tracked agent lab/helper, which Hermes already had`.
@@ -110,7 +113,7 @@ If you have your own Hermes, bring an agent from it. Its cron jobs come along an
 
 ```bash
 mkdir -p ~/exports && hermes profile export default -o ~/exports/mine.tar.gz
-enclos agent add lab/mine --from ~/exports/mine.tar.gz
+enclos --yes agent add lab/mine --from ~/exports/mine.tar.gz
 enclos connect lab -- hermes -p mine
 ```
 

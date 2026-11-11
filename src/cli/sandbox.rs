@@ -11,6 +11,7 @@ use enclos::engine::{
 };
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
+use enclos::model::count;
 use enclos::model::plan::{Confirm, Plan, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
@@ -361,8 +362,11 @@ fn print_list(views: &[SandboxView]) {
         let gone = v.sessions.len() - running;
         let sessions = match (running, gone) {
             (0, 0) => String::new(),
-            (n, 0) => format!(" ({n} sessions)"),
-            (n, g) => format!(" ({n} sessions, {g} gone, not recorded)"),
+            (n, 0) => format!(" ({})", count(n, "session", "sessions")),
+            (n, g) => format!(
+                " ({}, {g} gone, not recorded)",
+                count(n, "session", "sessions")
+            ),
         };
         println!(
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
@@ -590,6 +594,24 @@ fn not_restarted(name: &SandboxName, code: u8, stopped: Value) -> Value {
     )
 }
 
+/// The line a stop that ended everything prints, and what a stop that left
+/// processes running says it ended, each count agreeing with its noun.
+fn stop_lines(name: &SandboxName, report: &StopReport) -> (String, String) {
+    let gone = match report.gone.len() {
+        0 => String::new(),
+        n => format!(", {n} found gone and recorded"),
+    };
+    let ended = format!(
+        "{} ended{gone}",
+        count(report.stopped.len(), "session", "sessions")
+    );
+    let stopped = format!(
+        "Stopped sandbox {name}: {} removed, {ended}.",
+        count(report.services.len(), "service", "services")
+    );
+    (stopped, ended)
+}
+
 /// Says how a stop went, in text; returns its code and, for JSON, its
 /// report.
 pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value) {
@@ -618,27 +640,20 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
     );
     let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
     let value = output::with_error(value, code, || {
-        format!("sandbox {name} is marked failed: {survivors} processes survived stop. {what_now}")
+        format!(
+            "sandbox {name} is marked failed: {} survived stop. {what_now}",
+            count(survivors, "process", "processes")
+        )
     });
     if output::json() {
         return (code, value);
     }
-    let gone = match report.gone.len() {
-        0 => String::new(),
-        n => format!(", {n} found gone and recorded"),
-    };
+    let (stopped, ended) = stop_lines(name, report);
     if report.survivors.is_empty() {
-        println!(
-            "Stopped sandbox {name}: {} services removed, {} sessions ended{gone}.",
-            report.services.len(),
-            report.stopped.len()
-        );
+        println!("{stopped}");
         return (code, value);
     }
-    eprintln!(
-        "error: sandbox {name} is marked failed: some processes survived stop ({} sessions ended{gone}):",
-        report.stopped.len()
-    );
+    eprintln!("error: sandbox {name} is marked failed: some processes survived stop ({ended}):");
     for (session, survivors) in &report.survivors {
         for s in survivors {
             eprintln!(
@@ -852,8 +867,48 @@ mod tests {
             value["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("1 processes survived stop"),
+                .contains("1 process survived stop"),
             "{value}"
+        );
+    }
+
+    /// A stop's line says "1 session", "1 service", not "1 sessions".
+    #[test]
+    fn a_stops_counts_agree_with_their_nouns() {
+        use enclos::model::session::SessionId;
+        let name: SandboxName = "home".parse().unwrap();
+        let label = |s: &str| ServiceLabel::parse(s).unwrap();
+        let one = StopReport {
+            services: vec![label("enclos.home.proxy")],
+            stopped: vec![SessionId(3)],
+            gone: vec![SessionId(4)],
+            survivors: Vec::new(),
+        };
+        let (stopped, ended) = stop_lines(&name, &one);
+        assert_eq!(
+            stopped,
+            "Stopped sandbox home: 1 service removed, 1 session ended, 1 found gone and recorded."
+        );
+        assert_eq!(ended, "1 session ended, 1 found gone and recorded");
+        let none = StopReport {
+            services: Vec::new(),
+            stopped: Vec::new(),
+            gone: Vec::new(),
+            survivors: Vec::new(),
+        };
+        assert_eq!(
+            stop_lines(&name, &none).0,
+            "Stopped sandbox home: 0 services removed, 0 sessions ended."
+        );
+        let two = StopReport {
+            services: vec![label("enclos.home.proxy"), label("enclos.home.gateway")],
+            stopped: vec![SessionId(3), SessionId(5)],
+            gone: Vec::new(),
+            survivors: Vec::new(),
+        };
+        assert_eq!(
+            stop_lines(&name, &two).0,
+            "Stopped sandbox home: 2 services removed, 2 sessions ended."
         );
     }
 

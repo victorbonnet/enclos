@@ -28,7 +28,7 @@ More in the [glossary](GLOSSARY.md).
 
 ## How it works
 
-enclos adds no container and no VM. It uses the sandbox your operating system already has: on macOS, Seatbelt, through `sandbox-exec`. A session starts under its sandbox's compiled policy, and everything that session starts stays under it, whether a helper, an installer or a browser. On Linux, bubblewrap does the same in [milestone 3](docs/design.md#13-milestones), which is on `main` but in no release yet: there each sandbox has a network namespace of its own, and a Unix socket to its proxy. The rest of this section describes Seatbelt.
+enclos adds no container and no VM. It uses the sandbox your operating system already has: on macOS, Seatbelt, through `sandbox-exec`. A session starts under its sandbox's compiled policy, and everything that session starts stays under it, whether a helper, an installer or a browser. On Linux, bubblewrap does the same since 0.3.0 ([milestone 3](docs/design.md#13-milestones)): there each sandbox has a network namespace of its own, and a Unix socket to its proxy. The rest of this section describes Seatbelt.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/sandbox-dark.svg">
@@ -99,7 +99,7 @@ enclos init
 enclos sandbox create lab --template assistant   # the public web; minimal for only Hermes's hosts
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider, its login, a model
-enclos agent add lab/main
+enclos --yes agent add lab/main               # restarts the gateway the setup started, so it serves the agent
 enclos policy test lab                         # escape probes; every one must fail
 enclos sandbox start lab                       # proxy and gateway in the background
 enclos connect lab -- main                     # talk to the agent, with Hermes's own command

@@ -1714,7 +1714,7 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
     assert_eq!(out.code(), 0, "{}", out.stderr());
     assert!(
-        out.stderr().contains("left 1 processes running"),
+        out.stderr().contains("left 1 process running"),
         "{}",
         out.stderr()
     );
@@ -2630,8 +2630,11 @@ fn the_rarer_commands_print_one_document_piped() {
 fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
     use enclos::state::StateStore;
     let layout = enclos::layout::Layout::at(&home.root);
-    let state =
-        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = enclos::state::sqlite::SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        enclos::state::Wait::Command,
+    );
     let lock = state.lock().unwrap();
     let mut record = state.get(&name.parse().unwrap()).unwrap().unwrap();
     record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);
