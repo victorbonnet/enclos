@@ -415,8 +415,9 @@ impl Hub {
         let (writer, _) = plugins
             .get_mut(agent)
             .ok_or_else(|| format!("{agent}'s app channel closed"))?;
+        let host = self.host.as_deref() == Some(person.as_str());
         writer
-            .message(&conversation, &person, text)
+            .message(&conversation, &person, text, host)
             .map_err(|e| e.to_string())
     }
 
@@ -455,12 +456,18 @@ impl Hub {
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
-        self.question_connected(agent, &routine_connection);
+        let store = self.store().ok();
+        self.question_connected(
+            store.as_ref(),
+            agent,
+            &routine_connection,
+            &hello.capabilities,
+        );
         if (hello.capabilities.contains(&Capability::Questions)
             || hello.capabilities.contains(&Capability::RuntimeApprovals))
-            && let Ok(store) = self.store()
+            && let Some(store) = &store
         {
-            self.sync_questions(&store, agent, &mut writer)?;
+            self.sync_questions(store, agent, &mut writer)?;
         }
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
@@ -1897,7 +1904,12 @@ fn send(
     let sent = {
         let mut plugins = hub.plugins.lock().expect("not poisoned");
         let (writer, _) = plugins.get_mut(&name).expect("just opened");
-        writer.message(conversation, &person_id, text)
+        writer.message(
+            conversation,
+            &person_id,
+            text,
+            hub.host.as_deref() == Some(person),
+        )
     };
     let sent = sent.map_err(|e| e.to_string())?;
     if let Some(seq) = store

@@ -59,27 +59,54 @@ fn rpc_id(device: &str, person: &str, original: &MessageId) -> MessageId {
     MessageId::new(format!("question-{suffix}")).expect("bounded digest")
 }
 
-/// Whether a runtime reads `text` as one of its typed approval commands:
-/// `/approve` or `/deny`, in any case, with or without arguments or an
-/// `@name` suffix, after any leading `@image:`, `@file:` or `@url:` lines
-/// (Hermes's own parsing of a command message).
+/// Whether a character is whitespace to Python's `str.split` and `lstrip`,
+/// which Hermes parses commands with: Unicode's whitespace and also the
+/// separators U+001C to U+001F, which Rust's `char::is_whitespace` is not.
+fn python_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1C}'..='\u{1F}').contains(&c)
+}
+
+/// Whether a runtime reads `text` as one of its commands that decide or
+/// skip approvals: `/approve`, `/deny`, `/yolo` (no approval for the rest
+/// of the session) or `/approvals` (sets the approval mode, `off`
+/// included), in any case, with or without arguments or an `@name` suffix,
+/// after any leading `@image:`, `@file:` or `@url:` lines (Hermes's own
+/// parsing of a command message, `MessageEvent.get_command`). The channel
+/// checks again with Hermes's own parser and aliases (`message.in`'s
+/// `host`); this is the bridge's own line, for a channel that does not.
 pub(super) fn typed_approval(text: &str) -> bool {
-    let mut rest = text.trim_start();
+    let mut rest = text.trim_start_matches(python_space);
     while ["@image:", "@file:", "@url:"].iter().any(|prefix| {
         rest.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     }) {
         rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        rest = rest.trim_start_matches(python_space);
     }
     let Some(name) = rest
-        .split_whitespace()
-        .next()
+        .split(python_space)
+        .find(|word| !word.is_empty())
         .and_then(|word| word.strip_prefix('/'))
     else {
         return false;
     };
     let name = name.to_lowercase();
-    matches!(name.split('@').next(), Some("approve" | "deny"))
+    matches!(
+        name.split('@').next(),
+        Some("approve" | "deny" | "yolo" | "approvals")
+    )
+}
+
+/// Whether a settlement is what `requested` asked for.
+fn settles_as(
+    requested: &QuestionAnswer,
+    state: QuestionState,
+    answer: Option<&QuestionAnswer>,
+) -> bool {
+    match requested {
+        QuestionAnswer::Skip => state == QuestionState::Skipped && answer.is_none(),
+        requested => state == QuestionState::Answered && answer == Some(requested),
+    }
 }
 
 fn canonical_answer(mut answer: QuestionAnswer) -> QuestionAnswer {
@@ -120,6 +147,8 @@ pub(super) fn acknowledge_question(
             let code = match error {
                 QuestionStoreError::Unknown => ErrorCode::NotFound,
                 QuestionStoreError::Conflict => ErrorCode::Conflict,
+                // The channel denies such a runtime approval at once.
+                QuestionStoreError::NotAllowed(_) => ErrorCode::NotAllowed,
                 _ => ErrorCode::BadMessage,
             };
             let _ = writer.send(FromBridge::Error(failure(
@@ -147,12 +176,35 @@ impl Hub {
         definition.approval.is_none() || self.host.as_deref() == Some(person)
     }
 
-    pub(super) fn question_connected(&self, agent: &str, connection: &str) {
+    /// A channel connected. One without the `runtime_approvals` capability
+    /// cannot answer the runtime approvals it left (a runtime that lost the
+    /// native API, or one replaced): they expire now, rather than stay on
+    /// the host's person's devices with nothing to answer them.
+    pub(super) fn question_connected(
+        &self,
+        store: Option<&Store>,
+        agent: &str,
+        connection: &str,
+        capabilities: &[Capability],
+    ) {
         self.questions
             .lock()
             .expect("not poisoned")
             .connections
             .insert(agent.into(), connection.into());
+        if capabilities.contains(&Capability::RuntimeApprovals) {
+            return;
+        }
+        let Some(store) = store else { return };
+        for id in store.pending_approvals(agent).unwrap_or_default() {
+            let Ok(message) = new_id() else { return };
+            match store.settle_question(agent, &id, QuestionState::Expired, None, &message) {
+                Ok(change) => self.publish_question(store, change),
+                Err(error) => {
+                    eprintln!("enclos app: could not expire runtime approval {id}: {error}")
+                }
+            }
+        }
     }
 
     pub(super) fn sync_questions(
@@ -276,29 +328,40 @@ impl Hub {
                 "The native question receipt does not match its request.".into(),
             ));
         }
-        let (change, conflict) =
-            match store.settle_question(agent, question, state, answer, id.as_str()) {
-                Ok(change) => (change, false),
-                Err(QuestionStoreError::Conflict) => {
-                    let current = store
-                        .question(question)?
-                        .filter(|q| q.info.agent == agent)
-                        .ok_or(QuestionStoreError::Unknown)?;
-                    if !current.info.state.is_terminal() {
-                        return Err(QuestionStoreError::Conflict);
-                    }
-                    // An orphaned outbox ask can be expired after reconnect even if its earlier
-                    // terminal update was already stored. Preserve the first native settlement.
-                    (
-                        QuestionChange {
-                            question: current,
-                            message: None,
-                        },
-                        true,
-                    )
+        // Only the settlement of the device request it names, as that request
+        // asked, is the person's: anything else is the agent's report.
+        let confirmed = of
+            .and_then(|id| requests.pending.get(id.as_str()))
+            .is_some_and(|pending| settles_as(&pending.request.answer, state, answer.as_ref()));
+        let (change, conflict) = match store.settle_question_as(
+            agent,
+            question,
+            state,
+            answer,
+            id.as_str(),
+            confirmed,
+        ) {
+            Ok(change) => (change, false),
+            Err(QuestionStoreError::Conflict) => {
+                let current = store
+                    .question(question)?
+                    .filter(|q| q.info.agent == agent)
+                    .ok_or(QuestionStoreError::Unknown)?;
+                if !current.info.state.is_terminal() {
+                    return Err(QuestionStoreError::Conflict);
                 }
-                Err(error) => return Err(error),
-            };
+                // An orphaned outbox ask can be expired after reconnect even if its earlier
+                // terminal update was already stored. Preserve the first native settlement.
+                (
+                    QuestionChange {
+                        question: current,
+                        message: None,
+                    },
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         let info = change.question.info.clone();
         let mut replies = Vec::new();
         if info.state.is_terminal() {
@@ -312,15 +375,8 @@ impl Hub {
                 .collect();
             for key in keys {
                 let pending = requests.pending.get(&key).expect("looked up");
-                let expected = match &pending.request.answer {
-                    QuestionAnswer::Skip => {
-                        info.state == QuestionState::Skipped && info.answer.is_none()
-                    }
-                    answer => {
-                        info.state == QuestionState::Answered
-                            && info.answer.as_ref() == Some(answer)
-                    }
-                };
+                let expected =
+                    settles_as(&pending.request.answer, info.state, info.answer.as_ref());
                 // A native watcher may publish before the resolving RPC returns. Its
                 // broadcast updates the card but cannot confirm the matching answer.
                 if of.is_none() && expected {

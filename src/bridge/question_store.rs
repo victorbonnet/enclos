@@ -15,7 +15,17 @@ pub enum QuestionStoreError {
     Unknown,
     #[error("{0}")]
     Invalid(String),
+    /// Refused for who would answer it, not for what it is.
+    #[error("{0}")]
+    NotAllowed(String),
 }
+
+/// At most this many pending runtime approvals in one conversation, and of
+/// one agent across its conversations: each is sent to the host's person's
+/// devices at every sync. Hermes holds one at a time in a session, a few
+/// with parallel tool calls.
+pub const MAX_PENDING_APPROVALS_PER_CONVERSATION: i64 = 4;
+pub const MAX_PENDING_APPROVALS_PER_AGENT: i64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredQuestion {
@@ -128,13 +138,28 @@ fn introduction_kind(definition: &QuestionDefinition) -> &'static str {
     }
 }
 
-fn settlement(info: &QuestionInfo) -> String {
+/// The history line of a settlement. `confirmed`: the answer is the one a
+/// paired device submitted, matched by its request; any other is what the
+/// agent's channel reports, and an approval says so rather than read as the
+/// person's decision.
+fn settlement(info: &QuestionInfo, confirmed: bool) -> String {
     match &info.answer {
-        Some(QuestionAnswer::Approval { action }) => match action {
+        Some(QuestionAnswer::Approval { action }) if confirmed => match action {
             RuntimeApprovalAction::Once => "Runtime approval: allowed once.",
             RuntimeApprovalAction::Session => "Runtime approval: allowed for this runtime session.",
             RuntimeApprovalAction::Always => "Runtime approval: always allowed by this runtime.",
             RuntimeApprovalAction::Deny => "Runtime approval: denied.",
+        }
+        .into(),
+        Some(QuestionAnswer::Approval { action }) => match action {
+            RuntimeApprovalAction::Once => "Runtime approval: allowed once, as the agent reports.",
+            RuntimeApprovalAction::Session => {
+                "Runtime approval: allowed for this runtime session, as the agent reports."
+            }
+            RuntimeApprovalAction::Always => {
+                "Runtime approval: always allowed by this runtime, as the agent reports."
+            }
+            RuntimeApprovalAction::Deny => "Runtime approval: denied, as the agent reports.",
         }
         .into(),
         Some(QuestionAnswer::Choices { indices }) => format!(
@@ -179,6 +204,18 @@ impl Store {
     pub fn pending_questions(&self, agent: &str) -> rusqlite::Result<Vec<QuestionId>> {
         let mut query = self.db.prepare(
             "SELECT id FROM questions WHERE agent=?1 AND state='pending' ORDER BY rowid",
+        )?;
+        query
+            .query_map([agent], |row| {
+                QuestionId::new(row.get::<_, String>(0)?).map_err(json_error)
+            })?
+            .collect()
+    }
+
+    /// The agent's pending runtime approvals, oldest first.
+    pub fn pending_approvals(&self, agent: &str) -> rusqlite::Result<Vec<QuestionId>> {
+        let mut query = self.db.prepare(
+            "SELECT id FROM questions WHERE agent=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL ORDER BY rowid",
         )?;
         query
             .query_map([agent], |row| {
@@ -238,6 +275,31 @@ impl Store {
         {
             return Err(QuestionStoreError::Conflict);
         }
+        if definition.approval.is_some() {
+            // Nobody could answer it: the host's person does not have this
+            // conversation, and no one else decides runtime approvals.
+            if host != Some(owner.as_str()) {
+                return Err(QuestionStoreError::NotAllowed(
+                    "Only the host's person decides runtime approvals, and this conversation is not theirs.".into(),
+                ));
+            }
+            let pending = |sql: &str, key: &str| -> rusqlite::Result<i64> {
+                tx.query_row(sql, [key], |r| r.get(0))
+            };
+            if pending(
+                "SELECT COUNT(*) FROM questions WHERE conversation=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL",
+                conversation.as_str(),
+            )? >= MAX_PENDING_APPROVALS_PER_CONVERSATION
+                || pending(
+                    "SELECT COUNT(*) FROM questions WHERE agent=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL",
+                    origin,
+                )? >= MAX_PENDING_APPROVALS_PER_AGENT
+            {
+                return Err(QuestionStoreError::Invalid(
+                    "Too many runtime approvals are waiting for an answer.".into(),
+                ));
+            }
+        }
         let encoded = serde_json::to_string(definition)
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO questions(id,conversation,agent,owner,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,?5,'pending',0,NULL,?6)", params![definition.id.as_str(),conversation.as_str(),origin,owner,encoded,message_id])?;
@@ -250,6 +312,8 @@ impl Store {
         Ok(QuestionChange { question, message })
     }
 
+    /// Settles a question as its agent's channel reports, matched to no
+    /// device request.
     pub fn settle_question(
         &self,
         origin: &str,
@@ -257,6 +321,20 @@ impl Store {
         state: QuestionState,
         answer: Option<QuestionAnswer>,
         message_id: &str,
+    ) -> Result<QuestionChange, QuestionStoreError> {
+        self.settle_question_as(origin, id, state, answer, message_id, false)
+    }
+
+    /// Settles a question; `confirmed` when the answer is the one a paired
+    /// device submitted, matched by its request.
+    pub fn settle_question_as(
+        &self,
+        origin: &str,
+        id: &QuestionId,
+        state: QuestionState,
+        answer: Option<QuestionAnswer>,
+        message_id: &str,
+        confirmed: bool,
     ) -> Result<QuestionChange, QuestionStoreError> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -313,7 +391,7 @@ impl Store {
             ],
         )?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
-        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'status',?4,?5,?6)",params![message_id,next.info.conversation.as_str(),settlement(&next.info),now(),speaker,id.as_str()])?;
+        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'status',?4,?5,?6)",params![message_id,next.info.conversation.as_str(),settlement(&next.info, confirmed),now(),speaker,id.as_str()])?;
         let message = history_message(&tx, id.as_str(), "status")?;
         tx.commit()?;
         Ok(QuestionChange {
@@ -704,12 +782,13 @@ mod runtime_approval_tests {
                 created.message.unwrap().seq
             );
             let settled = store
-                .settle_question(
+                .settle_question_as(
                     "lab/coder",
                     &definition.id,
                     QuestionState::Answered,
                     Some(QuestionAnswer::Approval { action }),
                     &format!("settled-{index}"),
+                    true,
                 )
                 .unwrap();
             assert_eq!(settled.message.unwrap().text, expected);

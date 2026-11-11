@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from enclos import protocol, questions, runtime_approvals
+from enclos import protocol, questions, runtime_approvals, visible
 from enclos.outbox import Outbox
 
 
@@ -55,10 +55,27 @@ class RuntimeApprovalPatternsAndDisplay(unittest.TestCase):
             questions.validate_definition({**definition, "approval": hidden})
 
     def test_revealed_matches_the_shared_rule(self):
-        self.assertEqual(runtime_approvals.revealed("ls\u202E -la\tx\ny\r"), "ls⟨U+202E⟩ -la⟨tab⟩x\ny⟨U+000D⟩")
-        self.assertEqual(runtime_approvals.revealed("echo ok é 中"), "echo ok é 中")
-        for char in "\u202E\u2066\u200B\u200D\uFEFF\u061C\u0007\u00AD":
-            self.assertTrue(runtime_approvals.is_hidden(char), hex(ord(char)))
+        self.assertEqual(runtime_approvals.revealed, visible.revealed)
+        self.assertEqual(visible.revealed("ls\u202E -la\tx\ny\r"), "ls⟨U+202E⟩ -la⟨tab⟩x\ny⟨U+000D⟩")
+        self.assertEqual(visible.revealed("echo ok é 中"), "echo ok é 中")
+        # What the first rule missed: tags, variation selectors, separators, fillers.
+        for code in (0x202E, 0x200B, 0xE0041, 0xFE00, 0x2028, 0x2029, 0x206A, 0xFFF9, 0x115F, 0x3164, 0xFFA0):
+            self.assertEqual(visible.revealed("rm" + chr(code) + "x"), "rm⟨U+%04X⟩x" % code)
+        # A joiner beside ASCII is shown; a joined emoji is text.
+        self.assertEqual(visible.revealed("rm\u200Dx"), "rm⟨U+200D⟩x")
+        self.assertEqual(visible.revealed("\U0001F469\u200D\U0001F4BB"), "\U0001F469\u200D\U0001F4BB")
+
+    def test_a_long_command_is_numbered_part_by_part(self):
+        command = "echo " + "x" * 300
+        chunks = list(runtime_approvals.fallback_chunks(prompt(command=command), lambda text: len(text) < 120))
+        headed = [c for c in chunks if c.startswith("Command, part ")]
+        self.assertGreater(len(headed), 1)
+        for number, chunk in enumerate(headed, start=1):
+            self.assertTrue(chunk.startswith("Command, part %d of %d:\n" % (number, len(headed))), chunk)
+        self.assertEqual("".join(c.split("\n")[2] for c in headed), command)
+        self.assertFalse(any(c.startswith("Complete command:") for c in chunks))
+        short = list(runtime_approvals.fallback_chunks(prompt(), lambda text: True))
+        self.assertIn("Complete command:\n```\necho test\n```", short)
 
     def test_text_fallback_reveals_flags_and_names_what_a_grant_covers(self):
         tricky = prompt(command="ls #\u202Efr- mr\ncurl https://exаmple.com")
@@ -145,6 +162,132 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((update["type"], update["state"], update["of"]), ("question.update", "expired", request["id"]))
         self.assertNotIn("answer", update)
         await manager.close()
+
+
+class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
+    def manager(self, write=None):
+        adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
+                                        _outbox=Outbox(tempfile.mkdtemp()), _write=write or AsyncMock())
+        native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
+                                       observe_gateway_settle=Mock(return_value=True),
+                                       resolve_gateway_approval_card=Mock(return_value=1))
+        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager.bridge_runtime_supports = True
+        return manager, adapter, native
+
+    def sent(self, adapter):
+        return "\n".join(call.args[1] for call in adapter.send.await_args_list)
+
+    async def test_an_ask_refused_where_no_one_may_decide_is_denied_at_once(self):
+        manager, adapter, native = self.manager()
+        saved, question = await manager.ask_approval(prompt())
+        ask = adapter._outbox.pending()[0]
+        await manager.refused(ask["id"], "not_allowed")
+        native.resolve_gateway_approval_card.assert_called_once_with("session", "deny", "request-1")
+        self.assertIn("cannot be answered here", self.sent(adapter))
+        self.assertNotIn("/approve", self.sent(adapter))
+        self.assertFalse(manager.cards)
+        self.assertNotIn(question, manager.approval_ids)
+        await asyncio.sleep(0.15)  # Its watcher ends without an update to send.
+        self.assertFalse([m for m in adapter._outbox.pending() if m["type"] == "question.update"])
+        await manager.close()
+
+    async def test_an_ask_refused_otherwise_goes_as_typed_text(self):
+        manager, adapter, native = self.manager()
+        await manager.ask_approval(prompt())
+        await manager.refused(adapter._outbox.pending()[0]["id"], "bad_message")
+        native.resolve_gateway_approval_card.assert_not_called()
+        self.assertIn("/approve always", self.sent(adapter))
+        self.assertIn("echo test", self.sent(adapter))
+        self.assertFalse(manager.cards)
+        # Another message's refusal changes nothing.
+        await manager.refused("unrelated", "not_allowed")
+        await manager.close()
+
+    async def test_an_ask_that_could_not_be_sent_leaves_nothing_behind(self):
+        manager, adapter, native = self.manager()
+        with patch.object(adapter._outbox, "put", side_effect=OSError("full")), \
+                self.assertLogs(questions.logger, "WARNING"):
+            self.assertEqual(await manager.ask_approval(prompt()), (False, None))
+        self.assertFalse(manager.cards)
+        self.assertFalse(manager.approval_ids)
+
+    def test_approval_commands_are_read_with_hermes_own_parser_and_aliases(self):
+        def event(name):
+            return types.SimpleNamespace(get_command=lambda: name)
+        for name in ("approve", "deny", "yolo", "approvals"):
+            self.assertTrue(runtime_approvals.approval_command(event(name)), name)
+        for name in (None, "", "new", "approved"):
+            self.assertFalse(runtime_approvals.approval_command(event(name)), name)
+        commands = types.ModuleType("hermes_cli.commands")
+        commands.resolve_command = lambda name: types.SimpleNamespace(name="approve") if name == "ok" else None
+        with patch.dict(sys.modules, {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.commands": commands}):
+            self.assertTrue(runtime_approvals.approval_command(event("ok")))
+            self.assertTrue(runtime_approvals.approval_command(event("yolo")))
+            self.assertFalse(runtime_approvals.approval_command(event("new")))
+
+    def test_message_in_says_whether_its_person_is_the_hosts(self):
+        base = {"conversation": "c", "person": "guest@example.com", "text": "/approve"}
+        for host in (True, False):
+            line = protocol.encode_line(protocol._message("message.in", host=host, **base))
+            self.assertIs(protocol.decode_from_bridge(line)["host"], host)
+        self.assertNotIn("host", protocol.decode_from_bridge(protocol.encode_line(protocol._message("message.in", **base))))
+        with self.assertRaises(protocol.DecodeError):
+            protocol.decode_from_bridge(protocol.encode_line(protocol._message("message.in", host="yes", **base)))
+
+
+class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_an_approval_command_from_anyone_but_the_hosts_person_never_reaches_hermes(self):
+        config = types.ModuleType("gateway.config")
+        config.Platform = config.PlatformConfig = Mock
+        shared = types.ModuleType("gateway.platforms._shared")
+        shared.get_scoped_secret = Mock(return_value="")
+        base = types.ModuleType("gateway.platforms.base")
+        base.BasePlatformAdapter = object
+        base.SendResult = Mock
+        event = types.ModuleType("gateway.platforms.event")
+
+        class MessageEvent:
+            # Hermes's own reading, as `MessageEvent.get_command` does it.
+            def __init__(self, text, **_):
+                self.text = text
+
+            def get_command(self):
+                text = self.text.lstrip()
+                return text.split(maxsplit=1)[0][1:].lower().split("@", 1)[0] if text.startswith("/") else None
+
+        event.MessageEvent, event.MessageType = MessageEvent, Mock()
+        modules = {"gateway": types.ModuleType("gateway"), "gateway.config": config,
+                   "gateway.platforms": types.ModuleType("gateway.platforms"),
+                   "gateway.platforms._shared": shared, "gateway.platforms.base": base,
+                   "gateway.platforms.event": event}
+        with patch.dict(sys.modules, modules):
+            sys.modules.pop("enclos.adapter", None)
+            adapter_module = importlib.import_module("enclos.adapter")
+            adapter = adapter_module.EnclosAdapter.__new__(adapter_module.EnclosAdapter)
+            adapter._last_in = {}
+            adapter.build_source = Mock()
+            adapter.handle_message = AsyncMock()
+            adapter.send = AsyncMock()
+            adapter._write = AsyncMock(return_value=True)
+            adapter._questions = types.SimpleNamespace(refused=AsyncMock())
+            adapter.name = "enclos"
+            # Python's split takes U+001F for whitespace, as Hermes does.
+            for text in ("/yolo", chr(0x1F) + "/approve always", "/approvals off", "/DENY"):
+                message = protocol._message("message.in", conversation="c", person="guest@example.com",
+                                            text=text, host=False)
+                await adapter._on_message(message)
+                adapter.handle_message.assert_not_awaited()
+                self.assertEqual(adapter.send.await_args.args[1], runtime_approvals.NOT_HOST_ANSWER)
+                self.assertEqual(adapter._write.call_args.args[0]["of"], message["id"])
+            passed = [{"text": "/approve", "host": True}, {"text": "/approve"}, {"text": "hello", "host": False}]
+            for fields in passed:
+                await adapter._on_message(protocol._message("message.in", conversation="c", person="p", **fields))
+            self.assertEqual(adapter.handle_message.await_count, len(passed))
+            error = protocol.error("not_allowed", "Only the host's person decides.", "ask-1")
+            await adapter._on_line(protocol.encode_line(error))
+            adapter._questions.refused.assert_awaited_once_with("ask-1", "not_allowed")
+        sys.modules.pop("enclos.adapter", None)
 
 
 class RuntimeApprovalProtocol(unittest.TestCase):
@@ -422,8 +565,8 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
         parts = []
         for message in messages:
             text = message["text"]
-            if text.startswith("Complete command:\n"):
-                block = text.removeprefix("Complete command:\n")
+            if text.startswith("Complete command:\n") or text.startswith("Command, part "):
+                block = text.split("\n", 1)[1]
                 fence, rest = block.split("\n", 1)
                 self.assertTrue(fence.startswith("```") or fence.startswith("~~~"))
                 self.assertTrue(rest.endswith("\n" + fence))

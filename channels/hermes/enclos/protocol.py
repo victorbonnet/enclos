@@ -176,6 +176,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
             _check_text(message.get("text"), "text")
+            if not isinstance(message.get("host", False), bool):
+                raise ValueError("host must be a boolean")
         elif kind == "conversation.rename":
             _check_id(message.get("conversation"), "conversation")
             _check_text(message.get("title"), "title")

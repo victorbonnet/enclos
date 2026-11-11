@@ -453,8 +453,10 @@ fn chat(
         if text.is_empty() {
             continue;
         }
+        // Whoever types here is at the host itself, and could change the
+        // runtime's approvals there anyway: their approval commands pass.
         let id = writer
-            .message(&conversation, &person, text)
+            .message(&conversation, &person, text, true)
             .map_err(plugin_error)?;
         store
             .add(

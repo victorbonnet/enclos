@@ -47,6 +47,11 @@ pub enum FromBridge {
         conversation: ConversationId,
         person: Person,
         text: String,
+        /// Whether `person` is the host's person, who alone decides runtime
+        /// approvals: the plugin answers a runtime's approval commands from
+        /// anyone else itself. An older bridge says nothing (`None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<bool>,
     },
     /// The person named the conversation, or, with an empty `title`,
     /// cleared its name.

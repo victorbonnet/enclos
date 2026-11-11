@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import protocol, runtime_approvals
+from . import protocol, runtime_approvals, visible
 
 MAX_DEFINITION_BYTES = 24 * 1024
 MAX_ANSWER_BYTES = 8 * 1024
@@ -59,7 +59,7 @@ def validate_definition(value):
         if approval.get("smart_denied", False) and actions not in (["deny"], ["once", "deny"]):
             raise ValueError("smart deny only offers a one-operation override")
         # Shown with its hidden characters written out, the command must still fit.
-        if len(runtime_approvals.revealed(approval["command"]).encode("utf-8")) > MAX_DEFINITION_BYTES:
+        if len(visible.revealed(approval["command"]).encode("utf-8")) > MAX_DEFINITION_BYTES:
             raise ValueError("approval.command is too long to show in full")
         named = approval.get("patterns", [])
         if (not isinstance(named, list) or len(named) > runtime_approvals.MAX_PATTERNS
@@ -67,7 +67,7 @@ def validate_definition(value):
             raise ValueError("an approval names at most 16 distinct patterns")
         for pattern in named:
             _text(pattern, "approval.patterns")
-            if any(runtime_approvals.is_hidden(c) for c in pattern):
+            if visible.has_hidden(pattern):
                 raise ValueError("approval.patterns holds a hidden character")
         if any(a in runtime_approvals.PATTERN_GRANTS for a in actions) and not named:
             raise ValueError("a session or always grant must name the patterns it covers")
@@ -155,6 +155,8 @@ class Card:
     answer: dict | None = None
     update: dict | None = None
     queued: bool = False
+    # The id of the `question.ask` that published it: a refusal names it.
+    ask_id: str | None = None
 
 
 class Manager:
@@ -242,11 +244,16 @@ class Manager:
             logger.warning("Runtime approval %s settled before it could be observed; sending it as text",
                            prompt.request_id)
             return await self.approval_text_fallback(prompt, named), None
-        card = Card(definition, prompt.chat_id, prompt.request_id, prompt.session_key, binding, native)
+        ask = protocol._message("question.ask", conversation=prompt.chat_id, question=definition)
+        card = Card(definition, prompt.chat_id, prompt.request_id, prompt.session_key, binding, native,
+                    ask_id=ask["id"])
         self.cards[definition["id"]] = card
         self.approval_ids.add(definition["id"])
-        if not await self._emit(protocol._message("question.ask", conversation=prompt.chat_id, question=definition)):
+        if not await self._emit(ask):
+            # Nothing was sent: no card, and nothing of it to send later. Hermes has no way
+            # to remove the observer, which goes with its request; it now updates a dropped binding.
             self.cards.pop(definition["id"], None)
+            self.approval_ids.discard(definition["id"])
             return False, None
         self._track(self._watch(card))
         return True, definition["id"]
@@ -364,7 +371,8 @@ class Manager:
                 await self._settle(card, *observed)
                 break
             await asyncio.sleep(0.1)
-        while not card.queued:
+        # A refused card has no update: the bridge never kept it.
+        while card.update is not None and not card.queued:
             await asyncio.sleep(0.25)
             card.queued = self._queue(card.update)
             if card.queued and self.can_deliver(card.update):
@@ -418,6 +426,25 @@ class Manager:
             return
         await self.adapter._write(protocol.error("agent_unavailable",
             "The runtime approval was already resolved or is no longer available.", request_id))
+
+    async def refused(self, of, code=None):
+        """The bridge refused the message `of`. A refused approval ask would leave Hermes
+        waiting on a card nobody sees. Where the conversation's person cannot decide runtime
+        approvals (`not_allowed`), it is denied at once, and the text says why; otherwise it
+        goes as Hermes's typed text."""
+        card = next((c for c in self.cards.values() if c.ask_id == of and c.definition.get("approval")), None)
+        if card is None:
+            return
+        self.cards.pop(card.definition["id"], None)
+        self.approval_ids.discard(card.definition["id"])
+        card.state = "refused"
+        if not self._live(card):
+            return
+        if code == "not_allowed":
+            card.entry.resolve("deny")
+            await self.adapter.send(card.conversation, runtime_approvals.NOT_ANSWERABLE)
+        else:
+            await self.approval_text_fallback(card.entry.prompt, card.definition["approval"].get("patterns", ()))
 
     async def sync(self, ids):
         for question_id in ids:

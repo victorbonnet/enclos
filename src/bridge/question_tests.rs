@@ -155,14 +155,24 @@ fn next(rx: &Receiver<ToDevice>) -> ToDevice {
     rx.recv_timeout(Duration::from_secs(2)).unwrap()
 }
 fn ask(native: &mut Native, rx: &Receiver<ToDevice>, definition: &QuestionDefinition) {
+    ask_with(native, rx, definition, "ask");
+}
+
+/// [`ask`], with the ask message's own `id`, for a test that asks more than once.
+fn ask_with(
+    native: &mut Native,
+    rx: &Receiver<ToDevice>,
+    definition: &QuestionDefinition,
+    id: &str,
+) {
     native.send(
-        "ask",
+        id,
         FromPlugin::QuestionAsk {
             conversation: ConversationId::new("owned").unwrap(),
             question: definition.clone(),
         },
     );
-    native.ack("ask");
+    native.ack(id);
     assert!(
         matches!(next(rx), ToDevice::Question { question } if question.definition == *definition && question.state == QuestionState::Pending)
     );
@@ -897,7 +907,9 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
             &ConversationId::new("foreign").unwrap(),
             &foreign,
             "foreign-intro",
-            Some(OWNER),
+            // As if its owner were the host's person when it was asked: the
+            // bridge still refuses its answers now that they are not.
+            Some("guest@example.com"),
         )
         .unwrap();
     let (guest, _guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
@@ -1295,6 +1307,16 @@ fn typed_approval_commands_are_read_as_the_runtime_reads_them() {
         "@file:/tmp/x.txt\n/approve always",
         "@IMAGE:/tmp/a.png\n@url:https://example.com\n  /deny all",
         "\n\t/approve",
+        // Python's `lstrip` and `split`, which Hermes uses, take U+001C to
+        // U+001F for whitespace.
+        "\u{1F}/approve always",
+        "/approve\u{1F}always",
+        "\u{1C}\u{1D}\u{1E}/deny",
+        "@file:/tmp/x\n\u{1F}/approve",
+        // No approval for the rest of the session, or none at all.
+        "/yolo",
+        "/YOLO@enclos_bot",
+        "/approvals off",
     ] {
         assert!(super::typed_approval(text), "{text:?}");
     }
@@ -1378,9 +1400,16 @@ fn only_the_hosts_person_can_type_a_runtime_approval() {
     let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
     let (guest, guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
     let (mut guest_send, _guest) = device_session(&hub, guest, "guest@example.com", guest_rx);
-    for (index, text) in ["/approve always", "@file:/tmp/x\n/DENY all"]
-        .into_iter()
-        .enumerate()
+    for (index, text) in [
+        "/approve always",
+        "@file:/tmp/x\n/DENY all",
+        "\u{1F}/approve always",
+        "/approve\u{1F}always",
+        "/yolo",
+        "/approvals off",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = format!("typed-{index}");
         let reply = guest_send(
@@ -1409,7 +1438,7 @@ fn only_the_hosts_person_can_type_a_runtime_approval() {
         },
     );
     assert!(
-        matches!(native.receive().body, FromBridge::MessageIn { text, person, .. } if text == "hello" && person.as_str() == "guest@example.com")
+        matches!(native.receive().body, FromBridge::MessageIn { text, person, host, .. } if text == "hello" && person.as_str() == "guest@example.com" && host == Some(false))
     );
     // The host's person's typed approval is passed on unchanged.
     let (mut host_send, _host) = device_session(&hub, device, OWNER, rx);
@@ -1421,7 +1450,7 @@ fn only_the_hosts_person_can_type_a_runtime_approval() {
         },
     );
     assert!(
-        matches!(native.receive().body, FromBridge::MessageIn { text, .. } if text == "/approve")
+        matches!(native.receive().body, FromBridge::MessageIn { text, host, .. } if text == "/approve" && host == Some(true))
     );
 }
 
@@ -1436,37 +1465,7 @@ fn an_unknown_host_passes_on_no_typed_runtime_approval() {
 }
 
 #[test]
-fn approval_history_names_typed_commands_only_in_the_hosts_conversations() {
-    let (_dir, hub, store, _device, _rx) = fixture();
-    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
-    for (conversation, owner, typed) in [
-        ("owned", OWNER, true),
-        ("foreign", "guest@example.com", false),
-    ] {
-        let definition = approval_definition(&format!("approval-{conversation}"), false);
-        native.send(
-            conversation,
-            FromPlugin::QuestionAsk {
-                conversation: ConversationId::new(conversation).unwrap(),
-                question: definition.clone(),
-            },
-        );
-        native.ack(conversation);
-        let text = store
-            .since(owner, 0)
-            .unwrap()
-            .into_iter()
-            .find(|m| m.question.as_ref() == Some(&definition.id))
-            .unwrap()
-            .text;
-        assert_eq!(text.contains("/approve always"), typed, "{text}");
-        assert!(text.contains("npm install --ignore-scripts"));
-        assert!(text.contains("every command matching: package install scripts"));
-    }
-}
-
-#[test]
-fn a_guest_reads_an_approval_without_receiving_its_controls() {
+fn an_approval_nobody_may_answer_is_refused_so_the_runtime_denies_it() {
     let (_dir, hub, store, _device, rx) = fixture();
     let (_guest, guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
     let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
@@ -1478,20 +1477,149 @@ fn a_guest_reads_an_approval_without_receiving_its_controls() {
             question: definition.clone(),
         },
     );
-    native.ack("guest-ask");
-    let ToDevice::Message(message) = next(&guest_rx) else {
-        panic!("the guest gets the readable history, not the approval metadata")
-    };
-    assert_eq!(message.kind, "runtime_approval");
-    assert!(message.text.contains("Only the host's person"));
-    assert!(guest_rx.try_recv().is_err());
+    // `not_allowed`: the channel denies it at once rather than leave the
+    // runtime waiting out its timeout on a card no device shows.
     assert!(
-        rx.try_recv().is_err(),
-        "the host does not own this conversation"
+        matches!(native.receive().body, FromBridge::Error(error) if error.code == ErrorCode::NotAllowed
+            && error.of.as_ref().map(MessageId::as_str) == Some("guest-ask"))
     );
+    native.ack("guest-ask");
+    assert!(store.question(&definition.id).unwrap().is_none());
+    assert!(store.since("guest@example.com", 0).unwrap().is_empty());
+    assert!(guest_rx.try_recv().is_err());
+    assert!(rx.try_recv().is_err());
+    // In the host's person's own conversation it is a card, typed commands listed.
+    let definition = approval_definition("host-approval", false);
+    ask(&mut native, &rx, &definition);
+    let text = &store.since(OWNER, 0).unwrap()[0].text;
+    assert!(text.contains("/approve always"), "{text}");
+    assert!(text.contains("every command matching: package install scripts"));
     assert!(!hub.shows_question("guest@example.com", &definition));
     assert!(hub.shows_question(OWNER, &definition));
     assert!(hub.shows_question("guest@example.com", &super::tests::definition("ordinary")));
+}
+
+#[test]
+fn runtime_approvals_are_capped_per_conversation_and_per_agent() {
+    use super::super::super::store::{
+        MAX_PENDING_APPROVALS_PER_AGENT, MAX_PENDING_APPROVALS_PER_CONVERSATION,
+    };
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    for index in 0..MAX_PENDING_APPROVALS_PER_CONVERSATION {
+        ask_with(
+            &mut native,
+            &rx,
+            &approval_definition(&format!("a-{index}"), false),
+            &format!("ask-{index}"),
+        );
+    }
+    native.send(
+        "over",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: approval_definition("a-over", false),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::Error(error) if error.code == ErrorCode::BadMessage
+            && error.of.as_ref().map(MessageId::as_str) == Some("over"))
+    );
+    native.ack("over");
+    assert!(
+        store
+            .question(&approval_definition("a-over", false).id)
+            .unwrap()
+            .is_none()
+    );
+    // An ordinary question is not one of them.
+    ask_with(&mut native, &rx, &definition("q-ordinary"), "ask-ordinary");
+    // Across conversations, the agent's own cap.
+    for asked in MAX_PENDING_APPROVALS_PER_CONVERSATION..=MAX_PENDING_APPROVALS_PER_AGENT {
+        let id = format!("c-{asked}");
+        store.conversation(&id, "lab", "coder", OWNER).unwrap();
+        native.send(
+            &id,
+            FromPlugin::QuestionAsk {
+                conversation: ConversationId::new(id.clone()).unwrap(),
+                question: approval_definition(&format!("{id}-a"), false),
+            },
+        );
+        if asked == MAX_PENDING_APPROVALS_PER_AGENT {
+            assert!(matches!(native.receive().body, FromBridge::Error(_)));
+            native.ack(&id);
+            break;
+        }
+        native.ack(&id);
+        next(&rx);
+        next(&rx);
+    }
+    assert_eq!(
+        store.pending_approvals(AGENT).unwrap().len() as i64,
+        MAX_PENDING_APPROVALS_PER_AGENT
+    );
+}
+
+#[test]
+fn a_channel_without_runtime_approvals_expires_the_approvals_it_left() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut channel = native(
+        &hub,
+        vec![Capability::RuntimeApprovals, Capability::Questions],
+    );
+    let approval = approval_definition("approval", false);
+    ask(&mut channel, &rx, &approval);
+    let question = definition("question");
+    ask_with(&mut channel, &rx, &question, "ask-question");
+    drop(channel);
+    let closed = Instant::now();
+    while hub.plugins.lock().unwrap().contains_key(AGENT) {
+        assert!(
+            closed.elapsed() < Duration::from_secs(2),
+            "the bridge saw the close"
+        );
+        std::thread::yield_now();
+    }
+    std::fs::remove_file(&hub.agents[0].socket).unwrap();
+    let _channel = native(&hub, vec![Capability::Questions]);
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.definition.id == approval.id && question.state == QuestionState::Expired)
+    );
+    assert!(
+        matches!(next(&rx), ToDevice::Message(message) if message.kind == "status" && message.text == "Runtime approval expired.")
+    );
+    assert!(store.pending_approvals(AGENT).unwrap().is_empty());
+    // Its ordinary question, which the channel can still answer, stays.
+    assert_eq!(store.pending_questions(AGENT).unwrap(), [question.id]);
+}
+
+#[test]
+fn an_approval_the_agent_reports_is_not_read_as_the_persons_decision() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("claimed", false);
+    ask(&mut native, &rx, &definition);
+    // No device asked for it: a channel says the person always allowed it.
+    native.send(
+        "claimed",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Always)),
+            of: None,
+        },
+    );
+    native.ack("claimed");
+    next(&rx);
+    let ToDevice::Message(message) = next(&rx) else {
+        panic!("history")
+    };
+    assert_eq!(
+        message.text,
+        "Runtime approval: always allowed by this runtime, as the agent reports."
+    );
+    assert_eq!(store.since(OWNER, 0).unwrap()[1].text, message.text);
 }
 
 #[test]

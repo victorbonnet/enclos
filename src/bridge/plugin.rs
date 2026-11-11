@@ -135,17 +135,20 @@ impl PluginWriter {
         Ok(())
     }
 
-    /// A person's message to the agent, in `conversation`.
+    /// A person's message to the agent, in `conversation`; `host` when
+    /// the person is the host's person.
     pub fn message(
         &mut self,
         conversation: &ConversationId,
         person: &Person,
         text: &str,
+        host: bool,
     ) -> Result<MessageId, PluginError> {
         self.send(FromBridge::MessageIn {
             conversation: conversation.clone(),
             person: person.clone(),
             text: text.to_owned(),
+            host: Some(host),
         })
     }
 
@@ -254,6 +257,7 @@ mod tests {
                 &conversation,
                 &Person::new("victor@example.com").unwrap(),
                 "hi",
+                true,
             )
             .unwrap();
         let ack = reader.receive().unwrap().unwrap();

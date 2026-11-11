@@ -31,6 +31,7 @@ from .outbox import Outbox
 from . import approvals
 from . import routines
 from . import questions
+from . import runtime_approvals
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._write(protocol.error(error.code, str(error), message["id"]))
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
+            # A runtime approval the bridge refused would wait unseen: it is denied or sent as text.
+            await self._questions.refused(message.get("of"), message.get("code"))
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 
@@ -239,9 +242,18 @@ class EnclosAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
-        await self.handle_message(MessageEvent(
+        event = MessageEvent(
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
-            raw_message=message, timestamp=datetime.now(tz=UTC)))
+            raw_message=message, timestamp=datetime.now(tz=UTC))
+        # Only the host's person decides runtime approvals (ADR 0053). Hermes reads its
+        # approval commands from whoever it is told speaks, so one from anyone else is
+        # answered here, read with Hermes's own parser, and never reaches it. A bridge
+        # that does not say (`host` absent, an older one) filters them itself.
+        if message.get("host") is False and runtime_approvals.approval_command(event):
+            await self.send(message["conversation"], runtime_approvals.NOT_HOST_ANSWER, reply_to=message["id"])
+            await self._write(protocol.ack(message["id"]))
+            return
+        await self.handle_message(event)
         await self._write(protocol.ack(message["id"]))
 
     def _routine_runtime(self):

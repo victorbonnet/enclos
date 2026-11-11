@@ -3,8 +3,9 @@
 import inspect
 import re
 import time
-import unicodedata
 from dataclasses import dataclass
+
+from .visible import revealed
 
 
 ACTIONS = ("once", "session", "always", "deny")
@@ -24,28 +25,37 @@ def native_api():
     return None
 
 
+# Hermes's commands that decide or skip approvals: answering one, and turning the
+# gate off for a session (`/yolo`) or for good (`/approvals off`).
+APPROVAL_COMMANDS = frozenset(("approve", "deny", "yolo", "approvals"))
+NOT_HOST_ANSWER = ("Only the host's person decides runtime approvals, so this command was not passed "
+                   "to the agent.")
+NOT_ANSWERABLE = ("A command needed runtime approval. Only the host's person decides runtime approvals, "
+                  "and this conversation is not theirs, so it cannot be answered here: the command was denied.")
+
+
+def approval_command(event):
+    """Whether Hermes reads `event` as one of `APPROVAL_COMMANDS`: its own parser
+    (`MessageEvent.get_command`) and its own aliases (`hermes_cli.commands.resolve_command`)."""
+    name = event.get_command()
+    if not name:
+        return False
+    try:
+        from hermes_cli.commands import resolve_command
+        found = resolve_command(name)
+        if found is not None:
+            name = found.name
+    except ImportError:
+        pass
+    return name in APPROVAL_COMMANDS
+
+
 MAX_PATTERNS = 16
 PATTERN_GRANTS = ("session", "always")
 # What a pending native request is: an entry still matching these is the one shown.
 IDENTITY = ("request_id", "command", "description", "pattern_key", "pattern_keys")
 # How long a request may be missing from Hermes before its card closes as expired.
 MISSING_GRACE_SECONDS = 5.0
-
-
-def is_hidden(char):
-    """Whether `char` changes how the text around it reads without being seen; the
-    same rule as enclos-protocol's `visible` module."""
-    code = ord(char)
-    return (unicodedata.category(char) == "Cc" or code in (0x00AD, 0x061C, 0x180E, 0xFEFF)
-            or 0x200B <= code <= 0x200F or 0x202A <= code <= 0x202E
-            or 0x2060 <= code <= 0x2064 or 0x2066 <= code <= 0x2069)
-
-
-def revealed(text):
-    """`text` with each hidden character but a newline written as ⟨U+XXXX⟩ and each tab
-    as ⟨tab⟩: what is shown is what runs."""
-    return "".join(c if c == "\n" else "⟨tab⟩" if c == "\t" else f"⟨U+{ord(c):04X}⟩" if is_hidden(c) else c
-                   for c in text)
 
 
 def patterns(snapshot):
@@ -76,7 +86,8 @@ def _fenced(text):
     return f"{fence}\n{text}\n{fence}"
 
 
-def _bounded(text, render, fits):
+def _parts(text, render, fits):
+    """`text` cut into the longest parts that each fit once rendered."""
     while text:
         lo, hi = 1, len(text)
         while lo < hi:
@@ -87,8 +98,17 @@ def _bounded(text, render, fits):
                 hi = mid - 1
         if not fits(render(text[:lo])):
             raise ValueError("an approval text chunk cannot fit")
-        yield render(text[:lo])
+        yield text[:lo]
         text = text[lo:]
+
+
+def _bounded(text, render, fits):
+    for part in _parts(text, render, fits):
+        yield render(part)
+
+
+# The longest heading a command part can have: parts are cut to fit under it.
+_WIDEST_HEADING = "Command, part 9999 of 9999:\n"
 
 
 def fallback_chunks(prompt, fits, prefix="/", named=()):
@@ -100,7 +120,13 @@ def fallback_chunks(prompt, fits, prefix="/", named=()):
         yield text
     else:
         yield from _bounded(text, _fenced, fits)
-    yield from _bounded(revealed(prompt.command), lambda part: "Complete command:\n" + _fenced(part), fits)
+    # A long command is numbered, part i of n, so the first part is never read as all of it.
+    parts = list(_parts(revealed(prompt.command), lambda part: _WIDEST_HEADING + _fenced(part), fits))
+    if len(parts) == 1:
+        yield "Complete command:\n" + _fenced(parts[0])
+    else:
+        for number, part in enumerate(parts, start=1):
+            yield f"Command, part {number} of {len(parts)}:\n" + _fenced(part)
     if not prompt.command.isascii():
         yield "The command holds characters outside ASCII, some of which look like others. Check each one."
     offered = [row[1] for row in prompt.actions]
