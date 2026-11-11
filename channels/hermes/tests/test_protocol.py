@@ -38,6 +38,10 @@ class FromTheBridge(unittest.TestCase):
             (b'{"v":1,"id":"m1","type":"message.in","conversation":"c\\u0000","person":"p","text":"t"}', "bad_message"),
             (b"[1,2]", "bad_message"),
             (b" " * (protocol.MAX_MESSAGE_BYTES + 1), "bad_message"),
+            (b"[" * 100_000, "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"red \\u001b[31m"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"two\\nlines"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","of":"","message":"x"}', "bad_message"),
         ]
         for line, code in cases:
             with self.subTest(line[:40]):
@@ -72,6 +76,21 @@ class ToTheBridge(unittest.TestCase):
         self.assertTrue(line.endswith(b"\n"))
         self.assertNotIn(b"\n", line[:-1])
         self.assertEqual(json.loads(line)["text"], "two\nlines")
+
+
+class Unsendable(unittest.TestCase):
+    def test_what_the_bridge_would_refuse_is_named(self):
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "fine", "m0")))
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "x" * (protocol.MAX_MESSAGE_BYTES - 200))))
+        for message in (
+            protocol.message_out("", "hi"),
+            protocol.message_out("c" * 129, "hi"),
+            protocol.message_out("c-1\u0085", "hi"),
+            protocol.message_out("c-1", "hi", "m\u0000"),
+            protocol.message_out("c-1", "x" * protocol.MAX_MESSAGE_BYTES),
+        ):
+            with self.subTest(message["conversation"][:8]):
+                self.assertIsNotNone(protocol.unsendable(message))
 
 
 class Token(unittest.TestCase):

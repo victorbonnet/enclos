@@ -175,7 +175,20 @@ pub struct PairingRequest {
 }
 
 impl Store {
+    /// Opens the database at `path`, made for the user alone (`0600`): it
+    /// holds every conversation, and later each device's keys.
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let to_sqlite = |e: std::io::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(to_sqlite)?;
+        // One made before, with the default mode
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(to_sqlite)?;
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
         for (table, column, declaration) in ADDED_COLUMNS {
@@ -590,6 +603,20 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_database_is_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        Store::open(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        // One made before with another mode is made the user's alone too
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
 
     #[test]
     fn messages_keep_their_order_owner_and_are_stored_once() {
