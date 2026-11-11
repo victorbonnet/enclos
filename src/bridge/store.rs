@@ -45,6 +45,25 @@ pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
 pub const BY_PERSON: &str = "person";
 
+/// The longest name a conversation keeps, in characters.
+pub const MAX_TITLE_CHARS: usize = 100;
+
+/// A conversation's name as the bridge keeps it, whoever gave it: on one
+/// line, without hidden characters ([`enclos_protocol::visible`]), and at
+/// most [`MAX_TITLE_CHARS`]. The plugin's own cut runs in the sandbox, so
+/// the bridge does not rely on it: a name sent to devices must fit one
+/// Noise message, and must not read as another conversation's.
+pub fn conversation_title(text: &str) -> String {
+    let one_line: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let visible = enclos_protocol::visible::stripped(&one_line, false);
+    let words: Vec<&str> = visible.split_whitespace().collect();
+    let cut: String = words.join(" ").chars().take(MAX_TITLE_CHARS).collect();
+    cut.trim_end().to_owned()
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -172,9 +191,11 @@ impl Store {
     /// Names a conversation, saying who named it ([`BY_AGENT`] or
     /// [`BY_PERSON`]); whether its name changed. The person's name replaces
     /// any, and an empty one clears it, so the runtime may name it again;
-    /// the runtime's never replaces the person's.
+    /// the runtime's never replaces the person's. The name is kept as
+    /// [`conversation_title`] gives it.
     pub fn name(&self, id: &str, title: &str, by: &str) -> rusqlite::Result<bool> {
-        let title = title.trim();
+        let title = conversation_title(title);
+        let title = title.as_str();
         let changed = match (by, title.is_empty()) {
             (BY_PERSON, true) => self.db.execute(
                 "UPDATE conversations SET title = NULL, titled_by = NULL WHERE id = ?1 AND title IS NOT NULL",
@@ -528,6 +549,33 @@ mod tests {
             Some("Paris weather")
         );
         assert!(store.conversations("someone@else").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_name_is_kept_on_one_visible_line_of_at_most_100_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@example.com")
+            .unwrap();
+        let title = |s: &Store| s.conversation_info("c-1").unwrap().unwrap().title;
+        // An agent's name far above one Noise message is cut.
+        assert!(store.name("c-1", &"w".repeat(70_000), BY_AGENT).unwrap());
+        assert_eq!(title(&store), Some("w".repeat(MAX_TITLE_CHARS)));
+        // A person's too.
+        assert!(store.name("c-1", &"p".repeat(500), BY_PERSON).unwrap());
+        assert_eq!(title(&store), Some("p".repeat(MAX_TITLE_CHARS)));
+        // Lines are joined and hidden characters dropped: a name cannot read
+        // as another one.
+        let tricky = "Trip\n to\u{2028}Paris \u{202E}fdp.exe\u{200B}";
+        assert!(store.name("c-1", tricky, BY_PERSON).unwrap());
+        assert_eq!(title(&store), Some("Trip to Paris fdp.exe".into()));
+        // A name made of hidden characters only is no name.
+        assert!(store.name("c-1", "\u{202E}\u{2066}\n", BY_PERSON).unwrap());
+        assert_eq!(title(&store), None);
+        // Joined emoji and Persian spelling are kept.
+        let kept = "\u{0645}\u{06CC}\u{200C}\u{0647} \u{2764}\u{FE0F}";
+        assert_eq!(conversation_title(kept), kept);
     }
 
     #[test]

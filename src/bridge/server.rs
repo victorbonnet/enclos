@@ -27,7 +27,9 @@ use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
-use super::store::{BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, now};
+use super::store::{
+    BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, conversation_title, now,
+};
 use super::transport::Transport;
 
 /// How long a pairing waits for the terminal's answer.
@@ -157,7 +159,8 @@ impl Hub {
                         }
                     }
                     // The runtime's name for one of this agent's own
-                    // conversations: kept unless the person named it.
+                    // conversations: kept unless the person named it, cut
+                    // and cleaned in `Store::name` (`conversation_title`).
                     FromPlugin::Title {
                         conversation,
                         title,
@@ -634,7 +637,8 @@ fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
 /// The person names one of their conversations (or clears its name): stored,
 /// sent to their devices, and passed to the agent's plugin, so the runtime
 /// keeps the name and names it no more. A plugin that cannot be reached
-/// changes nothing: the bridge's name is the one the app shows.
+/// changes nothing: the bridge's name is the one the app shows. The name is
+/// cut and cleaned as [`conversation_title`] says, wherever it goes.
 fn rename(
     hub: &Arc<Hub>,
     store: &Store,
@@ -664,7 +668,7 @@ fn rename(
         if let Some((writer, _)) = plugins.get_mut(&name) {
             let _ = writer.send(FromBridge::Rename {
                 conversation: conversation.clone(),
-                title: title.trim().to_owned(),
+                title: conversation_title(title),
             });
         }
     }

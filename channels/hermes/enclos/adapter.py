@@ -59,6 +59,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
         self._title_checks: dict[str, asyncio.Task] = {}
+        # Whether a failure to read a session's title was logged at info already.
+        self._title_failure_told = False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -210,10 +212,23 @@ class EnclosAdapter(BasePlatformAdapter):
             self._canonicalize(source)
             key = build_session_key(source, profile=self._session_key_profile(source))
             store = getattr(self, "_session_store", None)
-            return store.peek_session_id(key) if store is not None else None
+            if store is None:
+                self._cannot_read_titles("the gateway has no session store")
+                return None
+            return store.peek_session_id(key)
         except Exception:
-            logger.debug("[%s] No session for %s", self.name, chat_id, exc_info=True)
+            self._cannot_read_titles(f"no session for {chat_id}")
             return None
+
+    def _cannot_read_titles(self, why: str) -> None:
+        """Titles are read through Hermes internals, not a plugin API: the first
+        failure is logged at info, so a Hermes release that moves them shows why
+        conversations stop getting names; later ones at debug."""
+        if not self._title_failure_told:
+            self._title_failure_told = True
+            logger.info("[%s] Cannot read session titles (%s); conversations keep no name from Hermes", self.name, why, exc_info=True)
+        else:
+            logger.debug("[%s] Cannot read session titles (%s)", self.name, why, exc_info=True)
 
     async def _session_db_call(self, method: str, *args: Any) -> Any:
         db = getattr(getattr(self, "gateway_runner", None), "_session_db", None)
@@ -231,7 +246,7 @@ class EnclosAdapter(BasePlatformAdapter):
             title = await self._session_db_call("get_session_title", session_id)
             source = await self._session_db_call("get_session_title_source", session_id)
         except Exception:
-            logger.debug("[%s] Cannot read the title of %s", self.name, chat_id, exc_info=True)
+            self._cannot_read_titles(f"the title of {chat_id}")
             return None
         return (title, source or "") if title else None
 
