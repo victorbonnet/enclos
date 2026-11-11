@@ -118,14 +118,27 @@ impl Hub {
             )
             .as_bytes(),
         );
+        // Decided or closed under this policy: not asked again until it
+        // changes. An agent is told so, not left waiting for a request
+        // nobody sees.
+        let known = |old: &Approval| {
+            if agent.contains('/') && !matches!(old.state.as_str(), "pending" | "applying") {
+                Err(format!(
+                    "A request for this scope was already {} under {sandbox}'s active policy. It is not asked again until the policy changes.",
+                    old.state
+                ))
+            } else {
+                Ok(())
+            }
+        };
         if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
             if old.state != "diagnostic" {
-                return Ok(());
+                return known(&old);
             }
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
-            if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
-                return Ok(());
+            if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
+                return known(&old);
             }
         }
         let mut a = Approval {
@@ -292,19 +305,30 @@ impl Hub {
         id: &str,
     ) -> Result<(), String> {
         self.approval_authority(store, device, person)?;
-        if let Some(a) = store.approval(id).map_err(|e| e.to_string())?
-            && let Some(why) = close_blocked(&a, |name| {
+        // Checked and closed from one reading of its state. A request that
+        // changed in between, such as an application that failed just after
+        // the check and left a pending change, is read and checked again;
+        // states only move forward, so this ends.
+        for _ in 0..3 {
+            let a = store
+                .approval(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("Unknown policy request")?;
+            if let Some(why) = close_blocked(&a, |name| {
                 Engine::open(self.layout.clone())
                     .policy(name)
                     .is_ok_and(|view| view.pending.is_some())
-            })
-        {
-            return Err(why);
+            }) {
+                return Err(why);
+            }
+            // The store transition also checks the state atomically against other devices.
+            let closed = store
+                .close_approval(id, &a.state, &device.id, person)
+                .map_err(|e| e.to_string())?;
+            if closed || !matches!(a.state.as_str(), "pending" | "failed") {
+                break;
+            }
         }
-        // The store transition also checks the state atomically against other devices.
-        store
-            .close_approval(id, &device.id, person)
-            .map_err(|e| e.to_string())?;
         let a = store
             .approval(id)
             .map_err(|e| e.to_string())?

@@ -74,6 +74,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        # By message id: a policy request's tool call waiting for the bridge.
+        self._answers: dict[str, asyncio.Future] = {}
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
@@ -205,6 +207,7 @@ class EnclosAdapter(BasePlatformAdapter):
         if kind == "ack":
             self._outbox.acknowledge(message["of"])
             self._questions.acknowledge(message["of"])
+            approvals.answered(self._answers, message)
         elif kind == "policy.context":
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
@@ -224,6 +227,7 @@ class EnclosAdapter(BasePlatformAdapter):
             except routines.RoutineError as error:
                 await self._write(protocol.error(error.code, str(error), message["id"]))
         elif kind == "error":
+            approvals.answered(self._answers, message)
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))

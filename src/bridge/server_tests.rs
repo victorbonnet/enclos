@@ -170,12 +170,12 @@ fn approval_close_persists_without_rewriting_the_request_or_deciding_access() {
     let original_body = body();
     assert!(
         store
-            .close_approval("r1", "phone", "owner@example.com")
+            .close_approval("r1", "pending", "phone", "owner@example.com")
             .unwrap()
     );
     assert!(
         !store
-            .close_approval("r1", "tablet", "owner@example.com")
+            .close_approval("r1", "pending", "tablet", "owner@example.com")
             .unwrap()
     );
     assert!(!store.claim_approval("r1").unwrap());
@@ -215,7 +215,7 @@ fn approval_close_allows_failed_requests_but_preserves_inflight_and_terminal_dec
         store.create_approval(&a).unwrap();
         assert_eq!(
             store
-                .close_approval(state, "phone", "owner@example.com")
+                .close_approval(state, state, "phone", "owner@example.com")
                 .unwrap(),
             state == "failed"
         );
@@ -226,10 +226,38 @@ fn approval_close_allows_failed_requests_but_preserves_inflight_and_terminal_dec
     }
     assert!(
         !store
-            .close_approval("unknown", "phone", "owner@example.com")
+            .close_approval("unknown", "pending", "phone", "owner@example.com")
             .unwrap()
     );
     assert_eq!(store.log_lines(20).unwrap().len(), 1);
+}
+
+#[test]
+fn approval_close_closes_only_from_the_state_that_was_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let mut a = approval_sample();
+    a.state = "failed".into();
+    store.create_approval(&a).unwrap();
+    // Read as applying, failed since: not closed without the failure's check.
+    assert!(
+        !store
+            .close_approval("r1", "applying", "phone", "owner@example.com")
+            .unwrap()
+    );
+    // Read as pending, failed since: the same.
+    assert!(
+        !store
+            .close_approval("r1", "pending", "phone", "owner@example.com")
+            .unwrap()
+    );
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+    assert!(store.log_lines(20).unwrap().is_empty());
+    assert!(
+        store
+            .close_approval("r1", "failed", "phone", "owner@example.com")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -245,7 +273,7 @@ fn approval_close_and_audit_are_atomic() {
     .unwrap();
     assert!(
         store
-            .close_approval("r1", "phone", "owner@example.com")
+            .close_approval("r1", "pending", "phone", "owner@example.com")
             .is_err()
     );
     assert_eq!(store.approval("r1").unwrap().unwrap().state, "pending");
@@ -266,7 +294,7 @@ fn approval_close_races_with_claim_and_exactly_one_wins() {
             let store = Store::open(&path).unwrap();
             barrier.wait();
             store
-                .close_approval("r1", "phone", "owner@example.com")
+                .close_approval("r1", "pending", "phone", "owner@example.com")
                 .unwrap()
         })
     };
@@ -524,10 +552,19 @@ fn approval_closed_requests_are_not_recreated_by_collection_or_agent_retries() {
         .unwrap();
     let request = store.approvals().unwrap().remove(0).request;
     hub.close_access(&store, &device, owner, &request).unwrap();
-    for (agent, conversation) in [("lab", None), ("lab/main", Some("c1"))] {
-        hub.request_access(&store, agent, conversation, access.clone(), "same refusal")
-            .unwrap();
-    }
+    hub.request_access(&store, "lab", None, access.clone(), "same refusal")
+        .unwrap();
+    // The agent is told, not left waiting for a request nobody sees.
+    let told = hub
+        .request_access(
+            &store,
+            "lab/main",
+            Some("c1"),
+            access.clone(),
+            "same refusal",
+        )
+        .unwrap_err();
+    assert!(told.contains("already closed"), "{told}");
     let reopened = hub.store().unwrap();
     reopened.recover_approvals().unwrap();
     hub.request_access(&reopened, "lab", None, access, "same refusal after restart")

@@ -685,16 +685,22 @@ impl Hub {
                                     .iter()
                                     .any(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
                         }) {
-                            match hub.request_access(&store, &agent, Some(id), access, &action) {
-                                Ok(()) => {
-                                    let _ = acks.send(FromBridge::Ack { of: message.id });
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "enclos app: could not save {agent}'s policy request: {e}"
-                                    );
-                                }
+                            // Refused or not, the plugin is answered, so its outbox
+                            // does not send the same request again forever, and its
+                            // tool tells the agent why.
+                            if let Err(e) =
+                                hub.request_access(&store, &agent, Some(id), access, &action)
+                            {
+                                eprintln!("enclos app: {agent}'s policy request: {e}");
+                                let _ = acks.send(FromBridge::Error(
+                                    enclos_protocol::plugin::ErrorBody {
+                                        of: Some(message.id.clone()),
+                                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                        message: e,
+                                    },
+                                ));
                             }
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
                         } else {
                             let _ =
                                 acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
