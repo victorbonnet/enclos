@@ -28,7 +28,7 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionRecord};
 use crate::runtime::SandboxCommand;
-use crate::state::{StateError, StateLock};
+use crate::state::{StateError, StateLock, StateStore, Wait};
 
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,11 +444,17 @@ impl Engine {
                     Err(e) => note(&mut notes, format!("could not look at its processes: {e}")),
                 }
                 // Recorded for `show`, `stop` and `rm`. This never waits for
-                // the lock: while another command holds it, a later look
-                // records them, and the program's exit is still seen at once.
+                // the state lock: while another command holds it, a later
+                // look records them, and the program's exit is still seen at
+                // once. It waits for state.db's write lock as long as a write
+                // no person waits on does (design §11), and sees the exit
+                // that much later.
                 if known != saved {
                     let tracked = self.state.try_lock().and_then(|lock| match lock {
-                        Some(lock) => self.state.track(&lock, session.id, &known).map(Some),
+                        Some(lock) => self
+                            .members_state()
+                            .track(&lock, session.id, &known)
+                            .map(Some),
                         None => Ok(None),
                     });
                     match tracked {
@@ -523,18 +529,26 @@ impl Engine {
         session: &SessionRecord,
         waited: &Waited,
     ) -> Result<()> {
+        let state = self.members_state();
         match &waited.left {
             Ok(left) if left.is_empty() => {
-                self.state.end_session(lock, session.id)?;
+                state.end_session(lock, session.id)?;
                 self.forget_marker(session);
             }
             Ok(left) => {
                 let sure: Vec<ProcessRef> = left.iter().filter_map(Found::sure_ref).collect();
-                self.state.track(lock, session.id, &sure)?;
+                state.track(lock, session.id, &sure)?;
             }
-            Err(_) => self.state.track(lock, session.id, &waited.known)?,
+            Err(_) => state.track(lock, session.id, &waited.known)?,
         }
         Ok(())
+    }
+
+    /// The state store for a session's record of its members, as it runs
+    /// and as its program ends: a write no person waits on, which would
+    /// otherwise be lost (design §11).
+    fn members_state(&self) -> Box<dyn StateStore> {
+        self.state.waiting(Wait::Background)
     }
 
     /// Stops the sandbox's open sessions that `which` selects, so that

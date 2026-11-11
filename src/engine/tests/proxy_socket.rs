@@ -33,7 +33,11 @@ fn runs_a_proxy_when_asked() {
     let port = std::env::var(PROXY_PORT).unwrap().parse().unwrap();
     let records = std::env::var_os(PROXY_RECORDS).is_some();
     let layout = Layout::at(std::path::PathBuf::from(folder));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     let err = engine
@@ -144,7 +148,11 @@ fn a_running_proxy_decides_and_logs_on_its_socket() {
 fn engine_with_a_long_path() -> (tempfile::TempDir, Engine) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path().join("e".repeat(120)));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     (dir, engine)
@@ -240,7 +248,11 @@ fn run_proxy_of(
     let name = name.clone();
     let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
     std::thread::spawn(move || {
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
         engine.run_proxy(&name, port, Some(&alice()))

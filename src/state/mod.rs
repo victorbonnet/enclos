@@ -8,6 +8,7 @@ pub mod sqlite;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
@@ -56,6 +57,28 @@ impl Migration {
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
+/// How long a write to the state database waits for another's to finish
+/// before it fails (design §11). A read never waits for a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// A write of a command the user waits on, who is told if it fails and
+    /// can run it again.
+    Command,
+    /// A write no person waits on, which nobody would make again if it
+    /// failed: a session's record of its members, the proxy's network log,
+    /// and what `enclos launch` and `enclos proxy run` record.
+    Background,
+}
+
+impl Wait {
+    pub fn limit(self) -> Duration {
+        match self {
+            Wait::Command => Duration::from_secs(10),
+            Wait::Background => Duration::from_secs(60),
+        }
+    }
+}
+
 /// A sandbox record that does not read: the name stored in it, which may
 /// not be a sandbox's, and why.
 #[derive(Debug)]
@@ -67,6 +90,8 @@ pub struct UnreadableRecord {
 /// Sandbox records, each change made under the state lock, and the network
 /// log beside them.
 pub trait StateStore: NetLogStore {
+    /// The same store, whose writes wait for another's as `wait` says.
+    fn waiting(&self, wait: Wait) -> Box<dyn StateStore>;
     /// Takes the exclusive state lock, waiting a few seconds for another
     /// enclos command to finish.
     fn lock(&self) -> Result<StateLock>;

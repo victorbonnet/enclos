@@ -2630,8 +2630,11 @@ fn the_rarer_commands_print_one_document_piped() {
 fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
     use enclos::state::StateStore;
     let layout = enclos::layout::Layout::at(&home.root);
-    let state =
-        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = enclos::state::sqlite::SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        enclos::state::Wait::Command,
+    );
     let lock = state.lock().unwrap();
     let mut record = state.get(&name.parse().unwrap()).unwrap().unwrap();
     record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);

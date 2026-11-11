@@ -24,7 +24,11 @@ fn alice() -> Actor {
 fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path().join("enclos"));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
         .with_downloader(Box::new(LocalFiles));

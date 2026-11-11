@@ -16,6 +16,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::proxy::{ActivePolicy, Listener, Proxy, listen, listen_unix};
+use crate::state::Wait;
 use crate::state::sqlite::{NetLogWriter, SqliteStateStore};
 
 impl Engine {
@@ -41,12 +42,15 @@ impl Engine {
     pub fn run_proxy(&self, name: &SandboxName, port: u16, record: Option<&Actor>) -> Result<()> {
         let sandbox = self.record(name)?;
         self.policy(name)?;
-        let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
+        let store =
+            |wait| SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock(), wait);
+        // It only reads, which never waits for a write.
         let policy = ActivePolicy {
-            store: store(),
+            store: store(Wait::Command),
             sandbox: name.clone(),
         };
-        let log = NetLogWriter::start(store());
+        // No person waits on a connection's row.
+        let log = NetLogWriter::start(store(Wait::Background));
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(log));
         // Held until the process ends, as the port is.
         let (_lock, listeners) = match sandbox.backend.reaches_proxy_over_socket() {

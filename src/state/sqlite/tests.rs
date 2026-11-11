@@ -7,7 +7,11 @@ use crate::model::sandbox::BackendKind;
 
 pub(super) fn store() -> (TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = SqliteStateStore::new(dir.path().join("state.db"), dir.path().join("state.lock"));
+    let store = SqliteStateStore::new(
+        dir.path().join("state.db"),
+        dir.path().join("state.lock"),
+        crate::state::Wait::Command,
+    );
     (dir, store)
 }
 
@@ -95,6 +99,63 @@ fn a_write_that_reads_first_waits_for_a_write_in_progress() {
     assert_eq!(applied.unwrap().unwrap().version, 2);
 }
 
+/// A write no person waits on outlasts a write lock held 12 seconds, as a
+/// commit that waits on a stalled disk holds it; a command's write still
+/// fails after its 10. Every length here is a tenth of the real one.
+#[test]
+fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
+    const SCALE: u32 = 10;
+    assert_eq!(Wait::Command.limit(), Duration::from_secs(10));
+    assert_eq!(Wait::Background.limit(), Duration::from_secs(60));
+    let held = Duration::from_secs(12) / SCALE;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    drop(lock);
+    let waiting = |wait: Wait| SqliteStateStore {
+        write_wait: wait.limit() / SCALE,
+        ..store.clone()
+    };
+    let (command, background) = (waiting(Wait::Command), waiting(Wait::Background));
+
+    let holder = Connection::open(&store.db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let write = |store: SqliteStateStore, name: &'static str| {
+        std::thread::spawn(move || {
+            let done = store.put(&StateLock::for_tests(), &record(name));
+            (done, started.elapsed())
+        })
+    };
+    let (command, background) = (write(command, "cmd"), write(background, "bg"));
+    std::thread::sleep(held);
+    holder.execute_batch("COMMIT").unwrap();
+
+    let (done, after) = command.join().unwrap();
+    assert!(
+        matches!(
+            &done,
+            Err(StateError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(e, _),
+                ..
+            }) if e.code == rusqlite::ErrorCode::DatabaseBusy
+        ),
+        "{done:?}"
+    );
+    // Failing at all, it gave up while the lock was held.
+    assert!(
+        after >= Wait::Command.limit() / SCALE,
+        "failed after {after:?}"
+    );
+    let (done, after) = background.join().unwrap();
+    done.unwrap();
+    assert!(
+        after >= held && after < Wait::Background.limit() / SCALE,
+        "written after {after:?}"
+    );
+    assert!(store.get(&"bg".parse().unwrap()).unwrap().is_some());
+}
+
 /// Each call opens its own connection, so it is often the only one open as
 /// it closes. Closing must leave the write-ahead log in place: copying it
 /// into `state.db` and deleting it holds the whole database through two
@@ -130,7 +191,11 @@ fn reads_before_init_say_to_run_init() {
 fn lock_fails_when_the_folder_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing");
-    let store = SqliteStateStore::new(missing.join("state.db"), missing.join("state.lock"));
+    let store = SqliteStateStore::new(
+        missing.join("state.db"),
+        missing.join("state.lock"),
+        crate::state::Wait::Command,
+    );
     assert!(matches!(
         store.lock(),
         Err(StateError::NotInitialized { .. })
