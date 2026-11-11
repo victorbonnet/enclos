@@ -24,6 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from enclos import protocol, routines
 
 
+FIVE = {"kind": "interval", "minutes": 5}
+
+
 def definition(**values):
     return {"prompt": "Summarize the day", "schedule": {"kind": "interval", "minutes": 60}, **values}
 
@@ -101,6 +104,10 @@ class FakeJobs:
         self.jobs[job_id] = {"id": job_id, "enabled": True, "schedule": {"kind": "interval", "minutes": minutes}, **fields}
         return copy.deepcopy(self.jobs[job_id])
 
+    def update_job(self, job_id, fields):
+        self.jobs[job_id].update(copy.deepcopy(fields))
+        return copy.deepcopy(self.jobs[job_id])
+
 
 class AppMadeRoutines(unittest.TestCase):
     """Creation's attribution and bound, without a Hermes checkout."""
@@ -135,6 +142,72 @@ class AppMadeRoutines(unittest.TestCase):
                 self.create("create-3")
         self.assertEqual(error.exception.code, "not_allowed")
         self.assertEqual(len(self.manager.jobs.jobs), 3)
+
+    def native_job(self, job_id, **fields):
+        self.manager.jobs.jobs[job_id] = {"id": job_id, "enabled": True, "prompt": "native", "deliver": "local",
+                                          "schedule": {"kind": "interval", "minutes": 5}, **fields}
+
+    def test_a_job_the_app_cannot_show_is_left_out_and_the_others_are_listed(self):
+        self.manager.run_supported = False
+        good = self.create("create-1")
+        self.native_job("no-schedule", schedule=None)
+        self.native_job("text-schedule", schedule="every 5m")
+        self.native_job("other-kind", schedule={"kind": "lunar"})
+        self.native_job("null-cron", schedule={"kind": "cron", "expr": None})
+        self.native_job("null-interval", schedule={"kind": "interval", "minutes": None})
+        self.native_job("long-" + "x" * 200)
+        self.native_job("bidi" + chr(0x202E))
+        self.native_job("line\nbreak")
+        with self.assertLogs("enclos.routines", "WARNING"):
+            listed = self.manager.handle(request("list"))
+        self.assertEqual([row["id"] for row in listed["routines"]], [good["id"]])
+        self.assertNotIn("next_cursor", listed)
+
+    def test_a_page_cursor_skips_the_jobs_left_out(self):
+        self.manager.run_supported = False
+        for number in range(26):
+            self.native_job(f"job-{number:03}")
+        self.native_job("job-010-bad", schedule=None)
+        with self.assertLogs("enclos.routines", "WARNING"):
+            first = self.manager.handle(request("list"))
+        self.assertEqual(len(first["routines"]), 25)
+        self.assertEqual(first["next_cursor"], "job-024")
+        second = self.manager.handle(request("list", cursor=first["next_cursor"]))
+        self.assertEqual([row["id"] for row in second["routines"]], ["job-025"])
+
+    def test_the_form_catalogues_are_read_once_for_several_pages(self):
+        options = {"timezone": "UTC", "features": [], "skills": [], "models": [], "toolsets": []}
+        with patch.object(self.manager, "_read_options", return_value=options) as read:
+            for _ in range(3):
+                self.manager.handle(request("list"))
+            self.assertEqual(read.call_count, 1)
+            with patch.object(routines.time, "monotonic", return_value=routines.time.monotonic() + 3600):
+                self.manager.handle(request("list"))
+            self.assertEqual(read.call_count, 2)
+
+    def test_an_unchanged_absolute_script_does_not_stop_an_update(self):
+        self.manager.run_supported = False
+        self.manager.parameters = self.manager.parameters | {"script"}
+        self.native_job("native-1", script="/opt/old/report.py")
+        listed = self.manager.handle(request("list"))["routines"][0]
+        updated = self.manager.handle(request("update", routine="native-1", revision=listed["revision"],
+                                              definition=definition(prompt="New", script="/opt/old/report.py", schedule=FIVE)))
+        self.assertEqual(updated["routine"]["definition"]["prompt"], "New")
+        self.assertEqual(self.manager.jobs.jobs["native-1"]["script"], "/opt/old/report.py")
+        with self.assertRaises(routines.RoutineError) as error:
+            self.manager.handle(request("update", routine="native-1", revision=updated["routine"]["revision"],
+                                        definition=definition(prompt="New", script="/opt/other.py", schedule=FIVE)))
+        self.assertIn("relative", str(error.exception))
+
+
+class CronExpressions(unittest.TestCase):
+    def test_only_cron_fields_are_taken_for_a_cron_expression(self):
+        for expression in ("0 9 * * 1", "*/15 9-17 * JAN MON-FRI", "0,30 8 1-7 * *", "5 4 * * sun"):
+            with self.subTest(expression=expression):
+                routines.validate_definition(definition(schedule={"kind": "cron", "expression": expression}))
+        for expression in ("every monday at 9 am", "0 9 * * 1 2", "a b c d e", "0 9 MON * *", "0 9 * * ;"):
+            with self.subTest(expression=expression), self.assertRaises(routines.RoutineError):
+                routines.validate_definition(definition(schedule={"kind": "cron", "expression": expression}))
 
 
 def gateway_stand_ins():
