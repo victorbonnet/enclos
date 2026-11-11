@@ -8,4 +8,5 @@ pub mod keys;
 pub mod plugin;
 pub mod server;
 pub mod store;
+pub mod text;
 pub mod transport;
