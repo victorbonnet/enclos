@@ -1,13 +1,13 @@
 # Policy compilation
 
-How a sandbox's `policy.toml` becomes the compiled policy that `sandbox-exec` applies to a session, on the Seatbelt backend. The [design](design.md) (§5, §7, §8) says what the policy is meant to do and the [ADRs](adr/) record why; this page follows the code. Words such as policy snapshot, active policy, compiled policy, workspace and protected path are defined in the [glossary](../GLOSSARY.md).
+How a sandbox's `policy.toml` becomes the compiled policy a session runs under: on macOS, the Seatbelt file that `sandbox-exec` applies; on Linux, the bubblewrap file that `wrap` reads at each launch, with bubblewrap's arguments, Landlock rules and a seccomp filter. The same `policy.toml` goes through the same first stages on both, and each backend compiles it its own way. The [design](design.md) (§5, §7, §8) says what the policy is meant to do and the [ADRs](adr/) record why; this page follows the code. Words such as policy snapshot, active policy, compiled policy, workspace and protected path are defined in the [glossary](../GLOSSARY.md).
 
 ## Overview
 
 A policy goes through two stages, at two different times:
 
 1. **Resolve and validate**, when the policy changes. The layers are merged into one policy, checked, and stored as an immutable policy snapshot that becomes the sandbox's active policy ([ADR 0018](adr/0018-immutable-policy-snapshots.md)). Paths stay as written (`~/…`, `{home}`), and nothing is written for the backend yet.
-2. **Compile**, each time a program starts in the sandbox. The active snapshot's paths are expanded and resolved on the host as it is now, and the backend turns the policy into its own file: a Seatbelt `.sb` file under `~/.enclos/sandboxes/<name>/compiled/`.
+2. **Compile**, each time a program starts in the sandbox. The active snapshot's paths are expanded and resolved on the host as it is now, and the backend turns the policy into its own file, in the sandbox's `compiled/` folder (`~/.enclos/sandboxes/<name>/compiled/` on macOS): a Seatbelt `.sb` file, or bubblewrap's `.json` file.
 
 ```mermaid
 flowchart TB
@@ -29,9 +29,9 @@ flowchart TB
   subgraph compile["2. Compile: connect, exec, launch, policy test"]
     active["the active snapshot, as stored"]
     pre["check_before_compile<br/>home is a folder; write checks again"]
-    sb["seatbelt::compile<br/>expand and resolve paths, render SBPL"]
-    file[["compiled/HASH.sb, named by its content<br/>reused when identical"]]
-    wrap["sandbox-exec -D … -f file program"]
+    sb["Backend::compile<br/>Seatbelt: expand and resolve paths, render SBPL<br/>bubblewrap: arguments, Landlock rules, seccomp filter"]
+    file[["compiled/HASH.sb or HASH.json, named by its content<br/>reused when identical"]]
+    wrap["Seatbelt: sandbox-exec -D … -f file program<br/>bubblewrap: bwrap, then enclos inside, then the program"]
     active --> pre --> sb --> file --> wrap
   end
 
@@ -46,8 +46,8 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | Resolve | `sandbox create`, `runtime install`, `policy allow` | `src/policy/mod.rs`, `src/policy/file.rs` | a `PolicySnapshot` |
 | Validate | the same, before anything is stored | `src/policy/validate.rs` | refused or malformed problems, or nothing |
 | Store | the same | `Engine::store_policy` in `src/engine/policy.rs` | `policy.toml` written, a new policy version in `state.db` |
-| Compile | `connect` and `exec`, `enclos launch` for a service, `policy test`; `sandbox show` in memory only | `src/engine/compile.rs`, `src/backend/seatbelt/compile.rs` | `compiled/<hash>.sb` |
-| Apply | the same, right after compiling | `src/backend/seatbelt/wrap.rs` | `sandbox-exec` running the program |
+| Compile | `connect` and `exec`, `enclos launch` for a service, `policy test`; `sandbox show` in memory only | `src/engine/compile.rs`, then `src/backend/seatbelt/compile.rs` or `src/backend/bubblewrap/compile.rs` | `compiled/<hash>.sb` or `compiled/<hash>.json` |
+| Apply | the same, right after compiling | `src/backend/seatbelt/wrap.rs` or `src/backend/bubblewrap/wrap.rs` | `sandbox-exec`, or bubblewrap, running the program |
 
 ## The templates
 
@@ -67,13 +67,13 @@ A sandbox starts from a template, named when it is created (`--template`) and ke
 | Reach other ports | only if listed | only if listed | yes |
 | Reach a host on your local network | only if listed and in `private` | only if listed and in `private` | only if listed and in `private` |
 | Reach your computer's own services or cloud metadata | no | no | no |
-| Open apps, send Apple Events or signal other processes | no | no | no |
+| Use your computer's services, such as opening apps or Apple Events on macOS or the session bus on Linux, or signal other processes | no | no | no |
 
 - **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
 - **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
-- **`autonomous`** is for an agent that looks after the host: sorting and moving your media, tidying folders, installing tools. It writes everywhere you can (`write = ["/"]`), except the sensitive paths, enclos's own files and program, and the read-only paths, by default your shell's startup files, since your next terminal would run what is written there. It reaches any public address on any port. Higher risk: nothing stops it changing or removing your own files, so keep backups, and anything your Mac later runs from a file it wrote, such as a program on your `PATH`, a Git hook or an app, runs outside the sandbox. Commands are not filtered: what `rm -rf` can remove is what the policy lets it write. `sandbox create` says so. Only the Seatbelt backend builds it; bubblewrap refuses a write grant of `/`. Narrow it in `policy.toml`: `write = [...]` to list the folders it may write instead, `read_only_add` to keep more paths unchanged, `public_ports = "web"` or `mode = "allowlist"` for the network.
+- **`autonomous`** is for an agent that looks after the host: sorting and moving your media, tidying folders, installing tools. It writes everywhere you can (`write = ["/"]`), except the sensitive paths, enclos's own files and program, and the read-only paths, by default your shell's startup files, since your next terminal would run what is written there. It reaches any public address on any port. Higher risk: nothing stops it changing or removing your own files, so keep backups, and anything your Mac later runs from a file it wrote, such as a program on your `PATH`, a Git hook or an app, runs outside the sandbox. Commands are not filtered: what `rm -rf` can remove is what the policy lets it write. `sandbox create` says so. Only the Seatbelt backend builds it: bubblewrap cannot keep a path unchanged inside a folder the sandbox writes yet, so it refuses a write grant of `/` and a read-only path inside a folder the sandbox writes. Narrow it in `policy.toml`: `write = [...]` to list the folders it may write instead, `read_only_add` to keep more paths unchanged, `public_ports = "web"` or `mode = "allowlist"` for the network.
 
-Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
+Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does. On macOS, anything in the sandbox can then serve your network; on Linux, only the sandbox's own sessions reach it, and you, through `enclos dashboard`. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
 
 A `coding` template is planned (design §7) and does not exist yet.
 
@@ -114,7 +114,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
-| `write` | a list of paths | `["{home}"]`; `autonomous` is `["/"]` | Replaces the folders the sandbox may write. The home stays writable either way. `/` grants the whole filesystem but `/dev` (Seatbelt only, proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md)), with enclos's own files and program, the deny list, `read_only` and every link on the way to them still kept after it. |
+| `write` | a list of paths | `["{home}"]`; `autonomous` is `["/"]` | Replaces the folders the sandbox may write. The home stays writable either way. `/` grants the whole filesystem but `/dev` (proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md)), with enclos's own files and program, the deny list, `read_only` and every link on the way to them still kept after it. Only Seatbelt builds that: bubblewrap cannot keep a path unchanged inside a folder the sandbox writes yet, so it refuses `/`, and a grant that holds enclos's program, for now. |
 | `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders, and a folder inside the home or another workspace. Malformed: a folder at or inside a deny-list path. |
 | `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
 | `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
@@ -128,23 +128,23 @@ There is no `read` list ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Rea
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
 | `mode` | `public`, `allowlist` | from the template: `assistant` and `autonomous` are `public`, `minimal` is `allowlist` | `public` reaches any public address on ports 80 and 443 (on any port with `public_ports = "any"`), as well as what is listed. `allowlist` reaches only what is listed. |
-| `public_ports` | `web`, `any` | `web`; `autonomous` is `any` | The ports `public` mode opens to any public address, proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md): `web`, 80 and 443, or `any`. Loopback, link-local and metadata addresses stay closed either way, and private ones open only per host through `private`. Outside `public` mode it opens nothing, and is stored as `web`. A runtime adapter may not set it. |
+| `public_ports` | `web`, `any` | `web`; `autonomous` is `any` | The ports `public` mode opens to any public address, proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md): `web`, 80 and 443, or `any`. Loopback, link-local and metadata addresses stay closed either way, and private ones open only per host through `private`. Outside `public` mode it opens nothing, and is stored as `web`. A runtime adapter may not set it. The proxy holds it, on either backend. |
 | `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
 | `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
 | `private_add` | a list of hosts | none | Adds to that list. |
 | `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
-| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. |
+| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. On bubblewrap, `false` is declared, not held: a listener in one session is reached by the sandbox's other sessions, never by your host's network, and each session's start says so ([ADR 0041](adr/0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md), [ADR 0057](adr/0057-landlocks-tcp-bind-right-is-not-built.md)). |
 
-**`[resources]`.** A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
+**`[resources]`.** A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it. A limit the backend cannot enforce is refused when the policy is stored, whatever its value ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)). `open_files` holds each process; `memory` and `cpu` hold the sandbox as a whole, its sessions and services together, on its systemd slice (design §7).
 
-| Setting | Accepts | On Seatbelt |
-| --- | --- | --- |
-| `open_files` | 16 to 1048576 | Enforced. Above macOS's own ceiling for a process (`kern.maxfilesperproc`), it is refused. |
-| `file_size` | bytes, or `512K`, `100M`, `1G` | Refused. |
-| `cpu_seconds` | a number of seconds | Refused. |
-| `memory` | any value | Refused. |
-| `cpu` | any value | Refused. |
+| Setting | Accepts | On Seatbelt | On bubblewrap |
+| --- | --- | --- | --- |
+| `open_files` | 16 to 1048576 | Enforced, on each process. Above macOS's own ceiling for a process (`kern.maxfilesperproc`), it is refused. | Enforced, on each process. |
+| `file_size` | bytes, or `512K`, `100M`, `1G` | Refused. | Refused. |
+| `cpu_seconds` | a number of seconds | Refused. | Refused. |
+| `memory` | a size, written as `file_size` is, from `64M` | Refused. | Enforced, on the sandbox as a whole, with no swap past it. Where the host has no memory controller, as Raspberry Pi OS leaves it, it runs not applied, and only once you accept that with `--accept-unenforced memory`, which the audit log records ([ADR 0038](adr/0038-a-memory-limit-the-host-cannot-hold-runs-unapplied-once-accepted.md)). |
+| `cpu` | a number of cores with at most two decimals, from 0.01 to 1024, such as `0.5` | Refused. | Enforced, on the sandbox as a whole. |
 
 **`[secrets]` and `[secrets.agents.<agent>]`.** Each grant maps a variable to `secret:<sandbox>/<name>`, a secret of this sandbox already stored with `enclos secret set`. A variable uses letters, digits and `_`, and not one enclos sets itself, such as `PATH`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
 
@@ -172,7 +172,7 @@ A variable granted to the whole sandbox cannot also be granted to an agent. An `
 
 - A list written `name = [...]` replaces what the layers below set; `name_add = [...]` adds to it. If one layer writes both, the replacement comes first, then the additions. The lists are `filesystem.write`, `filesystem.read_deny`, `network.allow` and `network.private`.
 - `secrets.env` replaces the secrets the layers below grant, and `secrets.env_add` adds to them, by variable; `secrets.agents.<agent>.env` and `.env_add` do the same for what one agent is granted (ADR 0036). An adapter's layer may not grant any. Each grant must read `secret:<sandbox>/<name>`, or the file is refused as it is read.
-- A single value (`network.mode`, `network.log`, `network.listen`, each of `[resources]`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`. An adapter's layer may not set `[resources]`; `cpu_seconds`, `memory`, `cpu` and `file_size` are refused on Seatbelt, and every limit on a backend not built yet.
+- A single value (`network.mode`, `network.log`, `network.listen`, each of `[resources]`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`. An adapter's layer may not set `[resources]`; `cpu_seconds`, `memory`, `cpu` and `file_size` are refused on Seatbelt, `cpu_seconds` and `file_size` on bubblewrap, and every limit on a backend not built yet.
 - Unknown keys and sections are errors (`deny_unknown_fields`). That is how enclos refuses `[exec]`, which it cannot enforce yet ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), and how it catches a misspelling such as `alow`.
 
 **Normalizing.** After the last layer, `normalize` puts the policy in one canonical form, so the same grants always give the same snapshot: each `network.allow` entry is rewritten in its canonical form (lowercase, default port dropped), each `network.private` entry the same way, and the four lists are sorted with repeats removed.
@@ -233,9 +233,9 @@ It resolves to `write = ["{home}"]`, the built-in read-deny list, `mode = "publi
 2. **Load the active snapshot as stored.** The policy is not resolved again: a newer template or enclos version changes no grant until a command stores a new snapshot (design §7, Updates).
 3. **Check the paths as they are now** (`check_before_compile`). The sandbox home must still be a real folder, not a symlink, a file or missing. The write checks of stage 2 run again (`validate_writes`), because a symlink on the way to a workspace may have changed since the policy was stored. The other checks are not repeated.
 4. **Build the context** (`SandboxContext::new`): the sandbox's name, folder and home, the user's home, the protected folders, the files and folders no sandbox may read (`state.db`, `state.lock`, `audit.jsonl`, `config.toml`, `run/`), the folder of all sandboxes, and the sandbox's proxy port.
-5. **Compile** (`Backend::compile`, pure). Seatbelt first expands every path and resolves it to where it really is (`FsPaths::of`, `real_path`): symlinks followed, a dangling link followed to what it points to, `..` taken after resolving. Seatbelt matches real paths, so `/tmp` must be written `/private/tmp`. Then it renders the file (next section).
-6. **Store by content.** The file is named after the first 16 hex digits of the SHA-256 of its text: `compiled/<hash>.sb`. A file already there is reused only when it holds exactly that text, since a cut-off Seatbelt file can still load and leave out every rule after the cut. Otherwise the text is written to a temporary file (mode `0600`), synced, and renamed into place. Older files are left where they are: sessions started under them still name them.
-7. **Wrap** (`Backend::wrap`). The session runs `/usr/bin/sandbox-exec -f <file> <program> <args>` with an emptied environment (design §5). Two values that differ between sessions are passed as parameters, not compiled in, so every session of a sandbox runs under one file:
+5. **Compile** (`Backend::compile`, pure). Seatbelt first expands every path and resolves it to where it really is (`FsPaths::of`, `real_path`): symlinks followed, a dangling link followed to what it points to, `..` taken after resolving. Seatbelt matches real paths, so `/tmp` must be written `/private/tmp`. Then it renders the file (next section). bubblewrap writes its JSON file instead ([the bubblewrap file](#the-bubblewrap-file)), whose links `wrap` resolves at each launch.
+6. **Store by content.** The file is named after the first 16 hex digits of the SHA-256 of its text: `compiled/<hash>.sb`, or `compiled/<hash>.json` on bubblewrap. A file already there is reused only when it holds exactly that text, since a cut-off Seatbelt file can still load and leave out every rule after the cut. Otherwise the text is written to a temporary file (mode `0600`), synced, and renamed into place. Older files are left where they are: sessions started under them still name them.
+7. **Wrap** (`Backend::wrap`). On bubblewrap, the session joins the sandbox's network namespace and runs `bwrap` with the file's arguments, and `enclos inside` applies its Landlock rules and seccomp filter before the program runs ([the bubblewrap file](#the-bubblewrap-file)). On Seatbelt, the session runs `/usr/bin/sandbox-exec -f <file> <program> <args>` with an emptied environment (design §5). Two values that differ between sessions are passed as parameters, not compiled in, so every session of a sandbox runs under one file:
    - `-D ENCLOS_TERMINAL=<device>`: the terminal the session runs in, for a session started in a terminal.
    - `-D ENCLOS_SERVICE=localhost:<port>`: the port where the runtime's service listens, for a session started while it listens (ADR 0028).
 
@@ -397,15 +397,15 @@ A change to the filesystem rules, `listen`, the secrets or the limits reaches ru
 | ``sandbox `<name>` uses the <backend> backend, which this host cannot run`` | compile | the sandbox's backend is not in this build or does not run on this host |
 | ``the home of sandbox `<name>` is not a real folder`` | compile | the sandbox home was removed, or replaced by a file or a symlink |
 | ``the active policy of sandbox `<name>` no longer passes enclos's write checks`` | compile | a write check fails on the paths as they are now, usually a symlink changed after the policy was stored |
-| `cannot compile the policy for seatbelt` | compile | a path the file cannot hold, or a proxy port outside 41000 to 41999 |
+| `cannot compile the policy for <backend>` | compile | a path the file cannot hold, or a proxy port outside 41000 to 41999 |
 
 ## Looking at a compiled policy
 
 - `enclos policy show <sandbox>` prints the active snapshot: its version, short id, template, write grants, deny list and network.
-- `ls ~/.enclos/sandboxes/<sandbox>/compiled/` lists the compiled files: the one the active policy compiles to, and those older sessions started under. `enclos sandbox show <sandbox>` says which sessions need a restart to run under the active one.
+- `ls ~/.enclos/sandboxes/<sandbox>/compiled/` (on Linux, under `$XDG_DATA_HOME/enclos`) lists the compiled files: the one the active policy compiles to, and those older sessions started under. `enclos sandbox show <sandbox>` says which sessions need a restart to run under the active one.
 - `enclos policy test <sandbox>` compiles the active policy and runs the escape probes against it from inside the sandbox; `--host-services` also probes the host-service routes.
 - `enclos policy show <sandbox> --compiled` prints what the active policy compiles to now, without writing it.
-- `log stream --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "enclos:<sandbox>"'` shows the denials as they happen (admin users only).
+- On macOS, `log stream --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "enclos:<sandbox>"'` shows the denials as they happen (admin users only).
 
 ## Changing the compiler
 

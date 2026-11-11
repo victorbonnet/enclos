@@ -77,15 +77,13 @@ impl Lab {
             _turn: turn,
         };
         lab.ok(&["init"]);
-        lab.ok(&[
-            "sandbox",
-            "create",
-            "lab",
-            "--backend",
-            "bubblewrap",
-            "--template",
-            "assistant",
-        ]);
+        // No `--backend`: bubblewrap is this host's default backend, which
+        // `init` wrote to config.toml.
+        lab.ok(&["sandbox", "create", "lab", "--template", "assistant"]);
+        assert_eq!(
+            lab.record("lab").backend,
+            enclos::model::sandbox::BackendKind::Bubblewrap
+        );
         lab
     }
 

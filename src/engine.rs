@@ -116,6 +116,13 @@ pub struct Engine {
     accepting: Vec<crate::model::unenforced::UnenforcedField>,
 }
 
+/// This system's own backend.
+const SYSTEM_BACKEND: BackendKind = if cfg!(target_os = "macos") {
+    BackendKind::Seatbelt
+} else {
+    BackendKind::Bubblewrap
+};
+
 /// How often [`Engine::write_in_background`] tries the state lock again.
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
@@ -388,6 +395,30 @@ impl Engine {
                 "it does not parse: {why}"
             ))),
         }
+    }
+
+    /// The backend a sandbox is made with when `sandbox create` names none:
+    /// the default backend `config.toml` names, which `enclos init` wrote
+    /// for this host; where it names none, or is not there, the first
+    /// available here, as init picks it, else this system's own (Seatbelt
+    /// on macOS, bubblewrap elsewhere), whose probe then says why it
+    /// cannot run.
+    pub fn default_backend(&self) -> Result<BackendKind> {
+        let path = self.layout.config_file();
+        let named = match std::fs::read_to_string(&path) {
+            Ok(text) => config::default_backend(&text)
+                .map_err(|reason| Error::DefaultBackend { path, reason })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(Error::DefaultBackend {
+                    path,
+                    reason: e.to_string(),
+                });
+            }
+        };
+        Ok(named
+            .or_else(|| self.probe_backends().0)
+            .unwrap_or(SYSTEM_BACKEND))
     }
 
     /// The first backend available here, and why each unavailable one is

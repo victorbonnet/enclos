@@ -10,7 +10,7 @@ The words used here:
 
 ## Before you start
 
-- An Apple silicon Mac running macOS 15 or later.
+- An Apple silicon Mac running macOS 15 or later, or a Linux host that meets the [Linux requirements](#linux-requirements) below.
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
@@ -18,11 +18,7 @@ The words used here:
 
 The installer below installs enclos on Linux on x86_64 or arm64 (aarch64), as on a Mac, from 0.3.0 on. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
 
-A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`), 0.9.0 or later, and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
-
-```bash
-enclos sandbox create lab --backend bubblewrap --template assistant
-```
+A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`), 0.9.0 or later, and user namespaces. `enclos init` writes it to `config.toml` as the default backend once it can run here, and `sandbox create` uses it when you name no `--backend`, so the commands below are the same as on a Mac. Install bubblewrap before `enclos init`. If init found no backend that runs here, `sandbox create` looks again for one that does, and the next `enclos init` writes it to `config.toml`.
 
 `sandbox create` refuses the backend where it cannot run, and says what it found and what to do; `enclos doctor` shows the same, with what the backend enforces on this host. Where the kernel has no Landlock, as on Raspberry Pi OS, the backend still runs, and `doctor` says that writes are then held by its mounts alone and that any program the sandbox can read can run (design §5, Degraded controls on Linux). Under Host, `doctor` lists each thing it checked, with the fix for each one that falls short: bubblewrap and its version, user namespaces, Landlock, the `memory` and `cpu` controllers delegated to your systemd manager, lingering, and whether a Secret Service answers. Lingering off and no Secret Service are not problems: without lingering, systemd stops your sandboxes' services at your last logout, and enclos never turns it on for you (`loginctl enable-linger` does); with no Secret Service, new secrets go to a `0600` file.
 
@@ -59,7 +55,7 @@ cargo install --locked --path .
 
 ```bash
 enclos init                                    # the ~/.enclos folder, state database and audit log
-enclos sandbox create lab --template assistant # Seatbelt backend, the public web
+enclos sandbox create lab --template assistant # the default backend (Seatbelt on a Mac, bubblewrap on Linux), the public web
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, run inside the sandbox; takes a few minutes
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider and its login, then a model
 ```
