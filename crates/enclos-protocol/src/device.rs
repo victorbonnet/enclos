@@ -175,16 +175,20 @@ pub const COMMANDS_BUDGET: usize = 60_000;
 
 /// A plugin's commands as a device gets them: each name once (lower case
 /// letters, digits, `_` and `-`, at most [`MAX_COMMAND_NAME`]; others are
-/// left out), each text on one line and cut to its limit, in the plugin's
-/// order until they fill [`COMMANDS_BUDGET`].
+/// left out), each text on one line, without hidden characters
+/// ([`crate::visible`]) and cut to its limit, in the plugin's order until
+/// they fill [`COMMANDS_BUDGET`].
 pub fn commands_for_devices(commands: Vec<Command>) -> Vec<Command> {
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    // A bidirectional override or a zero-width character would make the
+    // text beside a command read as something else than what was sent.
     fn line(text: &str, limit: usize) -> String {
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(limit)
-            .collect()
+        let shown = words(&crate::visible::stripped(&words(text), false));
+        let cut: String = shown.chars().take(limit).collect();
+        // A cut may leave a joiner at the end, where it is hidden.
+        crate::visible::stripped(cut.trim_end(), false)
     }
     let mut seen = std::collections::HashSet::new();
     let mut used = 0;
@@ -315,6 +319,12 @@ mod tests {
             command("", "empty", None),
             command(&"x".repeat(33), "too long", None),
             command("reload_mcp", &"d".repeat(200), None),
+            command(
+                "usage",
+                "Show\u{202E}tsoc \u{2066}usage\u{2069}\u{200B} \u{1b}[31m",
+                Some("[\u{2028}days\u{0}]"),
+            ),
+            command("tools", "\u{202E}\u{200B}", Some("\u{2067}")),
         ]);
         assert_eq!(
             kept,
@@ -322,6 +332,8 @@ mod tests {
                 command("new", "Start a new session", Some("[name]")),
                 command("model", "Switch model", None),
                 command("reload_mcp", &"d".repeat(MAX_COMMAND_DESCRIPTION), None),
+                command("usage", "Showtsoc usage [31m", Some("[ days]")),
+                command("tools", "", None),
             ]
         );
     }

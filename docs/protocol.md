@@ -38,7 +38,7 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
 
 1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation.
-2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`.
+2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`. The plugin has 10 seconds in all for it, and at most 64 KiB: the bridge gives up on the connection after that, and tries again when it next needs the agent. One agent's plugin slow to answer holds up only what needs that agent.
 3. Then, in either direction:
 
 | `type` | From | Fields | Meaning |
@@ -134,7 +134,7 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
 
-**An agent's commands** are the runtime's, which the bridge passes on without running or checking them: a command is a message like any other, sent with `message.send`. The bridge keeps the last list of each agent while it runs and gives a device each name once (lower case letters, digits, `_` and `-`, at most 32), each description on one line of at most 120 characters and `args` of at most 60, in the plugin's order until they fill 60,000 bytes, so the message fits a Noise message. When a device asks for the agents, the bridge also opens the plugin connections not yet open, so it learns the commands without waiting for a first message.
+**An agent's commands** are the runtime's, which the bridge passes on without running or checking them: a command is a message like any other, sent with `message.send`. The bridge keeps the last list of each agent while it runs and gives a device each name once (lower case letters, digits, `_` and `-`, at most 32), each description on one line of at most 120 characters and `args` of at most 60, in the plugin's order until they fill 60,000 bytes, so the message fits a Noise message. Each description and `args` loses its hidden characters (controls, bidirectional marks, zero-width characters), so what is shown beside a command is what was sent. A plugin that connects again without the `commands` capability has its list dropped, and devices are sent an empty one. When a device asks for the agents, the bridge also opens the plugin connections not yet open, one pass at a time, so it learns the commands without waiting for a first message.
 
 **How far a conversation was read** is the bridge's too, not the runtime's: the agent does not see what the person reads in the app. A device sends `conversation.read` when the person opens the conversation or reads a message arriving in it; the bridge keeps the highest `seq`, from the conversation's owner only and never past its newest message, and sends the `conversation` again to all of the person's devices. A device that syncs, a new one or one that was away, so counts as unread only the agent's messages after `read`.
 
