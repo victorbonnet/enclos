@@ -12,6 +12,42 @@ fn diagnostic_access(access: &Access) -> bool {
             .is_ok_and(|entry| entry.host_text() == crate::probes::POLICY_PROBE_HOST)
 }
 
+/// The most pending requests one sandbox may have: an agent that keeps
+/// asking for new targets fills neither the inbox nor the bridge's store.
+pub(super) const MAX_PENDING: usize = 50;
+
+/// Whether a proxy refusal of `access`, last seen at `last` (seconds), has
+/// already had its chance: it is older than the bridge's first collection
+/// (`since`), or a request for the same scope was made after it. Then a
+/// denial stays a denial when the policy later changes for another reason;
+/// only a refusal after the request asks again.
+pub(super) fn refusal_counted(
+    known: &[Approval],
+    sandbox: &str,
+    access: &Access,
+    last: i64,
+    since: i64,
+) -> bool {
+    last < since
+        || known
+            .iter()
+            .any(|a| a.sandbox == sandbox && &a.access == access && a.time >= last)
+}
+
+/// Whether `agent` (`<sandbox>/<agent>`, as its connection names it) may
+/// file a policy request for conversation `id`: one of its own, or a group
+/// it is a member of.
+pub(super) fn speaks_in(store: &Store, agent: &str, id: &str) -> bool {
+    store.conversation_info(id).ok().flatten().is_some_and(|c| {
+        format!("{}/{}", c.sandbox, c.agent) == agent
+            || store
+                .members(id)
+                .unwrap_or_default()
+                .iter()
+                .any(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
+    })
+}
+
 fn preview(engine: &Engine, a: &mut Approval) {
     match a
         .sandbox
@@ -21,6 +57,7 @@ fn preview(engine: &Engine, a: &mut Approval) {
     {
         Ok(p) => {
             a.change = p.change;
+            a.scope = p.scope;
             a.restart = p.restart;
             a.revision = p.revision;
             a.available = true;
@@ -28,6 +65,7 @@ fn preview(engine: &Engine, a: &mut Approval) {
         }
         Err(e) => {
             a.available = false;
+            a.scope.clear();
             a.reason = Some(e);
         }
     }
@@ -53,19 +91,21 @@ impl Hub {
         // Bounds apply before storage or display. No tool arguments or output are copied.
         if access.target.is_empty()
             || access.target.len() > 4096
-            || access.target.chars().any(char::is_control)
+            || enclos_protocol::visible::has_hidden(&access.target, false)
         {
             return Err("invalid access target".into());
         }
-        if let Some(mut existing) = store
-            .approvals()
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        let open = store.approvals().map_err(|e| e.to_string())?;
+        // A request for a scope already open adds nothing: no cap. A proxy's
+        // becomes the agent's explicit one, as #209 does.
+        if let Some(mut existing) = open
+            .iter()
             .find(|a| {
                 a.sandbox == sandbox
                     && a.access == access
                     && (a.state == "pending" || a.state == "applying")
             })
+            .cloned()
         {
             // An authenticated agent's explicit request must not be mistaken for a probe.
             if existing.state == "pending" && existing.agent.is_empty() && agent.contains('/') {
@@ -87,6 +127,21 @@ impl Hub {
                 }
             }
             return Ok(());
+        }
+        if open
+            .iter()
+            .filter(|a| a.sandbox == sandbox && a.state == "pending")
+            .count()
+            >= MAX_PENDING
+        {
+            // A proxy refusal waits for the next collection; an agent is told.
+            return if agent.contains('/') {
+                Err(format!(
+                    "{sandbox} already has {MAX_PENDING} pending policy requests. Wait for the person to decide them."
+                ))
+            } else {
+                Ok(())
+            };
         }
         let policy = sandbox
             .parse::<SandboxName>()
@@ -123,12 +178,13 @@ impl Hub {
             access,
             action: action
                 .chars()
-                .filter(|c| !c.is_control())
+                .filter(|c| !enclos_protocol::visible::is_hidden(*c))
                 .take(240)
                 .collect(),
             time: now(),
             state: "pending".into(),
             change: String::new(),
+            scope: String::new(),
             restart: false,
             revision: String::new(),
             available: false,
@@ -186,8 +242,15 @@ impl Hub {
         Ok(())
     }
 
+    /// Turns the proxies' recent refusals into policy requests. A refusal
+    /// counts once: one older than the bridge's first collection, or seen
+    /// last before a request for the same scope was made, already had its
+    /// chance, so a denial is not asked again after an unrelated policy
+    /// change; only a new refusal after it is.
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         self.dismiss_probe_requests(store)?;
+        let since = store.refusals_since().map_err(|e| e.to_string())?;
+        let known = store.all_approvals().map_err(|e| e.to_string())?;
         let engine = Engine::open(self.layout.clone());
         let sandboxes: std::collections::HashSet<_> = self
             .agents
@@ -198,17 +261,18 @@ impl Hub {
             let Ok(name) = sandbox.parse::<SandboxName>() else {
                 continue;
             };
-            let policy = engine
+            // One sandbox that cannot be read does not stop the others.
+            let (policy, denied) = match engine
                 .policy(&name)
-                .map_err(|e| e.to_string())?
-                .snapshot
-                .policy;
-            for d in engine
-                .net_denied_for_approval(&name)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .take(200)
+                .and_then(|view| Ok((view.snapshot.policy, engine.net_denied_for_approval(&name)?)))
             {
+                Ok(read) => read,
+                Err(e) => {
+                    eprintln!("enclos app approvals: {sandbox}: {e}");
+                    continue;
+                }
+            };
+            for d in denied.into_iter().take(200) {
                 use crate::model::net::Reason;
                 if d.host
                     .trim_end_matches('.')
@@ -217,6 +281,16 @@ impl Hub {
                     continue;
                 }
                 if !matches!(d.reason, Reason::NotAllowed | Reason::PrivateAddress) {
+                    continue;
+                }
+                let target = crate::model::net::destination(&d.host, d.port);
+                let private = d.reason == Reason::PrivateAddress;
+                let access = Access {
+                    kind: AccessKind::Network,
+                    target: target.clone(),
+                    private,
+                };
+                if refusal_counted(&known, sandbox, &access, d.last.as_second(), since) {
                     continue;
                 }
                 if let Ok(dest) = crate::proxy::decide::Destination::parse(&d.host, d.port) {
@@ -228,17 +302,12 @@ impl Hub {
                         continue;
                     }
                 }
-                let target = crate::model::net::destination(&d.host, d.port);
                 // The log is sandbox-wide: do not invent a requesting agent or conversation.
                 self.request_access(
                     store,
                     sandbox,
                     None,
-                    Access {
-                        kind: AccessKind::Network,
-                        target: target.clone(),
-                        private: d.reason == Reason::PrivateAddress,
-                    },
+                    access,
                     &format!("Connect to {target}"),
                 )?;
             }
@@ -337,10 +406,13 @@ impl Hub {
         };
         if let Ok(text) = Engine::open(self.layout.clone()).access_context(&name) {
             let mut plugins = self.plugins.lock().expect("not poisoned");
-            for (agent, (writer, caps)) in plugins.iter_mut() {
-                if agent.split('/').next() == Some(sandbox) && caps.contains(&Capability::Approval)
+            for (agent, plugin) in plugins.iter_mut() {
+                if agent.split('/').next() == Some(sandbox)
+                    && plugin.capabilities.contains(&Capability::Approval)
                 {
-                    let _ = writer.send(FromBridge::PolicyContext { text: text.clone() });
+                    let _ = plugin
+                        .writer
+                        .send(FromBridge::PolicyContext { text: text.clone() });
                 }
             }
         }
