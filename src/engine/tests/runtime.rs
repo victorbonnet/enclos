@@ -984,6 +984,216 @@ fn a_delete_runs_with_the_gateway_stopped_and_a_half_deleted_agent_is_deleted_ag
 }
 
 #[test]
+fn an_agent_added_while_the_gateway_runs_restarts_it_once_the_agent_exists() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    // The stub's create makes the agent's folder from the built-in one's
+    // settings.
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(lab.home.join(".hermes/config.yaml"), "").unwrap();
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let plan = |a: &str| {
+        let Planned::DryRun(plan) = lab
+            .engine
+            .add_agent(&alice(), &lab.name, agent(a), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run added");
+        };
+        plan.changes
+    };
+    // Each start of the gateway, with the agents whose folder it found:
+    // Hermes's gateway serves only those.
+    let starts: Rc<RefCell<Vec<Vec<String>>>> = Rc::default();
+    let seen = Rc::clone(&starts);
+    let profiles = lab.home.join(".hermes/profiles");
+    *fake.on_start.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            let mut found: Vec<String> = std::fs::read_dir(&profiles)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            found.sort();
+            seen.borrow_mut().push(found);
+        }
+    }));
+
+    // A stopped sandbox: nothing to restart, nothing to confirm.
+    assert_eq!(
+        plan("early"),
+        [
+            "run `hermes profile create early --clone-from default` in sandbox home under policy v2",
+            "run `hermes -p early config set secrets.command.enabled false` in sandbox home under policy v2",
+            "record agent home/early",
+        ]
+    );
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("early"), Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(fake.stopped.borrow().is_empty() && starts.borrow().is_empty());
+
+    // Started, as `sandbox start` leaves it: the plan and the confirmation
+    // say the gateway restarts, and asking runs nothing.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    assert_eq!(
+        plan("scout"),
+        [
+            "run `hermes profile create scout --clone-from default` in sandbox home under policy v2".to_owned(),
+            "run `hermes -p scout config set secrets.command.enabled false` in sandbox home under policy v2".to_owned(),
+            "record agent home/scout".to_owned(),
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/scout"),
+        ]
+    );
+    let before = calls();
+    let err = lab
+        .engine
+        .add_agent(&alice(), &lab.name, agent("scout"), Confirm::Ask)
+        .unwrap_err();
+    assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+    assert!(
+        err.to_string().starts_with(
+            "adding agent home/scout, which restarts the sandbox's service gateway and so ends a chat in progress, needs confirmation"
+        ),
+        "{err}"
+    );
+    assert_eq!(calls(), before);
+    assert!(fake.stopped.borrow().is_empty());
+
+    // Confirmed: Hermes creates the agent, then the gateway stops and
+    // starts again, finding it.
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("scout"), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(*fake.stopped.borrow(), std::slice::from_ref(&gateway));
+    assert_eq!(*starts.borrow(), [vec!["early", "scout"]]);
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
+    assert!(
+        lab.audit().contains("for agent add home/scout"),
+        "{}",
+        lab.audit()
+    );
+
+    // An agent made inside the sandbox while the gateway ran is adopted,
+    // and the gateway restarted for it too.
+    std::fs::create_dir_all(lab.home.join(".hermes/profiles/inside")).unwrap();
+    std::fs::write(lab.home.join(".hermes/profiles/inside/config.yaml"), "").unwrap();
+    assert_eq!(
+        plan("inside"),
+        [
+            "record agent home/inside, which Hermes already has in the sandbox".to_owned(),
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/inside"),
+        ]
+    );
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("inside"), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(starts.borrow().len(), 2);
+
+    // A gateway that cannot start again: the agent stays added, and enclos
+    // says how to start it.
+    *fake.refuse.borrow_mut() = Some("gateway".to_owned());
+    let err = lab
+        .engine
+        .add_agent(&alice(), &lab.name, agent("late"), Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::FailedAfter { .. }), "{err}");
+    let err = err.to_string();
+    assert!(
+        err.contains("its gateway could not start again")
+            && err.contains("`enclos sandbox start home` starts its services again")
+            && err.contains("after adding agent home/late"),
+        "{err}"
+    );
+    assert!(
+        lab.engine
+            .agents(&lab.name)
+            .unwrap()
+            .iter()
+            .any(|a| a.name == agent("late"))
+    );
+    // Stopped now: the next add restarts nothing.
+    assert_eq!(plan("after").len(), 3);
+}
+
+#[test]
+fn an_agent_imported_while_the_gateway_runs_restarts_it() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let archive = lab._dir.path().join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let import = |confirm| {
+        lab.engine
+            .import_agent(&alice(), &lab.name, agent("main"), &archive, confirm)
+    };
+
+    let Planned::DryRun(plan) = import(Confirm::DryRun).unwrap() else {
+        panic!("a dry run imported");
+    };
+    assert_eq!(
+        plan.changes[3..],
+        [
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/main"),
+        ]
+    );
+    let err = import(Confirm::Ask).unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "importing agent home/main, which restarts the sandbox's service gateway and so ends a chat in progress, needs confirmation"
+        ),
+        "{err}"
+    );
+    assert!(!lab.home.join("hermes-calls").exists());
+    done(import(Confirm::Yes).unwrap());
+    assert!(
+        std::fs::read_to_string(lab.home.join("hermes-calls"))
+            .unwrap()
+            .contains("profile import")
+    );
+    assert_eq!(*fake.stopped.borrow(), std::slice::from_ref(&gateway));
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
+}
+
+#[test]
 fn a_delete_hermes_leaves_to_purge_is_finished_with_its_purge() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
