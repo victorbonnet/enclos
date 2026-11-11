@@ -57,17 +57,17 @@ fn access_approval_refuses_absolute_paths_that_run_code_outside_the_sandbox() {
 fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
     use crate::engine::approvals::phone_write_refusal;
     use std::path::{Path, PathBuf};
-    let home = Path::new("/Users/me");
+    let home = Path::new("/Users/alice");
     let path = [
-        PathBuf::from("/Users/me/tools/bin"),
+        PathBuf::from("/Users/alice/tools/bin"),
         PathBuf::from("/usr/bin"),
     ];
     for refused in [
-        "/Users/me/tools/bin",
-        "/Users/me/tools/bin/new",
+        "/Users/alice/tools/bin",
+        "/Users/alice/tools/bin/new",
         // Holds a PATH folder: its programs could be replaced.
-        "/Users/me/tools",
-        "/Users/me",
+        "/Users/alice/tools",
+        "/Users/alice",
         "/Users/other/work",
         "/Volumes/Disk",
         "/Volumes/Disk/.Trashes",
@@ -80,8 +80,8 @@ fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
         );
     }
     for allowed in [
-        "/Users/me/work",
-        "/Users/me/Documents/report",
+        "/Users/alice/work",
+        "/Users/alice/Documents/report",
         "/Volumes/Disk/projects",
         "/mnt/disk/projects",
         "/media/me/disk/projects",
