@@ -478,6 +478,18 @@ fn approval_close_reaches_all_owner_devices_without_policy_or_runtime_work() {
 }
 
 #[test]
+fn approval_close_keeps_a_failure_while_its_policy_change_waits_on_the_host() {
+    let mut a = approval_sample();
+    a.state = "failed".into();
+    let why = approvals::close_blocked(&a, |_| true).unwrap();
+    assert!(why.contains("enclos policy apply lab"), "{why}");
+    assert!(approvals::close_blocked(&a, |_| false).is_none());
+    // A pending request has no policy work left behind: it closes.
+    a.state = "pending".into();
+    assert!(approvals::close_blocked(&a, |_| true).is_none());
+}
+
+#[test]
 fn approval_close_waits_for_an_inflight_decision_then_can_close_its_failure() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";

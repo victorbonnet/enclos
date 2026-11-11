@@ -6,6 +6,23 @@ use crate::{
 };
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 
+/// Why request `a` cannot be closed yet, if it cannot: a failed application
+/// may have left a pending policy change (`pending` says whether its
+/// sandbox has one), and the request is then the phone's only sign of it,
+/// so it stays until the host applies or discards that change. A sandbox
+/// whose policy cannot be read shows no such change, and closes.
+pub(super) fn close_blocked(
+    a: &Approval,
+    pending: impl FnOnce(&SandboxName) -> bool,
+) -> Option<String> {
+    let name = a.sandbox.parse::<SandboxName>().ok()?;
+    (a.state == "failed" && pending(&name)).then(|| {
+        format!(
+            "A policy change waits on the host for {name}. Apply it with `enclos policy apply {name}` or drop it with `enclos policy discard {name}`, then close this request."
+        )
+    })
+}
+
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
         && crate::net::host::AllowEntry::parse(&access.target)
@@ -275,6 +292,15 @@ impl Hub {
         id: &str,
     ) -> Result<(), String> {
         self.approval_authority(store, device, person)?;
+        if let Some(a) = store.approval(id).map_err(|e| e.to_string())?
+            && let Some(why) = close_blocked(&a, |name| {
+                Engine::open(self.layout.clone())
+                    .policy(name)
+                    .is_ok_and(|view| view.pending.is_some())
+            })
+        {
+            return Err(why);
+        }
         // The store transition also checks the state atomically against other devices.
         store
             .close_approval(id, &device.id, person)
