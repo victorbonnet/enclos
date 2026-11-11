@@ -75,16 +75,21 @@ fn hub_with(
     let mut received = Vec::new();
     for (i, person) in people.iter().enumerate() {
         let (sender, receiver) = channel();
-        devices.insert(format!("d-{i}"), ((*person).to_owned(), sender));
+        devices.insert(format!("d-{i}"), ((*person).to_owned(), sender, i as u64));
         received.push(receiver);
     }
     let hub = Hub {
         transport: Transport::Tailscale,
+        whois: Arc::new(|_: &str| Err("no transport in this test".to_owned())),
         store_path: dir.join("app.db"),
         bridge_private: vec![0; 32],
         agents: Vec::new(),
         plugins: Mutex::new(HashMap::new()),
+        generations: AtomicU64::new(0),
         devices: Mutex::new(devices),
+        waiting: AtomicUsize::new(0),
+        refusals: Mutex::new(HashMap::new()),
+        silence: SILENCE,
     };
     (hub, received)
 }
