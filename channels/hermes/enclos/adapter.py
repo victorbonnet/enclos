@@ -370,14 +370,16 @@ def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: 
         if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
             return None
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        if not chat_id or not _ADAPTERS:
+        # Without the call's id, its end cannot be matched to its start, and
+        # the app would show the step running for good: it is not sent.
+        if not chat_id or not tool_call_id or not _ADAPTERS:
             return None
         label = None
         if phase == "start":
             from agent.display import build_tool_preview
             label = build_tool_preview(tool_name, args if isinstance(args, dict) else {}, max_len=protocol.MAX_TOOL_LABEL_CHARS)
         message = protocol.tool(
-            chat_id, tool_call_id or f"{tool_name}-{id(args)}", tool_name, phase, label=label,
+            chat_id, tool_call_id, tool_name, phase, label=label,
             # Hermes says ok, error or blocked (a policy refused it).
             ok=None if phase == "start" else status in (None, "ok"),
             duration_ms=duration_ms if phase == "end" and isinstance(duration_ms, (int, float)) else None)
