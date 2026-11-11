@@ -101,7 +101,9 @@ fn a_write_that_reads_first_waits_for_a_write_in_progress() {
 
 /// A write no person waits on outlasts a write lock held 12 seconds, as a
 /// commit that waits on a stalled disk holds it; a command's write still
-/// fails after its 10. Every length here is a tenth of the real one.
+/// fails after its 10. Every length here is a tenth of the real one. The
+/// lock is held until the command's write has given up too: SQLite counts
+/// its own sleeps, which a loaded machine stretches.
 #[test]
 fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
     const SCALE: u32 = 10;
@@ -128,10 +130,11 @@ fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
         })
     };
     let (command, background) = (write(command, "cmd"), write(background, "bg"));
-    std::thread::sleep(held);
+    let (done, after) = command.join().unwrap();
+    std::thread::sleep(held.saturating_sub(started.elapsed()));
+    let released = started.elapsed();
     holder.execute_batch("COMMIT").unwrap();
 
-    let (done, after) = command.join().unwrap();
     assert!(
         matches!(
             &done,
@@ -142,7 +145,6 @@ fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
         ),
         "{done:?}"
     );
-    // Failing at all, it gave up while the lock was held.
     assert!(
         after >= Wait::Command.limit() / SCALE,
         "failed after {after:?}"
@@ -150,8 +152,8 @@ fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
     let (done, after) = background.join().unwrap();
     done.unwrap();
     assert!(
-        after >= held && after < Wait::Background.limit() / SCALE,
-        "written after {after:?}"
+        after >= released && released >= held,
+        "written after {after:?}, the lock released after {released:?}"
     );
     assert!(store.get(&"bg".parse().unwrap()).unwrap().is_some());
 }
