@@ -33,6 +33,7 @@ use tungstenite::handshake::server::{Request, Response};
 use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
+use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::store::{
     BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, StoredAttachment,
@@ -67,11 +68,35 @@ struct Hub {
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not.
     commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// How fast each agent may have its messages stored, kept across its
+    /// plugin's connections.
+    paces: Mutex<HashMap<String, Pace>>,
     /// Connected devices: who they speak for, and where to send.
     devices: Mutex<HashMap<String, (String, Sender<ToDevice>)>>,
 }
 
 impl Hub {
+    /// Returns once `agent` may have one more message stored ([`Pace`]):
+    /// at once in a burst, else after a wait, in which its plugin's
+    /// connection is not read.
+    fn pace(&self, agent: &str) {
+        loop {
+            let wait = {
+                let mut paces = self.paces.lock().expect("not poisoned");
+                let now = std::time::Instant::now();
+                match paces
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| Pace::new(now))
+                    .take(now)
+                {
+                    Ok(()) => return,
+                    Err(wait) => wait,
+                }
+            };
+            std::thread::sleep(wait);
+        }
+    }
+
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
@@ -174,6 +199,10 @@ impl Hub {
                         attachments,
                         ..
                     } => {
+                        // Every runtime may send on its own: past a burst,
+                        // at a pace, so that a loop fills neither the
+                        // database nor the devices' queues.
+                        hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
                             OutKind::Notify => "notify",
@@ -311,6 +340,7 @@ pub fn serve(
         host,
         plugins: Mutex::new(HashMap::new()),
         commands: Mutex::new(HashMap::new()),
+        paces: Mutex::new(HashMap::new()),
         devices: Mutex::new(HashMap::new()),
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
