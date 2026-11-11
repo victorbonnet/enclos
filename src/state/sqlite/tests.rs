@@ -181,6 +181,114 @@ fn a_connection_closing_alone_leaves_the_log_in_place() {
     );
 }
 
+/// The variable that has [`reads_the_state_when_asked`] read the
+/// `state.db` it names.
+const READER_DB: &str = "ENCLOS_TEST_READER_DB";
+
+/// What [`another_process_never_makes_a_read_kept_open_wait`] runs in a
+/// child, as another enclos command: reads the state, a connection at a
+/// time, until killed, with a file `reading` beside it once it has read.
+/// Passes at once otherwise.
+#[test]
+fn reads_the_state_when_asked() {
+    let Some(db) = std::env::var_os(READER_DB) else {
+        return;
+    };
+    let db = PathBuf::from(db);
+    let store = SqliteStateStore::new(&db, db.with_file_name("state.lock"), Wait::Command);
+    store.list().unwrap();
+    std::fs::write(db.with_file_name("reading"), "").unwrap();
+    loop {
+        let _ = store.list();
+    }
+}
+
+/// The proxy reads the active policy for each connection, while other
+/// commands open and close their own. A connection that opens while none is
+/// open rebuilds the log's index from the whole log and holds every read
+/// off until it is done; with a connection kept open in the proxy's
+/// process, none rebuilds it, so no read waits. Its reads here wait for no
+/// lock at all, and fail if they would.
+#[test]
+fn another_process_never_makes_a_read_kept_open_wait() {
+    let (_dir, store) = store();
+    let name: SandboxName = "home".parse().unwrap();
+    {
+        let lock = store.lock().unwrap();
+        store.migrate(&lock).unwrap();
+        let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+        let by = Actor {
+            user: "alice".into(),
+            host: "mac".into(),
+        };
+        store
+            .create_sandbox(&lock, &record("home"), &snap, &by)
+            .unwrap();
+        // A log of about 2 MB, as a proxy's network log makes it.
+        store
+            .open()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
+                 INSERT INTO net_events
+                   (at, sandbox, host, port, method, verdict, bytes_up, bytes_down, duration_ms)
+                 SELECT '2026-01-02T03:04:05Z', 'home', printf('%d.example.com', i), 443,
+                        'CONNECT', 'allowed', 0, 0, 0 FROM n",
+            )
+            .unwrap();
+    }
+    let reader = SqliteStateStore {
+        write_wait: Duration::ZERO,
+        ..store.clone()
+    };
+    let _open = reader.keep_open().unwrap();
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        crate::lifecycle::marker::spawn_unmarked(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state::sqlite::tests::reads_the_state_when_asked",
+                    "--test-threads=1",
+                ])
+                .env(READER_DB, &store.db)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .unwrap(),
+    );
+    let started = Instant::now();
+    while !store.db.with_file_name("reading").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(30),
+            "the other process did not read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    let mut reads = 0;
+    while started.elapsed() < Duration::from_secs(1) {
+        let read = reader.active_policy(&name);
+        assert!(
+            matches!(read, Ok(Some(_))),
+            "read {reads}, after {:?}: {read:?}",
+            started.elapsed()
+        );
+        reads += 1;
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the other process stopped reading"
+    );
+}
+
 #[test]
 fn reads_before_init_say_to_run_init() {
     let (_dir, store) = store();
