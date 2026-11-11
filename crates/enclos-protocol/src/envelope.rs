@@ -39,8 +39,10 @@ pub enum DecodeError {
     TooBig,
     #[error("not a JSON object: {0}")]
     NotJson(String),
-    #[error("version {0} is not spoken here")]
-    Version(u64),
+    /// A `v` this receiver does not speak: answer `version`, naming the
+    /// message by `id` when it has one, then close.
+    #[error("version {v} is not spoken here")]
+    Version { id: Option<String>, v: u64 },
     /// A `type` this receiver does not know: answer `unknown_type` and go on,
     /// since a newer peer may send optional messages.
     #[error("unknown type {kind:?}")]
@@ -53,6 +55,11 @@ pub enum DecodeError {
 
 /// Reads one message. `known` lists the `type`s the body accepts, so an
 /// unknown one is told apart from a known one with bad fields.
+///
+/// It refuses `bytes` over [`MAX_MESSAGE_BYTES`], but only once the caller
+/// holds them: it does not bound the read. A caller reading from a peer
+/// stops at `MAX_MESSAGE_BYTES` plus one byte (the line break) rather than
+/// buffering more first.
 pub fn decode<B: DeserializeOwned>(
     bytes: &[u8],
     known: &[&str],
@@ -71,7 +78,7 @@ pub fn decode<B: DeserializeOwned>(
         .map(str::to_owned);
     match object.get("v").and_then(serde_json::Value::as_u64) {
         Some(v) if v == u64::from(VERSION) => {}
-        Some(v) => return Err(DecodeError::Version(v)),
+        Some(v) => return Err(DecodeError::Version { id, v }),
         None => {
             return Err(DecodeError::Bad {
                 id,
