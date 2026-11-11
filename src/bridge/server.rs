@@ -415,11 +415,39 @@ impl Hub {
     /// Sends conversation `id`, with its name and how far it was read, to
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
-        if let Ok(Some(c)) = store.conversation_info(id)
-            && let Some(info) = conversation_info(store, c)
-        {
-            self.deliver(person, ToDevice::Conversation(info));
+        match store.conversation_info(id) {
+            Ok(Some(c)) => {
+                if let Some(info) = conversation_info(store, c) {
+                    self.deliver(person, ToDevice::Conversation(info));
+                }
+            }
+            Ok(None) => {}
+            // The change is stored; the devices learn it at their next sync.
+            Err(e) => eprintln!(
+                "enclos app: conversation {id} changed, but its metadata could not be read to send it: {e}"
+            ),
         }
+    }
+
+    /// Brings an archived conversation back to its owner's active Inbox
+    /// when a request that waits for the person arrives in it (ADR 0049):
+    /// the flag is cleared, and the owner's devices get the metadata.
+    /// Whether it was archived.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "questions and command approvals, which call it, are not on this branch yet"
+        )
+    )]
+    pub(super) fn unarchive_for_request(&self, store: &Store, id: &str) -> rusqlite::Result<bool> {
+        if !store.unarchive_for_request(id)? {
+            return Ok(false);
+        }
+        if let Some(owner) = store.owner(id)? {
+            self.deliver_conversation(store, &owner, id);
+        }
+        Ok(true)
     }
 
     /// The agent's plugin connection, opened if it is not; its reader runs

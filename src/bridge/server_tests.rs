@@ -313,6 +313,40 @@ fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
 }
 
 #[test]
+fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    store.conversation("c-asks", "lab", "main", owner).unwrap();
+    let (phone_tx, phone_rx) = channel();
+    let (guest_tx, guest_rx) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("phone".into(), (owner.into(), phone_tx));
+        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx));
+    }
+    // Not archived: nothing changes and nothing is sent.
+    assert!(!hub.unarchive_for_request(&store, "c-asks").unwrap());
+    assert!(phone_rx.try_recv().is_err());
+    let archived = archive_conversation(&hub, &store, owner, "c-asks", true).unwrap();
+    phone_rx.try_recv().unwrap();
+    // A reply leaves the flag as it is.
+    store
+        .add("asks-1", "c-asks", &From::Agent, "still working", "reply")
+        .unwrap();
+    assert!(store.conversation_info("c-asks").unwrap().unwrap().archived);
+    // A question or a command approval brings it back, on every device.
+    assert!(hub.unarchive_for_request(&store, "c-asks").unwrap());
+    let ToDevice::Conversation(info) = phone_rx.try_recv().unwrap() else {
+        panic!("expected conversation metadata");
+    };
+    assert!(!info.archived);
+    assert!(info.revision > archived.revision);
+    assert!(guest_rx.try_recv().is_err());
+    assert!(!store.conversation_info("c-asks").unwrap().unwrap().archived);
+    assert!(!hub.unarchive_for_request(&store, "missing").unwrap());
+}
+
+#[test]
 fn an_archive_storage_failure_is_not_a_refusal_and_keeps_the_database_words_on_the_host() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";

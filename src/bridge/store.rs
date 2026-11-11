@@ -513,6 +513,18 @@ impl Store {
         }
     }
 
+    /// Restores conversation `id` to the active Inbox because something in
+    /// it now waits for the person (an agent's question, a command
+    /// approval), whoever archived it; whether it was archived. Replies and
+    /// notices never call this (ADR 0049).
+    pub fn unarchive_for_request(&self, id: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversations SET archived = 0, revision = revision + 1 WHERE id = ?1 AND archived",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Its owner read conversation `id` up to message `seq`; whether that
     /// moved how far it was read. It only moves forward, and never past the
     /// conversation's newest message.
