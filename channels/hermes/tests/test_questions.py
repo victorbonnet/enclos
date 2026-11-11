@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from enclos import protocol, questions
+from enclos import protocol, questions, visible
 from enclos.outbox import Outbox
 
 
@@ -118,13 +118,20 @@ class QuestionProtocol(unittest.TestCase):
 
     def test_hidden_characters_and_duplicate_labels_follow_the_protocol_rule(self):
         # The characters of enclos-protocol's `visible` tests, and the same verdicts.
-        for code in (0x202E, 0x2066, 0x200B, 0x200D, 0xFEFF, 0x061C, 0x0007, 0x00AD):
-            self.assertTrue(questions.is_hidden(chr(code)), hex(code))
-        for char in "aéß中😀 -":
-            self.assertFalse(questions.is_hidden(char), char)
+        for code in (0x202E, 0x2066, 0x200B, 0x200E, 0xFEFF, 0x061C, 0x0007, 0x0085, 0x00AD,
+                     0x034F, 0x115F, 0x3164, 0xFFA0, 0x2800, 0x2028, 0x2029, 0x206A, 0xFFF9,
+                     0xFE00, 0xE0041, 0xE007F, 0xE0100, 0x200D):
+            self.assertTrue(visible.is_hidden(chr(code)), hex(code))
+            self.assertTrue(visible.has_hidden("a" + chr(code) + "b", True), hex(code))
+        for char in "a\u00e9\u00df\u4e2d\U0001f600 -\u06cc":
+            self.assertFalse(visible.is_hidden(char), char)
         value = {"id": "q", "text": "Which?", "choices": ["Allow", "Deny"], "multiple": False}
         for changed in ({**value, "choices": ["Deny\u202Ewolla", "Allow"]},
                         {**value, "choices": ["Allow\u200B", "Allow"]},
+                        {**value, "choices": ["Allow\U000E0041", "Allow"]},
+                        {**value, "choices": ["\u2764", "\u2764\uFE0F"]},
+                        {**value, "choices": ["Allow\u2028"]},
+                        {**value, "choices": ["\u3164"]},
                         {**value, "choices": ["Allow", "Allow"]},
                         {**value, "choices": ["Two\nlines"]},
                         {**value, "choices": ["Tab\there"]},
@@ -137,6 +144,13 @@ class QuestionProtocol(unittest.TestCase):
         for text in ("ok\u200D", "a\tb", "a\r\nb", "\u00AD"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 questions.validate_answer({"kind": "text", "text": text}, value)
+        # Persian spelling, a joined emoji and an emoji's presentation selector are text.
+        for text in ("\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645", "\U0001F469\u200D\U0001F4BB",
+                     "\u2764\uFE0F"):
+            with self.subTest(text=text):
+                self.assertEqual(questions.validate_answer({"kind": "text", "text": text}, value)["text"], text)
+                self.assertEqual(questions.validate_definition({**value, "text": text})["text"], text)
+                questions.validate_definition({**value, "choices": [text, "Deny"]})
 
 
 class AdapterControls(unittest.IsolatedAsyncioTestCase):
@@ -259,6 +273,15 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         self.native.resolve_gateway_clarify(card.native_id, self.native.CANCELLED)
         await self.manager.retire(card.native_id)
         self.assertEqual(card.state, "cancelled")
+
+    async def test_a_typed_answer_the_app_cannot_carry_is_still_answered(self):
+        # Hermes accepts any composer text; the agent has it, so the card is not cancelled.
+        entry, card = await self.ask()
+        self.native.resolve_gateway_clarify(card.native_id, "ok" + chr(0x202E) + "kc")
+        await self.manager.retire(card.native_id)
+        self.assertEqual(card.state, "answered")
+        self.assertEqual(self.updates()[-1]["state"], "answered")
+        self.assertNotIn("answer", self.updates()[-1])
 
     async def test_watcher_first_still_gets_exact_correlated_confirmation(self):
         entry, card = await self.ask(["One", "Two"])

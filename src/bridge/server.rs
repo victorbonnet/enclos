@@ -507,7 +507,7 @@ impl Hub {
                             &question,
                             &message.id,
                         );
-                        questions::acknowledge_question(&mut acks, &message.id, result);
+                        questions::acknowledge_ask(&mut acks, &message.id, result);
                     }
                     FromPlugin::QuestionUpdate {
                         question,

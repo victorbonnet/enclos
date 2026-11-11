@@ -658,6 +658,30 @@ fn a_channel_without_questions_expires_the_cards_it_left() {
 }
 
 #[test]
+fn an_ask_the_bridge_cannot_save_is_refused_so_the_channel_sends_text() {
+    let (_dir, hub, _store, _device, _rx) = fixture();
+    let mut channel = native(&hub, vec![Capability::Questions]);
+    // The database fails the ask's transaction (as a full disk would).
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER full BEFORE INSERT ON questions BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+    channel.send(
+        "ask",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("q-1"),
+        },
+    );
+    assert!(
+        matches!(channel.receive().body, FromBridge::Error(error) if error.of.as_ref().map(MessageId::as_str) == Some("ask"))
+    );
+    channel.ack("ask");
+}
+
+#[test]
 fn questions_no_channel_can_answer_expire_on_the_bridge() {
     let (_dir, hub, store, device, rx) = fixture();
     let owned = ConversationId::new("owned").unwrap();
@@ -839,9 +863,9 @@ fn only_a_matched_device_answer_reads_as_the_persons_in_history() {
         },
     );
     native.ack("answered");
-    next(&rx);
+    assert!(matches!(next(&rx), ToDevice::Question { question } if question.confirmed));
     assert!(matches!(next(&rx), ToDevice::Message(m) if m.text == "Answered: Classement"));
-    assert!(matches!(next(&rx), ToDevice::QuestionResult { .. }));
+    assert!(matches!(next(&rx), ToDevice::QuestionResult { question, .. } if question.confirmed));
     // The agent claims an answer nobody sent: the history says whose claim it is.
     native.send(
         "ask-2",
@@ -865,7 +889,10 @@ fn only_a_matched_device_answer_reads_as_the_persons_in_history() {
         },
     );
     native.ack("claimed");
-    next(&rx);
+    // The card, too, shows it as the agent's report, not the person's choice.
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.state == QuestionState::Answered && !question.confirmed)
+    );
     assert!(
         matches!(next(&rx), ToDevice::Message(m) if m.text == "Answered, as the agent reports: Delete everything")
     );

@@ -202,6 +202,24 @@ pub(super) fn acknowledge_question(
     }
 }
 
+/// An ask the bridge could not save is refused rather than left in the
+/// channel's outbox until it reconnects: the channel then sends the
+/// question as text, so the agent does not wait on a question nobody sees.
+pub(super) fn acknowledge_ask(
+    writer: &mut PluginWriter,
+    id: &MessageId,
+    result: Result<(), QuestionStoreError>,
+) {
+    let result = result.map_err(|error| match error {
+        QuestionStoreError::Sql(error) => {
+            eprintln!("enclos app: could not save a question: {error}");
+            QuestionStoreError::Invalid("The bridge could not save the question.".into())
+        }
+        error => error,
+    });
+    acknowledge_question(writer, id, result);
+}
+
 impl Hub {
     /// A channel connected. One without the `questions` capability cannot
     /// answer the cards it left (a runtime that lost its native API, or

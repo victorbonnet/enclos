@@ -57,6 +57,12 @@ pub struct QuestionInfo {
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<QuestionAnswer>,
+    /// Whether this settlement is the one a paired device submitted,
+    /// matched by its request. False while pending and for a state the
+    /// agent's channel reports on its own, which a card shows as the
+    /// agent's report rather than the person's choice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
 /// Nonblank text without hidden characters ([`crate::visible`]); `lines`
@@ -92,7 +98,11 @@ impl QuestionDefinition {
         }
         for (index, label) in self.choices.iter().enumerate() {
             text(label, "Choice label", false)?;
-            if self.choices[..index].contains(label) {
+            let bare = crate::visible::bare(label);
+            if self.choices[..index]
+                .iter()
+                .any(|other| crate::visible::bare(other) == bare)
+            {
                 return Err("Choice labels must be distinct.".into());
             }
         }
@@ -161,11 +171,16 @@ impl QuestionInfo {
                 "Question revision cannot be represented by the conversation cache.".into(),
             );
         }
+        if self.confirmed && self.state == QuestionState::Pending {
+            return Err("A pending question has no confirmed answer.".into());
+        }
+        // An answer the runtime accepted that this contract cannot carry
+        // (text with a hidden character, say) is answered without one.
         match (&self.state, &self.answer) {
             (QuestionState::Answered, Some(answer)) if !matches!(answer, QuestionAnswer::Skip) => {
                 answer.validate(&self.definition)?;
             }
-            (QuestionState::Answered, _) | (_, Some(_)) => {
+            (_, Some(_)) => {
                 return Err("Question state and answer disagree.".into());
             }
             (_, None) => {}
@@ -205,6 +220,7 @@ mod tests {
             state: QuestionState::Pending,
             revision: 0,
             answer: None,
+            confirmed: false,
         }
     }
 
@@ -217,6 +233,10 @@ mod tests {
             vec!["Deny\u{202E}wolla".to_owned(), "Allow".into()],
             vec!["Allow\u{200B}".to_owned(), "Allow".into()],
             vec!["Allow".to_owned(), "Allow".into()],
+            vec!["Allow\u{E0041}".to_owned(), "Allow".into()],
+            vec!["\u{2764}".to_owned(), "\u{2764}\u{FE0F}".into()],
+            vec!["Allow\u{2028}".to_owned()],
+            vec!["\u{3164}".to_owned()],
             vec!["Two\nlines".to_owned()],
             vec!["Tab\there".to_owned()],
         ] {
@@ -248,6 +268,26 @@ mod tests {
                     .is_err(),
                 "{text:?}"
             );
+        }
+        // Persian spelling, a joined emoji and an emoji's presentation
+        // selector are ordinary text, in a question, a label or an answer.
+        for text in [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_ok(),
+                "{text:?}"
+            );
+            let joined = QuestionDefinition {
+                text: text.into(),
+                choices: vec![text.into(), "Deny".into()],
+                ..original.clone()
+            };
+            assert!(joined.validate().is_ok(), "{text:?}");
         }
     }
 
@@ -386,13 +426,42 @@ mod tests {
             .validate()
             .is_err()
         );
+        // Answered, with nothing this contract can carry: the runtime has
+        // the answer, the card says so without its text.
         assert!(
             QuestionInfo {
                 state: QuestionState::Answered,
                 ..pending.clone()
             }
             .validate()
+            .is_ok()
+        );
+        assert!(
+            QuestionInfo {
+                confirmed: true,
+                ..pending.clone()
+            }
+            .validate()
             .is_err()
+        );
+        let confirmed = QuestionInfo {
+            state: QuestionState::Skipped,
+            confirmed: true,
+            ..pending.clone()
+        };
+        assert!(confirmed.validate().is_ok());
+        let encoded = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(encoded["confirmed"], true);
+        assert_eq!(
+            serde_json::from_value::<QuestionInfo>(encoded).unwrap(),
+            confirmed
+        );
+        // Unconfirmed is the default, and not written.
+        assert!(
+            serde_json::to_value(&pending)
+                .unwrap()
+                .get("confirmed")
+                .is_none()
         );
         assert!(
             QuestionInfo {

@@ -424,11 +424,17 @@ jobs:
   # The same tests against the latest Hermes, its default branch, never
   # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`),
   # and one that skips for want of it fails the job, so a Hermes change the
-  # plugin relies on shows here rather than in a gateway.
+  # plugin relies on shows here rather than in a gateway. It is in `ci-ok`
+  # on purpose: an upstream change that breaks the plugin blocks every PR
+  # until enclos is changed to fit it, since enclos follows the latest
+  # Hermes rather than pinning one. It runs Hermes's code, so neither
+  # checkout keeps the token.
   hermes-latest:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent

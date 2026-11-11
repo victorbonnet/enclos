@@ -59,40 +59,63 @@ fn json_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
-fn read_question(row: &rusqlite::Row) -> rusqlite::Result<StoredQuestion> {
-    let definition: QuestionDefinition =
-        serde_json::from_str(&row.get::<_, String>(0)?).map_err(json_error)?;
-    let conversation = ConversationId::new(row.get::<_, String>(1)?).map_err(json_error)?;
-    let state: QuestionState =
-        serde_json::from_value(serde_json::Value::String(row.get(4)?)).map_err(json_error)?;
-    let revision: i64 = row.get(5)?;
-    let answer = row
-        .get::<_, Option<String>>(6)?
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .map_err(json_error)?;
-    let info = QuestionInfo {
-        definition,
-        conversation,
-        agent: row.get(2)?,
-        state,
-        revision: revision
-            .try_into()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        answer,
-    };
-    info.validate().map_err(|_| rusqlite::Error::InvalidQuery)?;
-    Ok(StoredQuestion {
-        info,
-        owner: row.get(3)?,
-    })
+/// A question's row: its id, and the question, or why the row no longer
+/// reads as one. Rows are checked when they are written; one an earlier
+/// build wrote may not pass a rule tightened since, and it is then left
+/// out of every read (and said in the log) rather than failing the read,
+/// which would end every sync of its owner.
+type QuestionRow = (String, Result<StoredQuestion, String>);
+
+fn read_question(row: &rusqlite::Row) -> rusqlite::Result<QuestionRow> {
+    let id: String = row.get(0)?;
+    let definition: String = row.get(1)?;
+    let conversation: String = row.get(2)?;
+    let agent: String = row.get(3)?;
+    let owner: String = row.get(4)?;
+    let state: String = row.get(5)?;
+    let revision: i64 = row.get(6)?;
+    let answer: Option<String> = row.get(7)?;
+    let confirmed: bool = row.get(8)?;
+    let parsed = (|| -> Result<StoredQuestion, String> {
+        let info = QuestionInfo {
+            definition: serde_json::from_str(&definition).map_err(|e| e.to_string())?,
+            conversation: ConversationId::new(conversation).map_err(|e| e.to_string())?,
+            agent,
+            state: serde_json::from_value(serde_json::Value::String(state))
+                .map_err(|e| e.to_string())?,
+            revision: revision.try_into().map_err(|_| "negative revision")?,
+            answer: answer
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(|e| e.to_string())?,
+            confirmed,
+        };
+        info.validate()?;
+        Ok(StoredQuestion { info, owner })
+    })();
+    Ok((id, parsed))
 }
 
-const QUESTION_SELECT: &str = "SELECT q.definition,q.conversation,q.agent,c.owner,q.state,q.revision,q.answer FROM questions q JOIN conversations c ON c.id=q.conversation WHERE q.id=?1";
+/// The question of a row that still reads as one.
+fn usable((id, parsed): QuestionRow) -> Option<StoredQuestion> {
+    parsed
+        .inspect_err(|e| {
+            eprintln!("enclos app: question {id} no longer reads and is left out: {e}")
+        })
+        .ok()
+}
+
+const QUESTION_COLUMNS: &str = "SELECT q.id,q.definition,q.conversation,q.agent,c.owner,q.state,q.revision,q.answer,q.confirmed FROM questions q JOIN conversations c ON c.id=q.conversation";
 
 fn question_in(db: &Connection, id: &str) -> rusqlite::Result<Option<StoredQuestion>> {
-    db.query_row(QUESTION_SELECT, [id], read_question)
-        .optional()
+    Ok(db
+        .query_row(
+            &format!("{QUESTION_COLUMNS} WHERE q.id=?1"),
+            [id],
+            read_question,
+        )
+        .optional()?
+        .and_then(usable))
 }
 
 fn history_message(
@@ -107,12 +130,12 @@ fn origin_conversation(
     db: &Connection,
     origin: &str,
     conversation: &ConversationId,
-) -> Result<(String, bool), QuestionStoreError> {
-    let (sandbox, target, owner): (String, String, String) = db
+) -> Result<bool, QuestionStoreError> {
+    let (sandbox, target): (String, String) = db
         .query_row(
-            "SELECT sandbox,agent,owner FROM conversations WHERE id=?1",
+            "SELECT sandbox,agent FROM conversations WHERE id=?1",
             [conversation.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
         .ok_or(QuestionStoreError::Unknown)?;
@@ -132,7 +155,7 @@ fn origin_conversation(
     {
         return Err(QuestionStoreError::Unknown);
     }
-    Ok((owner, is_member))
+    Ok(is_member)
 }
 
 fn state_text(state: &QuestionState) -> String {
@@ -178,11 +201,14 @@ impl Store {
     }
 
     pub fn pending_questions_for(&self, person: &str) -> rusqlite::Result<Vec<StoredQuestion>> {
-        let sql = "SELECT q.definition,q.conversation,q.agent,c.owner,q.state,q.revision,q.answer FROM questions q JOIN conversations c ON c.id=q.conversation WHERE c.owner=?1 AND q.state='pending' ORDER BY q.rowid";
-        self.db
-            .prepare(sql)?
+        let sql =
+            format!("{QUESTION_COLUMNS} WHERE c.owner=?1 AND q.state='pending' ORDER BY q.rowid");
+        let rows = self
+            .db
+            .prepare(&sql)?
             .query_map([person], read_question)?
-            .collect()
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter_map(usable).collect())
     }
 
     /// Every pending question: its agent, id, and when it was asked
@@ -234,7 +260,7 @@ impl Store {
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let (owner, is_member) = origin_conversation(&tx, origin, conversation)?;
+        let is_member = origin_conversation(&tx, origin, conversation)?;
         QuestionInfo {
             definition: definition.clone(),
             conversation: conversation.clone(),
@@ -242,6 +268,7 @@ impl Store {
             state: QuestionState::Pending,
             revision: 0,
             answer: None,
+            confirmed: false,
         }
         .validate()
         .map_err(QuestionStoreError::Invalid)?;
@@ -258,12 +285,14 @@ impl Store {
                 message,
             });
         }
-        if tx
-            .query_row("SELECT 1 FROM messages WHERE id=?1", [message_id], |_| {
-                Ok(())
-            })
-            .optional()?
-            .is_some()
+        let exists = |sql: &str, key: &str| -> rusqlite::Result<bool> {
+            Ok(tx.query_row(sql, [key], |_| Ok(())).optional()?.is_some())
+        };
+        // A row that no longer reads holds this id: never a second one.
+        if exists(
+            "SELECT 1 FROM questions WHERE id=?1",
+            definition.id.as_str(),
+        )? || exists("SELECT 1 FROM messages WHERE id=?1", message_id)?
         {
             return Err(QuestionStoreError::Conflict);
         }
@@ -285,7 +314,7 @@ impl Store {
         }
         let encoded = serde_json::to_string(definition)
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
-        tx.execute("INSERT INTO questions(id,conversation,agent,owner,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,?5,'pending',0,NULL,?6)", params![definition.id.as_str(),conversation.as_str(),origin,owner,encoded,message_id])?;
+        tx.execute("INSERT INTO questions(id,conversation,agent,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,'pending',0,NULL,?5)", params![definition.id.as_str(),conversation.as_str(),origin,encoded,message_id])?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
         tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'question',?4,?5,?6)",params![message_id,conversation.as_str(),definition.fallback_text(),now(),speaker,definition.id.as_str()])?;
         let question =
@@ -311,11 +340,24 @@ impl Store {
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let current = question_in(&tx, id.as_str())?.ok_or(QuestionStoreError::Unknown)?;
+        let Some(current) = question_in(&tx, id.as_str())? else {
+            // A row that no longer reads can be neither shown nor answered:
+            // its agent's terminal update closes it, so that no sync offers
+            // it to the channel again.
+            if state.is_terminal()
+                && tx.execute(
+                    "UPDATE questions SET state='expired',revision=revision+1 WHERE id=?1 AND agent=?2 AND state='pending'",
+                    params![id.as_str(), origin],
+                )? > 0
+            {
+                tx.commit()?;
+            }
+            return Err(QuestionStoreError::Unknown);
+        };
         if current.info.agent != origin {
             return Err(QuestionStoreError::Unknown);
         }
-        let (_, is_member) = origin_conversation(&tx, origin, &current.info.conversation)?;
+        let is_member = origin_conversation(&tx, origin, &current.info.conversation)?;
         let mut answer = answer;
         if let Some(QuestionAnswer::Choices { indices }) = &mut answer {
             indices.sort_unstable();
@@ -323,6 +365,7 @@ impl Store {
         let mut next = current.clone();
         next.info.state = state;
         next.info.answer = answer;
+        next.info.confirmed = confirmed && state.is_terminal();
         next.info.validate().map_err(QuestionStoreError::Invalid)?;
         if current.info.state != QuestionState::Pending {
             if current.info.state != next.info.state || current.info.answer != next.info.answer {
@@ -353,12 +396,13 @@ impl Store {
             .transpose()
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute(
-            "UPDATE questions SET state=?2,revision=?3,answer=?4 WHERE id=?1",
+            "UPDATE questions SET state=?2,revision=?3,answer=?4,confirmed=?5 WHERE id=?1",
             params![
                 id.as_str(),
                 state_text(&next.info.state),
                 next.info.revision as i64,
-                answer
+                answer,
+                next.info.confirmed
             ],
         )?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
@@ -759,6 +803,113 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(change.message.unwrap().text, text);
+            // The card can tell them apart too, after a restart as well.
+            assert_eq!(change.question.info.confirmed, confirmed);
+            assert_eq!(
+                store
+                    .question(&question.id)
+                    .unwrap()
+                    .unwrap()
+                    .info
+                    .confirmed,
+                confirmed
+            );
         }
+    }
+
+    #[test]
+    fn a_runtime_answer_the_contract_cannot_carry_is_answered_without_text() {
+        let (_dir, store, conversation) = fixture();
+        let question = definition("q-1");
+        store
+            .ask_question("lab/coder", &conversation, &question, "ask")
+            .unwrap();
+        let change = store
+            .settle_question(
+                "lab/coder",
+                &question.id,
+                Settlement::reported(QuestionState::Answered, None),
+                "answered",
+            )
+            .unwrap();
+        assert_eq!(change.question.info.state, QuestionState::Answered);
+        assert_eq!(change.question.info.answer, None);
+        assert_eq!(change.message.unwrap().text, "Question answered.");
+    }
+
+    #[test]
+    fn a_row_that_no_longer_reads_is_left_out_and_closed_not_fatal() {
+        let (_dir, store, conversation) = fixture();
+        for id in ["old", "new"] {
+            store
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &definition(id),
+                    &format!("{id}-ask"),
+                )
+                .unwrap();
+        }
+        // As an earlier build could write it: a tab, refused since.
+        store
+            .db
+            .execute(
+                "UPDATE questions SET definition=?1 WHERE id='old'",
+                [serde_json::to_string(&QuestionDefinition {
+                    text: "Which\tone?".into(),
+                    ..definition("old")
+                })
+                .unwrap()],
+            )
+            .unwrap();
+        let old = QuestionId::new("old").unwrap();
+        assert!(store.question(&old).unwrap().is_none());
+        let pending = store.pending_questions_for("owner").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].info.definition.id.as_str(), "new");
+        // Its id is never taken by another ask.
+        assert!(matches!(
+            store.ask_question("lab/coder", &conversation, &definition("old"), "again"),
+            Err(QuestionStoreError::Conflict)
+        ));
+        // Its agent's terminal update closes it: no channel sync offers it again.
+        assert_eq!(store.pending_questions("lab/coder").unwrap().len(), 2);
+        assert!(matches!(
+            store.settle_question(
+                "lab/coder",
+                &old,
+                Settlement::reported(QuestionState::Expired, None),
+                "expired"
+            ),
+            Err(QuestionStoreError::Unknown)
+        ));
+        assert_eq!(
+            store.pending_questions("lab/coder").unwrap(),
+            [QuestionId::new("new").unwrap()]
+        );
+    }
+
+    #[test]
+    fn an_earlier_question_table_loses_its_owner_copy_and_gains_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE questions (id TEXT PRIMARY KEY, conversation TEXT NOT NULL, agent TEXT NOT NULL, owner TEXT NOT NULL, definition TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0), answer TEXT, ask_message TEXT NOT NULL UNIQUE);").unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        store
+            .conversation("owned", "lab", "coder", "owner")
+            .unwrap();
+        let conversation = ConversationId::new("owned").unwrap();
+        let question = definition("q-1");
+        store
+            .ask_question("lab/coder", &conversation, &question, "ask")
+            .unwrap();
+        let stored = store.question(&question.id).unwrap().unwrap();
+        assert_eq!(stored.owner, "owner");
+        assert!(!stored.info.confirmed);
+        drop(store);
+        // Opening it again changes nothing more.
+        Store::open(&path).unwrap();
     }
 }

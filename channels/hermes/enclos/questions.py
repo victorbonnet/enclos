@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import protocol
+from . import protocol, visible
 
 MAX_DEFINITION_BYTES = 24 * 1024
 MAX_ANSWER_BYTES = 8 * 1024
@@ -20,22 +20,6 @@ NATIVE_SENTINELS = ("SKIPPED", "CANCELLED")
 logger = logging.getLogger(__name__)
 
 
-def is_hidden(char: str) -> bool:
-    """Whether `char` changes how the text around it reads without being seen: the
-    same rule as enclos-protocol's `visible::is_hidden` (control characters,
-    bidirectional marks and isolates, zero-width characters, the soft hyphen)."""
-    code = ord(char)
-    return (code < 0x20 or 0x7F <= code <= 0x9F
-            or code in (0x00AD, 0x061C, 0x180E, 0xFEFF)
-            or 0x200B <= code <= 0x200F or 0x202A <= code <= 0x202E
-            or 0x2060 <= code <= 0x2064 or 0x2066 <= code <= 0x2069)
-
-
-def has_hidden(text: str, lines: bool) -> bool:
-    """Whether `text` holds a hidden character, newlines aside when `lines` is true."""
-    return any(is_hidden(c) and not (lines and c == "\n") for c in text)
-
-
 def _size(value) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
@@ -43,7 +27,7 @@ def _size(value) -> int:
 def _text(value, name, lines):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be nonblank text")
-    if has_hidden(value, lines):
+    if visible.has_hidden(value, lines):
         raise ValueError(f"{name} holds a hidden or control character")
     return value
 
@@ -58,7 +42,7 @@ def validate_definition(value):
         raise ValueError("question supports at most 12 choices")
     for index, label in enumerate(choices):
         _text(label, "choice", lines=False)
-        if label in choices[:index]:
+        if visible.bare(label) in (visible.bare(other) for other in choices[:index]):
             raise ValueError("choice labels must be distinct")
     if not isinstance(value.get("multiple", False), bool):
         raise ValueError("multiple must be a boolean")
@@ -286,9 +270,9 @@ class Manager:
         try:
             answer = validate_answer(answer, card.definition)
         except ValueError:
-            # Hermes accepted text outside the app's bounded contract; the card can no
-            # longer be answered, while the native tool retains its actual result.
-            return "cancelled", None
+            # Hermes accepted text outside the app's bounded contract: the agent has its
+            # answer, so the card says answered, without the text it cannot carry.
+            return "answered", None
         return "answered", answer
 
     async def _settle(self, card, state, answer=None, of=None):

@@ -185,6 +185,18 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "question") {
         db.execute_batch("ALTER TABLE messages ADD COLUMN question TEXT")?;
     }
+    // A question's owner is its conversation's, read from there: the copy
+    // an earlier build kept went stale when a Home was claimed.
+    let mut query = db.prepare("SELECT name FROM pragma_table_info('questions')")?;
+    let columns = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|c| c == "owner") {
+        db.execute_batch("ALTER TABLE questions DROP COLUMN owner")?;
+    }
+    if !columns.iter().any(|c| c == "confirmed") {
+        db.execute_batch("ALTER TABLE questions ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -193,11 +205,11 @@ CREATE TABLE IF NOT EXISTS questions (
     id TEXT PRIMARY KEY,
     conversation TEXT NOT NULL REFERENCES conversations(id),
     agent TEXT NOT NULL,
-    owner TEXT NOT NULL,
     definition TEXT NOT NULL,
     state TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0),
     answer TEXT,
+    confirmed INTEGER NOT NULL DEFAULT 0,
     ask_message TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0), display_name TEXT);
