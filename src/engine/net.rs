@@ -49,8 +49,8 @@ impl Engine {
             store: store(Wait::Command),
             sandbox: name.clone(),
         };
-        // No person waits on a connection's row.
-        let log = NetLogWriter::start(store(Wait::Background));
+        // A connection waits for its row before it is forwarded.
+        let log = NetLogWriter::start(store(Wait::Command));
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(log));
         // Held until the process ends, as the port is.
         let (_lock, listeners) = match sandbox.backend.reaches_proxy_over_socket() {

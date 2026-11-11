@@ -62,11 +62,12 @@ pub type Result<T> = std::result::Result<T, StateError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
     /// A write of a command the user waits on, who is told if it fails and
-    /// can run it again.
+    /// can run it again; also the proxy's network log, since a connection
+    /// waits for its row before it is forwarded.
     Command,
     /// A write no person waits on, which nobody would make again if it
-    /// failed: a session's record of its members, the proxy's network log,
-    /// and what `enclos launch` and `enclos proxy run` record.
+    /// failed: a session's record of its members, and what `enclos launch`
+    /// and `enclos proxy run` record.
     Background,
 }
 
