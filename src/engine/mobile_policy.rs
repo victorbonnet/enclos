@@ -245,6 +245,18 @@ impl Engine {
                 ));
             }
         }
+        // What the phone writes is shown later in the policy page and the
+        // agents' context: nothing in it may change how it reads. An entry
+        // already in the file is named as it is, to be removed.
+        if edit
+            .after
+            .as_deref()
+            .is_some_and(|text| enclos_protocol::visible::has_hidden(text, false))
+        {
+            return Err(refused(
+                "This value contains hidden characters, which would change how it reads.",
+            ));
+        }
         if edit.before == edit.after {
             return Err(refused("This edit changes nothing."));
         }
@@ -292,10 +304,8 @@ impl Engine {
             doc[section] = toml_edit::Item::Table(toml_edit::Table::new());
         }
         if multiple {
-            let mut values: Vec<_> = field.values.iter().map(|v| v.value.clone()).collect();
-            if let Some(old) = &edit.before {
-                values.retain(|v| v != old);
-            }
+            let values: Vec<_> = field.values.iter().map(|v| v.value.clone()).collect();
+            let mut added = None;
             if let Some(new) = &edit.after {
                 let value = if edit.field == "write" {
                     let expanded = self
@@ -309,22 +319,18 @@ impl Engine {
                 } else {
                     new.clone()
                 };
-                if values.contains(&value) {
+                if values.contains(&value) && edit.before.as_ref() != Some(&value) {
                     return Err(refused("This entry already exists."));
                 }
-                values.push(value);
+                added = Some(value);
             }
-            values.sort();
-            values.dedup();
-            let mut array = Array::new();
-            for value in values {
-                array.push(value);
-            }
-            doc[section][key] = toml_edit::value(array);
-            doc[section]
-                .as_table_mut()
-                .expect("existing policy section")
-                .remove(&format!("{key}_add"));
+            edit_list(
+                &mut doc,
+                section,
+                key,
+                edit.before.as_deref(),
+                added.as_deref(),
+            )?;
         } else {
             let value = edit.after.as_deref().expect("checked replacement");
             doc[section][key] = match edit.field.as_str() {
@@ -347,9 +353,11 @@ impl Engine {
             && let Some(old) = &edit.before
             && let Ok(removed) = crate::net::host::AllowEntry::parse(old)
         {
-            let candidate = PolicyFile::parse("policy.toml", &doc.to_string())?;
-            let mut policy = self.policy(name)?.snapshot.policy;
-            candidate.apply(&mut policy);
+            // Resolved as stored, before validation, which refuses the
+            // opt-in this edit leaves unused.
+            let policy =
+                crate::policy::resolve(&doc.to_string(), self.adapter_layer(name)?.as_ref())?
+                    .policy;
             let host = removed.host_text();
             if policy.net.private.contains(&host)
                 && !policy
@@ -359,15 +367,7 @@ impl Engine {
                     .filter_map(|v| crate::net::host::AllowEntry::parse(v).ok())
                     .any(|e| e.matches(&host, e.port))
             {
-                let mut remaining = Array::new();
-                for value in policy.net.private.iter().filter(|v| *v != &host) {
-                    remaining.push(value.as_str());
-                }
-                doc["network"]["private"] = toml_edit::value(remaining);
-                doc["network"]
-                    .as_table_mut()
-                    .expect("network section")
-                    .remove("private_add");
+                edit_list(&mut doc, "network", "private", Some(&host), None)?;
             }
         }
         let after = doc.to_string();
@@ -419,7 +419,13 @@ impl Engine {
         let recorded = self.write(
             by,
             "app policy edit",
-            Some(name.to_string()),
+            // The edit itself, so the audit says what changed, not only where.
+            Some(format!(
+                "{name} {}: {} -> {}",
+                edit.field,
+                edit.before.as_deref().unwrap_or("(none)"),
+                edit.after.as_deref().unwrap_or("(none)")
+            )),
             |_: &Recorded| "applied the reviewed policy edit".into(),
             |lock| {
                 let (_, after, preview) = self.mobile_edit(name, base, edit)?;
@@ -433,5 +439,132 @@ impl Engine {
             },
         )?;
         self.restart_if_asked(by, name, Confirm::Yes, recorded)
+    }
+}
+
+/// Edits one list of the sandbox's own layer and leaves what it inherits
+/// inherited: never a copy of the resolved list, which would freeze the
+/// template's, the runtime adapter's and the built-in defaults' entries in
+/// this file, so a later enclos or runtime that changes them would not reach
+/// this sandbox (and a frozen `read_deny` would miss a new default denial).
+/// `old` comes out of the list that holds it, or, inherited, goes to
+/// `<key>_remove`; `new` goes back from `<key>_remove`, or into the list
+/// this file replaces, or to `<key>_add`.
+fn edit_list(
+    doc: &mut DocumentMut,
+    section: &str,
+    key: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Result<()> {
+    let read = |doc: &DocumentMut, name: &str| -> Result<Option<Vec<String>>> {
+        match doc.get(section).and_then(|s| s.get(name)) {
+            None => Ok(None),
+            Some(item) => item
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .map(Some)
+                .ok_or_else(|| refused(format!("{section}.{name} is not a list."))),
+        }
+    };
+    let (add_key, remove_key) = (format!("{key}_add"), format!("{key}_remove"));
+    let mut replace = read(doc, key)?;
+    let mut adds = read(doc, &add_key)?;
+    let mut removes = read(doc, &remove_key)?.unwrap_or_default();
+    if let Some(old) = old {
+        if let Some(list) = replace.as_mut().filter(|l| l.iter().any(|v| v == old)) {
+            list.retain(|v| v != old);
+        } else if let Some(list) = adds.as_mut().filter(|l| l.iter().any(|v| v == old)) {
+            list.retain(|v| v != old);
+        } else if !removes.iter().any(|v| v == old) {
+            removes.push(old.to_owned());
+        }
+    }
+    if let Some(new) = new {
+        if removes.iter().any(|v| v == new) {
+            removes.retain(|v| v != new);
+        } else if let Some(list) = replace.as_mut() {
+            list.push(new.to_owned());
+        } else {
+            adds.get_or_insert_with(Vec::new).push(new.to_owned());
+        }
+    }
+    let array = |values: Vec<String>| {
+        let mut array = Array::new();
+        for value in values {
+            array.push(value);
+        }
+        toml_edit::value(array)
+    };
+    if let Some(list) = replace {
+        doc[section][key] = array(list);
+    }
+    if let Some(list) = adds {
+        doc[section][add_key.as_str()] = array(list);
+    }
+    if removes.is_empty() {
+        if let Some(table) = doc[section].as_table_like_mut() {
+            table.remove(&remove_key);
+        }
+    } else {
+        doc[section][remove_key.as_str()] = array(removes);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edited(text: &str, old: Option<&str>, new: Option<&str>) -> PolicyFile {
+        let mut doc = text.parse::<DocumentMut>().unwrap();
+        edit_list(&mut doc, "network", "allow", old, new).unwrap();
+        PolicyFile::parse("policy.toml", &doc.to_string()).unwrap()
+    }
+
+    #[test]
+    fn an_inherited_entry_is_removed_by_name_and_comes_back_by_name() {
+        let layer = edited(
+            "[network]\nallow_add = [\"mine.com\"]\n",
+            Some("inherited.com"),
+            None,
+        );
+        assert_eq!(layer.network.allow, None);
+        assert_eq!(layer.network.allow_remove, ["inherited.com"]);
+        assert_eq!(layer.network.allow_add, ["mine.com"]);
+        let layer = edited(
+            "[network]\nallow_remove = [\"inherited.com\"]\n",
+            None,
+            Some("inherited.com"),
+        );
+        assert!(layer.network.allow_remove.is_empty());
+        assert!(layer.network.allow_add.is_empty());
+    }
+
+    #[test]
+    fn the_files_own_entries_are_edited_where_they_are() {
+        let layer = edited(
+            "[network]\nallow_add = [\"a.com\"]\n",
+            Some("a.com"),
+            Some("b.com"),
+        );
+        assert_eq!(layer.network.allow_add, ["b.com"]);
+        assert!(layer.network.allow_remove.is_empty());
+        // A list this file already replaces stays its replacement.
+        let layer = edited(
+            "[network]\nallow = [\"a.com\"]\n",
+            Some("a.com"),
+            Some("b.com"),
+        );
+        assert_eq!(layer.network.allow, Some(vec!["b.com".to_owned()]));
+        assert!(layer.network.allow_add.is_empty());
+        // A first entry goes to `allow_add`, never a copy of the resolved list.
+        let layer = edited("[network]\n", None, Some("c.com"));
+        assert_eq!(layer.network.allow, None);
+        assert_eq!(layer.network.allow_add, ["c.com"]);
     }
 }

@@ -129,7 +129,7 @@ impl Hub {
                 runtime: a.runtime.clone(),
                 capabilities: plugins
                     .get(&a.name)
-                    .map(|(_, c)| c.clone())
+                    .map(|p| p.capabilities.clone())
                     .unwrap_or_default(),
                 abilities: vec!["read".to_owned(), "chat".to_owned()],
             })
@@ -222,7 +222,7 @@ impl Hub {
         let paired = store.devices().map_err(internal)?;
         let message = photo_message(agent, saved.clone(), String::new());
         let devices = self.devices.lock().expect("not poisoned");
-        for (id, (person, sender)) in devices.iter() {
+        for (id, (person, sender, _)) in devices.iter() {
             if id != &device.id
                 && self.sees_agent(person, agent)
                 && paired.iter().any(|d| &d.id == id && &d.person == person)
