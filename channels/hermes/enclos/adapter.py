@@ -208,7 +208,9 @@ class EnclosAdapter(BasePlatformAdapter):
             if self.config is not None:
                 self.config.home_channel = channel
         except Exception:
-            logger.debug("[%s] Cannot set Home as the home channel", self.name, exc_info=True)
+            # Hermes internals, not a plugin API: when a release moves them,
+            # Hermes asks for /sethome again, and this line says why.
+            logger.info("[%s] Cannot set Home as the home channel", self.name, exc_info=True)
 
     async def _write(self, message: dict[str, Any]) -> bool:
         writer = self._bridge

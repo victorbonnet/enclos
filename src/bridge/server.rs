@@ -106,8 +106,10 @@ struct Hub {
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// The person the host belongs to, on the transport: whose the agents'
-    /// Home conversations are. Unknown, the first person who connects.
-    host: Option<String>,
+    /// Home conversations are. Read again at each connection while unknown;
+    /// until then, the first person who connects has them, and stderr says
+    /// so.
+    host: Mutex<Option<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     generations: AtomicU64,
@@ -138,6 +140,46 @@ impl Drop for Waiting {
 impl Hub {
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
+    }
+
+    /// The host's person, as far as the transport has said.
+    fn known_host(&self) -> Option<String> {
+        self.host.lock().expect("not poisoned").clone()
+    }
+
+    /// The agents' Homes, as `person` connects: the host's person's when the
+    /// transport names them (asked again while it has not: `tailscale
+    /// status` may have failed when the bridge started), taken back from
+    /// anyone who had one meanwhile; else `person`'s, the first to connect,
+    /// which stderr says.
+    fn ensure_homes(&self, store: &Store, person: &str) {
+        let host = {
+            let mut host = self.host.lock().expect("not poisoned");
+            if host.is_none() {
+                *host = self.transport.host_person();
+            }
+            host.clone()
+        };
+        for agent in &self.agents {
+            match host.as_deref() {
+                Some(host) => {
+                    if let Ok(true) = store.ensure_home(&agent.name, host, true) {
+                        eprintln!(
+                            "enclos app: {}'s Home is {host}'s, the host's person",
+                            agent.name
+                        );
+                    }
+                }
+                None => {
+                    if let Ok(true) = store.ensure_home(&agent.name, person, false) {
+                        eprintln!(
+                            "enclos app: {}'s Home goes to {person}, the first person to connect: the transport does not say whose host this is",
+                            agent.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Where the bridge keeps the files of messages, by attachment id:
@@ -238,21 +280,14 @@ impl Hub {
                             OutKind::Notify => "notify",
                             OutKind::Status => "status",
                         };
-                        // A conversation the bridge does not know, or another
-                        // agent's: the runtime's home channel as it was, or a
-                        // chat gone. It goes to this agent's Home, not nowhere.
-                        let own = matches!(
-                            store.conversation_of(conversation.as_str()),
-                            Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
-                        );
-                        let conversation = if own {
-                            conversation
-                        } else {
-                            let _ = store.ensure_home(&agent, hub.host.as_deref().unwrap_or(""));
-                            match ConversationId::new(home_id(&agent)) {
-                                Ok(home) => home,
-                                Err(_) => continue,
-                            }
+                        let host = hub.known_host();
+                        let Some(conversation) =
+                            destination(&store, host.as_deref(), &agent, conversation)
+                        else {
+                            // Not stored, and acknowledged all the same: sent
+                            // again, it would fail again at every connection.
+                            let _ = acks.ack(&message.id);
+                            continue;
                         };
                         let whole = ConversationMessage {
                             conversation,
@@ -454,13 +489,18 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let host = transport.host_person();
+    if host.is_none() {
+        eprintln!(
+            "enclos app: the transport does not say whose host this is: each agent's Home goes to the first person who connects, until it does"
+        );
+    }
     let hub = Arc::new(Hub {
         transport,
         whois: Arc::new(move |address: &str| transport.whois(address)),
         store_path,
         bridge_private,
         agents,
-        host,
+        host: Mutex::new(host),
         plugins: Mutex::new(HashMap::new()),
         generations: AtomicU64::new(0),
         devices: Mutex::new(HashMap::new()),
@@ -489,9 +529,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         }
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
-    if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
+    if let (Some(host), Ok(store)) = (hub.known_host(), hub.store()) {
         for agent in &hub.agents {
-            let _ = store.ensure_home(&agent.name, host);
+            let _ = store.ensure_home(&agent.name, &host, true);
         }
     }
     for stream in listener.incoming() {
@@ -814,11 +854,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     drop(waiting);
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
-    // The agents' Homes, made at start when the transport names the host's
-    // person; else this person's, the first to connect.
-    for agent in &hub.agents {
-        let _ = store.ensure_home(&agent.name, hub.host.as_deref().unwrap_or(&person));
-    }
+    hub.ensure_homes(&store, &person);
     let (sender, outbox) = channel();
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
@@ -1276,6 +1312,35 @@ fn read(
     Ok(())
 }
 
+/// Where `agent`'s message for `conversation` is kept: there, when it is
+/// one of `agent`'s own; else (a conversation the bridge does not know, or
+/// another agent's: the runtime's home channel as it was, or a chat gone)
+/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None`, said on
+/// stderr, when Home's id is not one the protocol takes.
+fn destination(
+    store: &Store,
+    host: Option<&str>,
+    agent: &str,
+    conversation: ConversationId,
+) -> Option<ConversationId> {
+    let own = matches!(
+        store.conversation_of(conversation.as_str()),
+        Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+    );
+    if own {
+        return Some(conversation);
+    }
+    let home = ConversationId::new(home_id(agent))
+        .inspect_err(|e| {
+            eprintln!(
+                "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
+            );
+        })
+        .ok()?;
+    let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
+    Some(home)
+}
+
 /// A conversation for a device: `None` for an id the protocol refuses.
 fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
     Some(ConversationInfo {
@@ -1460,7 +1525,7 @@ mod connection_end_tests {
                 socket: socket.clone(),
                 token: TOKEN.to_owned(),
             }],
-            host: Some(PERSON.to_owned()),
+            host: Mutex::new(Some(PERSON.to_owned())),
             plugins: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
             devices: Mutex::new(HashMap::new()),

@@ -76,6 +76,13 @@ class Home(unittest.TestCase):
             with self.subTest(text[:20]):
                 self.assertFalse(protocol.is_notice(text))
 
+    def test_a_reply_that_starts_as_a_notice_reads_as_one(self):
+        # A notice is told by its first words only, as Hermes marks none: an
+        # agent's reply that starts with the same words is taken for one
+        # (a quiet line, and no title check). The choice, recorded.
+        self.assertTrue(protocol.is_notice(
+            "\u267b\ufe0f Gateway online \u2014 that is what the log said at 9:00."))
+
     def test_sethome_is_caught_however_written(self):
         for text in ["/sethome", "  /SetHome ", "/set-home now"]:
             self.assertTrue(protocol.is_home_command(text), text)
