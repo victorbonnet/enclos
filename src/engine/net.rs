@@ -44,11 +44,14 @@ impl Engine {
         self.policy(name)?;
         let store =
             |wait| SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock(), wait);
-        // It only reads, which never waits for a write.
+        // It only reads, which never waits for a write, nor, with a
+        // connection kept open as long as the proxy runs, for another
+        // command's connection to rebuild the log's index.
         let policy = ActivePolicy {
             store: store(Wait::Command),
             sandbox: name.clone(),
         };
+        let _open = policy.store.keep_open()?;
         // A connection waits for its row before it is forwarded.
         let log = NetLogWriter::start(store(Wait::Command));
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(log));

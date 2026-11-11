@@ -53,6 +53,11 @@ pub struct SqliteStateStore {
     schema_checked: OnceLock<()>,
 }
 
+/// A connection to `state.db` held open, unused: [`SqliteStateStore::keep_open`].
+pub struct KeptOpen {
+    _conn: Connection,
+}
+
 impl SqliteStateStore {
     /// The store whose writes wait for another's as `wait` says.
     pub fn new(db: impl Into<PathBuf>, lock_file: impl Into<PathBuf>, wait: Wait) -> Self {
@@ -129,6 +134,26 @@ impl SqliteStateStore {
             let _ = self.schema_checked.set(());
         }
         Ok(conn)
+    }
+
+    /// A connection kept open, and never used, while the result lives: so
+    /// that no read of this process waits on SQLite rebuilding the log's
+    /// index, which `state.db-shm` holds.
+    ///
+    /// A connection that opens while no other connection has the database
+    /// open, in any process, starts the index over and rebuilds it from the
+    /// whole log, holding the write lock and the lock that keeps every
+    /// other connection off the index until it is done: every read waits for
+    /// it, as every write does. enclos opens a connection for each call and
+    /// leaves the log in place, so the next call often finds none open and
+    /// rebuilds, reading up to 1000 pages or more from a disk that may be
+    /// slow. While this process keeps a connection open, the index stays
+    /// valid and no connection, of any process, rebuilds it.
+    pub fn keep_open(&self) -> Result<KeptOpen> {
+        // `open` reads, which maps the index.
+        Ok(KeptOpen {
+            _conn: self.open()?,
+        })
     }
 
     /// Refuses a database whose tables and columns differ from what this
