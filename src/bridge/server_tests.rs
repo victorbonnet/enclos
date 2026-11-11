@@ -566,6 +566,7 @@ fn avatar_persistence_conflicts_and_removal_survive_other_connections_and_restar
 #[test]
 fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devices_cannot_write() {
     use enclos_protocol::avatar::AvatarSet;
+    use enclos_protocol::plugin::ErrorCode;
     let (dir, mut hub, store) = diagnostic_approval_hub();
     Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
         name: "lab/coder".into(),
@@ -574,42 +575,52 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
         token: "fixture".into(),
     });
     let owner = avatar_device("phone", "owner@example.com");
+    let other = avatar_device("laptop", "owner@example.com");
     let guest = avatar_device("tablet", "guest@example.com");
     let revoked = avatar_device("revoked", "owner@example.com");
     store.add_device(&owner).unwrap();
+    store.add_device(&other).unwrap();
     store.add_device(&guest).unwrap();
     let (s1, r1) = channel();
     let (s2, r2) = channel();
     let (s3, r3) = channel();
+    let (s4, r4) = channel();
     hub.devices.lock().unwrap().extend([
         (owner.id.clone(), (owner.person.clone(), s1)),
         (guest.id.clone(), (guest.person.clone(), s2)),
         (revoked.id.clone(), (revoked.person.clone(), s3)),
+        (other.id.clone(), (other.person.clone(), s4)),
     ]);
     let edit = AvatarSet {
         agent: "lab/coder".into(),
         revision: 0,
         image: Some(encode(&avatar_fixture(40, 40))),
     };
-    assert!(
-        hub.set_agent_avatar(&store, &guest, &guest.person, &edit, "denied".into())
-            .unwrap_err()
-            .contains("Only the host")
-    );
-    assert!(
+    let denied = hub
+        .set_agent_avatar(&store, &guest, &guest.person, &edit, "denied".into())
+        .unwrap_err();
+    assert!(denied.message().contains("Only the host"));
+    assert_eq!(denied.code(), ErrorCode::NotAllowed);
+    assert_eq!(
         hub.set_agent_avatar(&store, &revoked, &revoked.person, &edit, "denied".into())
-            .is_err()
+            .unwrap_err()
+            .code(),
+        ErrorCode::NotAllowed
     );
-    assert!(
+    assert_eq!(
         hub.get_avatar(&store, &owner, &owner.person, "lab/missing", "read".into())
-            .is_err()
+            .unwrap_err()
+            .code(),
+        ErrorCode::UnknownAgent
     );
     assert_eq!(store.avatar("lab/coder").unwrap().revision, 0);
     let reply = hub
         .set_agent_avatar(&store, &owner, &owner.person, &edit, "saved".into())
         .unwrap();
-    let broadcast = r1.try_recv().unwrap();
-    assert_eq!(broadcast, r2.try_recv().unwrap());
+    // The device that asked gets the reply only; every other one the broadcast.
+    assert!(r1.try_recv().is_err());
+    let broadcast = r2.try_recv().unwrap();
+    assert_eq!(broadcast, r4.try_recv().unwrap());
     assert!(r3.try_recv().is_err());
     let ToDevice::AgentAvatar(photo) = reply else {
         panic!("photo reply")
@@ -623,13 +634,15 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
         hub.get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
             .is_ok()
     );
-    assert!(
+    assert_eq!(
         hub.set_agent_avatar(&store, &owner, &owner.person, &edit, "stale".into())
-            .is_err()
+            .unwrap_err()
+            .code(),
+        ErrorCode::Conflict
     );
-    assert!(r1.try_recv().is_err());
+    assert!(r1.try_recv().is_err() && r2.try_recv().is_err());
     for image in ["%%%".to_owned(), "A".repeat(50_000)] {
-        assert!(
+        assert_eq!(
             hub.set_agent_avatar(
                 &store,
                 &owner,
@@ -641,7 +654,9 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
                 },
                 "bad".into()
             )
-            .is_err()
+            .unwrap_err()
+            .code(),
+            ErrorCode::BadMessage
         );
     }
     assert_eq!(store.avatar("lab/coder").unwrap().revision, 1);
@@ -660,4 +675,147 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
         hub.get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
             .is_err()
     );
+}
+
+fn photo_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/coder".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("unused.sock"),
+        token: "fixture".into(),
+    });
+    (dir, hub, store)
+}
+
+#[test]
+fn agents_list_says_who_may_change_a_photo_and_which_photo_is_current() {
+    let (_dir, hub, store) = photo_hub();
+    store
+        .set_avatar("lab/coder", 0, Some(b"image"), ("d1", "owner@example.com"))
+        .unwrap()
+        .unwrap();
+    let owner = hub.agent_infos(&store, "owner@example.com").unwrap();
+    let guest = hub.agent_infos(&store, "guest@example.com").unwrap();
+    assert_eq!((owner.len(), guest.len()), (1, 1));
+    assert!(owner[0].can_edit_avatar);
+    assert!(!guest[0].can_edit_avatar);
+    for info in [&owner[0], &guest[0]] {
+        assert_eq!(info.avatar.revision, 1);
+        assert_eq!(
+            info.avatar.version,
+            Some(crate::policy::sha256_hex(b"image"))
+        );
+    }
+    // Present even when false: its presence is how a device knows the host has photos.
+    let json = serde_json::to_value(&guest[0]).unwrap();
+    assert_eq!(json["can_edit_avatar"], serde_json::Value::Bool(false));
+}
+
+#[test]
+fn a_refused_photo_edit_answers_with_the_current_photo_then_the_error() {
+    use enclos_protocol::avatar::AvatarSet;
+    use enclos_protocol::plugin::ErrorCode;
+    let (_dir, hub, store) = photo_hub();
+    let owner = avatar_device("phone", "owner@example.com");
+    store.add_device(&owner).unwrap();
+    let edit = AvatarSet {
+        agent: "lab/coder".into(),
+        revision: 0,
+        image: Some(encode(&avatar_fixture(40, 40))),
+    };
+    let id = |s: &str| MessageId::new(s).unwrap();
+    let saved = hub.avatar_set_replies(&store, &owner, &owner.person, &edit, id("first"));
+    assert!(
+        matches!(saved.as_slice(), [ToDevice::AgentAvatar(p)] if p.of == "first" && p.revision == 1)
+    );
+    let stale = hub.avatar_set_replies(&store, &owner, &owner.person, &edit, id("stale"));
+    match stale.as_slice() {
+        [ToDevice::AgentAvatar(current), ToDevice::Error(error)] => {
+            assert_eq!((current.of.as_str(), current.revision), ("", 1));
+            assert!(current.image.is_some());
+            assert_eq!(error.of, Some(id("stale")));
+            assert_eq!(error.code, ErrorCode::Conflict);
+        }
+        other => panic!("current photo then error, got {other:?}"),
+    }
+    // A device no longer paired may not read it either: the error alone.
+    let gone = avatar_device("gone", "owner@example.com");
+    let refused = hub.avatar_set_replies(&store, &gone, &gone.person, &edit, id("gone"));
+    assert!(matches!(refused.as_slice(), [ToDevice::Error(e)] if e.code == ErrorCode::NotAllowed));
+    assert!(matches!(
+        hub.avatar_get_reply(&store, &owner, &owner.person, "lab/missing", id("missing")),
+        ToDevice::Error(e) if e.code == ErrorCode::UnknownAgent
+    ));
+}
+
+#[test]
+fn avatar_takes_a_jpeg_too() {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .encode_image(&image::RgbImage::from_pixel(
+            300,
+            200,
+            image::Rgb([10, 120, 200]),
+        ))
+        .unwrap();
+    let out = avatars::normalize(&jpeg).unwrap();
+    let decoded = image::load_from_memory(&out).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (256, 256));
+}
+
+/// A PNG whose header claims 100,000 × 100,000 pixels in a few bytes.
+fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for &b in bytes {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    }
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut png, b"IHDR", &header);
+    // An empty zlib stream: what follows the header never decodes.
+    chunk(
+        &mut png,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+#[test]
+fn avatar_refuses_a_png_that_claims_huge_dimensions_before_allocating() {
+    let bomb = png_claiming(100_000, 100_000);
+    assert!(bomb.len() < 100);
+    // Taken for a PNG, then refused on its claim: nothing of 30 GB is allocated.
+    assert!(avatars::normalize(&bomb).unwrap_err().contains("too large"));
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bomb))
+        .with_guessed_format()
+        .unwrap();
+    assert_eq!(reader.format(), Some(image::ImageFormat::Png));
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(512);
+    limits.max_image_height = Some(512);
+    reader.limits(limits);
+    assert!(matches!(reader.decode(), Err(image::ImageError::Limits(_))));
 }

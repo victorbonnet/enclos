@@ -1091,30 +1091,11 @@ fn run_session(
         };
         match message.body {
             FromDevice::AgentAvatarGet { agent } => {
-                match hub.get_avatar(store, device, person, &agent, message.id.to_string()) {
-                    Ok(photo) => link.send(photo)?,
-                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                        of: Some(message.id),
-                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
-                        message: e,
-                    }))?,
-                }
+                link.send(hub.avatar_get_reply(store, device, person, &agent, message.id))?;
             }
             FromDevice::AgentAvatarSet(edit) => {
-                match hub.set_agent_avatar(store, device, person, &edit, message.id.to_string()) {
-                    Ok(photo) => link.send(photo)?,
-                    Err(e) => {
-                        if let Ok(current) =
-                            hub.get_avatar(store, device, person, &edit.agent, String::new())
-                        {
-                            link.send(current)?;
-                        }
-                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                            of: Some(message.id),
-                            code: enclos_protocol::plugin::ErrorCode::NotAllowed,
-                            message: e,
-                        }))?;
-                    }
+                for reply in hub.avatar_set_replies(store, device, person, &edit, message.id) {
+                    link.send(reply)?;
                 }
             }
             FromDevice::SandboxPolicyGet { sandbox } => {
@@ -1190,24 +1171,7 @@ fn run_session(
                 }
             }
             FromDevice::Agents => {
-                let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
-                let plugins = hub.plugins.lock().expect("not poisoned");
-                let agents = hub
-                    .agents
-                    .iter()
-                    .map(|a| AgentInfo {
-                        avatar: photos.get(&a.name).cloned().unwrap_or_default(),
-                        can_edit_avatar: hub.host.as_deref() == Some(person),
-                        agent: a.name.clone(),
-                        runtime: a.runtime.clone(),
-                        capabilities: plugins
-                            .get(&a.name)
-                            .map(|(_, c)| c.clone())
-                            .unwrap_or_default(),
-                        abilities: vec!["read".to_owned(), "chat".to_owned()],
-                    })
-                    .collect();
-                drop(plugins);
+                let agents = hub.agent_infos(store, person)?;
                 link.send(ToDevice::AgentsList { agents })?;
                 // Each agent's commands, as far as the bridge knows them;
                 // the others come once their plugin connects.
