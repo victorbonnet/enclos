@@ -482,7 +482,7 @@ def _env_enablement() -> dict | None:
 
 
 def register(ctx) -> None:
-    approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"))
+    approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"), PLATFORM)
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config,

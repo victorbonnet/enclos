@@ -617,24 +617,22 @@ impl Hub {
                     } => {
                         // The endpoint, not the plugin's text, names its sandbox and agent.
                         let id = conversation.as_str();
-                        if store.conversation_info(id).ok().flatten().is_some_and(|c| {
-                            format!("{}/{}", c.sandbox, c.agent) == agent
-                                || store
-                                    .members(id)
-                                    .unwrap_or_default()
-                                    .iter()
-                                    .any(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
-                        }) {
-                            match hub.request_access(&store, &agent, Some(id), access, &action) {
-                                Ok(()) => {
-                                    let _ = acks.send(FromBridge::Ack { of: message.id });
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "enclos app: could not save {agent}'s policy request: {e}"
-                                    );
-                                }
+                        if approvals::speaks_in(&store, &agent, id) {
+                            // Refused or not, the plugin is answered, so its outbox
+                            // does not send the same request again forever.
+                            if let Err(e) =
+                                hub.request_access(&store, &agent, Some(id), access, &action)
+                            {
+                                eprintln!("enclos app: {agent}'s policy request: {e}");
+                                let _ = acks.send(FromBridge::Error(
+                                    enclos_protocol::plugin::ErrorBody {
+                                        of: Some(message.id.clone()),
+                                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                        message: e,
+                                    },
+                                ));
                             }
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
                         } else {
                             let _ =
                                 acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {

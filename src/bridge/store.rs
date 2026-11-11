@@ -146,6 +146,7 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS approval_marks (name TEXT PRIMARY KEY, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     sandbox TEXT NOT NULL,
@@ -277,6 +278,35 @@ impl Store {
                 Ok(a)
             })
             .collect()
+    }
+    /// Every policy request, decided ones too, beyond the inbox's window.
+    pub fn all_approvals(&self) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        let mut q = self.db.prepare("SELECT body, state FROM approvals")?;
+        let rows = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(s, state)| {
+                let mut a: enclos_protocol::approval::Approval = serde_json::from_str(&s)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                a.state = state;
+                Ok(a)
+            })
+            .collect()
+    }
+    /// Since when, in seconds, proxy refusals become policy requests: the
+    /// first time this bridge collected them, so the network log's history
+    /// from before the bridge never floods the inbox.
+    pub fn refusals_since(&self) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO approval_marks VALUES ('refusals', ?1)",
+            [now()],
+        )?;
+        self.db.query_row(
+            "SELECT at FROM approval_marks WHERE name='refusals'",
+            [],
+            |r| r.get(0),
+        )
     }
     pub fn approval(
         &self,

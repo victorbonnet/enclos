@@ -17,6 +17,7 @@ pub mod noise;
 pub mod pairing;
 pub mod plugin;
 pub mod preview;
+pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
 pub use ids::{ConversationId, IdError, MessageId, Person};

@@ -8,6 +8,137 @@ fn network(target: &str) -> Access {
         private: false,
     }
 }
+fn write(target: impl AsRef<std::path::Path>) -> Access {
+    Access {
+        kind: AccessKind::Write,
+        target: target.as_ref().display().to_string(),
+        private: false,
+    }
+}
+
+#[test]
+fn access_approval_refuses_absolute_paths_that_run_code_outside_the_sandbox() {
+    let (dir, e, name) = with_sandbox();
+    // The fixture's home is the temporary folder: these are absolute paths in it.
+    let home = dir.path();
+    std::fs::create_dir_all(home.join("project/.git/hooks")).unwrap();
+    for target in [
+        home.join(".zshrc"),
+        home.join(".bashrc"),
+        home.join(".gitconfig"),
+        home.join(".config/git"),
+        home.join(".local/bin"),
+        home.join(".ssh"),
+        home.join(".vscode/extensions"),
+        home.join("Library/Application Support/Code/User"),
+        home.join("Library/LaunchAgents"),
+        home.join("bin"),
+        home.join("go/bin"),
+        home.join("project/.git/hooks"),
+        // enclos's own files, inside the home too: refused by validation.
+        dir.path().join("enclos"),
+        dir.path().join("enclos/sandboxes"),
+        std::path::PathBuf::from("/opt/homebrew/bin"),
+        std::path::PathBuf::from("/usr/local/bin"),
+        std::path::PathBuf::from("/etc"),
+        std::path::PathBuf::from("/Volumes/Disk"),
+    ] {
+        assert!(
+            e.access_plan(&name, &write(&target)).is_err(),
+            "{}",
+            target.display()
+        );
+    }
+    assert!(e.access_plan(&name, &write(home.join("project"))).is_ok());
+    assert_eq!(e.policy(&name).unwrap().version.version, 1);
+}
+
+#[test]
+fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
+    use crate::engine::approvals::phone_write_refusal;
+    use std::path::{Path, PathBuf};
+    let home = Path::new("/Users/me");
+    let path = [
+        PathBuf::from("/Users/me/tools/bin"),
+        PathBuf::from("/usr/bin"),
+    ];
+    for refused in [
+        "/Users/me/tools/bin",
+        "/Users/me/tools/bin/new",
+        // Holds a PATH folder: its programs could be replaced.
+        "/Users/me/tools",
+        "/Users/me",
+        "/Users/other/work",
+        "/Volumes/Disk",
+        "/Volumes/Disk/.Trashes",
+        "/mnt/disk",
+        "/media/me/disk",
+    ] {
+        assert!(
+            phone_write_refusal(Path::new(refused), home, &path).is_some(),
+            "{refused}"
+        );
+    }
+    for allowed in [
+        "/Users/me/work",
+        "/Users/me/Documents/report",
+        "/Volumes/Disk/projects",
+        "/mnt/disk/projects",
+        "/media/me/disk/projects",
+    ] {
+        assert_eq!(phone_write_refusal(Path::new(allowed), home, &path), None);
+    }
+}
+
+#[test]
+fn access_approval_private_names_are_local_only() {
+    let (_dir, e, name) = with_sandbox();
+    let mut a = network("nas.example.com:8443");
+    a.private = true;
+    let refused = e.access_plan(&name, &a).err().unwrap().to_string();
+    assert!(refused.contains("local name"), "{refused}");
+    a.target = "nas.local:8443".into();
+    let plan = e.access_plan(&name, &a).unwrap();
+    assert!(
+        plan.change
+            .contains("whatever it resolves to on your network"),
+        "{}",
+        plan.change
+    );
+    e.approve_access(&alice(), &name, &a, &plan.revision)
+        .unwrap();
+    assert_eq!(
+        e.policy(&name).unwrap().snapshot.policy.net.private,
+        ["nas.local"]
+    );
+}
+
+#[test]
+fn access_approval_shows_the_scope_it_writes() {
+    let (dir, e, name) = with_sandbox();
+    let plan = e
+        .access_plan(&name, &network("API.Example.com:443"))
+        .unwrap();
+    assert_eq!(plan.scope, "api.example.com");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+    let plan = e
+        .access_plan(&name, &write(dir.path().join("alias")))
+        .unwrap();
+    assert_eq!(
+        plan.scope,
+        crate::policy::paths::real_path(&real).display().to_string()
+    );
+}
+
+#[test]
+fn access_context_counts_read_denials_without_listing_host_paths() {
+    let (_dir, e, name) = with_sandbox();
+    let text = e.access_context(&name).unwrap();
+    assert!(!text.contains(".ssh"), "{text}");
+    assert!(text.contains("cannot be read"), "{text}");
+}
 
 #[test]
 fn access_approval_adds_only_the_reviewed_scope_and_updates_knowledge() {
