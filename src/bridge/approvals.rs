@@ -118,8 +118,18 @@ impl Hub {
             )
             .as_bytes(),
         );
-        if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
-            return Ok(());
+        // Decided under this policy: not asked again until it changes. An
+        // agent is told so, not left waiting for a request nobody sees.
+        if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
+            return if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying")
+            {
+                Err(format!(
+                    "A request for this scope was already {} under {sandbox}'s active policy. It is not asked again until the policy changes.",
+                    known.state
+                ))
+            } else {
+                Ok(())
+            };
         }
         let mut a = Approval {
             request: key,
@@ -131,9 +141,8 @@ impl Hub {
             },
             conversation: conversation.map(str::to_owned),
             access,
-            action: action
+            action: enclos_protocol::visible::stripped(action, false)
                 .chars()
-                .filter(|c| !enclos_protocol::visible::is_hidden(*c))
                 .take(240)
                 .collect(),
             time: now(),
@@ -162,7 +171,6 @@ impl Hub {
     /// change; only a new refusal after it is.
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         let since = store.refusals_since().map_err(|e| e.to_string())?;
-        let known = store.all_approvals().map_err(|e| e.to_string())?;
         let engine = Engine::open(self.layout.clone());
         let sandboxes: std::collections::HashSet<_> = self
             .agents
@@ -184,7 +192,25 @@ impl Hub {
                     continue;
                 }
             };
-            for d in denied.into_iter().take(200) {
+            let denied: Vec<_> = denied.into_iter().take(200).collect();
+            // Only the requests a refusal still to be counted can match:
+            // this sandbox's, made since the oldest of them was last seen.
+            let Some(from) = denied
+                .iter()
+                .map(|d| d.last.as_second())
+                .filter(|&last| last >= since)
+                .min()
+            else {
+                continue;
+            };
+            let known = match store.approvals_since(sandbox, from) {
+                Ok(known) => known,
+                Err(e) => {
+                    eprintln!("enclos app approvals: {sandbox}: {e}");
+                    continue;
+                }
+            };
+            for d in denied {
                 use crate::model::net::Reason;
                 if !matches!(d.reason, Reason::NotAllowed | Reason::PrivateAddress) {
                     continue;
