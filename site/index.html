@@ -134,8 +134,10 @@ allow_add = ["api.telegram.org"]</code></pre>
           <pre><code><span class="command">curl -fsSL https://enclos.dev/install.sh | bash</span>
 <span class="command">enclos init</span>
 
-<span class="comment"># Seatbelt on macOS, bubblewrap on Linux</span>
+<span class="comment"># on macOS</span>
 <span class="command">enclos sandbox create lab --template assistant</span>
+<span class="comment"># on Linux</span>
+<span class="command">enclos sandbox create lab --backend bubblewrap --template assistant</span>
 
 <span class="command">enclos runtime install hermes --sandbox lab</span>
 

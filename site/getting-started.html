@@ -34,7 +34,7 @@
       </ul>
 
       <h3 id="linux">Linux requirements</h3>
-      <p>Ubuntu 24.04 or 26.04, Debian 13 or 64-bit Raspberry Pi OS, on x86_64 or arm64, with systemd 254 or later (Debian 12 has 252, so it does not work). A Linux sandbox uses the bubblewrap backend, which needs bubblewrap 0.9.0 or later and user namespaces. Install it before <code>enclos init</code>, which then picks it as the default backend:</p>
+      <p>Ubuntu 24.04 or 26.04, Debian 13 or 64-bit Raspberry Pi OS, on x86_64 or arm64, with systemd 254 or later (Debian 12 has 252, so it does not work). A Linux sandbox uses the bubblewrap backend, which needs bubblewrap 0.9.0 or later and user namespaces:</p>
       <div class="terminal"><pre><code><span class="command">sudo apt install bubblewrap</span></code></pre></div>
       <p>On Ubuntu 24.04, AppArmor keeps bubblewrap from making user namespaces until it has a rule for it; Ubuntu 26.04 needs none. The <a href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md#linux-requirements">full guide</a> gives the rule. Once enclos is installed, <code>enclos doctor</code> checks each of these and says how to fix what falls short. Where the kernel has no Landlock, as on Raspberry Pi OS, the sandbox still runs, and <code>doctor</code> says that writes are then held by bubblewrap’s mounts alone and that any program the sandbox can read can run.</p>
 
@@ -45,8 +45,10 @@
       <h2>Create a sandbox and install Hermes</h2>
       <div class="terminal"><pre><code><span class="command">enclos init</span>
 
-<span class="comment"># the backend init picked: Seatbelt on macOS, bubblewrap on Linux</span>
+<span class="comment"># on macOS: the Seatbelt backend</span>
 <span class="command">enclos sandbox create lab --template assistant</span>
+<span class="comment"># on Linux: the bubblewrap backend</span>
+<span class="command">enclos sandbox create lab --backend bubblewrap --template assistant</span>
 
 <span class="comment"># takes a few minutes</span>
 <span class="command">enclos runtime install hermes --sandbox lab</span>
