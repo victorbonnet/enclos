@@ -35,6 +35,9 @@ pub struct PolicyView {
     pub pending: Option<(PendingPolicy, PolicySnapshot)>,
     /// The sandbox's `policy.toml`.
     pub file: PathBuf,
+    /// The sandbox's backend: what a rule means can depend on it, such as
+    /// who reaches what the sandbox listens on.
+    pub backend: BackendKind,
 }
 
 impl PolicyView {
@@ -102,6 +105,7 @@ impl Engine {
             snapshot,
             pending: self.state.pending_policy(name)?,
             file: self.layout.policy_file(name.as_str()),
+            backend: self.recorded_backend(name)?,
         })
     }
 

@@ -352,7 +352,7 @@ fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
     // Listening is what the adapter brings, like its destinations: named,
     // and not an "also" change that would ask first (ADR 0028).
     assert!(
-        plan.contains("let sandbox home listen on TCP for hermes"),
+        plan.contains("let sandbox home listen for hermes (ADR 0028), on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"),
         "{plan}"
     );
     assert!(!plan.contains("also "), "{plan}");
@@ -389,7 +389,7 @@ fn an_install_says_when_policy_toml_keeps_listening_off() {
         plan.contains("keep sandbox home from listening, as its policy.toml sets `listen = false`: hermes's service cannot start"),
         "{plan}"
     );
-    assert!(!plan.contains("listen on TCP for hermes"), "{plan}");
+    assert!(!plan.contains("listen for hermes"), "{plan}");
     done(lab.install(INSTALLS, Confirm::Yes).unwrap());
     assert!(
         !lab.engine

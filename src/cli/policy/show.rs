@@ -7,7 +7,7 @@ use super::super::output;
 use enclos::engine::{PolicyDiff, PolicyHistory, PolicyView};
 use enclos::error::{Error, Result};
 use enclos::model::policy::{NetMode, PendingPolicy, Policy, PolicyVersion};
-use enclos::model::sandbox::SandboxName;
+use enclos::model::sandbox::{BackendKind, SandboxName};
 
 fn version_json(v: &PolicyVersion) -> Value {
     json!({
@@ -94,7 +94,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
             version.version,
             view.sandbox,
         );
-        print_rules(&pending.policy);
+        print_rules(&pending.policy, view.backend);
         return Ok(());
     }
     println!(
@@ -107,7 +107,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
         version.by.host,
         version.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
     );
-    print_rules(&snap.policy);
+    print_rules(&snap.policy, view.backend);
     match &view.pending {
         Some((p, pending)) => {
             println!(
@@ -134,7 +134,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_rules(policy: &Policy) {
+fn print_rules(policy: &Policy, backend: BackendKind) {
     println!("\nFiles (everything else is readable)");
     println!("  writable:   {}", policy.fs.write.join(", "));
     println!(
@@ -169,9 +169,7 @@ fn print_rules(policy: &Policy) {
         );
     }
     if policy.net.listen {
-        println!(
-            "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
-        );
+        println!("  listening: allowed {}", backend.listening());
     }
     let r = &policy.resources;
     // Every field named, so one added is decided on here.

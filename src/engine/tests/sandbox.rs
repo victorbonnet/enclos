@@ -355,7 +355,7 @@ fn stop_records_the_end_of_a_session_gone_after_a_crash_and_marks_the_sandbox_st
     assert_eq!(
         last_audit(&engine),
         format!(
-            "removed 0 services, stopped 0 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            "removed 0 services, stopped 0 sessions; recorded the end of session {gone}, whose processes were gone"
         )
     );
 }
@@ -384,7 +384,7 @@ fn stop_ends_a_session_still_running_and_records_one_gone_beside_it() {
     assert_eq!(
         last_audit(&engine),
         format!(
-            "removed 0 services, stopped 1 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            "removed 0 services, stopped 1 session; recorded the end of session {gone}, whose processes were gone"
         )
     );
 }
