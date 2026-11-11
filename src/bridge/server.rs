@@ -1065,14 +1065,10 @@ fn run_session(
             // `enclos app unpair` does, then the connection ends. The
             // conversations stay, the person's.
             FromDevice::DeviceForget => {
-                store.remove_device(&device.id).map_err(|e| e.to_string())?;
-                let _ = store.log(
-                    Some(&device.id),
-                    Some(person),
-                    "unpaired",
-                    Some("forgotten on the device"),
-                );
-                link.send(ToDevice::Ack { of: message.id })?;
+                forget(store, device, person)?;
+                // Unpaired whether or not the answer reaches the device: a
+                // failure to send it is not why the connection ended.
+                let _ = link.send(ToDevice::Ack { of: message.id });
                 let _ = link.socket.close(None);
                 let _ = link.socket.flush();
                 return Ok(());
@@ -1080,6 +1076,19 @@ fn run_session(
             _ => {}
         }
     }
+}
+
+/// The person forgot this host on `device`: its row goes, so its keys
+/// open no connection again ("an unknown device"), and the log says so.
+fn forget(store: &Store, device: &Device, person: &str) -> Result<(), String> {
+    store.remove_device(&device.id).map_err(|e| e.to_string())?;
+    let _ = store.log(
+        Some(&device.id),
+        Some(person),
+        "unpaired",
+        Some("forgotten on the device"),
+    );
+    Ok(())
 }
 
 /// The largest file the bridge takes from a plugin.
@@ -2092,6 +2101,23 @@ mod connection_end_tests {
             "{log:?}"
         );
         // And it cannot come back
+        let (_, first) = connect(&bridge, &phone);
+        assert_eq!(first, None);
+    }
+
+    #[test]
+    fn a_device_forgotten_on_one_connection_loses_its_others() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // A connection left half open, and the one the device reconnected on
+        let (mut old, _) = connect(&bridge, &phone);
+        let (mut new, _) = connect(&bridge, &phone);
+        new.send("forget-1", FromDevice::DeviceForget);
+        assert!(matches!(new.receive(), Some(ToDevice::Ack { .. })));
+        assert_eq!(new.receive(), None);
+        // The other one ends too, with nothing more from the bridge
+        assert_eq!(old.receive(), None);
         let (_, first) = connect(&bridge, &phone);
         assert_eq!(first, None);
     }

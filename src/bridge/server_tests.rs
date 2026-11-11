@@ -120,3 +120,42 @@ fn only_the_owner_moves_how_far_a_conversation_was_read() {
     }
     assert!(received[1].try_recv().is_err());
 }
+
+#[test]
+fn a_forgotten_device_is_unpaired_and_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let phone = Device {
+        id: "d-1".to_owned(),
+        name: "Pixel".to_owned(),
+        person: "alice@example.com".to_owned(),
+        noise_key: vec![1; 32],
+        device_key: vec![2; 32],
+        push_key: vec![3; 32],
+        push_token: None,
+        paired: 1,
+        seen: None,
+        node: Some("n-pixel".to_owned()),
+    };
+    store.add_device(&phone).unwrap();
+    forget(&store, &phone, "alice@example.com").unwrap();
+    // Its keys find no device: `connection` refuses the next `auth` with
+    // them as "an unknown device".
+    assert_eq!(store.device_by_noise_key(&phone.noise_key).unwrap(), None);
+    assert!(store.devices().unwrap().is_empty());
+    let last = store.log_lines(1).unwrap().pop().unwrap();
+    assert_eq!(
+        (
+            last.device.as_deref(),
+            last.person.as_deref(),
+            last.event.as_str(),
+            last.reason.as_deref()
+        ),
+        (
+            Some("d-1"),
+            Some("alice@example.com"),
+            "unpaired",
+            Some("forgotten on the device")
+        )
+    );
+}
