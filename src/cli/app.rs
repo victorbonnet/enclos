@@ -8,9 +8,9 @@ use clap::{Args, Subcommand};
 
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::new_id;
-use enclos::bridge::plugin::{PluginError, connect};
+use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::store::{From, Store};
-use enclos::engine::Engine;
+use enclos::engine::{Engine, printable_line};
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
 use enclos_protocol::plugin::{FromPlugin, OutKind};
@@ -86,46 +86,25 @@ fn chat(
         connect(&endpoint.socket, endpoint.token.expose()).map_err(plugin_error)?;
     eprintln!(
         "Talking to {sandbox}/{agent} ({}) in conversation {conversation}; Ctrl-D to stop.",
-        hello.runtime
+        printable_line(&hello.runtime)
     );
 
     // What the agent sends, printed as it comes and stored, then
     // acknowledged so its plugin drops it from its outbox.
     let store_path = engine.app_store_path();
     let mut acks = writer_ack(&mut writer)?;
+    let (with, at) = (sandbox.to_string(), agent.clone());
     let printer = std::thread::spawn(move || -> std::result::Result<(), String> {
         let store = Store::open(&store_path).map_err(|e| e.to_string())?;
-        while let Some(message) = reader.receive().map_err(|e| e.to_string())? {
-            if let FromPlugin::MessageOut {
-                conversation,
-                text,
-                kind,
-                ..
-            } = &message.body
-            {
-                let kind = match kind {
-                    OutKind::Reply => "reply",
-                    OutKind::Notify => "notify",
-                };
-                let new = store
-                    .add(
-                        message.id.as_str(),
-                        conversation.as_str(),
-                        &From::Agent,
-                        text,
-                        kind,
-                    )
-                    .map_err(|e| e.to_string())?;
-                if new.is_some() {
-                    match kind {
-                        "notify" => println!("\n[{conversation}, on its own] {text}"),
-                        _ => println!("\n{text}"),
-                    }
-                }
-                acks.ack(&message.id).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
+        let stdout = std::io::stdout();
+        read_agent(
+            &mut reader,
+            &store,
+            &mut acks,
+            &mut stdout.lock(),
+            &with,
+            &at,
+        )
     });
 
     for line in std::io::stdin().lock().lines() {
@@ -180,6 +159,77 @@ fn resumable(
     Ok(())
 }
 
+/// What the agent sends, until its plugin closes the connection: each
+/// message stored, printed to `out` and acknowledged, so the plugin drops
+/// it from its outbox. Only messages in a conversation of this agent's
+/// (`sandbox`/`agent`) are kept: one naming another agent's conversation
+/// is acknowledged and dropped, with a note, since its history is not this
+/// agent's to write. The text is the sandbox's, so it is printed escaped,
+/// line by line; the stored text stays as sent.
+fn read_agent(
+    reader: &mut PluginReader,
+    store: &Store,
+    acks: &mut PluginWriter,
+    out: &mut impl std::io::Write,
+    sandbox: &str,
+    agent: &str,
+) -> std::result::Result<(), String> {
+    while let Some(message) = reader.receive().map_err(|e| e.to_string())? {
+        let FromPlugin::MessageOut {
+            conversation,
+            text,
+            kind,
+            ..
+        } = &message.body
+        else {
+            continue;
+        };
+        let kind = match kind {
+            OutKind::Reply => "reply",
+            OutKind::Notify => "notify",
+        };
+        let ours = store
+            .conversation_of(conversation.as_str())
+            .map_err(|e| e.to_string())?
+            .is_some_and(|(s, a, _)| s == sandbox && a == agent);
+        let shown = |text: &str| {
+            text.split('\n')
+                .map(printable_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if !ours {
+            let _ = writeln!(
+                out,
+                "\n[dropped: {sandbox}/{agent} sent a message to conversation {}, which is not one of its own]",
+                printable_line(conversation.as_str())
+            );
+        } else if store
+            .add(
+                message.id.as_str(),
+                conversation.as_str(),
+                &From::Agent,
+                text,
+                kind,
+            )
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            let _ = match kind {
+                "notify" => writeln!(
+                    out,
+                    "\n[{}, on its own] {}",
+                    printable_line(conversation.as_str()),
+                    shown(text)
+                ),
+                _ => writeln!(out, "\n{}", shown(text)),
+            };
+        }
+        acks.ack(&message.id).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// A second writer on the same connection, for the acknowledgements the
 /// reading thread sends.
 fn writer_ack(
@@ -193,6 +243,131 @@ fn writer_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in plugin: answers the hello, sends `messages`, and closes
+    /// once each is acknowledged; the acknowledged ids come back.
+    fn plugin_sending(
+        socket: &std::path::Path,
+        messages: Vec<(&'static str, &'static str, &'static str, OutKind)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use enclos_protocol::plugin::{FromBridge, decode_from_bridge};
+        use enclos_protocol::{Envelope, MessageId, encode_line};
+        use std::io::Write;
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = std::io::BufReader::new(stream);
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).unwrap();
+            let mut send = |id: &str, body: FromPlugin| {
+                out.write_all(&encode_line(&Envelope::new(
+                    MessageId::new(id).unwrap(),
+                    body,
+                )))
+                .unwrap();
+            };
+            send(
+                "h-1",
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![],
+                },
+            );
+            for (id, conversation, text, kind) in &messages {
+                send(
+                    id,
+                    FromPlugin::MessageOut {
+                        conversation: ConversationId::new(*conversation).unwrap(),
+                        text: (*text).into(),
+                        kind: *kind,
+                        reply_to: None,
+                    },
+                );
+            }
+            let mut acked = Vec::new();
+            while acked.len() < messages.len() {
+                line.clear();
+                if lines.read_until(b'\n', &mut line).unwrap() == 0 {
+                    break;
+                }
+                if let FromBridge::Ack { of } = decode_from_bridge(&line).unwrap().body {
+                    acked.push(of.as_str().to_owned());
+                }
+            }
+            acked
+        })
+    }
+
+    #[test]
+    fn the_chat_keeps_its_agents_messages_only_and_prints_them_escaped() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@mac")
+            .unwrap();
+        store
+            .conversation("home.work.default", "work", "default", "victor@mac")
+            .unwrap();
+        let plugin = plugin_sending(
+            &socket,
+            vec![
+                (
+                    "m-1",
+                    "c-1",
+                    "line one\nline two \x1b]52;c;cGFzdGU=\x07\u{202e}",
+                    OutKind::Reply,
+                ),
+                (
+                    "m-2",
+                    "home.work.default",
+                    "I am work/default",
+                    OutKind::Notify,
+                ),
+                ("m-3", "c-1", "the weather", OutKind::Notify),
+            ],
+        );
+        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        let mut acks = writer.try_clone().unwrap();
+        let mut printed = Vec::new();
+        let done = std::thread::spawn(move || {
+            let r = read_agent(&mut reader, &store, &mut acks, &mut printed, "lab", "main");
+            (r, printed, store)
+        });
+        // Every message is acknowledged, the dropped one included
+        assert_eq!(plugin.join().unwrap(), ["m-1", "m-2", "m-3"]);
+        writer.shutdown();
+        let (ended, printed, store) = done.join().unwrap();
+        ended.unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        // Line breaks kept, the escape and the override shown, not run
+        assert!(printed.contains("line one\nline two "), "{printed}");
+        assert!(
+            !printed.contains('\x1b') && !printed.contains('\u{202e}'),
+            "{printed}"
+        );
+        assert!(printed.contains("\\u{1b}]52"), "{printed}");
+        assert!(
+            printed.contains("[c-1, on its own] the weather"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("[dropped: lab/main sent a message to conversation home.work.default"),
+            "{printed}"
+        );
+        assert!(!printed.contains("I am work/default"), "{printed}");
+        // Stored: this agent's two, as sent; nothing in work/default's
+        let mine = store.since("victor@mac", 0).unwrap();
+        assert_eq!(
+            mine.iter()
+                .map(|m| m.conversation.as_str())
+                .collect::<Vec<_>>(),
+            ["c-1", "c-1"]
+        );
+        assert!(mine[0].text.contains('\x1b'));
+    }
 
     #[test]
     fn a_conversation_goes_on_only_with_its_own_agent_and_person() {
