@@ -246,7 +246,7 @@ fn native_socket_answer_requires_exact_receipt_and_keeps_history_in_order() {
         AnswerRequest {
             question: definition.id.clone(),
             revision: 0,
-            answer: answer,
+            answer,
         },
     )
     .unwrap();
@@ -273,7 +273,7 @@ fn two_phones_first_native_answer_wins_and_other_people_cannot_control_it() {
                 "guest@example.com",
                 MessageId::new("foreign").unwrap(),
                 AnswerRequest {
-                    question: question,
+                    question,
                     revision: 0,
                     answer: QuestionAnswer::Skip,
                 },

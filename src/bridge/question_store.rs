@@ -667,9 +667,8 @@ mod tests {
             .ask_question("lab/coder", &conversation, &definition("q-next"), "next")
             .unwrap();
         // Across conversations, the agent's own cap.
-        let mut asked = MAX_PENDING_PER_CONVERSATION;
-        for index in 0.. {
-            let id = format!("c-{index}");
+        for asked in MAX_PENDING_PER_CONVERSATION..=MAX_PENDING_PER_AGENT {
+            let id = format!("c-{asked}");
             store.conversation(&id, "lab", "coder", "owner").unwrap();
             let conversation = ConversationId::new(id.clone()).unwrap();
             let result = store.ask_question(
@@ -683,7 +682,6 @@ mod tests {
                 break;
             }
             result.unwrap();
-            asked += 1;
         }
         assert_eq!(
             store.pending_questions("lab/coder").unwrap().len() as i64,
