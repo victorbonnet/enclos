@@ -632,15 +632,8 @@ fn run_session(
             } => {
                 rename(hub, store, person, &conversation, &title)?;
             }
-            // How far the owner read: kept, and sent to all their devices,
-            // so a message read on one is not unread on another.
             FromDevice::ConversationRead { conversation, seq } => {
-                let id = conversation.as_str();
-                if store.owner(id).map_err(|e| e.to_string())?.as_deref() == Some(person)
-                    && store.mark_read(id, seq).map_err(|e| e.to_string())?
-                {
-                    hub.deliver_conversation(store, person, id);
-                }
+                read(hub, store, person, &conversation, seq)?;
             }
             FromDevice::Sync { since } => {
                 // Every conversation first, named or empty, then the messages.
@@ -832,6 +825,25 @@ fn attachment_info(a: StoredAttachment) -> Attachment {
         name: a.name,
         size: a.size.max(0) as u64,
     }
+}
+
+/// How far `person` read `conversation`: kept, and sent to all their
+/// devices, so a message read on one is not unread on another. Only the
+/// conversation's owner moves it; anyone else changes and learns nothing.
+fn read(
+    hub: &Hub,
+    store: &Store,
+    person: &str,
+    conversation: &ConversationId,
+    seq: i64,
+) -> Result<(), String> {
+    let id = conversation.as_str();
+    if store.owner(id).map_err(|e| e.to_string())?.as_deref() == Some(person)
+        && store.mark_read(id, seq).map_err(|e| e.to_string())?
+    {
+        hub.deliver_conversation(store, person, id);
+    }
+    Ok(())
 }
 
 /// A conversation for a device: `None` for an id the protocol refuses.
