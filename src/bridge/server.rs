@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,16 +25,18 @@ use std::time::Duration;
 use enclos_protocol::device::{
     AgentInfo, ConversationMessage, FromDevice, ToDevice, decode_from_device, split_text,
 };
-use enclos_protocol::noise::{Responder, Session};
+use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutKind};
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
 use super::store::{Added, Device, From, PairingRequest, Store, now};
+use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
 
 /// How long a pairing waits for the terminal's answer.
@@ -42,6 +44,26 @@ const PAIRING_WAIT: Duration = Duration::from_secs(120);
 
 /// How often the bridge tries again to give pending messages to agents.
 const RETRY: Duration = Duration::from_secs(10);
+
+/// How long a caller has, from connecting, to send its first message
+/// (`auth` or `pair.request`).
+const HANDSHAKE: Duration = Duration::from_secs(30);
+
+/// Connections not yet authenticated at once: any login of the tailnet
+/// gets that far, so they are few, and a caller past them is closed.
+const MAX_WAITING: usize = 16;
+
+/// How long a device's session goes on with nothing from it, not even a
+/// ping (the enclos app pings every 30 s): a phone that changed network
+/// or slept rarely says goodbye.
+const SILENCE: Duration = Duration::from_secs(75);
+
+/// Refusals the log keeps per caller address and minute; past them, that
+/// address's connections are closed unlogged and unexamined.
+const REFUSALS_PER_MINUTE: u32 = 10;
+
+/// The longest device name the bridge keeps.
+const NAME_CHARS: usize = 64;
 
 /// Who is at an address, as the transport says.
 type Whois = Arc<dyn Fn(&str) -> Result<Caller, String> + Send + Sync>;
@@ -76,8 +98,28 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     generations: AtomicU64,
-    /// Connected devices: who they speak for, and where to send.
-    devices: Mutex<HashMap<String, (String, Sender<ToDevice>)>>,
+    /// Connected devices: who they speak for, where to send, and which
+    /// connection that is (a phone that reconnects has two for a while).
+    devices: Mutex<HashMap<String, Route>>,
+    /// Connections not yet authenticated.
+    waiting: AtomicUsize,
+    /// Refusals logged per caller address in the current minute.
+    refusals: Mutex<HashMap<String, (i64, u32)>>,
+    silence: Duration,
+}
+
+/// Where a connected device's messages go: the person it speaks for, its
+/// session's outbox, and that connection's number.
+type Route = (String, Sender<ToDevice>, u64);
+
+/// A place among the connections not yet authenticated, given back when
+/// dropped.
+struct Waiting(Arc<Hub>);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Hub {
@@ -88,7 +130,7 @@ impl Hub {
     /// Sends `message` to every connected device of `person`.
     fn deliver(&self, person: &str, message: ToDevice) {
         let devices = self.devices.lock().expect("not poisoned");
-        for (owner, sender) in devices.values() {
+        for (owner, sender, _) in devices.values() {
             if owner == person {
                 let _ = sender.send(message.clone());
             }
@@ -99,8 +141,12 @@ impl Hub {
     /// in a thread of its own, storing what the agent says and passing it
     /// on to the conversation's owner.
     fn plugin(self: &Arc<Hub>, agent: &str) -> Result<(), String> {
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        if plugins.contains_key(agent) {
+        if self
+            .plugins
+            .lock()
+            .expect("not poisoned")
+            .contains_key(agent)
+        {
             return Ok(());
         }
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
@@ -109,9 +155,18 @@ impl Hub {
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
+        // Outside the lock: a plugin that is slow to answer its hello holds
+        // only the caller, not every other agent's messages
         let (hello, mut reader, writer) =
             connect(&endpoint.socket, &endpoint.token).map_err(|e| e.to_string())?;
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let mut plugins = self.plugins.lock().expect("not poisoned");
+        if plugins.contains_key(agent) {
+            // Another thread opened one meanwhile: the plugin takes one
+            // bridge connection at a time, and that one is it
+            writer.shutdown();
+            return Ok(());
+        }
         plugins.insert(
             agent.to_owned(),
             Plugin {
@@ -121,6 +176,7 @@ impl Hub {
                 sent: HashSet::new(),
             },
         );
+        drop(plugins);
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
         std::thread::spawn(move || {
@@ -169,7 +225,11 @@ impl Hub {
                         let _ = store.delivered(of.as_str());
                     }
                     FromPlugin::Typing { conversation, on } => {
-                        if let Ok(Some(owner)) = store.owner(conversation.as_str()) {
+                        // Only in this agent's own conversations
+                        if let Ok(Some((sandbox, with, owner))) =
+                            store.conversation_of(conversation.as_str())
+                            && format!("{sandbox}/{with}") == agent
+                        {
                             hub.deliver(&owner, ToDevice::Typing { conversation, on });
                         }
                     }
@@ -293,6 +353,9 @@ pub fn serve(
         plugins: Mutex::new(HashMap::new()),
         generations: AtomicU64::new(0),
         devices: Mutex::new(HashMap::new()),
+        waiting: AtomicUsize::new(0),
+        refusals: Mutex::new(HashMap::new()),
+        silence: SILENCE,
     });
     serve_on(listener, hub, RETRY);
     Ok(())
@@ -316,13 +379,19 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if hub.waiting.fetch_add(1, Ordering::Relaxed) >= MAX_WAITING {
+            // Too many callers mid-handshake: closed, as the stream drops
+            hub.waiting.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+        let waiting = Waiting(Arc::clone(&hub));
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
-            match connection(&hub, stream) {
+            match connection(&hub, stream, waiting) {
                 // The device hung up, or went away (a phone that locks, sleeps
                 // or changes network rarely says goodbye): how connections
                 // end, not an error. `enclos app log` has who, when and how.
-                Err(e) if e == CLOSED || e == GONE => {}
+                Err(e) if e == CLOSED || e == GONE || e == SILENT || e == UNPAIRED => {}
                 Err(e) => eprintln!("enclos app: a connection ended: {e}"),
                 Ok(()) => {}
             }
@@ -336,6 +405,10 @@ const CLOSED: &str = "closed";
 const GONE: &str = "went away without closing the connection";
 /// The device was unpaired while it was connected.
 const UNPAIRED: &str = "unpaired";
+/// Nothing came from the device, not even a ping, for [`SILENCE`].
+const SILENT: &str = "silent for too long";
+/// The caller sent no first message within [`HANDSHAKE`].
+const TOO_SLOW: &str = "no first message in time";
 
 /// Why reading or writing a device's connection failed: [`GONE`] when the
 /// device is simply no longer there, else the error itself.
@@ -362,6 +435,8 @@ fn ended(e: tungstenite::Error) -> String {
 struct Link {
     socket: WebSocket<TcpStream>,
     session: Session,
+    /// When the device last sent anything, a ping included.
+    heard: std::time::Instant,
 }
 
 impl Link {
@@ -376,7 +451,11 @@ impl Link {
 
     /// The next message, `None` while nothing came in time.
     fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, String> {
-        match self.socket.read() {
+        let read = self.socket.read();
+        if read.is_ok() {
+            self.heard = std::time::Instant::now();
+        }
+        match read {
             Ok(Message::Binary(bytes)) => {
                 let plain = self.session.decrypt(&bytes).map_err(|e| e.to_string())?;
                 decode_from_device(&plain)
@@ -398,41 +477,99 @@ impl Link {
     }
 }
 
-fn binary(socket: &mut WebSocket<TcpStream>) -> Result<Vec<u8>, String> {
+/// The next binary message, before `deadline`.
+fn binary(
+    socket: &mut WebSocket<TcpStream>,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
     loop {
-        match socket.read().map_err(ended)? {
-            Message::Binary(bytes) => return Ok(bytes.to_vec()),
-            Message::Close(_) => return Err(CLOSED.to_owned()),
-            _ => {}
+        if std::time::Instant::now() > deadline {
+            return Err(TOO_SLOW.to_owned());
         }
+        match socket.read() {
+            Ok(Message::Binary(bytes)) => return Ok(bytes.to_vec()),
+            Ok(Message::Close(_)) => return Err(CLOSED.to_owned()),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(ended(e)),
+        }
+    }
+}
+
+impl Hub {
+    /// Whether a refusal of a caller at `address` is still logged this
+    /// minute; past [`REFUSALS_PER_MINUTE`], its connections are closed
+    /// without a line in the log or a question to the transport.
+    fn may_refuse_aloud(&self, address: &str) -> bool {
+        let minute = now() / 60;
+        let mut refusals = self.refusals.lock().expect("not poisoned");
+        if refusals.len() > 1024 {
+            refusals.retain(|_, (m, _)| *m == minute);
+        }
+        let (m, count) = refusals.entry(address.to_owned()).or_insert((minute, 0));
+        if *m != minute {
+            *m = minute;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= REFUSALS_PER_MINUTE
+    }
+
+    fn over_refusals(&self, address: &str) -> bool {
+        let minute = now() / 60;
+        self.refusals
+            .lock()
+            .expect("not poisoned")
+            .get(address)
+            .is_some_and(|(m, count)| *m == minute && *count >= REFUSALS_PER_MINUTE)
     }
 }
 
 // The handshake callback's error is tungstenite's `ErrorResponse`, a whole
 // HTTP response: its size is set by the `Callback` trait, not by us.
 #[allow(clippy::result_large_err)]
-fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
+fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + HANDSHAKE;
     let store = hub.store()?;
     let mut login: Option<String> = None;
     let mut address: Option<String> = None;
+    // Each read waits at most this long, so the deadline is looked at
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
-    let mut socket = tungstenite::accept_hdr(stream, |request: &Request, response: Response| {
-        let header = |name: &str| {
-            request
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        };
-        login = header(hub.transport.login_header());
-        address = header(hub.transport.address_header()).and_then(|a| caller_address(&a));
-        Ok(response)
-    })
-    .map_err(|e| e.to_string())?;
+    // No device-leg message is larger than one Noise message
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_NOISE_MESSAGE))
+        .max_frame_size(Some(MAX_NOISE_MESSAGE));
+    let accepted = tungstenite::accept_hdr_with_config(
+        stream,
+        |request: &Request, response: Response| {
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            login = header(hub.transport.login_header());
+            address = header(hub.transport.address_header()).and_then(|a| caller_address(&a));
+            Ok(response)
+        },
+        Some(limits),
+    );
+    let mut socket = accepted.map_err(|e| e.to_string())?;
+    let at = address.clone().unwrap_or_else(|| "no address".to_owned());
+    if hub.over_refusals(&at) {
+        return Err(format!("{at} was refused too often this minute"));
+    }
     let refuse = |device: Option<&str>, person: Option<&str>, why: &str| {
-        let _ = store.log(device, person, "refused", Some(why));
+        if hub.may_refuse_aloud(&at) {
+            let _ = store.log(device, person, "refused", Some(why));
+        }
         why.to_owned()
     };
     let (Some(person), Some(address)) = (login, address) else {
@@ -451,17 +588,27 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         ));
     }
     let mut responder = Responder::new(&hub.bridge_private).map_err(|e| e.to_string())?;
-    let hello = binary(&mut socket)?;
+    let hello = binary(&mut socket, deadline).map_err(|e| match e.as_str() {
+        TOO_SLOW => refuse(None, Some(&person), TOO_SLOW),
+        _ => e,
+    })?;
     let noise_key = responder
         .read_hello(&hello)
         .map_err(|e| refuse(None, Some(&person), &format!("handshake: {e}")))?;
     let (answer, session) = responder.answer().map_err(|e| e.to_string())?;
     socket.send(Message::Binary(answer.into())).map_err(ended)?;
-    let mut link = Link { socket, session };
+    let mut link = Link {
+        socket,
+        session,
+        heard: std::time::Instant::now(),
+    };
     let known = store
         .device_by_noise_key(&noise_key)
         .map_err(|e| e.to_string())?;
     let first = loop {
+        if std::time::Instant::now() > deadline {
+            return Err(refuse(None, Some(&person), TOO_SLOW));
+        }
         if let Some(message) = link.receive()? {
             break message;
         }
@@ -534,19 +681,28 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     link.send(ToDevice::Authenticated {
         person: person.clone(),
     })?;
+    // Authenticated: no longer among the callers that are few at once
+    drop(waiting);
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
     let (sender, outbox) = channel();
+    let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
         .lock()
         .expect("not poisoned")
-        .insert(device.id.clone(), (person.clone(), sender));
+        .insert(device.id.clone(), (person.clone(), sender, this));
     link.socket
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| e.to_string())?;
     let ended = run_session(hub, &store, &mut link, &device, &person, &outbox);
-    hub.devices.lock().expect("not poisoned").remove(&device.id);
+    {
+        // Only this connection's route: the device may have connected again
+        let mut devices = hub.devices.lock().expect("not poisoned");
+        if devices.get(&device.id).map(|d| d.2) == Some(this) {
+            devices.remove(&device.id);
+        }
+    }
     let _ = store.device_seen(&device.id);
     let _ = store.log(
         Some(&device.id),
@@ -569,6 +725,8 @@ fn pair(
     push: Option<enclos_protocol::device::PushToken>,
 ) -> Result<Device, String> {
     let person = caller.login.as_str();
+    // Shown at the terminal that decides, and in `app devices`
+    let name = plain(&name, NAME_CHARS, "unnamed device");
     let refused = |link: &mut Link, why: &str| -> String {
         let _ = link.send(ToDevice::PairRefused {
             reason: why.to_owned(),
@@ -662,7 +820,7 @@ fn pair(
         push_key: encode(&device.push_key),
     }) {
         let _ = store.remove_device(&device.id);
-        let _ = store.settle_pairing(&code, "gone");
+        let _ = store.settle_pairing(&code, "gone", None);
         let _ = store.log(
             None,
             Some(person),
@@ -671,7 +829,7 @@ fn pair(
         );
         return Err(e);
     }
-    let _ = store.settle_pairing(&code, "paired");
+    let _ = store.settle_pairing(&code, "paired", Some(&device.id));
     Ok(device)
 }
 
@@ -684,6 +842,9 @@ fn run_session(
     outbox: &Receiver<ToDevice>,
 ) -> Result<(), String> {
     loop {
+        if link.heard.elapsed() > hub.silence {
+            return Err(SILENT.to_owned());
+        }
         // Unpaired since the last message: it gets nothing more
         if store
             .device(&device.id)
@@ -872,17 +1033,25 @@ mod tests {
         public: Vec<u8>,
         store: PathBuf,
         socket: PathBuf,
+        /// The node `whois` names.
         node: Arc<Mutex<String>>,
+        /// The login `whois` names.
+        whois_login: Arc<Mutex<String>>,
     }
 
     fn bridge(folder: &Path) -> Bridge {
+        bridge_with(folder, SILENCE)
+    }
+
+    fn bridge_with(folder: &Path, silence: Duration) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
-        let answer = Arc::clone(&node);
+        let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
+        let (answer, login) = (Arc::clone(&node), Arc::clone(&whois_login));
         let whois: Whois = Arc::new(move |address: &str| {
             assert_eq!(address, "100.64.0.9");
             Ok(Caller {
-                login: PERSON.to_owned(),
+                login: login.lock().unwrap().clone(),
                 node_id: answer.lock().unwrap().clone(),
                 node: "pixel".to_owned(),
             })
@@ -903,6 +1072,9 @@ mod tests {
             plugins: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
             devices: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            refusals: Mutex::new(HashMap::new()),
+            silence,
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -913,6 +1085,7 @@ mod tests {
             store,
             socket,
             node,
+            whois_login,
         }
     }
 
@@ -988,9 +1161,9 @@ mod tests {
         }
     }
 
-    /// Connects through the transport's headers and authenticates; the
-    /// bridge's first answer, `authenticated` or `None` when it refused.
-    fn connect(bridge: &Bridge, phone: &Phone) -> (PhoneLink, Option<ToDevice>) {
+    /// A WebSocket to the bridge, with the headers `tailscale serve` adds
+    /// for `login`.
+    fn websocket(bridge: &Bridge, login: &str) -> WebSocket<TcpStream> {
         let stream = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1000,19 +1173,39 @@ mod tests {
             .unwrap();
         request
             .headers_mut()
-            .insert("Tailscale-User-Login", PERSON.parse().unwrap());
+            .insert("Tailscale-User-Login", login.parse().unwrap());
         request
             .headers_mut()
             .insert("X-Forwarded-For", "100.64.0.9".parse().unwrap());
-        let (mut socket, _) = tungstenite::client(request, stream).unwrap();
-        let mut initiator = Initiator::new(&phone.noise_private, &bridge.public).unwrap();
+        tungstenite::client(request, stream).unwrap().0
+    }
+
+    /// The Noise handshake as `login`, with the device's static key; `None`
+    /// when the bridge closes the connection before answering.
+    fn handshake(bridge: &Bridge, noise_private: &[u8], login: &str) -> Option<PhoneLink> {
+        let mut socket = websocket(bridge, login);
+        let mut initiator = Initiator::new(noise_private, &bridge.public).unwrap();
         socket
             .send(Message::Binary(initiator.hello().unwrap().into()))
-            .unwrap();
-        let answer = binary(&mut socket).unwrap();
+            .ok()?;
+        let answer = binary(
+            &mut socket,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .ok()?;
         let session = initiator.finish(&answer).unwrap();
-        let signature: Signature = phone.signing.sign(session.handshake_hash());
-        let mut device = PhoneLink { socket, session };
+        Some(PhoneLink { socket, session })
+    }
+
+    /// Connects through the transport's headers and authenticates; the
+    /// bridge's first answer, `authenticated` or `None` when it refused.
+    fn connect(bridge: &Bridge, phone: &Phone) -> (PhoneLink, Option<ToDevice>) {
+        connect_as(bridge, phone, PERSON)
+    }
+
+    fn connect_as(bridge: &Bridge, phone: &Phone, login: &str) -> (PhoneLink, Option<ToDevice>) {
+        let mut device = handshake(bridge, &phone.noise_private, login).expect("no handshake");
+        let signature: Signature = phone.signing.sign(device.session.handshake_hash());
         device.send(
             "auth-1",
             FromDevice::Auth {
@@ -1105,6 +1298,319 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    /// What `enclos app pair` does at the terminal: waits for the request
+    /// made with `code`, then answers it.
+    fn terminal(
+        store: &Path,
+        code: &'static [u8],
+        answer: &'static str,
+    ) -> std::thread::JoinHandle<PairingRequest> {
+        let store = store.to_owned();
+        std::thread::spawn(move || {
+            let store = Store::open(&store).unwrap();
+            for _ in 0..100 {
+                if let Some(request) = store.pairing_request(code).unwrap() {
+                    store.decide_pairing(code, answer).unwrap();
+                    return request;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("no pairing request");
+        })
+    }
+
+    /// A new device asking to pair with `code`, named `name`: the bridge's
+    /// answer, `None` when it closed the connection instead.
+    fn ask_to_pair(
+        bridge: &Bridge,
+        code: &[u8],
+        name: &str,
+    ) -> (Option<PhoneLink>, Option<ToDevice>) {
+        let noise = generate_keypair().unwrap();
+        let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let Some(mut device) = handshake(bridge, &noise.private, PERSON) else {
+            return (None, None);
+        };
+        let proof = enclos_protocol::pairing::proof(code, device.session.handshake_hash());
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: name.to_owned(),
+                device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
+                proof: encode(&proof),
+                push: None,
+            },
+        );
+        let answer = device.receive();
+        (Some(device), answer)
+    }
+
+    #[test]
+    fn an_accepted_pairing_stores_the_device_its_node_and_a_plain_name() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let terminal = terminal(&bridge.store, b"code-1", "accept");
+        // A name that would redraw the terminal's question
+        let (device, answer) = ask_to_pair(&bridge, b"code-1", "Pixel\r\x1b[2KAccept?\u{202e}");
+        let Some(ToDevice::PairAccepted { device: id, .. }) = answer else {
+            panic!("not accepted: {answer:?}");
+        };
+        let asked = terminal.join().unwrap();
+        assert_eq!(
+            (
+                asked.name.as_str(),
+                asked.node.as_str(),
+                asked.node_id.as_str()
+            ),
+            ("Pixel [2KAccept?", "pixel", "n-pixel")
+        );
+        assert!(matches!(
+            device.unwrap().receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        let stored = store.device(&id).unwrap().unwrap();
+        assert_eq!(stored.node.as_deref(), Some("n-pixel"));
+        assert_eq!(stored.name, "Pixel [2KAccept?");
+        assert!(eventually(|| store
+            .paired_device(b"code-1")
+            .unwrap()
+            .as_deref()
+            == Some(id.as_str())));
+    }
+
+    #[test]
+    fn a_declined_pairing_stores_nothing() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let terminal = terminal(&bridge.store, b"code-1", "decline");
+        let (_, answer) = ask_to_pair(&bridge, b"code-1", "Pixel");
+        terminal.join().unwrap();
+        assert_eq!(
+            answer,
+            Some(ToDevice::PairRefused {
+                reason: "declined".into()
+            })
+        );
+        assert!(store.devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_wrong_used_or_expired_code_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"open", now() + 300).unwrap();
+        store.add_pairing(b"used", now() + 300).unwrap();
+        let request = PairingRequest {
+            name: "other".into(),
+            person: PERSON.into(),
+            node: "pixel".into(),
+            node_id: "n-pixel".into(),
+        };
+        assert!(store.use_pairing(b"used", &request).unwrap());
+        store.add_pairing(b"expired", now() - 1).unwrap();
+        for code in [&b"wrong"[..], b"used", b"expired"] {
+            let (_, answer) = ask_to_pair(&bridge, code, "Pixel");
+            assert_eq!(
+                answer,
+                Some(ToDevice::PairRefused {
+                    reason: "bad_proof".into()
+                }),
+                "{}",
+                String::from_utf8_lossy(code)
+            );
+        }
+        assert!(store.devices().unwrap().is_empty());
+        // The open code is still there for its device
+        assert_eq!(store.open_pairings().unwrap(), [b"open".to_vec()]);
+    }
+
+    fn refusal(bridge: &Bridge) -> String {
+        let store = Store::open(&bridge.store).unwrap();
+        let mut reason = None;
+        assert!(eventually(|| {
+            reason = store
+                .log_lines(10)
+                .unwrap()
+                .into_iter()
+                .rfind(|l| l.event == "refused")
+                .and_then(|l| l.reason);
+            reason.is_some()
+        }));
+        reason.unwrap()
+    }
+
+    #[test]
+    fn a_signature_by_another_key_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let mut phone = paired(&bridge, "n-pixel");
+        phone.signing = SigningKey::from_slice(&[8u8; 32]).unwrap();
+        let (_, first) = connect(&bridge, &phone);
+        assert_eq!(first, None);
+        assert_eq!(refusal(&bridge), "the device's signature does not hold");
+    }
+
+    #[test]
+    fn a_login_the_transport_does_not_confirm_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // The header says victor; WhoIs says the address is mallory's
+        *bridge.whois_login.lock().unwrap() = "mallory@example.com".to_owned();
+        assert!(handshake(&bridge, &phone.noise_private, PERSON).is_none());
+        assert!(refusal(&bridge).contains("mallory@example.com calls from"));
+    }
+
+    #[test]
+    fn a_device_used_under_another_login_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
+        let (_, first) = connect_as(&bridge, &phone, "alice@example.com");
+        assert_eq!(first, None);
+        assert_eq!(
+            refusal(&bridge),
+            format!("the device is {PERSON}'s, and alice@example.com is calling")
+        );
+    }
+
+    #[test]
+    fn refusals_past_the_limit_are_closed_unlogged() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        *bridge.whois_login.lock().unwrap() = "mallory@example.com".to_owned();
+        let noise = generate_keypair().unwrap();
+        for _ in 0..REFUSALS_PER_MINUTE + 5 {
+            assert!(handshake(&bridge, &noise.private, PERSON).is_none());
+        }
+        let store = Store::open(&bridge.store).unwrap();
+        let refused = store
+            .log_lines(100)
+            .unwrap()
+            .iter()
+            .filter(|l| l.event == "refused")
+            .count();
+        // Unless the minute turned while it ran
+        assert!(
+            (REFUSALS_PER_MINUTE as usize..=REFUSALS_PER_MINUTE as usize * 2).contains(&refused),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn callers_mid_handshake_are_few_and_a_large_frame_ends_one() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // Callers that connect and say nothing
+        let quiet: Vec<_> = (0..MAX_WAITING)
+            .map(|_| websocket(&bridge, PERSON))
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        // One more is closed at once
+        let stream = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = format!("ws://127.0.0.1:{}/", bridge.port)
+            .into_client_request()
+            .unwrap();
+        assert!(tungstenite::client(request, stream).is_err());
+        // Once they leave, the device gets in
+        drop(quiet);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(matches!(
+            connect(&bridge, &phone).1,
+            Some(ToDevice::Authenticated { .. })
+        ));
+        // A frame larger than any device-leg message ends the connection
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).unwrap();
+        let _ = device
+            .socket
+            .send(Message::Binary(vec![0; MAX_NOISE_MESSAGE + 1].into()));
+        assert_eq!(device.receive(), None);
+    }
+
+    #[test]
+    fn a_device_that_reconnects_keeps_getting_its_messages() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let phone = paired(&bridge, "n-pixel");
+        // The phone changed network: B opens while A is still there
+        let (mut first, _) = connect(&bridge, &phone);
+        start_conversation(&mut first);
+        let (mut second, _) = connect(&bridge, &phone);
+        // A ends: B's route stays
+        let _ = first.socket.close(None);
+        let _ = first.socket.flush();
+        drop(first);
+        std::thread::sleep(Duration::from_millis(500));
+        say(&mut second, "m-1", "still there?");
+        assert!(matches!(
+            second.receive(),
+            Some(ToDevice::Message(ref m)) if m.text == "still there?"
+        ));
+    }
+
+    #[test]
+    fn a_plugin_that_never_answers_holds_no_other_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        // An agent that takes the connection and says nothing
+        let listener = UnixListener::bind(&bridge.socket).unwrap();
+        let _held = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(2).collect();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut waiting, _) = connect(&bridge, &phone);
+        start_conversation(&mut waiting);
+        // Its session waits for the plugin's hello, up to 10 s
+        say(&mut waiting, "m-1", "hello?");
+        std::thread::sleep(Duration::from_millis(300));
+        // Another session is answered meanwhile
+        let (mut other, _) = connect(&bridge, &phone);
+        let started = std::time::Instant::now();
+        other.send("a-1", FromDevice::Agents);
+        loop {
+            match other.receive() {
+                Some(ToDevice::AgentsList { agents }) => {
+                    assert_eq!(agents.len(), 1);
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_silent_device_is_let_go() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge_with(folder.path(), Duration::from_millis(500));
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // Nothing from the device, not even a ping
+        assert_eq!(device.receive(), None);
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(eventually(|| store.log_lines(10).unwrap().iter().any(
+            |l| l.event == "disconnected" && l.reason.as_deref() == Some(SILENT)
+        )));
     }
 
     #[test]

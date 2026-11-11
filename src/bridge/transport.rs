@@ -154,7 +154,12 @@ fn whois_caller(answer: &[u8]) -> Option<Caller> {
     Some(Caller {
         login: text(answer.get("UserProfile")?.get("LoginName"))?,
         node_id: text(node.get("StableID"))?,
-        node: text(node.get("ComputedName")).or_else(|| text(node.get("Name")))?,
+        // The node's owner names it: shown at the terminal, so made plain
+        node: super::text::plain(
+            &text(node.get("ComputedName")).or_else(|| text(node.get("Name")))?,
+            64,
+            "unnamed node",
+        ),
     })
 }
 

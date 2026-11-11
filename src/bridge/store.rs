@@ -91,7 +91,13 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("devices", "node", "TEXT"),
     ("pairings", "request_node", "TEXT"),
     ("pairings", "request_node_id", "TEXT"),
+    // The device a pairing made, for the terminal's audit entry.
+    ("pairings", "device", "TEXT"),
 ];
+
+/// How many lines of its log the bridge keeps: refused callers write
+/// there, so it must not grow without end.
+const LOG_KEPT: i64 = 10_000;
 
 fn add_column(
     db: &Connection,
@@ -453,6 +459,10 @@ impl Store {
             "INSERT INTO log (at, device, person, event, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![now(), device, person, event, reason],
         )?;
+        self.db.execute(
+            "DELETE FROM log WHERE rowid <= ?1",
+            params![self.db.last_insert_rowid() - LOG_KEPT],
+        )?;
         Ok(())
     }
 
@@ -530,13 +540,32 @@ impl Store {
     }
 
     /// What became of an accepted pairing, for the terminal: `paired` once
-    /// the device has its answer, `gone` when it left before.
-    pub fn settle_pairing(&self, code: &[u8], outcome: &str) -> rusqlite::Result<()> {
+    /// the device has its answer, with the device's id, or `gone` when it
+    /// left before.
+    pub fn settle_pairing(
+        &self,
+        code: &[u8],
+        outcome: &str,
+        device: Option<&str>,
+    ) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE pairings SET decision = ?2 WHERE code = ?1 AND decision = 'accept'",
-            params![code, outcome],
+            "UPDATE pairings SET decision = ?2, device = ?3 WHERE code = ?1 AND decision = 'accept'",
+            params![code, outcome, device],
         )?;
         Ok(())
+    }
+
+    /// The device a settled pairing made.
+    pub fn paired_device(&self, code: &[u8]) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT device FROM pairings WHERE code = ?1",
+                params![code],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn pairing_decision(&self, code: &[u8]) -> rusqlite::Result<Option<String>> {
@@ -697,6 +726,24 @@ mod tests {
     }
 
     #[test]
+    fn the_log_keeps_its_newest_lines_only() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        for n in 0..LOG_KEPT + 5 {
+            store
+                .log(None, None, "refused", Some(&n.to_string()))
+                .unwrap();
+        }
+        let lines = store.log_lines(LOG_KEPT * 2).unwrap();
+        assert_eq!(lines.len() as i64, LOG_KEPT);
+        assert_eq!(lines[0].reason.as_deref(), Some("5"));
+        assert_eq!(
+            lines.last().unwrap().reason.as_deref(),
+            Some((LOG_KEPT + 4).to_string().as_str())
+        );
+    }
+
+    #[test]
     fn an_older_database_gets_the_new_columns() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("app.db");
@@ -726,8 +773,9 @@ mod tests {
         store.add_pairing(b"one", now() + 300).unwrap();
         assert!(store.decide_pairing(b"one", "accept").unwrap());
         assert!(!store.decide_pairing(b"one", "decline").unwrap());
-        store.settle_pairing(b"one", "paired").unwrap();
+        store.settle_pairing(b"one", "paired", Some("d-1")).unwrap();
         assert_eq!(decision(&store, b"one").as_deref(), Some("paired"));
+        assert_eq!(store.paired_device(b"one").unwrap().as_deref(), Some("d-1"));
         // The device left first: the terminal's answer comes too late.
         store.add_pairing(b"two", now() + 300).unwrap();
         assert!(store.decide_pairing(b"two", "gone").unwrap());
@@ -736,7 +784,10 @@ mod tests {
         // An outcome settles an accepted pairing only.
         store.add_pairing(b"three", now() + 300).unwrap();
         assert!(store.decide_pairing(b"three", "decline").unwrap());
-        store.settle_pairing(b"three", "paired").unwrap();
+        store
+            .settle_pairing(b"three", "paired", Some("d-3"))
+            .unwrap();
+        assert_eq!(store.paired_device(b"three").unwrap(), None);
         assert_eq!(decision(&store, b"three").as_deref(), Some("decline"));
     }
 }

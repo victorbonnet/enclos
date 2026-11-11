@@ -209,7 +209,9 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     };
     print!(
         "{} ({transport} login: {}, node: {}) wants to pair. Accept? [y/N] ",
-        request.name, request.person, request.node
+        shown(&request.name),
+        shown(&request.person),
+        shown(&request.node)
     );
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -257,13 +259,15 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
                     .as_deref()
                 {
                     Some("paired") => {
-                        let devices = store.devices().map_err(|e| failed(e.to_string()))?;
-                        return Ok(devices
-                            .into_iter()
-                            .filter(|d| d.node.as_deref() == Some(request.node_id.as_str()))
-                            .max_by_key(|d| d.paired)
-                            .map(|d| d.id)
-                            .unwrap_or_default());
+                        // The bridge records the device it made
+                        return store
+                            .paired_device(&code)
+                            .map_err(|e| failed(e.to_string()))?
+                            .ok_or_else(|| {
+                                failed(
+                                    "the bridge paired a device but did not say which".to_owned(),
+                                )
+                            });
                     }
                     Some("gone") => return Err(left()),
                     _ => std::thread::sleep(std::time::Duration::from_millis(500)),
@@ -277,6 +281,21 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     )?;
     println!("Paired: device {device}.");
     Ok(exit::OK)
+}
+
+/// Text a device or a caller chose, as the terminal shows it: controls
+/// escaped, so it cannot move the cursor or redraw a line, then what
+/// `output::for_terminal` escapes (invisible and bidirectional marks). The
+/// bridge keeps names plain already; this covers rows stored before it did.
+fn shown(text: &str) -> String {
+    let escaped: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{0}'..='\u{1f}' => format!("\\u{:04x}", c as u32),
+            c => c.to_string(),
+        })
+        .collect();
+    output::for_terminal(&escaped)
 }
 
 fn when(seconds: Option<i64>) -> String {
@@ -325,8 +344,8 @@ fn devices(engine: &Engine) -> Result<u8> {
         println!(
             "{}  {}  {}  paired {}, seen {}",
             d.id,
-            d.name,
-            d.person,
+            shown(&d.name),
+            shown(&d.person),
             when(Some(d.paired)),
             when(d.seen)
         );
@@ -379,9 +398,11 @@ fn log(engine: &Engine, lines: i64) -> Result<u8> {
             "{}  {}  {}  {}{}",
             when(Some(line.at)),
             line.event,
-            line.device.as_deref().unwrap_or("-"),
-            line.person.as_deref().unwrap_or("-"),
-            line.reason.map(|r| format!("  ({r})")).unwrap_or_default()
+            shown(line.device.as_deref().unwrap_or("-")),
+            shown(line.person.as_deref().unwrap_or("-")),
+            line.reason
+                .map(|r| format!("  ({})", shown(&r)))
+                .unwrap_or_default()
         );
     }
     Ok(exit::OK)
@@ -551,6 +572,15 @@ fn writer_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_from_a_device_cannot_redraw_the_terminal() {
+        assert_eq!(shown("Pixel 9"), "Pixel 9");
+        assert_eq!(
+            shown("Pixel\r\x1b[2Kok\u{202e}"),
+            "Pixel\\u000d\\u001b[2Kok\\u202e"
+        );
+    }
 
     #[test]
     fn a_conversation_goes_on_only_with_its_own_agent_and_person() {

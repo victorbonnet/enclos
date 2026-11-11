@@ -14,6 +14,10 @@ use super::ids::new_id;
 
 /// How long the plugin has to answer the bridge's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a write to the plugin may wait for it to read: the socket is
+/// in the sandbox home, and an agent that never reads must not hold the
+/// bridge.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -64,6 +68,7 @@ pub fn connect(
         path: socket.display().to_string(),
         source,
     })?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
     };
