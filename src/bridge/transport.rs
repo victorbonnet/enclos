@@ -2,7 +2,8 @@
 //! (ADR 0042, proposed). The transport puts the bridge on a network the
 //! person's devices are on, and says who each caller is. Tailscale is the
 //! only one for now: `tailscale serve` forwards to the loopback and adds the
-//! caller's tailnet login.
+//! caller's tailnet login and address, and `tailscale whois` names the
+//! caller's node.
 
 use std::fmt;
 use std::path::Path;
@@ -31,6 +32,23 @@ impl Transport {
     pub fn login_header(self) -> &'static str {
         match self {
             Transport::Tailscale => "Tailscale-User-Login",
+        }
+    }
+
+    /// The header the transport adds with the caller's address on the
+    /// network, which [`Transport::whois`] takes.
+    pub fn address_header(self) -> &'static str {
+        match self {
+            // `tailscale serve` proxies over HTTP, and says who it proxies for
+            Transport::Tailscale => "X-Forwarded-For",
+        }
+    }
+
+    /// Who is at `address` on the network, as the transport knows them: the
+    /// person and the node.
+    pub fn whois(self, address: &str) -> Result<Caller, String> {
+        match self {
+            Transport::Tailscale => tailscale_whois(address),
         }
     }
 
@@ -75,18 +93,94 @@ impl Transport {
     }
 }
 
+/// Who calls the bridge, as the transport knows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The person's login.
+    pub login: String,
+    /// The node's id, which stays the same when the node is renamed.
+    pub node_id: String,
+    /// The node's name, for people to read.
+    pub node: String,
+}
+
+/// The caller's address in the transport's address header: the last one,
+/// which the transport's proxy adds after any the caller sent itself.
+pub fn caller_address(header: &str) -> Option<String> {
+    let last = header.rsplit(',').next()?.trim();
+    // An address, not anything else a command could take for an option
+    let ip = last
+        .parse::<std::net::IpAddr>()
+        .or_else(|_| last.parse::<std::net::SocketAddr>().map(|a| a.ip()))
+        .ok()?;
+    Some(ip.to_string())
+}
+
+/// The `tailscale` command: the one on the PATH, else the Mac app's own.
+fn tailscale_commands() -> Vec<&'static str> {
+    let mut commands = vec!["tailscale"];
+    if Path::new(TAILSCALE_MAC_APP).exists() {
+        commands.push(TAILSCALE_MAC_APP);
+    }
+    commands
+}
+
+/// `tailscale whois --json <address>`.
+fn tailscale_whois(address: &str) -> Result<Caller, String> {
+    let mut why = "no `tailscale` command".to_owned();
+    for command in tailscale_commands() {
+        match std::process::Command::new(command)
+            .args(["whois", "--json", address])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                return whois_caller(&out.stdout)
+                    .ok_or_else(|| "cannot read `tailscale whois`'s answer".to_owned());
+            }
+            Ok(out) => {
+                why = format!(
+                    "`tailscale whois {address}` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => why = format!("cannot run `{command}`: {e}"),
+        }
+    }
+    Err(why)
+}
+
+/// The caller in `tailscale whois --json`'s output: `UserProfile.LoginName`,
+/// `Node.StableID` and the node's name.
+fn whois_caller(answer: &[u8]) -> Option<Caller> {
+    let answer: serde_json::Value = serde_json::from_slice(answer).ok()?;
+    let node = answer.get("Node")?;
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim_end_matches('.').to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    Some(Caller {
+        login: text(answer.get("UserProfile")?.get("LoginName"))?,
+        node_id: text(node.get("StableID"))?,
+        // The node's owner names it: shown at the terminal, so made plain
+        node: super::text::plain(
+            &text(node.get("ComputedName")).or_else(|| text(node.get("Name")))?,
+            64,
+            "unnamed node",
+        ),
+    })
+}
+
 /// `https://<host>.<tailnet>.ts.net`, from `tailscale status --json`.
 fn tailscale_address() -> Option<String> {
     dns_name_url(&tailscale_status()?)
 }
 
-/// `tailscale status --json`: the command on the PATH, else the Mac app's own.
+/// `tailscale status --json`, from the first `tailscale` command that
+/// answers.
 fn tailscale_status() -> Option<Vec<u8>> {
-    let mut commands = vec!["tailscale"];
-    if Path::new(TAILSCALE_MAC_APP).exists() {
-        commands.push(TAILSCALE_MAC_APP);
-    }
-    commands.into_iter().find_map(|command| {
+    tailscale_commands().into_iter().find_map(|command| {
         let out = std::process::Command::new(command)
             .args(["status", "--json"])
             .output()
@@ -158,6 +252,41 @@ mod tests {
             Transport::Tailscale.expose_hint(47100),
             "tailscale serve --bg 47100"
         );
+    }
+
+    #[test]
+    fn the_caller_is_the_last_address_the_proxy_added() {
+        assert_eq!(caller_address("100.64.0.9").as_deref(), Some("100.64.0.9"));
+        // One the caller sent itself comes first
+        assert_eq!(
+            caller_address("100.64.0.1, 100.64.0.9").as_deref(),
+            Some("100.64.0.9")
+        );
+        assert_eq!(
+            caller_address("[fd7a:115c:a1e0::9]:41000").as_deref(),
+            Some("fd7a:115c:a1e0::9")
+        );
+        assert_eq!(caller_address("--help"), None);
+        assert_eq!(caller_address(""), None);
+    }
+
+    #[test]
+    fn whois_names_the_person_and_the_node() {
+        let answer = br#"{
+            "Node": {"ID": 7, "StableID": "nPixel1CNTRL", "Name": "pixel.tail1234.ts.net.", "ComputedName": "pixel"},
+            "UserProfile": {"ID": 3, "LoginName": "victor@example.com", "DisplayName": "Victor"}
+        }"#;
+        assert_eq!(
+            whois_caller(answer),
+            Some(Caller {
+                login: "victor@example.com".into(),
+                node_id: "nPixel1CNTRL".into(),
+                node: "pixel".into(),
+            })
+        );
+        let no_computed_name = br#"{"Node": {"StableID": "n1", "Name": "pixel.ts.net."}, "UserProfile": {"LoginName": "v@example.com"}}"#;
+        assert_eq!(whois_caller(no_computed_name).unwrap().node, "pixel.ts.net");
+        assert_eq!(whois_caller(br#"{"Node": {"StableID": "n1"}}"#), None);
     }
 
     #[test]

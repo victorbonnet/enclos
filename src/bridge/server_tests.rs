@@ -64,3 +64,60 @@ fn a_strange_media_type_is_a_plain_file() {
         "application/octet-stream"
     );
 }
+
+/// A hub with no agent, its database in `dir`, and one connected device
+/// for each of `people`: what each of them receives.
+fn hub_with(
+    dir: &std::path::Path,
+    people: &[&str],
+) -> (Hub, Vec<std::sync::mpsc::Receiver<ToDevice>>) {
+    let mut devices = HashMap::new();
+    let mut received = Vec::new();
+    for (i, person) in people.iter().enumerate() {
+        let (sender, receiver) = channel();
+        devices.insert(format!("d-{i}"), ((*person).to_owned(), sender, i as u64));
+        received.push(receiver);
+    }
+    let hub = Hub {
+        transport: Transport::Tailscale,
+        whois: Arc::new(|_: &str| Err("no transport in this test".to_owned())),
+        store_path: dir.join("app.db"),
+        bridge_private: vec![0; 32],
+        agents: Vec::new(),
+        host: None,
+        plugins: Mutex::new(HashMap::new()),
+        generations: AtomicU64::new(0),
+        devices: Mutex::new(devices),
+        waiting: AtomicUsize::new(0),
+        refusals: Mutex::new(HashMap::new()),
+        silence: SILENCE,
+    };
+    (hub, received)
+}
+
+#[test]
+fn only_the_owner_moves_how_far_a_conversation_was_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, received) = hub_with(dir.path(), &["alice@example.com", "bob@example.com"]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    for id in ["m-1", "m-2", "m-3"] {
+        store.add(id, "c-1", &From::Agent, "hi", "reply").unwrap();
+    }
+    let c1 = ConversationId::new("c-1").unwrap();
+    let read_of = |store: &Store| store.conversation_info("c-1").unwrap().unwrap().read;
+    // Another person's device: nothing moves, and nobody is told.
+    read(&hub, &store, "bob@example.com", &c1, 2).unwrap();
+    assert_eq!(read_of(&store), None);
+    assert!(received.iter().all(|r| r.try_recv().is_err()));
+    // The owner's: kept, and sent to the owner's devices only.
+    read(&hub, &store, "alice@example.com", &c1, 2).unwrap();
+    assert_eq!(read_of(&store), Some(2));
+    match received[0].try_recv() {
+        Ok(ToDevice::Conversation(info)) => assert_eq!(info.read, Some(2)),
+        other => panic!("expected the conversation, got {other:?}"),
+    }
+    assert!(received[1].try_recv().is_err());
+}

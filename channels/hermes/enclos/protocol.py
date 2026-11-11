@@ -34,7 +34,8 @@ PLATFORM_HINT = (
     "on a phone screen, and keep tables narrow. A single newline is a line break. "
     "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
     "shows in the conversation, another file as an attachment, and the person can share either. "
-    "A remote image in markdown is not loaded, and HTML shows as literal text."
+    "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
+    "HTML shows as literal text."
 )
 
 
@@ -131,6 +132,14 @@ def _check_text(value: Any, field: str) -> str:
     return value
 
 
+def _check_line(value: Any, field: str) -> str:
+    """Text for people that the host may print: no control character."""
+    _check_text(value, field)
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in value):
+        raise ValueError(f"{field} holds a control character")
+    return value
+
+
 def decode_from_bridge(line: bytes) -> dict[str, Any]:
     """One message the bridge sent, checked; raises DecodeError."""
     if len(line) > MAX_MESSAGE_BYTES:
@@ -139,6 +148,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         message = json.loads(line)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise DecodeError("bad_message", f"not JSON: {e}") from None
+    except RecursionError:
+        raise DecodeError("bad_message", "nested too deep") from None
     if not isinstance(message, dict):
         raise DecodeError("bad_message", "not a JSON object")
     raw_id = message.get("id") if isinstance(message.get("id"), str) else None
@@ -168,10 +179,31 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("of"), "of")
         elif kind == "error":
             _check_text(message.get("code"), "code")
-            _check_text(message.get("message"), "message")
+            _check_line(message.get("message"), "message")
+            if message.get("of") is not None:
+                _check_id(message.get("of"), "of")
     except ValueError as e:
         raise DecodeError("bad_message", str(e), raw_id) from None
     return message
+
+
+def unsendable(message: dict[str, Any]) -> str | None:
+    """Why the bridge would refuse this message of the plugin's, or None.
+
+    The bridge's decoder refuses a conversation or id that breaks the id
+    rule and a line over 1 MiB; such a message, kept in the outbox, would
+    be sent again after every hello and refused every time.
+    """
+    try:
+        _check_id(message.get("id"), "id")
+        for field in ("conversation", "reply_to"):
+            if message.get(field) is not None:
+                _check_id(message.get(field), field)
+    except ValueError as e:
+        return str(e)
+    if len(encode_line(message)) > MAX_MESSAGE_BYTES + 1:
+        return "larger than 1 MiB"
+    return None
 
 
 def token_matches(presented: Any, expected: str) -> bool:

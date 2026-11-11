@@ -38,6 +38,10 @@ class FromTheBridge(unittest.TestCase):
             (b'{"v":1,"id":"m1","type":"message.in","conversation":"c\\u0000","person":"p","text":"t"}', "bad_message"),
             (b"[1,2]", "bad_message"),
             (b" " * (protocol.MAX_MESSAGE_BYTES + 1), "bad_message"),
+            (b"[" * 100_000, "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"red \\u001b[31m"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"two\\nlines"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","of":"","message":"x"}', "bad_message"),
         ]
         for line, code in cases:
             with self.subTest(line[:40]):
@@ -125,6 +129,21 @@ class ToTheBridge(unittest.TestCase):
         self.assertEqual(json.loads(line)["text"], "two\nlines")
 
 
+class Unsendable(unittest.TestCase):
+    def test_what_the_bridge_would_refuse_is_named(self):
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "fine", "m0")))
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "x" * (protocol.MAX_MESSAGE_BYTES - 200))))
+        for message in (
+            protocol.message_out("", "hi"),
+            protocol.message_out("c" * 129, "hi"),
+            protocol.message_out("c-1\u0085", "hi"),
+            protocol.message_out("c-1", "hi", "m\u0000"),
+            protocol.message_out("c-1", "x" * protocol.MAX_MESSAGE_BYTES),
+        ):
+            with self.subTest(message["conversation"][:8]):
+                self.assertIsNotNone(protocol.unsendable(message))
+
+
 class Token(unittest.TestCase):
     def test_only_the_agents_token_matches(self):
         self.assertTrue(protocol.token_matches("t0ken", "t0ken"))
@@ -146,6 +165,10 @@ class Hint(unittest.TestCase):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
         self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
+
+    def test_it_says_what_an_image_shows_as_the_protocol_does(self):
+        # docs/protocol.md, "What the agent says is markdown", and the app's spec
+        self.assertIn("an image shows as its alt text, a link to it", protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
         self.assertLess(len(protocol.PLATFORM_HINT), 750)
