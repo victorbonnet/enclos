@@ -123,18 +123,18 @@ class QuestionProtocol(unittest.TestCase):
         for char in "aéß中😀 -":
             self.assertFalse(questions.is_hidden(char), char)
         value = {"id": "q", "text": "Which?", "choices": ["Allow", "Deny"], "multiple": False}
-        for changed in ({**value, "choices": ["Deny‮wolla", "Allow"]},
-                        {**value, "choices": ["Allow​", "Allow"]},
+        for changed in ({**value, "choices": ["Deny\u202Ewolla", "Allow"]},
+                        {**value, "choices": ["Allow\u200B", "Allow"]},
                         {**value, "choices": ["Allow", "Allow"]},
                         {**value, "choices": ["Two\nlines"]},
                         {**value, "choices": ["Tab\there"]},
-                        {**value, "text": "Which⁦?"}, {**value, "text": "Which\r\n?"},
+                        {**value, "text": "Which\u2066?"}, {**value, "text": "Which\r\n?"},
                         {**value, "text": "Which\t?"}):
             with self.subTest(changed=str(changed)), self.assertRaises(ValueError):
                 questions.validate_definition(changed)
         self.assertEqual(questions.validate_definition({**value, "text": "Which?\nPick one."})["text"],
                          "Which?\nPick one.")
-        for text in ("ok‍", "a\tb", "a\r\nb", "­"):
+        for text in ("ok\u200D", "a\tb", "a\r\nb", "\u00AD"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 questions.validate_answer({"kind": "text", "text": text}, value)
 
@@ -412,7 +412,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1. One", self.sent_text())
 
     async def test_duplicate_or_hidden_labels_never_become_a_card(self):
-        for choices in (["Allow", "Allow"], ["Allow‮", "Deny"]):
+        for choices in (["Allow", "Allow"], ["Allow\u202E", "Deny"]):
             native_id = str(uuid.uuid4())
             self.native.register(native_id, self.scope, "Which?", choices)
             self.assertTrue(await self.manager.ask("c", "Which?", choices, native_id, self.scope))
