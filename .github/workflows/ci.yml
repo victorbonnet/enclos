@@ -413,9 +413,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --locked -p enclos-protocol --target aarch64-linux-android
 
+  # The Hermes channel plugin's protocol and outbox, against the crate's
+  # fixtures; standard library only, no Hermes needed
+  hermes-plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -I -m unittest discover -s channels/hermes/tests -v
+
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
