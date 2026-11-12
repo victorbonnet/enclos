@@ -831,7 +831,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - `docs/protocol.md`, the protocol between the app, the bridge and a runtime's channel plugin, and `enclos-protocol`, a crate of its own in a Cargo workspace, without I/O, which the bridge and the app (`victorbonnet/enclos-app`) share;
    - the Hermes channel plugin, carried by enclos's binary, and `runtime configure <sandbox>/<agent> --channel app`, which writes it into the sandbox home and grants the agent its socket token ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md));
    - the bridge as a service of the install, served through `tailscale serve`; conversations stored with their owner and a person on every message from the first version ([ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md), proposed), with the host's user the only person;
-   - pairing: `app pair` (a QR code and a confirmation at the terminal), `app devices`, `app unpair`, audited; Noise with the keys from pairing, and Tailscale's identity of the caller checked;
+   - pairing: `app pair` (a QR code and a confirmation at the terminal), `app devices`, `app unpair`, audited; the first device paired names the host's person, whose each agent's Home is, and `app host` shows or changes it; Noise with the keys from pairing, and Tailscale's identity of the caller checked;
    - `app status` (devices, connected now, last seen) and `app log` (connections and refusals);
    - push through FCM, from the host, the preview encrypted for the device;
    - the Android app, in its own repository: hosts, agents, conversations, notifications.
