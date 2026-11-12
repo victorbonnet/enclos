@@ -77,17 +77,17 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 
 | `type` | From | Fields |
 | --- | --- | --- |
-| `auth` | device | `device`, `sig` (base64url DER signature of the handshake hash) |
+| `auth` | device | `device`, `sig` (base64url DER signature of `enclos auth v1` ‖ the handshake hash) |
 | `authenticated` | bridge | `person` |
-| `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of the handshake hash, keyed with `code`), `push` (`{"kind":"fcm","token":…}`)? |
+| `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of `enclos pair proof v1` ‖ the handshake hash, keyed with `code`), `sig` (base64url DER signature, by `device_key`, of `enclos pair v1` ‖ the handshake hash), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
-| `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `declined` |
+| `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `bad_signature`, `declined` |
 
-The bridge checks `proof`, then shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer. The device chose its `name`, so the bridge keeps it plain before the terminal shows it: without the characters `enclos-protocol`'s `visible` rule calls hidden (controls, bidirectional and invisible marks), white space made single spaces, at most 64 characters. While the person decides, the device's pings count as hearing from it.
+The bridge checks `proof`, and `sig` with `device_key`, so the device holds the key it asks to pair; then it shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer. The device chose its `name`, so the bridge keeps it plain before the terminal shows it: without the characters `enclos-protocol`'s `visible` rule calls hidden (controls, bidirectional and invisible marks), white space made single spaces, at most 64 characters. While the person decides, the device's pings count as hearing from it.
 
 ### Handshake
 
-`Noise_IK_25519_ChaChaPoly_SHA256`, the device as initiator, the bridge's static key known from pairing; the handshake messages carry no payload. The device's first message once it is done is `auth` (or `pair.request` while pairing): its id on this host and an ECDSA P-256 signature, by the device key, DER as the phone's keystore gives it, of the **handshake hash**, which binds it to this session's ephemeral keys. The bridge then:
+`Noise_IK_25519_ChaChaPoly_SHA256`, the device as initiator, the bridge's static key known from pairing, with the prologue `enclos/device/1` on both sides, so a handshake of another version never yields this one's hash; the handshake messages carry no payload, and one that does is refused. The device's first message once it is done is `auth` (or `pair.request` while pairing): its id on this host and an ECDSA P-256 signature, by the device key, DER as the phone's keystore gives it, of a fixed label and the **handshake hash**, which binds it to this session's ephemeral keys. The bridge then:
 
 1. knows the device by its static key, or refuses it (unless pairing);
 2. checks `sig` with the device key it stored, and answers `authenticated` with the person the device speaks for;
@@ -96,7 +96,7 @@ The bridge checks `proof`, then shows at the terminal the device's name, its tai
 
 Any login of the tailnet gets as far as the first message, so the bridge keeps callers that are not authenticated yet few and short: at most 16 at once (one more is closed at once), 30 s from connecting to its first message, and no WebSocket message or frame larger than one Noise message (65,535 bytes). It logs at most 10 refusals per caller address and minute; past them, that address's connections are closed that minute without a log line or a question to Tailscale. The log keeps its newest 10,000 lines. Once authenticated, a session with nothing from the device, not even a ping, for 75 s ends: the enclos app pings every 30 s. When a device connects again while its old connection is still open, the new connection is the one messages go to.
 
-The hardware key never signs anything but handshake hashes, the pairing handshake's included. `pair.request` itself carries no signature: it proves the one-time code (`proof`), and the device key it names is the one whose signature the same handshake already carried.
+The hardware key signs two things only, each a fixed label then the handshake hash: `enclos auth v1` for `auth`, `enclos pair v1` for `pair.request`. A signature for one is never one for the other, nor for anything outside this protocol.
 
 ### Messages after the handshake
 
@@ -119,13 +119,15 @@ The hardware key never signs anything but handshake hashes, the pairing handshak
 
 ### Notifications
 
+Not built yet: the bridge sends no push. `enclos-protocol`'s `preview` seals and opens a preview as below; nothing in the bridge calls it, and no FCM client exists.
+
 When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is
 
 ```json
 {"v":1,"host":"<host name>","seq":1234,"preview":"<base64url: nonce ‖ ciphertext>"}
 ```
 
-`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`. Google sees the host's name, a number and ciphertext. The app decrypts it, shows the notification, and fetches the message with `sync` over the tailnet when it can.
+`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`, padded to 2,048 bytes (the byte `0x80`, then zeros) so its length does not tell the text's. Its associated data are `v`, `host` and `seq`, so a preview opens only with the ones it was sealed with: one kept by the push service cannot come back under another `seq`. The app drops a `seq` it has already shown. Google sees the host's name, a number and ciphertext of one size. The app decrypts it, shows the notification, and fetches the message with `sync` over the tailnet when it can.
 
 ## Capabilities
 
