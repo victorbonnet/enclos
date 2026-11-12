@@ -197,6 +197,13 @@ pub(super) fn unmovable(home: &Path, workspaces: &[PathBuf], placed: &Placed) ->
             .chain(&placed.in_workspace)
             .cloned()
             .collect(),
+        // Validation refuses, on bubblewrap, a read-only path or enclos's
+        // program inside a folder the sandbox writes, and a grant holding a
+        // protected folder (ADR 0058), at each compile too: none to keep.
+        read_only: Vec::new(),
+        protected: Vec::new(),
+        program: Vec::new(),
+        links: Vec::new(),
     }
     .unmovable()
     .into_iter()
