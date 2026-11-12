@@ -3137,6 +3137,42 @@ fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
     assert!(done(configure(&users, Confirm::Yes).unwrap()).reachable);
 }
 
+/// The app channel gives the plugin the public key the bridge signs
+/// runtime-approval decisions with (ADR 0060): made by the first run that
+/// needs it, the user's alone, kept after, and named, not made, by a dry
+/// run. (A whole `runtime configure --channel app` here would need a socket
+/// path shorter than a test's folder gives on macOS.)
+#[test]
+fn the_app_channel_gives_the_plugin_the_bridges_approval_key() {
+    let (_dir, engine) = super::engine_with(Vec::new());
+    let key = engine.app_approval_key_path();
+    let named = engine.app_approval_public_key(Confirm::DryRun).unwrap();
+    assert!(named.contains("made when this runs"), "{named}");
+    assert!(!key.exists());
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    let public = engine.app_approval_public_key(Confirm::Yes).unwrap();
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        public,
+        crate::bridge::keys::approval_key(&key)
+            .unwrap()
+            .public_text()
+    );
+    // Again, and in a dry run: the same key, never a new one the plugins
+    // would not know.
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::Yes).unwrap(),
+        public
+    );
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::DryRun).unwrap(),
+        public
+    );
+}
+
 /// A token granted only by the pending policy waits for it: nothing
 /// runs before `policy apply`.
 #[test]

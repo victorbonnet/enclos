@@ -173,6 +173,10 @@ struct Hub {
     /// Refusals logged per caller address in the current minute.
     refusals: Mutex<HashMap<String, (i64, u32)>>,
     silence: Duration,
+    /// The key the bridge signs each runtime-approval decision with (ADR
+    /// 0060, proposed), which the plugin checks; without it the bridge
+    /// passes on no runtime-approval decision.
+    approval_key: Option<enclos_protocol::decision::DecisionKey>,
 }
 
 /// Where a connected device's messages go: the person it speaks for, its
@@ -249,6 +253,15 @@ impl Hub {
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
             silence,
+            approval_key: None,
+        }
+    }
+
+    /// The hub, signing runtime-approval decisions with `key`.
+    fn with_approval_key(self, key: enclos_protocol::decision::DecisionKey) -> Hub {
+        Hub {
+            approval_key: Some(key),
+            ..self
         }
     }
 
@@ -872,8 +885,9 @@ impl Hub {
             let body = FromBridge::MessageIn {
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
-                // Only the host's person decides runtime approvals: the
-                // plugin answers anyone else's approval commands itself.
+                // Whether the person is the host's. Not signed, so it grants
+                // nothing: runtime approvals are decided with the app's
+                // buttons, whose decisions the bridge signs (ADR 0060).
                 host: Some(host.as_deref() == Some(message.person.as_str())),
                 person: Person::new(message.person).map_err(|e| e.to_string())?,
                 text: message.text,
@@ -961,6 +975,7 @@ pub fn serve(
     store_path: std::path::PathBuf,
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
+    approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -970,16 +985,19 @@ pub fn serve(
             "enclos app: the transport does not say whose host this is: each agent's Home goes to the first person who connects, until it does"
         );
     }
-    let hub = Arc::new(Hub::new(
-        transport,
-        Arc::new(move |address: &str| transport.whois(address)),
-        store_path,
-        layout,
-        bridge_private,
-        agents,
-        host,
-        SILENCE,
-    ));
+    let hub = Arc::new(
+        Hub::new(
+            transport,
+            Arc::new(move |address: &str| transport.whois(address)),
+            store_path,
+            layout,
+            bridge_private,
+            agents,
+            host,
+            SILENCE,
+        )
+        .with_approval_key(approval_key),
+    );
     serve_on(listener, hub, RETRY);
     Ok(())
 }
@@ -2382,14 +2400,17 @@ fn send(
     if owner != person {
         return Ok(None);
     }
-    // A runtime reads `/approve` and `/deny` as its own approval commands,
-    // from whoever it is told speaks; the bridge passes them on from the
-    // host's person only (ADR 0053), as it does the app's approval controls.
-    if hub.refuses_typed_approval(person, &text) {
+    // A runtime reads `/approve`, `/deny`, `/yolo` and `/approvals` as its
+    // own approval commands, from whoever it is told speaks; and a message
+    // carries no proof of who sent it that the plugin could check. So no
+    // one's is passed on: a runtime approval is decided with the app's
+    // buttons, whose decision the bridge signs (ADR 0060).
+    if questions::typed_approval(&text) {
         return Ok(Some(ToDevice::Error(ErrorBody {
             of: Some(id),
             code: ErrorCode::NotAllowed,
-            message: "Only the host's person can answer a runtime approval.".into(),
+            message: "Runtime approvals are decided with the app's buttons, not typed commands."
+                .into(),
         })));
     }
     if group_of(store, conversation.as_str()).is_some() {

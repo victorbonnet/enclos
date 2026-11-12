@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::output;
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
-use enclos::bridge::keys::bridge_keypair;
+use enclos::bridge::keys::{approval_key, bridge_keypair};
 use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
@@ -109,6 +109,11 @@ fn open_store(engine: &Engine) -> Result<Store> {
 fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
+    let approvals = approval_key(&engine.app_approval_key_path()).map_err(|e| {
+        failed(format!(
+            "cannot read or make the bridge's key for runtime approvals: {e}"
+        ))
+    })?;
     let mut agents = Vec::new();
     for (sandbox, agent, runtime) in engine.app_agents()? {
         match engine.app_endpoint(&sandbox, &agent) {
@@ -135,6 +140,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         engine.app_store_path(),
         engine.app_layout(),
         key.private.to_vec(),
+        approvals,
         agents,
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
