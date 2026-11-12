@@ -3461,6 +3461,8 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
         "{plan:?}"
     );
     nothing_ran(&lab);
+    // Nor makes the bridge's key for runtime approvals (ADR 0060): it names it.
+    assert!(!lab.engine.app_approval_key_path().exists());
 
     let Planned::Done(configured) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
         panic!("not a dry run");
@@ -3475,15 +3477,25 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
     assert_eq!(
         configured.settings,
-        ["MOBILE_APP_SOCKET", "MOBILE_APP_ALLOW_ALL"]
+        [
+            "MOBILE_APP_SOCKET",
+            "MOBILE_APP_ALLOW_ALL",
+            "MOBILE_APP_HOME_CHANNEL",
+            "agent.clarify_timeout",
+            "MOBILE_APP_BRIDGE_KEY"
+        ]
     );
+    // The public key of the bridge's key for runtime approvals, made now.
+    let public = crate::bridge::keys::approval_key(&lab.engine.app_approval_key_path())
+        .unwrap()
+        .public_text();
     assert_eq!(
         std::fs::read_to_string(lab.home.join(".hermes/plugins/enclos/plugin.yaml")).unwrap(),
         include_str!("../../../channels/hermes/enclos/plugin.yaml")
     );
     assert!(
         calls().ends_with(&format!(
-            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n",
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n-p default config set agent.clarify_timeout 3600\n-p default config set MOBILE_APP_BRIDGE_KEY {public}\n",
             socket.display()
         )),
         "{}",
