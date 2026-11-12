@@ -9,7 +9,7 @@ import hmac
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -32,8 +32,10 @@ PLATFORM_HINT = (
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
     "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
     "on a phone screen, and keep tables narrow. A single newline is a line break. "
-    "Images are not shown (an image shows as its alt text, a link to it) and HTML shows as "
-    "literal text."
+    "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
+    "shows in the conversation, another file as an attachment, and the person can share either. "
+    "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
+    "HTML shows as literal text."
 )
 
 
@@ -158,13 +160,52 @@ def hello(runtime: str, agent: str) -> dict[str, Any]:
     return _message("hello", runtime=runtime, agent=agent, capabilities=list(CAPABILITIES))
 
 
-def message_out(conversation: str, text: str, reply_to: str | None = None) -> dict[str, Any]:
-    """A reply when it answers a message, `notify` otherwise (a cron job, background work)."""
+def message_out(conversation: str, text: str, reply_to: str | None = None,
+                attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A reply when it answers a message, `notify` otherwise (a cron job, background work);
+    with the files it carries, each already in the channel's media folder (`attachment`)."""
     fields: dict[str, Any] = {"conversation": conversation, "text": text,
                               "kind": "reply" if reply_to else "notify"}
     if reply_to:
         fields["reply_to"] = reply_to
+    if attachments:
+        fields["attachments"] = attachments
     return _message("message.out", **fields)
+
+
+def attachment(file: str, mime: str, name: str, size: int) -> dict[str, Any]:
+    """A file of the media folder, by its name there, for message_out."""
+    return {"file": file, "mime": mime, "name": name, "size": size}
+
+
+# A markdown image whose source is not a web address: a file the agent made,
+# by its path (`![Unicorn](cache/generated/images/x.png)`).
+LOCAL_IMAGE = re.compile(r"!\[([^\]]*)\]\((?!https?://)([^)\s]+)\)")
+
+
+def local_images(text: str, sendable: Callable[[str], bool] = lambda path: True) -> tuple[str, list[tuple[str, str]]]:
+    """The text without the local markdown images whose path `sendable` takes,
+    and each taken one's (alt, path). An image it does not take stays in the
+    text, so that nothing the agent wrote goes missing without a sign."""
+    found: list[tuple[str, str]] = []
+
+    def take(m: re.Match) -> str:
+        if not sendable(m.group(2)):
+            return m.group(0)
+        found.append((m.group(1), m.group(2)))
+        return ""
+
+    rest = LOCAL_IMAGE.sub(take, text)
+    return re.sub(r"\n{3,}", "\n\n", rest).strip(), found
+
+
+def with_files_not_sent(text: str, names: list[str]) -> str:
+    """The text, with a line for each file the agent sent that could not be
+    passed on, so the person knows one is missing."""
+    if not names:
+        return text
+    note = "\n".join(f"(A file could not be sent: {name})" for name in names)
+    return f"{text}\n\n{note}" if text else note
 
 
 def typing(conversation: str, on: bool) -> dict[str, Any]:

@@ -495,6 +495,7 @@ fn chat(
             kind: "message".to_owned(),
             time: now(),
             seq: 0,
+            attachments: Vec::new(),
         };
         store
             .add_pieces(
@@ -606,6 +607,7 @@ fn read_agent(
                         kind: kind.to_owned(),
                         time: now(),
                         seq: 0,
+                        attachments: Vec::new(),
                     },
                 )?,
                 conversation.as_str(),
@@ -683,6 +685,7 @@ mod tests {
                         text: (*text).into(),
                         kind: *kind,
                         reply_to: None,
+                        attachments: vec![],
                     },
                 );
             }

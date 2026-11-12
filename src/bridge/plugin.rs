@@ -344,6 +344,7 @@ mod tests {
                             text: format!("echo: {text}"),
                             kind: OutKind::Reply,
                             reply_to: Some(message.id),
+                            attachments: Vec::new(),
                         },
                     );
                 }
@@ -375,6 +376,7 @@ mod tests {
             text,
             kind,
             reply_to,
+            ..
         } = reply.body
         else {
             panic!("not a reply: {:?}", reply.body);
@@ -466,6 +468,7 @@ mod tests {
             text: text.into(),
             kind: OutKind::Reply,
             reply_to: None,
+            attachments: vec![],
         };
         encode_line(&Envelope::new(MessageId::new(id).unwrap(), body))
     }

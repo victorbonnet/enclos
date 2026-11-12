@@ -15,21 +15,27 @@
 //! pending until the plugin acknowledges it: while the agent cannot be
 //! reached, the bridge tries again, with the same id, until it can.
 
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use enclos_protocol::device::{
-    AgentInfo, ConversationInfo, ConversationMessage, FromDevice, ToDevice, decode_from_device,
-    split_text,
+    ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
+    ToDevice, decode_from_device, split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
-    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutKind, ToolStep,
+    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind, ToolStep,
 };
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
@@ -40,10 +46,11 @@ use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
 use super::store::{
     Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
-    conversation_title, now,
+    StoredAttachment, conversation_title, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
+use crate::runtime::home::{open_folder, open_home};
 
 /// How long a pairing waits for the terminal's answer.
 const PAIRING_WAIT: Duration = Duration::from_secs(120);
@@ -140,6 +147,12 @@ impl Hub {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
 
+    /// Where the bridge keeps the files of messages, by attachment id:
+    /// beside its database.
+    fn media(&self) -> std::path::PathBuf {
+        self.store_path.with_file_name("app-media")
+    }
+
     /// Sends `message` to every connected device of `person`.
     fn deliver(&self, person: &str, message: ToDevice) {
         let devices = self.devices.lock().expect("not poisoned");
@@ -204,6 +217,8 @@ impl Hub {
         drop(plugins);
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
+        // The plugin puts the files the agent sends in the sandbox home.
+        let home = sandbox_home(&endpoint.socket);
         std::thread::spawn(move || {
             let store = match hub.store() {
                 Ok(store) => store,
@@ -223,6 +238,7 @@ impl Hub {
                         conversation,
                         text,
                         kind,
+                        attachments,
                         ..
                     } => {
                         let kind = match kind {
@@ -237,9 +253,11 @@ impl Hub {
                             kind: kind.to_owned(),
                             time: now(),
                             seq: 0,
+                            attachments: Vec::new(),
                         };
                         // Unacknowledged, the plugin sends it again
-                        match hub.store_agent_text(&store, &message.id, whole) {
+                        match hub.store_agent_text(&store, &message.id, whole, &attachments, &home)
+                        {
                             Ok(()) => {
                                 let _ = acks.ack(&message.id);
                             }
@@ -304,8 +322,23 @@ impl Hub {
         store: &Store,
         id: &MessageId,
         whole: ConversationMessage,
+        attachments: &[OutAttachment],
+        home: &Path,
     ) -> Result<(), String> {
-        let pieces = pieces(id, &whole)?;
+        // Measured with its files' details, which the first piece carries
+        let measured = ConversationMessage {
+            attachments: attachments
+                .iter()
+                .map(|a| Attachment {
+                    id: "f".repeat(36),
+                    mime: a.mime.clone(),
+                    name: a.name.clone(),
+                    size: a.size,
+                })
+                .collect(),
+            ..whole.clone()
+        };
+        let pieces = pieces(id, &measured)?;
         let conversation = whole.conversation.as_str();
         let Some(seqs) = store
             .add_pieces(&pieces, conversation, &From::Agent, &whole.kind)
@@ -313,6 +346,17 @@ impl Hub {
         else {
             return Ok(());
         };
+        // A message stored once: its files taken once too, with its first
+        // piece, whose id is the plugin's
+        let mut files = take_attachments(
+            store,
+            home,
+            &self.media(),
+            &whole.agent,
+            conversation,
+            id.as_str(),
+            attachments,
+        );
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
                 self.deliver(
@@ -320,6 +364,7 @@ impl Hub {
                     ToDevice::Message(ConversationMessage {
                         text,
                         seq,
+                        attachments: std::mem::take(&mut files),
                         ..whole.clone()
                     }),
                 );
@@ -1047,6 +1092,12 @@ fn run_session(
                         .map(|(s, a, _)| format!("{s}/{a}"))
                         .unwrap_or_default();
                     last = m.seq;
+                    let attachments = store
+                        .attachments_of(&m.id)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(attachment_info)
+                        .collect();
                     link.send(ToDevice::Message(ConversationMessage {
                         conversation: ConversationId::new(m.conversation)
                             .map_err(|e| e.to_string())?,
@@ -1060,9 +1111,13 @@ fn run_session(
                         // When it was said, not when it is synced.
                         time: m.at,
                         seq: m.seq,
+                        attachments,
                     }))?;
                 }
                 link.send(ToDevice::Synced { seq: last })?;
+            }
+            FromDevice::AttachmentGet { attachment, offset } => {
+                send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
             }
             FromDevice::PushTokenUpdate(push) => {
                 store
@@ -1071,6 +1126,260 @@ fn run_session(
             }
             _ => {}
         }
+    }
+}
+
+/// The largest file the bridge takes from a plugin.
+const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+/// The most files the bridge takes from one message.
+const MAX_ATTACHMENTS: usize = 10;
+
+/// Where the plugin puts the files the agent sends, under the sandbox
+/// home: `.enclos-app/media`, beside its socket
+/// (`Layout::agent_app_socket`).
+const INBOX: [&str; 2] = [".enclos-app", "media"];
+
+/// The sandbox home of an agent's app socket, which is
+/// `<sandbox home>/.enclos-app/<agent>.sock`.
+fn sandbox_home(socket: &Path) -> PathBuf {
+    socket
+        .ancestors()
+        .nth(2)
+        .map(Path::to_owned)
+        .unwrap_or_default()
+}
+
+/// The plugin's `media` folder, opened from the sandbox home one folder at
+/// a time without following a link at any of them: the sandbox may put a
+/// link to a host folder in place of `.enclos-app` or `media`, and the
+/// bridge, which runs outside the sandbox, must not read or remove what is
+/// there.
+fn open_inbox(home: &Path) -> Result<OwnedFd, String> {
+    let mut dir = open_home(home).map_err(|e| e.to_string())?;
+    let mut shown = "~".to_owned();
+    for name in INBOX {
+        shown = format!("{shown}/{name}");
+        dir = open_folder(&dir, name, &shown)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{shown}: no such folder"))?;
+    }
+    Ok(dir)
+}
+
+/// The files of an agent's message, once it is stored: each taken from the
+/// plugin's `media` folder under `home` ([`take_attachment`]) and recorded
+/// with the message, at most [`MAX_ATTACHMENTS`]. One that cannot be is
+/// left out, said on stderr, and leaves no file in `media`.
+fn take_attachments(
+    store: &Store,
+    home: &Path,
+    media: &Path,
+    agent: &str,
+    conversation: &str,
+    message: &str,
+    attachments: &[OutAttachment],
+) -> Vec<Attachment> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        eprintln!(
+            "enclos app: {agent}: a message carries {} files, the first {MAX_ATTACHMENTS} are taken",
+            attachments.len()
+        );
+    }
+    attachments
+        .iter()
+        .take(MAX_ATTACHMENTS)
+        .filter_map(|a| {
+            let taken = take_attachment(home, media, conversation, a)
+                .inspect_err(|e| eprintln!("enclos app: {agent}: an attachment is left out: {e}"))
+                .ok()?;
+            if let Err(e) = store.add_attachment(&taken, message) {
+                eprintln!("enclos app: {agent}: an attachment is left out: cannot record it: {e}");
+                let _ = std::fs::remove_file(media.join(&taken.id));
+                return None;
+            }
+            Some(attachment_info(taken))
+        })
+        .collect()
+}
+
+/// Copies `source` into the new file `to`, and its size: no more than `max`
+/// bytes are copied, and a source found longer leaves no file and is an
+/// error, as is any failure.
+fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)
+        .map_err(|e| e.to_string())?;
+    let copied = std::io::copy(&mut source.take(max + 1), &mut target);
+    drop(target);
+    match copied {
+        Ok(size) if size <= max => Ok(size),
+        Ok(_) => {
+            let _ = std::fs::remove_file(to);
+            Err(format!("longer than {max} bytes"))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(to);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Moves a file the agent sends from the plugin's `media` folder (in the
+/// sandbox `home`) into the bridge's own, under a new id. The plugin runs
+/// in the sandbox: the folder is opened without following a link
+/// ([`open_inbox`]); in it, only a plain file name is taken, opened without
+/// following a link and without waiting (a named pipe would block), and
+/// only a regular file with no other link to it, of at most
+/// [`MAX_ATTACHMENT_BYTES`], copied no further than that limit even while
+/// it grows. The plugin's copy is then removed through the same folder.
+fn take_attachment(
+    home: &Path,
+    media: &Path,
+    conversation: &str,
+    a: &OutAttachment,
+) -> Result<StoredAttachment, String> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use std::os::unix::fs::DirBuilderExt;
+    let plain = !a.file.is_empty()
+        && a.file.len() <= 200
+        && !a.file.starts_with('.')
+        && a.file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !plain {
+        return Err(format!(
+            "{:?} is not a file name of the media folder",
+            a.file
+        ));
+    }
+    let inbox = open_inbox(home)?;
+    let from = format!("~/{}/{}", INBOX.join("/"), a.file);
+    let fd = rustix::fs::openat(
+        &inbox,
+        a.file.as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{from}: {e}"))?;
+    let opened = rustix::fs::fstat(&fd).map_err(|e| format!("{from}: {e}"))?;
+    if !rustix::fs::FileType::from_raw_mode(opened.st_mode).is_file() {
+        return Err(format!("{from} is not a file"));
+    }
+    // A second link may be one to a host file the sandbox could not read.
+    if opened.st_nlink != 1 {
+        return Err(format!("{from} has other links to it"));
+    }
+    if opened.st_size < 0 || opened.st_size as u64 > MAX_ATTACHMENT_BYTES {
+        return Err(format!("{from} is larger than 25 MiB"));
+    }
+    let source = std::fs::File::from(fd);
+    let id = new_id().map_err(|e| e.to_string())?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(media)
+        .map_err(|e| e.to_string())?;
+    // The sandbox may write on while the bridge reads.
+    let size = copy_at_most(source, &media.join(&id), MAX_ATTACHMENT_BYTES)
+        .map_err(|e| format!("{from}: {e}"))?;
+    // The plugin's copy, through the same folder, and only while its name
+    // is still the file that was read.
+    if let Ok(now) = rustix::fs::statat(&inbox, a.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+        && (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino)
+    {
+        let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
+    }
+    let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
+        !t.is_empty()
+            && !s.is_empty()
+            && a.mime
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
+    });
+    // Shown and shared under this name: without the characters that would
+    // make it read as another (`U+202E` before `fdp.exe`).
+    let name = enclos_protocol::visible::stripped(
+        a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
+        false,
+    );
+    let name = name.trim();
+    Ok(StoredAttachment {
+        id,
+        conversation: conversation.to_owned(),
+        mime: if typed {
+            a.mime.to_ascii_lowercase()
+        } else {
+            "application/octet-stream".to_owned()
+        },
+        name: if name.is_empty() {
+            a.file.clone()
+        } else {
+            name.chars().take(120).collect()
+        },
+        size: size as i64,
+    })
+}
+
+/// The bytes of an attachment from `offset`, at most [`ATTACHMENT_CHUNK`],
+/// for the owner of its conversation; anyone else, or an unknown id, gets
+/// an `error` and nothing of it.
+fn send_attachment(
+    hub: &Arc<Hub>,
+    store: &Store,
+    link: &mut Link,
+    person: &str,
+    id: &str,
+    offset: u64,
+    asked: MessageId,
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let refuse = |link: &mut Link, why: &str| {
+        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+            of: Some(asked.clone()),
+            code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+            message: why.to_owned(),
+        }))
+    };
+    let Some(a) = store.attachment(id).map_err(|e| e.to_string())? else {
+        return refuse(link, "no such attachment");
+    };
+    if store
+        .owner(&a.conversation)
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        != Some(person)
+    {
+        return refuse(link, "no such attachment");
+    }
+    // The id is the bridge's own (a UUID), never a path from a device.
+    let Ok(mut file) = std::fs::File::open(hub.media().join(&a.id)) else {
+        return refuse(link, "the attachment's file is gone");
+    };
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut chunk = vec![0; ATTACHMENT_CHUNK.min(size.saturating_sub(offset) as usize)];
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    file.read_exact(&mut chunk).map_err(|e| e.to_string())?;
+    link.send(ToDevice::AttachmentData {
+        attachment: a.id,
+        offset,
+        size,
+        data: encode(&chunk),
+    })
+}
+
+/// A file as a device sees it.
+fn attachment_info(a: StoredAttachment) -> Attachment {
+    Attachment {
+        id: a.id,
+        mime: a.mime,
+        name: a.name,
+        size: a.size.max(0) as u64,
     }
 }
 
@@ -1163,6 +1472,7 @@ fn send(
         kind: "message".to_owned(),
         time: now(),
         seq: 0,
+        attachments: Vec::new(),
     };
     // The app refuses one this long before it is sent (`docs/protocol.md`,
     // Framing): its echo would not fit in one message
@@ -1204,7 +1514,7 @@ fn send(
 }
 
 #[cfg(test)]
-mod tests {
+mod connection_end_tests {
     use super::*;
     use enclos_protocol::device::decode_to_device;
     use enclos_protocol::noise::{Initiator, generate_keypair};
@@ -1460,6 +1770,7 @@ mod tests {
                                     text: "é".repeat(150_000),
                                     kind: OutKind::Reply,
                                     reply_to: None,
+                                    attachments: vec![],
                                 });
                             }
                         }

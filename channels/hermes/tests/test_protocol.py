@@ -129,8 +129,9 @@ class Hint(unittest.TestCase):
             with self.subTest(element):
                 self.assertIn(element, protocol.PLATFORM_HINT)
 
-    def test_it_says_images_and_html_are_not_drawn(self):
-        self.assertIn("Images are not shown", protocol.PLATFORM_HINT)
+    def test_it_says_how_files_go_and_what_is_not_drawn(self):
+        self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
+        self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
         self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
 
     def test_it_says_what_an_image_shows_as_the_protocol_does(self):
@@ -138,7 +139,40 @@ class Hint(unittest.TestCase):
         self.assertIn("an image shows as its alt text, a link to it", protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
-        self.assertLess(len(protocol.PLATFORM_HINT), 600)
+        self.assertLess(len(protocol.PLATFORM_HINT), 750)
+
+
+class Files(unittest.TestCase):
+    def test_a_reply_with_an_image_has_the_fixtures_shape(self):
+        expected = json.loads(fixture("from_plugin_message_out_image.json"))
+        a = expected["attachments"][0]
+        message = protocol.message_out(
+            "c-42", expected["text"], expected["reply_to"],
+            [protocol.attachment(a["file"], a["mime"], a["name"], a["size"])])
+        self.assertEqual({k: v for k, v in message.items() if k != "id"},
+                         {k: v for k, v in expected.items() if k != "id"})
+
+    def test_local_markdown_images_are_taken_out_and_web_ones_stay(self):
+        text = ("Here's your unicorn on the moon:\n\n"
+                "![Unicorn on the moon](cache/generated/images/krea_1.png)\n\n"
+                "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
+        rest, found = protocol.local_images(text)
+        self.assertEqual(found, [("Unicorn on the moon", "cache/generated/images/krea_1.png")])
+        self.assertEqual(rest, "Here's your unicorn on the moon:\n\n"
+                               "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
+
+    def test_a_local_image_that_cannot_be_sent_stays_in_the_text(self):
+        text = "Two:\n\n![a](images/a.png)\n\n![b](/etc/b.png)"
+        rest, found = protocol.local_images(text, lambda path: path == "images/a.png")
+        self.assertEqual(found, [("a", "images/a.png")])
+        self.assertEqual(rest, "Two:\n\n![b](/etc/b.png)")
+
+    def test_a_file_that_could_not_be_sent_is_said_in_the_text(self):
+        self.assertEqual(protocol.with_files_not_sent("Here", []), "Here")
+        self.assertEqual(protocol.with_files_not_sent("Here", ["a.pdf"]),
+                         "Here\n\n(A file could not be sent: a.pdf)")
+        self.assertEqual(protocol.with_files_not_sent("", ["a.pdf", "b.png"]),
+                         "(A file could not be sent: a.pdf)\n(A file could not be sent: b.png)")
 
 
 if __name__ == "__main__":

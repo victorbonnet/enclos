@@ -78,6 +78,10 @@ pub enum FromPlugin {
         kind: OutKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<MessageId>,
+        /// Files the agent sends with it (an image it made, a document),
+        /// each put in the channel's `media` folder first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<OutAttachment>,
     },
     /// The agent is, or stops, working on an answer.
     #[serde(rename = "typing")]
@@ -112,6 +116,20 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "ack",
     "error",
 ];
+
+/// A file the agent sends, which the plugin put in the channel's `media`
+/// folder (beside its socket, in the sandbox home): the bridge takes it from
+/// there, by its name alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutAttachment {
+    /// Its name in the `media` folder: no folder, no `..`.
+    pub file: String,
+    /// Its media type (`image/png`, `application/pdf`).
+    pub mime: String,
+    /// The name to show and to share it as.
+    pub name: String,
+    pub size: u64,
+}
 
 /// One tool the agent runs while it works on an answer, as the plugin
 /// reports it and the bridge passes it on: shown live, not stored.

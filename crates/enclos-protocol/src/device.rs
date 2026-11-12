@@ -52,6 +52,10 @@ pub enum FromDevice {
         conversation: ConversationId,
         title: String,
     },
+    /// The bytes of an attachment of one of the person's messages, from
+    /// `offset`: the bridge answers with one `attachment.data`.
+    #[serde(rename = "attachment.get")]
+    AttachmentGet { attachment: String, offset: u64 },
     #[serde(rename = "sync")]
     Sync { since: i64 },
     #[serde(rename = "push.token")]
@@ -69,6 +73,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "conversation.new",
     "message.send",
     "conversation.rename",
+    "attachment.get",
     "sync",
     "push.token",
     "ack",
@@ -103,6 +108,17 @@ pub enum ToDevice {
     /// leg, live, not kept.
     #[serde(rename = "tool")]
     Tool(ToolStep),
+    /// Bytes of an attachment, from `offset`, at most [`ATTACHMENT_CHUNK`]:
+    /// a Noise message holds 64 KiB, base64 included.
+    #[serde(rename = "attachment.data")]
+    AttachmentData {
+        attachment: String,
+        offset: u64,
+        /// The whole attachment's size.
+        size: u64,
+        /// base64url.
+        data: String,
+    },
     #[serde(rename = "synced")]
     Synced { seq: i64 },
     #[serde(rename = "ack")]
@@ -110,6 +126,10 @@ pub enum ToDevice {
     #[serde(rename = "error")]
     Error(ErrorBody),
 }
+
+/// The most bytes of an attachment one `attachment.data` carries: base64
+/// makes 60,000 characters of them, inside a Noise message's 65,519.
+pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
     "authenticated",
@@ -120,6 +140,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "message",
     "typing",
     "tool",
+    "attachment.data",
     "synced",
     "ack",
     "error",
@@ -167,6 +188,19 @@ pub struct ConversationMessage {
     /// Seconds since the Unix epoch.
     pub time: i64,
     pub seq: i64,
+    /// Its files, which the device fetches with `attachment.get`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file of a message, as a device sees it before fetching it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The bridge's id for it.
+    pub id: String,
+    pub mime: String,
+    pub name: String,
+    pub size: u64,
 }
 
 /// The most a message on the device leg may be, as it is sealed: its JSON
@@ -232,6 +266,7 @@ mod tests {
             kind: "reply".into(),
             time: 1_700_000_000,
             seq: 1,
+            attachments: Vec::new(),
         }
     }
 
@@ -283,6 +318,10 @@ mod tests {
                 text: "hi".into(),
             },
             FromDevice::Sync { since: 4 },
+            FromDevice::AttachmentGet {
+                attachment: "a-1".into(),
+                offset: 45_000,
+            },
             FromDevice::PairRequest {
                 name: "Pixel".into(),
                 device_key: "a2V5".into(),
@@ -308,9 +347,34 @@ mod tests {
             kind: "reply".into(),
             time: 1_800_000_000,
             seq: 7,
+            attachments: vec![Attachment {
+                id: "a-1".into(),
+                mime: "image/png".into(),
+                name: "unicorn.png".into(),
+                size: 1_962_976,
+            }],
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn a_full_attachment_chunk_fits_in_a_noise_message() {
+        use base64::Engine as _;
+        let data =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0xA5; ATTACHMENT_CHUNK]);
+        let body = ToDevice::AttachmentData {
+            attachment: "0b8f5f0e-4a1d-4f0f-8a43-6c2a7e9d1b21".into(),
+            offset: 1_000_000_000,
+            size: 2_000_000_000,
+            data,
+        };
+        let line = encode_line(&Envelope::new(
+            MessageId::new("0b8f5f0e-4a1d-4f0f-8a43-6c2a7e9d1b22").unwrap(),
+            body,
+        ));
+        // A Noise transport message is 65,535 bytes, its tag 16 of them.
+        assert!(line.len() <= 65_535 - 16, "{} bytes", line.len());
     }
 }
