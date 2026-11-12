@@ -224,7 +224,14 @@ CREATE TABLE IF NOT EXISTS log (
     event TEXT NOT NULL,
     reason TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
+
+/// The `settings` row naming the host's person (ADR 0044).
+const HOST_PERSON: &str = "host_person";
 
 /// Columns added after the first version of the database, which an older
 /// `app.db` gets when it is opened.
@@ -468,10 +475,10 @@ impl Store {
 
     /// Makes the Home conversation of `agent` (`<sandbox>/<agent>`), owned
     /// by `owner` (`""`: nobody yet) and named Home, so the runtime's names
-    /// do not replace it. With `host` true, `owner` is the host's person as
-    /// the transport names them, and takes Home from anyone else (a person
-    /// it went to while the host was not known). Otherwise `owner` takes it
-    /// only when it has no owner. Whether it was made or changed owner.
+    /// do not replace it. With `host` true, `owner` is the host's person
+    /// ([`Store::host_person`]), and takes Home from anyone else. Otherwise
+    /// `owner` takes it only when it has no owner. Whether it was made or
+    /// changed owner.
     pub fn ensure_home(&self, agent: &str, owner: &str, host: bool) -> rusqlite::Result<bool> {
         let Some((sandbox, name)) = agent.split_once('/') else {
             return Ok(false);
@@ -776,6 +783,44 @@ impl Store {
 
     const DEVICE_COLUMNS: &'static str =
         "id, name, person, noise_key, device_key, push_key, push_token, paired, seen, node";
+
+    /// The host's person (ADR 0044): the person of the first device paired
+    /// at the host's terminal, or the one `enclos app host` named since.
+    /// `None` until a device is paired.
+    pub fn host_person(&self) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT value FROM settings WHERE name = ?1",
+                params![HOST_PERSON],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Names `person` the host's person when nobody is yet: the first
+    /// device paired does. Whether they now are, by this call.
+    pub fn claim_host(&self, person: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO settings (name, value) VALUES (?1, ?2)",
+            params![HOST_PERSON, person],
+        )? == 1)
+    }
+
+    /// Names `person` the host's person in place of anyone before, and
+    /// gives them every agent's Home, with what it holds.
+    pub fn set_host(&self, person: &str) -> rusqlite::Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO settings (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            params![HOST_PERSON, person],
+        )?;
+        transaction.execute(
+            "UPDATE conversations SET owner = ?1 WHERE id LIKE 'home.%'",
+            params![person],
+        )?;
+        transaction.commit()
+    }
 
     pub fn add_device(&self, device: &Device) -> rusqlite::Result<()> {
         self.db.execute(
@@ -1536,7 +1581,7 @@ mod tests {
             store.owner("home.lab.scout").unwrap().as_deref(),
             Some("alice@example.com")
         );
-        // Once the transport names the host's person, Home is theirs.
+        // Given as the host's person's, Home is theirs.
         assert!(
             store
                 .ensure_home("lab/scout", "victor@example.com", true)
@@ -1547,5 +1592,45 @@ mod tests {
             Some("victor@example.com")
         );
         assert!(!store.ensure_home("lab/scout", "", false).unwrap());
+    }
+
+    #[test]
+    fn the_first_person_named_is_the_host_until_another_is_set() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.host_person().unwrap(), None);
+        assert!(store.claim_host("victor@example.com").unwrap());
+        // A second device's person does not take it.
+        assert!(!store.claim_host("alice@example.com").unwrap());
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .host_person()
+                .unwrap()
+                .as_deref(),
+            Some("victor@example.com")
+        );
+        // Set: the host's person, with every agent's Home, and no other
+        // conversation.
+        store
+            .ensure_home("lab/main", "victor@example.com", true)
+            .unwrap();
+        store.ensure_home("lab/scout", "", false).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@example.com")
+            .unwrap();
+        store.set_host("alice@example.com").unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        for (id, owner) in [
+            ("home.lab.main", "alice@example.com"),
+            ("home.lab.scout", "alice@example.com"),
+            ("c-1", "victor@example.com"),
+        ] {
+            assert_eq!(store.owner(id).unwrap().as_deref(), Some(owner), "{id}");
+        }
     }
 }
