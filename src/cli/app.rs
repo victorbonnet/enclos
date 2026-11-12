@@ -33,6 +33,14 @@ pub struct AppArgs {
     verb: AppVerb,
 }
 
+impl AppArgs {
+    /// Whether this is `app serve`, the bridge the service manager runs
+    /// rather than a person.
+    pub fn is_service(&self) -> bool {
+        matches!(self.verb, AppVerb::Serve { .. })
+    }
+}
+
 #[derive(Subcommand)]
 enum AppVerb {
     /// Talk to an agent through its app channel, from this terminal: each

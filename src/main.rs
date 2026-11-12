@@ -407,6 +407,8 @@ fn writes_wait(command: &Command) -> Wait {
         Command::Launch(_) | Command::Proxy(_) | Command::Holder(_) | Command::Relay(_) => {
             Wait::Background
         }
+        // The bridge, which the service manager runs
+        Command::App(args) if args.is_service() => Wait::Background,
         Command::Init
         | Command::Doctor
         | Command::Audit(_)
