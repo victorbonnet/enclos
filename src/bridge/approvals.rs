@@ -195,14 +195,26 @@ impl Hub {
             )
             .as_bytes(),
         );
-        if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
-            if old.state != "diagnostic" {
-                return Ok(());
+        // Decided under this policy: not asked again until it changes. An
+        // agent is told so, not left waiting for a request nobody sees.
+        let told = |known: &Approval| -> Result<(), String> {
+            if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying") {
+                Err(format!(
+                    "A request for this scope was already {} under {sandbox}'s active policy. It is not asked again until the policy changes.",
+                    known.state
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
+            if known.state != "diagnostic" {
+                return told(&known);
             }
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
-            if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
-                return Ok(());
+            if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
+                return told(&known);
             }
         }
         let mut a = Approval {
@@ -215,9 +227,8 @@ impl Hub {
             },
             conversation: conversation.map(str::to_owned),
             access,
-            action: action
+            action: enclos_protocol::visible::stripped(action, false)
                 .chars()
-                .filter(|c| !enclos_protocol::visible::is_hidden(*c))
                 .take(240)
                 .collect(),
             time: now(),
@@ -274,7 +285,6 @@ impl Hub {
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         self.dismiss_probe_requests(store)?;
         let since = store.refusals_since().map_err(|e| e.to_string())?;
-        let known = store.all_approvals().map_err(|e| e.to_string())?;
         let engine = Engine::open(self.layout.clone());
         let sandboxes: std::collections::HashSet<_> = self
             .agents
@@ -296,7 +306,25 @@ impl Hub {
                     continue;
                 }
             };
-            for d in denied.into_iter().take(200) {
+            let denied: Vec<_> = denied.into_iter().take(200).collect();
+            // Only the requests a refusal still to be counted can match:
+            // this sandbox's, made since the oldest of them was last seen.
+            let Some(from) = denied
+                .iter()
+                .map(|d| d.last.as_second())
+                .filter(|&last| last >= since)
+                .min()
+            else {
+                continue;
+            };
+            let known = match store.approvals_since(sandbox, from) {
+                Ok(known) => known,
+                Err(e) => {
+                    eprintln!("enclos app approvals: {sandbox}: {e}");
+                    continue;
+                }
+            };
+            for d in denied {
                 use crate::model::net::Reason;
                 if d.host
                     .trim_end_matches('.')

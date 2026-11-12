@@ -54,6 +54,48 @@ class Approvals(unittest.TestCase):
             env["HERMES_SESSION_PLATFORM"] = "enclos"
             self.assertEqual(approvals.session("enclos"), "12345")
 
+    def test_the_tool_says_what_the_bridge_answered(self):
+        import asyncio
+        import threading
+
+        class Bridge:
+            """An agent's connection whose bridge answers each request with `reply`."""
+            def __init__(self, loop, reply):
+                self._loop, self._reply, self._answers = loop, reply, {}
+                self._last_in = {"c1": ("m", 0.0)}
+                self._outbox = Mock()
+                self._outbox.put.return_value = True
+
+            async def _write(self, message):
+                if self._reply == "silent":
+                    return True
+                if self._reply:
+                    approvals.answered(self._answers, protocol.error("not_allowed", self._reply, message["id"]))
+                approvals.answered(self._answers, protocol.ack(message["id"]))
+                return True
+
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        env = {"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "c1"}
+        module = types.ModuleType("gateway.session_context")
+        module.get_session_env = lambda name: env.get(name)
+
+        def ask(*replies):
+            ctx = Mock()
+            approvals.register(ctx, [Bridge(loop, r) for r in replies], lambda: "/absent/main.sock", "enclos")
+            return json.loads(ctx.register_tool.call_args.kwargs["handler"]({"kind": "network", "target": "example.com:443"}))
+
+        with patch.dict(sys.modules, {"gateway": types.ModuleType("gateway"), "gateway.session_context": module}):
+            self.assertEqual(ask(None)["status"], "requested")
+            denied = ask("A request for this scope was already denied.")
+            self.assertNotIn("status", denied)
+            self.assertIn("already denied", denied["error"])
+            # One connection kept it: it is in the inbox.
+            self.assertEqual(ask("Not this agent's conversation.", None)["status"], "requested")
+            with patch.object(approvals, "ANSWER_SECONDS", 0.05):
+                self.assertEqual(ask("silent")["status"], "queued")
+
     def test_request_has_no_authority_or_raw_tool_output(self):
         request = approvals.request("c1", "write", "/work/a")
         self.assertEqual(request["type"], "approval.request")
