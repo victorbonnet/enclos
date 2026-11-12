@@ -24,6 +24,8 @@ mod group_turns;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,7 @@ use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
+    ToolStep,
 };
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
@@ -55,6 +58,7 @@ use super::store::{
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
+use crate::runtime::home::{open_folder, open_home};
 
 /// How long a pairing waits for the terminal's answer.
 const PAIRING_WAIT: Duration = Duration::from_secs(120);
@@ -97,10 +101,17 @@ pub struct AgentEndpoint {
 
 /// An open plugin connection.
 struct Plugin {
-    writer: PluginWriter,
     capabilities: Vec<Capability>,
     /// Tells this connection from a later one to the same agent.
     generation: u64,
+    /// Its writing side, locked apart from the other plugins: a plugin
+    /// that does not read holds only those writing to it.
+    out: Arc<Mutex<PluginOut>>,
+}
+
+/// What the bridge writes to a plugin, and what it gave it already.
+struct PluginOut {
+    writer: PluginWriter,
     /// The pending messages given to it already.
     sent: HashSet<String>,
 }
@@ -113,8 +124,10 @@ struct Hub {
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// The person the host belongs to, on the transport: whose the agents'
-    /// Home conversations are. Unknown, the first person who connects.
-    host: Option<String>,
+    /// Home conversations are. Read again at each connection while unknown;
+    /// until then, the first person who connects has them, and stderr says
+    /// so.
+    host: Mutex<Option<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     /// One lock per agent, held while its plugin connection opens, never
@@ -202,7 +215,7 @@ impl Hub {
             store_path,
             bridge_private,
             agents,
-            host,
+            host: Mutex::new(host),
             plugins: Mutex::new(HashMap::new()),
             opening,
             opening_all: AtomicBool::new(false),
@@ -220,6 +233,46 @@ impl Hub {
 
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
+    }
+
+    /// The host's person, as far as the transport has said.
+    fn known_host(&self) -> Option<String> {
+        self.host.lock().expect("not poisoned").clone()
+    }
+
+    /// The agents' Homes, as `person` connects: the host's person's when the
+    /// transport names them (asked again while it has not: `tailscale
+    /// status` may have failed when the bridge started), taken back from
+    /// anyone who had one meanwhile; else `person`'s, the first to connect,
+    /// which stderr says.
+    fn ensure_homes(&self, store: &Store, person: &str) {
+        let host = {
+            let mut host = self.host.lock().expect("not poisoned");
+            if host.is_none() {
+                *host = self.transport.host_person();
+            }
+            host.clone()
+        };
+        for agent in &self.agents {
+            match host.as_deref() {
+                Some(host) => {
+                    if let Ok(true) = store.ensure_home(&agent.name, host, true) {
+                        eprintln!(
+                            "enclos app: {}'s Home is {host}'s, the host's person",
+                            agent.name
+                        );
+                    }
+                }
+                None => {
+                    if let Ok(true) = store.ensure_home(&agent.name, person, false) {
+                        eprintln!(
+                            "enclos app: {}'s Home goes to {person}, the first person to connect: the transport does not say whose host this is",
+                            agent.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Where the bridge keeps the files of messages, by attachment id:
@@ -361,10 +414,12 @@ impl Hub {
             plugins.insert(
                 agent.to_owned(),
                 Plugin {
-                    writer,
                     capabilities: hello.capabilities,
                     generation,
-                    sent: HashSet::new(),
+                    out: Arc::new(Mutex::new(PluginOut {
+                        writer,
+                        sent: HashSet::new(),
+                    })),
                 },
             );
         }
@@ -385,8 +440,8 @@ impl Hub {
         }
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
-        // Where the plugin puts the files the agent sends: beside its socket.
-        let inbox = endpoint.socket.with_file_name("media");
+        // The plugin puts the files the agent sends in the sandbox home.
+        let home = sandbox_home(&endpoint.socket);
         std::thread::spawn(move || {
             let store = match hub.store() {
                 Ok(store) => store,
@@ -449,19 +504,17 @@ impl Hub {
                         // A conversation the bridge does not know, or another
                         // agent's: the runtime's home channel as it was, or a
                         // chat gone. It goes to this agent's Home, not nowhere.
-                        let own = group.is_some()
-                            || matches!(
-                                store.conversation_of(conversation.as_str()),
-                                Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
-                            );
-                        let conversation = if own {
-                            conversation
+                        let conversation = if group.is_some() {
+                            Some(conversation)
                         } else {
-                            let _ = store.ensure_home(&agent, hub.host.as_deref().unwrap_or(""));
-                            match ConversationId::new(home_id(&agent)) {
-                                Ok(home) => home,
-                                Err(_) => continue,
-                            }
+                            let host = hub.known_host();
+                            destination(&store, host.as_deref(), &agent, conversation)
+                        };
+                        let Some(conversation) = conversation else {
+                            // Not stored, and acknowledged all the same: sent
+                            // again, it would fail again at every connection.
+                            let _ = acks.ack(&message.id);
+                            continue;
                         };
                         let from = if group.is_some() {
                             From::Member(member.clone())
@@ -484,7 +537,7 @@ impl Hub {
                             &message.id,
                             whole,
                             &attachments,
-                            &inbox,
+                            &home,
                             &from,
                         );
                         match &stored {
@@ -552,10 +605,7 @@ impl Hub {
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
                     FromPlugin::Tool(step) => {
-                        if let Ok(Some(c)) = store.conversation_info(step.conversation.as_str())
-                            && format!("{}/{}", c.sandbox, c.agent) == agent
-                            && let Ok(Some(owner)) = store.owner(step.conversation.as_str())
-                        {
+                        if let Some((owner, step)) = tool_step(&store, &agent, step) {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
@@ -594,7 +644,7 @@ impl Hub {
         id: &MessageId,
         whole: ConversationMessage,
         attachments: &[OutAttachment],
-        inbox: &std::path::Path,
+        home: &Path,
         from: &From,
     ) -> Result<Option<i64>, String> {
         // Measured with its files' details, which the first piece carries
@@ -621,16 +671,15 @@ impl Hub {
         let last = seqs.last().copied();
         // A message stored once: its files taken once too, with its first
         // piece, whose id is the plugin's
-        let mut files: Vec<Attachment> = attachments
-            .iter()
-            .filter_map(|a| {
-                take_attachment(inbox, &self.media(), conversation, a)
-                    .inspect_err(|e| eprintln!("enclos app: an attachment is left out: {e}"))
-                    .ok()
-            })
-            .filter(|a| store.add_attachment(a, id.as_str()).is_ok())
-            .map(attachment_info)
-            .collect();
+        let mut files = take_attachments(
+            store,
+            home,
+            &self.media(),
+            &whole.agent,
+            conversation,
+            id.as_str(),
+            attachments,
+        );
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
                 self.deliver(
@@ -659,10 +708,16 @@ impl Hub {
             return Ok(());
         }
         self.plugin(agent)?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let Some(plugin) = plugins.get_mut(agent) else {
-            return Err(format!("{agent}'s app channel closed"));
+        // The plugins lock is let go before writing: a write waits for the
+        // plugin to read, up to the plugin leg's write timeout
+        let (out, generation) = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            let Some(plugin) = plugins.get(agent) else {
+                return Err(format!("{agent}'s app channel closed"));
+            };
+            (Arc::clone(&plugin.out), plugin.generation)
         };
+        let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
             if plugin.sent.contains(&message.id) {
                 continue;
@@ -677,7 +732,11 @@ impl Hub {
             if let Err(e) = plugin.writer.send_as(&id, body) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
-                plugins.remove(agent);
+                drop(plugin);
+                let mut plugins = self.plugins.lock().expect("not poisoned");
+                if plugins.get(agent).map(|p| p.generation) == Some(generation) {
+                    plugins.remove(agent);
+                }
                 return Err(e.to_string());
             }
             plugin.sent.insert(message.id);
@@ -705,6 +764,46 @@ pub fn pieces(
         .collect()
 }
 
+/// The longest tool label passed on, in characters, before its hidden
+/// characters are written out.
+const MAX_TOOL_LABEL_CHARS: usize = 120;
+/// The longest tool name passed on, in characters, likewise.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+/// The longest call id passed on, in characters.
+const MAX_TOOL_CALL_CHARS: usize = 128;
+
+/// A tool step from `agent`'s plugin as the bridge passes it on, with the
+/// person to send it to: `None` unless its conversation is one of `agent`'s
+/// own. The plugin's cuts run in the sandbox, so the bridge makes its own:
+/// each field on one line and short, so the step fits one Noise message,
+/// and the label and name with their hidden characters written out
+/// ([`enclos_protocol::visible::revealed`]), so what the person reads is
+/// what ran.
+fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, ToolStep)> {
+    let c = store.conversation_info(step.conversation.as_str()).ok()??;
+    if format!("{}/{}", c.sandbox, c.agent) != agent {
+        return None;
+    }
+    let owner = store.owner(step.conversation.as_str()).ok()??;
+    let cut = |text: &str, max: usize| -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        words.join(" ").chars().take(max).collect()
+    };
+    let shown = |text: &str, max: usize| enclos_protocol::visible::revealed(&cut(text, max));
+    Some((
+        owner,
+        ToolStep {
+            call: cut(&step.call, MAX_TOOL_CALL_CHARS),
+            name: shown(&step.name, MAX_TOOL_NAME_CHARS),
+            label: step
+                .label
+                .as_deref()
+                .map(|l| shown(l, MAX_TOOL_LABEL_CHARS)),
+            ..step
+        },
+    ))
+}
+
 /// Serves on `127.0.0.1:port` until the process ends.
 pub fn serve(
     transport: Transport,
@@ -715,6 +814,11 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let host = transport.host_person();
+    if host.is_none() {
+        eprintln!(
+            "enclos app: the transport does not say whose host this is: each agent's Home goes to the first person who connects, until it does"
+        );
+    }
     let hub = Arc::new(Hub::new(
         transport,
         Arc::new(move |address: &str| transport.whois(address)),
@@ -745,9 +849,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         }
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
-    if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
+    if let (Some(host), Ok(store)) = (hub.known_host(), hub.store()) {
         for agent in &hub.agents {
-            let _ = store.ensure_home(&agent.name, host);
+            let _ = store.ensure_home(&agent.name, &host, true);
         }
     }
     // Turns left running when the bridge stopped: failed, and their
@@ -1085,11 +1189,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     drop(waiting);
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
-    // The agents' Homes, made at start when the transport names the host's
-    // person; else this person's, the first to connect.
-    for agent in &hub.agents {
-        let _ = store.ensure_home(&agent.name, hub.host.as_deref().unwrap_or(&person));
-    }
+    hub.ensure_homes(&store, &person);
     let (sender, outbox) = channel();
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
@@ -1179,7 +1279,12 @@ fn pair(
         }
         let left = match link.socket.read() {
             Ok(Message::Close(_)) => true,
-            Ok(_) => false,
+            // A ping counts as hearing from it: the person may take longer
+            // to answer than a session may stay silent
+            Ok(_) => {
+                link.heard = std::time::Instant::now();
+                false
+            }
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),
@@ -1385,14 +1490,10 @@ fn run_session(
             // `enclos app unpair` does, then the connection ends. The
             // conversations stay, the person's.
             FromDevice::DeviceForget => {
-                store.remove_device(&device.id).map_err(|e| e.to_string())?;
-                let _ = store.log(
-                    Some(&device.id),
-                    Some(person),
-                    "unpaired",
-                    Some("forgotten on the device"),
-                );
-                link.send(ToDevice::Ack { of: message.id })?;
+                forget(store, device, person)?;
+                // Unpaired whether or not the answer reaches the device: a
+                // failure to send it is not why the connection ended.
+                let _ = link.send(ToDevice::Ack { of: message.id });
                 let _ = link.socket.close(None);
                 let _ = link.socket.flush();
                 return Ok(());
@@ -1402,22 +1503,135 @@ fn run_session(
     }
 }
 
+/// The person forgot this host on `device`: its row goes, so its keys
+/// open no connection again ("an unknown device"), and the log says so.
+fn forget(store: &Store, device: &Device, person: &str) -> Result<(), String> {
+    store.remove_device(&device.id).map_err(|e| e.to_string())?;
+    let _ = store.log(
+        Some(&device.id),
+        Some(person),
+        "unpaired",
+        Some("forgotten on the device"),
+    );
+    Ok(())
+}
+
 /// The largest file the bridge takes from a plugin.
 const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
+/// The most files the bridge takes from one message.
+const MAX_ATTACHMENTS: usize = 10;
+
+/// Where the plugin puts the files the agent sends, under the sandbox
+/// home: `.enclos-app/media`, beside its socket
+/// (`Layout::agent_app_socket`).
+const INBOX: [&str; 2] = [".enclos-app", "media"];
+
+/// The sandbox home of an agent's app socket, which is
+/// `<sandbox home>/.enclos-app/<agent>.sock`.
+fn sandbox_home(socket: &Path) -> PathBuf {
+    socket
+        .ancestors()
+        .nth(2)
+        .map(Path::to_owned)
+        .unwrap_or_default()
+}
+
+/// The plugin's `media` folder, opened from the sandbox home one folder at
+/// a time without following a link at any of them: the sandbox may put a
+/// link to a host folder in place of `.enclos-app` or `media`, and the
+/// bridge, which runs outside the sandbox, must not read or remove what is
+/// there.
+fn open_inbox(home: &Path) -> Result<OwnedFd, String> {
+    let mut dir = open_home(home).map_err(|e| e.to_string())?;
+    let mut shown = "~".to_owned();
+    for name in INBOX {
+        shown = format!("{shown}/{name}");
+        dir = open_folder(&dir, name, &shown)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{shown}: no such folder"))?;
+    }
+    Ok(dir)
+}
+
+/// The files of an agent's message, once it is stored: each taken from the
+/// plugin's `media` folder under `home` ([`take_attachment`]) and recorded
+/// with the message, at most [`MAX_ATTACHMENTS`]. One that cannot be is
+/// left out, said on stderr, and leaves no file in `media`.
+fn take_attachments(
+    store: &Store,
+    home: &Path,
+    media: &Path,
+    agent: &str,
+    conversation: &str,
+    message: &str,
+    attachments: &[OutAttachment],
+) -> Vec<Attachment> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        eprintln!(
+            "enclos app: {agent}: a message carries {} files, the first {MAX_ATTACHMENTS} are taken",
+            attachments.len()
+        );
+    }
+    attachments
+        .iter()
+        .take(MAX_ATTACHMENTS)
+        .filter_map(|a| {
+            let taken = take_attachment(home, media, conversation, a)
+                .inspect_err(|e| eprintln!("enclos app: {agent}: an attachment is left out: {e}"))
+                .ok()?;
+            if let Err(e) = store.add_attachment(&taken, message) {
+                eprintln!("enclos app: {agent}: an attachment is left out: cannot record it: {e}");
+                let _ = std::fs::remove_file(media.join(&taken.id));
+                return None;
+            }
+            Some(attachment_info(taken))
+        })
+        .collect()
+}
+
+/// Copies `source` into the new file `to`, and its size: no more than `max`
+/// bytes are copied, and a source found longer leaves no file and is an
+/// error, as is any failure.
+fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)
+        .map_err(|e| e.to_string())?;
+    let copied = std::io::copy(&mut source.take(max + 1), &mut target);
+    drop(target);
+    match copied {
+        Ok(size) if size <= max => Ok(size),
+        Ok(_) => {
+            let _ = std::fs::remove_file(to);
+            Err(format!("longer than {max} bytes"))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(to);
+            Err(e.to_string())
+        }
+    }
+}
+
 /// Moves a file the agent sends from the plugin's `media` folder (in the
-/// sandbox home) into the bridge's own, under a new id. The plugin runs in
-/// the sandbox: only a plain file name of that folder is taken, opened
-/// without following a link, and only a regular file of at most
-/// [`MAX_ATTACHMENT_BYTES`].
+/// sandbox `home`) into the bridge's own, under a new id. The plugin runs
+/// in the sandbox: the folder is opened without following a link
+/// ([`open_inbox`]); in it, only a plain file name is taken, opened without
+/// following a link and without waiting (a named pipe would block), and
+/// only a regular file with no other link to it, of at most
+/// [`MAX_ATTACHMENT_BYTES`], copied no further than that limit even while
+/// it grows. The plugin's copy is then removed through the same folder.
 fn take_attachment(
-    inbox: &std::path::Path,
-    media: &std::path::Path,
+    home: &Path,
+    media: &Path,
     conversation: &str,
     a: &OutAttachment,
 ) -> Result<StoredAttachment, String> {
-    use rustix::fs::{Mode, OFlags};
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use std::os::unix::fs::DirBuilderExt;
     let plain = !a.file.is_empty()
         && a.file.len() <= 200
         && !a.file.starts_with('.')
@@ -1430,35 +1644,43 @@ fn take_attachment(
             a.file
         ));
     }
-    let from = inbox.join(&a.file);
-    let fd = rustix::fs::open(
-        &from,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    let inbox = open_inbox(home)?;
+    let from = format!("~/{}/{}", INBOX.join("/"), a.file);
+    let fd = rustix::fs::openat(
+        &inbox,
+        a.file.as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| format!("{}: {e}", from.display()))?;
-    let mut source = std::fs::File::from(fd);
-    let meta = source.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a file", from.display()));
+    .map_err(|e| format!("{from}: {e}"))?;
+    let opened = rustix::fs::fstat(&fd).map_err(|e| format!("{from}: {e}"))?;
+    if !rustix::fs::FileType::from_raw_mode(opened.st_mode).is_file() {
+        return Err(format!("{from} is not a file"));
     }
-    if meta.len() > MAX_ATTACHMENT_BYTES {
-        return Err(format!("{} is larger than 25 MiB", from.display()));
+    // A second link may be one to a host file the sandbox could not read.
+    if opened.st_nlink != 1 {
+        return Err(format!("{from} has other links to it"));
     }
+    if opened.st_size < 0 || opened.st_size as u64 > MAX_ATTACHMENT_BYTES {
+        return Err(format!("{from} is larger than 25 MiB"));
+    }
+    let source = std::fs::File::from(fd);
     let id = new_id().map_err(|e| e.to_string())?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(media)
         .map_err(|e| e.to_string())?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(media.join(&id))
-        .map_err(|e| e.to_string())?;
-    let size = std::io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&from);
+    // The sandbox may write on while the bridge reads.
+    let size = copy_at_most(source, &media.join(&id), MAX_ATTACHMENT_BYTES)
+        .map_err(|e| format!("{from}: {e}"))?;
+    // The plugin's copy, through the same folder, and only while its name
+    // is still the file that was read.
+    if let Ok(now) = rustix::fs::statat(&inbox, a.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+        && (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino)
+    {
+        let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
+    }
     let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
         !t.is_empty()
             && !s.is_empty()
@@ -1466,7 +1688,13 @@ fn take_attachment(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
     });
-    let name = a.name.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    // Shown and shared under this name: without the characters that would
+    // make it read as another (`U+202E` before `fdp.exe`).
+    let name = enclos_protocol::visible::stripped(
+        a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
+        false,
+    );
+    let name = name.trim();
     Ok(StoredAttachment {
         id,
         conversation: conversation.to_owned(),
@@ -1561,6 +1789,35 @@ fn read(
     Ok(())
 }
 
+/// Where `agent`'s message for `conversation` is kept: there, when it is
+/// one of `agent`'s own; else (a conversation the bridge does not know, or
+/// another agent's: the runtime's home channel as it was, or a chat gone)
+/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None`, said on
+/// stderr, when Home's id is not one the protocol takes.
+fn destination(
+    store: &Store,
+    host: Option<&str>,
+    agent: &str,
+    conversation: ConversationId,
+) -> Option<ConversationId> {
+    let own = matches!(
+        store.conversation_of(conversation.as_str()),
+        Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+    );
+    if own {
+        return Some(conversation);
+    }
+    let home = ConversationId::new(home_id(agent))
+        .inspect_err(|e| {
+            eprintln!(
+                "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
+            );
+        })
+        .ok()?;
+    let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
+    Some(home)
+}
+
 /// A conversation for a device: `None` for an id the protocol refuses.
 fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo> {
     let members: Vec<String> = store
@@ -1638,12 +1895,20 @@ fn rename(
     hub.deliver_conversation(store, person, conversation.as_str());
     let name = format!("{sandbox}/{agent}");
     if hub.plugin(&name).is_ok() {
-        let mut plugins = hub.plugins.lock().expect("not poisoned");
-        if let Some(plugin) = plugins.get_mut(&name) {
-            let _ = plugin.writer.send(FromBridge::Rename {
-                conversation: conversation.clone(),
-                title: conversation_title(title),
-            });
+        // Written outside the plugins lock, as in forward
+        let out = {
+            let plugins = hub.plugins.lock().expect("not poisoned");
+            plugins.get(&name).map(|plugin| Arc::clone(&plugin.out))
+        };
+        if let Some(out) = out {
+            let _ = out
+                .lock()
+                .expect("not poisoned")
+                .writer
+                .send(FromBridge::Rename {
+                    conversation: conversation.clone(),
+                    title: conversation_title(title),
+                });
         }
     }
     Ok(())
@@ -1753,11 +2018,12 @@ mod connection_end_tests {
     use super::*;
     use enclos_protocol::device::decode_to_device;
     use enclos_protocol::noise::{Initiator, generate_keypair};
+    use enclos_protocol::plugin::ToolPhase;
     use enclos_protocol::plugin::decode_from_bridge;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use tungstenite::client::IntoClientRequest;
 
@@ -2354,6 +2620,178 @@ mod connection_end_tests {
         )));
     }
 
+    /// A stand-in plugin at `socket` that answers the bridge's hello, then
+    /// does `then` with the connection; it takes up to two connections.
+    fn plugin_that(
+        socket: &Path,
+        then: impl Fn(BufReader<UnixStream>, UnixStream) + Send + Sync + 'static,
+    ) {
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut out = stream.try_clone().unwrap();
+                let mut lines = BufReader::new(stream);
+                let mut line = Vec::new();
+                lines.read_until(b'\n', &mut line).unwrap();
+                let id = MessageId::new(new_id().unwrap()).unwrap();
+                let hello = FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![],
+                };
+                out.write_all(&encode_line(&Envelope::new(id, hello)))
+                    .unwrap();
+                then(lines, out);
+            }
+        });
+    }
+
+    #[test]
+    fn a_plugin_that_never_reads_holds_no_other_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        // An agent that says hello, then reads nothing more
+        plugin_that(&bridge.socket, |lines, out| {
+            std::thread::sleep(Duration::from_secs(30));
+            drop((lines, out));
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut writing, _) = connect(&bridge, &phone);
+        start_conversation(&mut writing);
+        // Larger than the socket's buffers: the write waits for the plugin
+        say(&mut writing, "m-1", &"a".repeat(40_000));
+        std::thread::sleep(Duration::from_millis(500));
+        let (mut other, _) = connect(&bridge, &phone);
+        let started = std::time::Instant::now();
+        other.send("a-1", FromDevice::Agents);
+        while !matches!(other.receive(), Some(ToDevice::AgentsList { .. })) {}
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn typing_reaches_a_device_only_for_the_agents_own_conversations() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        // The person's conversation with another agent
+        store
+            .conversation("c-other", "lab", "other", PERSON)
+            .unwrap();
+        // On the person's message, lab/main says it types in both
+        plugin_that(&bridge.socket, |mut lines, mut out| {
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let message = decode_from_bridge(&line).unwrap();
+                line.clear();
+                if let FromBridge::MessageIn { .. } = message.body {
+                    for conversation in ["c-other", "c-1"] {
+                        let id = MessageId::new(new_id().unwrap()).unwrap();
+                        let typing = FromPlugin::Typing {
+                            conversation: ConversationId::new(conversation).unwrap(),
+                            on: true,
+                        };
+                        out.write_all(&encode_line(&Envelope::new(id, typing)))
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        say(&mut device, "m-1", "hello");
+        let typing = loop {
+            match device.receive() {
+                Some(ToDevice::Typing { conversation, .. }) => break conversation,
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        };
+        assert_eq!(typing.as_str(), "c-1");
+    }
+
+    #[test]
+    fn a_device_that_pings_while_the_person_decides_stays_connected() {
+        let folder = tempfile::tempdir().unwrap();
+        // The person answers later than a session may stay silent
+        let bridge = bridge_with(folder.path(), Duration::from_millis(1500));
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let path = bridge.store.clone();
+        let terminal = std::thread::spawn(move || {
+            let store = Store::open(&path).unwrap();
+            while store.pairing_request(b"code-1").unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(Duration::from_secs(3));
+            store.decide_pairing(b"code-1", "accept").unwrap();
+        });
+        let noise = generate_keypair().unwrap();
+        let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).unwrap();
+        let proof = enclos_protocol::pairing::proof(b"code-1", device.session.handshake_hash());
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
+                proof: encode(&proof),
+                push: None,
+            },
+        );
+        // Pings, as the app does, until the answer comes
+        let stream = device.socket.get_ref().try_clone().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let answer = loop {
+            device
+                .socket
+                .send(Message::Ping(Vec::new().into()))
+                .unwrap();
+            match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    break decode_to_device(&plain).unwrap().body;
+                }
+                Ok(Message::Close(_)) => panic!("closed"),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        terminal.join().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(
+            matches!(answer, ToDevice::PairAccepted { .. }),
+            "{answer:?}"
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        // Its session goes on
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the new device's session ended"),
+            }
+        }
+    }
+
     #[test]
     fn a_message_sent_twice_reaches_the_agent_once() {
         let folder = tempfile::tempdir().unwrap();
@@ -2477,6 +2915,23 @@ mod connection_end_tests {
     }
 
     #[test]
+    fn a_device_forgotten_on_one_connection_loses_its_others() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // A connection left half open, and the one the device reconnected on
+        let (mut old, _) = connect(&bridge, &phone);
+        let (mut new, _) = connect(&bridge, &phone);
+        new.send("forget-1", FromDevice::DeviceForget);
+        assert!(matches!(new.receive(), Some(ToDevice::Ack { .. })));
+        assert_eq!(new.receive(), None);
+        // The other one ends too, with nothing more from the bridge
+        assert_eq!(old.receive(), None);
+        let (_, first) = connect(&bridge, &phone);
+        assert_eq!(first, None);
+    }
+
+    #[test]
     fn a_device_from_another_node_is_refused() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
@@ -2495,6 +2950,80 @@ mod connection_end_tests {
         *bridge.node.lock().unwrap() = "n-pixel".to_owned();
         let (_, first) = connect(&bridge, &phone);
         assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+    }
+
+    fn step(conversation: &str, call: &str, name: &str, label: Option<&str>) -> ToolStep {
+        ToolStep {
+            conversation: ConversationId::new(conversation).unwrap(),
+            call: call.to_owned(),
+            name: name.to_owned(),
+            label: label.map(str::to_owned),
+            phase: ToolPhase::Start,
+            ok: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_tool_step_goes_only_to_the_owner_of_the_agents_own_conversation() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-b", "lab", "b", "bob@example.com")
+            .unwrap();
+        let (owner, _) = tool_step(&store, "lab/a", step("c-a", "1", "terminal", None)).unwrap();
+        assert_eq!(owner, "alice@example.com");
+        // Agent lab/a cannot show a step in a conversation of lab/b, nor in
+        // one the bridge does not know.
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-b", "1", "terminal", None)),
+            None
+        );
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-x", "1", "terminal", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tool_step_is_cut_to_fit_and_shows_its_hidden_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        // Each field far above one Noise message.
+        let huge = "x".repeat(70_000);
+        let (_, cut) = tool_step(&store, "lab/a", step("c-a", &huge, &huge, Some(&huge))).unwrap();
+        assert_eq!(cut.call.chars().count(), MAX_TOOL_CALL_CHARS);
+        assert_eq!(cut.name.chars().count(), MAX_TOOL_NAME_CHARS);
+        assert_eq!(
+            cut.label.as_deref().map(|l| l.chars().count()),
+            Some(MAX_TOOL_LABEL_CHARS)
+        );
+        let sealed = encode_line(&Envelope::new(
+            MessageId::new("m-1").unwrap(),
+            ToDevice::Tool(cut),
+        ));
+        assert!(sealed.len() < 2_000);
+        // What the person reads is what runs: a reversed tail is written out,
+        // and a label stays on one line.
+        let (_, shown) = tool_step(
+            &store,
+            "lab/a",
+            step(
+                "c-a",
+                "1",
+                "term\u{200B}inal",
+                Some("rm -rf ~/\u{202E}txt.\nls"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(shown.name, "term⟨U+200B⟩inal");
+        assert_eq!(shown.label.as_deref(), Some("rm -rf ~/⟨U+202E⟩txt. ls"));
     }
 
     #[test]
