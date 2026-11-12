@@ -78,7 +78,7 @@ The bridge runs outside the sandbox, and everything in the sandbox home is the s
 
 **Delivery is at least once.** The plugin keeps each `message.out` on disk, in the sandbox home, until the bridge's `ack` for it, and sends what it kept again after each `hello`. The bridge drops an `id` it has already stored. The bridge acknowledges a `message.in` it sent only once it has stored it; the plugin acknowledges it once the runtime has it.
 
-**An agent's messages are paced.** Every runtime may send on its own, so the bridge stores at most 30 of an agent's `message.out` at once and then 30 a minute (`src/bridge/pace.rs`). Past that, it reads the plugin's next message only when there is room again: the plugin waits, and loses nothing, since it keeps each message until the `ack`.
+**An agent's messages are paced.** Every runtime may send on its own, so the bridge stores at most 120 of an agent's `message.out` at once and then 60 a minute, one a second (`src/bridge/pace.rs`). Past that, it reads the plugin's next message only when there is room again: the plugin waits, and loses nothing, since it keeps each message until the `ack`.
 
 ## The device leg
 
