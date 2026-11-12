@@ -1050,12 +1050,20 @@ fn rename(
     hub.deliver_conversation(store, person, conversation.as_str());
     let name = format!("{sandbox}/{agent}");
     if hub.plugin(&name).is_ok() {
-        let mut plugins = hub.plugins.lock().expect("not poisoned");
-        if let Some(plugin) = plugins.get_mut(&name) {
-            let _ = plugin.writer.send(FromBridge::Rename {
-                conversation: conversation.clone(),
-                title: conversation_title(title),
-            });
+        // Written outside the plugins lock, as in forward
+        let out = {
+            let plugins = hub.plugins.lock().expect("not poisoned");
+            plugins.get(&name).map(|plugin| Arc::clone(&plugin.out))
+        };
+        if let Some(out) = out {
+            let _ = out
+                .lock()
+                .expect("not poisoned")
+                .writer
+                .send(FromBridge::Rename {
+                    conversation: conversation.clone(),
+                    title: conversation_title(title),
+                });
         }
     }
     Ok(())
