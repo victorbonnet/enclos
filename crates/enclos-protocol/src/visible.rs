@@ -23,7 +23,8 @@ pub fn is_joiner(c: char) -> bool {
 /// wherever it stands: a control character, a bidirectional mark,
 /// embedding, override or isolate, a default-ignorable character (zero
 /// width, soft hyphen, tags, variation selectors), a line or paragraph
-/// separator, or a blank filler. A joiner ([`is_joiner`]) counts too: a
+/// separator, a blank filler, a private-use character (its glyph is
+/// whatever a font says) or a noncharacter. A joiner ([`is_joiner`]) counts too: a
 /// caller that looks at one character at a time cannot tell where it
 /// stands, so it refuses it; [`has_hidden`], [`stripped`] and [`revealed`]
 /// look at its neighbours.
@@ -53,8 +54,12 @@ pub fn is_hidden(c: char) -> bool {
                 | '\u{FFF0}'..='\u{FFFB}'
                 | '\u{1BCA0}'..='\u{1BCA3}'
                 | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E000}'..='\u{F8FF}'
+                | '\u{FDD0}'..='\u{FDEF}'
                 | '\u{E0000}'..='\u{E0FFF}'
+                | '\u{F0000}'..='\u{10FFFF}'
         )
+        || (c as u32) & 0xFFFE == 0xFFFE
 }
 
 /// For each character of `text`, whether it is hidden where it stands: as
@@ -157,6 +162,12 @@ mod tests {
             '\u{E007F}',
             '\u{E0100}',
             '\u{200D}',
+            '\u{E000}',
+            '\u{F8FF}',
+            '\u{FDD0}',
+            '\u{1FFFE}',
+            '\u{F0000}',
+            '\u{10FFFD}',
         ] {
             assert!(is_hidden(c), "{:04X}", c as u32);
             assert!(has_hidden(&format!("a{c}b"), true), "{:04X}", c as u32);
