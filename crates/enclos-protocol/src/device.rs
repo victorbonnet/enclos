@@ -4,8 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId, QuestionId};
+use crate::envelope::{DecodeError, Envelope, decode, encode_line};
+use crate::ids::{ConversationId, MAX_ID_BYTES, MessageId, QuestionId};
+use crate::noise::MAX_NOISE_MESSAGE;
 use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
 /// What a device sends.
@@ -47,7 +48,8 @@ pub enum FromDevice {
         edit: crate::policy::PolicyApply,
     },
     /// First after the handshake of a paired device: its id on this host
-    /// and its hardware key's DER signature of the handshake hash.
+    /// and its hardware key's DER signature of the handshake hash for
+    /// `auth` ([`crate::pairing::Signed::Auth`]).
     #[serde(rename = "auth")]
     Auth { device: String, sig: String },
     /// First after the handshake of a device that is pairing.
@@ -58,6 +60,10 @@ pub enum FromDevice {
         device_key: String,
         /// HMAC-SHA256 of the handshake hash, keyed with the code.
         proof: String,
+        /// Its hardware key's DER signature of the handshake hash for
+        /// pairing ([`crate::pairing::Signed::Pair`]): it holds the key it
+        /// asks to pair.
+        sig: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push: Option<PushToken>,
     },
@@ -292,16 +298,20 @@ pub const COMMANDS_BUDGET: usize = 60_000;
 
 /// A plugin's commands as a device gets them: each name once (lower case
 /// letters, digits, `_` and `-`, at most [`MAX_COMMAND_NAME`]; others are
-/// left out), each text on one line and cut to its limit, in the plugin's
-/// order until they fill [`COMMANDS_BUDGET`].
+/// left out), each text on one line, without hidden characters
+/// ([`crate::visible`]) and cut to its limit, in the plugin's order until
+/// they fill [`COMMANDS_BUDGET`].
 pub fn commands_for_devices(commands: Vec<Command>) -> Vec<Command> {
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    // A bidirectional override or a zero-width character would make the
+    // text beside a command read as something else than what was sent.
     fn line(text: &str, limit: usize) -> String {
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(limit)
-            .collect()
+        let shown = words(&crate::visible::stripped(&words(text), false));
+        let cut: String = shown.chars().take(limit).collect();
+        // A cut may leave a joiner at the end, where it is hidden.
+        crate::visible::stripped(cut.trim_end(), false)
     }
     let mut seen = std::collections::HashSet::new();
     let mut used = 0;
@@ -348,7 +358,7 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default)]
-    pub name_revision: i64,
+    pub name_revision: u64,
     /// Always sent by new hosts; its presence advertises shared-name support.
     #[serde(default)]
     pub can_edit_name: bool,
@@ -359,6 +369,10 @@ pub struct AgentInfo {
     pub avatar: crate::avatar::AvatarMetadata,
     #[serde(default)]
     pub can_edit_avatar: bool,
+    /// Whether this person may manage the agent's routines: the host's
+    /// person only. Absent (an older host) means no.
+    #[serde(default)]
+    pub can_manage_routines: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,
@@ -460,6 +474,48 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// The most a message on the device leg may be, as it is sealed: its JSON
+/// and the line break after it. A Noise transport message holds 65,535
+/// bytes, its 16-byte tag included, and the protocol does not fragment.
+pub const MAX_DEVICE_MESSAGE: usize = MAX_NOISE_MESSAGE - 16;
+
+/// Room for any id and `seq`, beyond those the envelope is measured with.
+const ID_AND_SEQ_ROOM: usize = MAX_ID_BYTES + 20;
+
+/// `message`'s text in pieces, cut at character boundaries, each of which
+/// fits on the device leg as the text of a `message` like this one,
+/// whatever its id and `seq`: the bridge sends an agent's long text as
+/// consecutive messages. One piece when it fits already.
+pub fn split_text(message: &ConversationMessage) -> Vec<String> {
+    let empty = ConversationMessage {
+        text: String::new(),
+        seq: 0,
+        ..message.clone()
+    };
+    let id = MessageId::new("m").expect("a valid id");
+    let around = encode_line(&Envelope::new(id, ToDevice::Message(empty))).len();
+    let room = MAX_DEVICE_MESSAGE.saturating_sub(around + ID_AND_SEQ_ROOM);
+    let escaped = |text: &str| serde_json::to_string(text).map_or(0, |json| json.len() - 2);
+    if escaped(&message.text) <= room {
+        return vec![message.text.clone()];
+    }
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut size = 0;
+    let mut buffer = [0u8; 4];
+    for character in message.text.chars() {
+        let length = escaped(character.encode_utf8(&mut buffer));
+        if size + length > room && !piece.is_empty() {
+            pieces.push(std::mem::take(&mut piece));
+            size = 0;
+        }
+        piece.push(character);
+        size += length;
+    }
+    pieces.push(piece);
+    pieces
+}
+
 pub fn decode_from_device(bytes: &[u8]) -> Result<Envelope<FromDevice>, DecodeError> {
     decode(bytes, FROM_DEVICE_TYPES)
 }
@@ -471,7 +527,54 @@ pub fn decode_to_device(bytes: &[u8]) -> Result<Envelope<ToDevice>, DecodeError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_line;
+
+    fn agent_text(text: &str) -> ConversationMessage {
+        ConversationMessage {
+            question: None,
+            conversation: ConversationId::new("c-1").unwrap(),
+            agent: "lab/main".into(),
+            from: "agent".into(),
+            text: text.into(),
+            kind: "reply".into(),
+            time: 1_700_000_000,
+            seq: 1,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The largest the piece's envelope can be: the longest id, the
+    /// widest `seq`.
+    fn sealed_size(message: &ConversationMessage, text: &str) -> usize {
+        let id = MessageId::new("i".repeat(MAX_ID_BYTES)).unwrap();
+        let piece = ConversationMessage {
+            text: text.into(),
+            seq: i64::MIN,
+            ..message.clone()
+        };
+        encode_line(&Envelope::new(id, ToDevice::Message(piece))).len()
+    }
+
+    #[test]
+    fn a_text_that_fits_stays_whole() {
+        let message = agent_text("hello");
+        assert_eq!(split_text(&message), ["hello"]);
+    }
+
+    #[test]
+    fn a_long_text_is_cut_into_pieces_that_each_fit() {
+        // Characters of one to four bytes, and some JSON escapes to six
+        let text: String = "aé€😀\"\u{1}\n".repeat(20_000);
+        let message = agent_text(&text);
+        let pieces = split_text(&message);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat(), text);
+        for piece in &pieces {
+            assert!(sealed_size(&message, piece) <= MAX_DEVICE_MESSAGE);
+        }
+        // Nearly full: no piece but the last is left far below the limit
+        let first = sealed_size(&message, &pieces[0]);
+        assert!(first > MAX_DEVICE_MESSAGE - ID_AND_SEQ_ROOM - 8, "{first}");
+    }
 
     #[test]
     fn approval_close_device_message_round_trips() {
@@ -535,6 +638,12 @@ mod tests {
             command("", "empty", None),
             command(&"x".repeat(33), "too long", None),
             command("reload_mcp", &"d".repeat(200), None),
+            command(
+                "usage",
+                "Show\u{202E}tsoc \u{2066}usage\u{2069}\u{200B} \u{1b}[31m",
+                Some("[\u{2028}days\u{0}]"),
+            ),
+            command("tools", "\u{202E}\u{200B}", Some("\u{2067}")),
         ]);
         assert_eq!(
             kept,
@@ -542,6 +651,8 @@ mod tests {
                 command("new", "Start a new session", Some("[name]")),
                 command("model", "Switch model", None),
                 command("reload_mcp", &"d".repeat(MAX_COMMAND_DESCRIPTION), None),
+                command("usage", "Showtsoc usage [31m", Some("[ days]")),
+                command("tools", "", None),
             ]
         );
     }
@@ -600,10 +711,23 @@ mod tests {
                 attachment: "a-1".into(),
                 offset: 45_000,
             },
+            FromDevice::PairRequest {
+                name: "Pixel".into(),
+                device_key: "a2V5".into(),
+                proof: "cHJvb2Y".into(),
+                sig: "c2ln".into(),
+                push: None,
+            },
         ] {
             let line = encode_line(&Envelope::new(id(), body.clone()));
             assert_eq!(decode_from_device(&line).unwrap().body, body);
         }
+        // A pairing request must carry the device key's signature.
+        let unsigned = br#"{"v":1,"id":"m","type":"pair.request","name":"Pixel","device_key":"a2V5","proof":"cHJvb2Y"}"#;
+        assert!(matches!(
+            decode_from_device(unsigned),
+            Err(DecodeError::Bad { .. })
+        ));
         let body = ToDevice::Message(ConversationMessage {
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
