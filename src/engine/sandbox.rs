@@ -8,7 +8,6 @@ use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
 use crate::model::audit::Actor;
-use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
 use crate::model::sandbox::{
@@ -16,6 +15,7 @@ use crate::model::sandbox::{
 };
 use crate::model::secret::SecretRecord;
 use crate::model::session::{Member, SessionId, SessionRecord};
+use crate::model::{count, now};
 use crate::policy;
 use crate::secrets::SecretError;
 use crate::service::ServiceLabel;
@@ -346,10 +346,10 @@ impl Engine {
                         v.session.kind.as_str()
                     ),
                     false => format!(
-                        "stop session {} ({}, {} processes)",
+                        "stop session {} ({}, {})",
                         v.session.id,
                         v.session.kind.as_str(),
-                        v.members.len()
+                        count(v.members.len(), "process", "processes")
                     ),
                 })
                 .collect();
@@ -366,16 +366,15 @@ impl Engine {
             }));
         }
         let summary = |r: &StopReport| {
+            let services = count(r.services.len(), "service", "services");
             let done = match r.survivors.is_empty() {
                 true => format!(
-                    "removed {} services, stopped {} sessions",
-                    r.services.len(),
-                    r.stopped.len()
+                    "removed {services}, stopped {}",
+                    count(r.stopped.len(), "session", "sessions")
                 ),
                 false => format!(
-                    "removed {} services; {} sessions left members running",
-                    r.services.len(),
-                    r.survivors.len()
+                    "removed {services}; {} left members running",
+                    count(r.survivors.len(), "session", "sessions")
                 ),
             };
             format!("{done}{}", ended_gone(&r.gone))
@@ -672,6 +671,7 @@ impl Engine {
 fn ended_gone(gone: &[SessionId]) -> String {
     match gone {
         [] => String::new(),
+        [id] => format!("; recorded the end of session {id}, whose processes were gone"),
         ids => format!(
             "; recorded the end of sessions {}, whose processes were gone",
             join_ids(ids)
