@@ -77,7 +77,7 @@ impl Engine {
 
     /// The bridge's static key pair's file.
     pub fn app_key_path(&self) -> PathBuf {
-        self.layout.data().join("app-bridge.key")
+        self.layout.app_bridge_key()
     }
 
     /// The bridge's own database: conversations and their messages.

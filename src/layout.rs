@@ -273,6 +273,12 @@ impl Layout {
         self.data.join("secrets.json")
     }
 
+    /// The bridge's static key pair, which every paired device pins. For
+    /// the host alone.
+    pub fn app_bridge_key(&self) -> PathBuf {
+        self.data.join("app-bridge.key")
+    }
+
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
@@ -338,6 +344,9 @@ impl Layout {
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
+            // The bridge's Noise key: a sandbox that read it could pass
+            // for the bridge to every paired device.
+            self.app_bridge_key(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
         // stores: the two change together.
@@ -542,10 +551,27 @@ mod tests {
                 layout.state_db(),
                 layout.state_lock(),
                 layout.audit_log(),
-                layout.config_file()
+                layout.config_file(),
+                layout.app_bridge_key(),
             ]
         );
         assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
+    }
+
+    /// The bridge's Noise key is hidden on every system: a sandbox that
+    /// read it could pass for the bridge to every paired device.
+    #[test]
+    fn the_bridges_key_is_on_the_hidden_files() {
+        let layout = Layout::at("/data/enclos");
+        for os in [Os::Linux, Os::MacOs] {
+            let file = layout.app_bridge_key();
+            assert!(file.starts_with(layout.data()));
+            assert!(
+                layout.hidden_files_on(os).contains(&file),
+                "{os:?}: {}",
+                file.display()
+            );
+        }
     }
 
     #[test]
