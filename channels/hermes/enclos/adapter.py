@@ -88,6 +88,8 @@ class EnclosAdapter(BasePlatformAdapter):
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
         self._questions = questions.Manager(self._outbox, self._write, self.send)
+        # By message id: a policy request's tool call waiting for the bridge.
+        self._answers: dict[str, asyncio.Future] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -260,6 +262,7 @@ class EnclosAdapter(BasePlatformAdapter):
         if kind == "ack":
             self._outbox.acknowledge(message["of"])
             self._questions.acknowledge(message["of"])
+            approvals.answered(self._answers, message)
         elif kind == "policy.context":
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
@@ -280,6 +283,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._routine_tasks.add(task)
             task.add_done_callback(self._routine_tasks.discard)
         elif kind == "error":
+            approvals.answered(self._answers, message)
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
             # A question the bridge refused would wait unseen: it goes as text.
             await self._questions.refused(message.get("of"))

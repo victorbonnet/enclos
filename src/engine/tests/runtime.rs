@@ -240,26 +240,33 @@ impl Lab {
 
     /// A lab whose engine installs services through `services`.
     fn with_services(services: Option<Box<dyn crate::service::ServiceManager>>) -> Lab {
-        Lab::build(services, None, None)
+        Lab::build(services, None, None, &super::Root::usual())
     }
 
     /// A lab whose `launch` stops a session's members with `stop` once
     /// told to end.
     fn stopping_with(stop: crate::engine::StopMembers) -> Lab {
-        Lab::build(None, Some(stop), None)
+        Lab::build(None, Some(stop), None, &super::Root::usual())
     }
 
     /// A lab whose engine keeps secrets in `secrets`.
     fn with_secrets(secrets: Box<dyn crate::secrets::Stores>) -> Lab {
-        Lab::build(None, None, Some(secrets))
+        Lab::build(None, None, Some(secrets), &super::Root::usual())
+    }
+
+    /// [`Lab::with_secrets`], enclos's folder at `root`.
+    fn with_secrets_under(secrets: Box<dyn crate::secrets::Stores>, root: &super::Root) -> Lab {
+        Lab::build(None, None, Some(secrets), root)
     }
 
     fn build(
         services: Option<Box<dyn crate::service::ServiceManager>>,
         stop: Option<crate::engine::StopMembers>,
         secrets: Option<Box<dyn crate::secrets::Stores>>,
+        root: &super::Root,
     ) -> Lab {
-        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let (dir, engine, name) =
+            super::policy::with_sandbox_under(FakeBackend::available(BackendKind::Seatbelt), root);
         let engine = match services {
             Some(services) => engine.with_services(services),
             None => engine,
@@ -2874,12 +2881,20 @@ fn configure_channel(
         match engine.configure_agent(by, name, agent, Some(request), &[], confirm)? {
             Planned::DryRun(plan) => Planned::DryRun(plan),
             Planned::Done(done) => {
-                let bot = done.channel.expect("a channel was asked for");
+                let Some(crate::engine::ChannelSet::Bot {
+                    token,
+                    answers,
+                    reachable,
+                    ..
+                }) = done.channel
+                else {
+                    panic!("a bot was asked for: {:?}", done.channel);
+                };
                 Planned::Done(Bot {
                     agent: done.agent,
-                    token: bot.token,
-                    answers: bot.answers,
-                    reachable: bot.reachable,
+                    token,
+                    answers,
+                    reachable,
                 })
             }
         },
@@ -3257,6 +3272,249 @@ fn an_agent_is_given_a_bot_of_its_own() {
     );
     assert!(!calls.contains("-p default config set"), "{calls}");
     assert!(!calls.contains("123:main"), "{calls}");
+}
+
+/// `runtime configure --channel app`, with `--allow-user` and
+/// `--token-env` given as `answers` and `token`.
+fn configure_app(
+    lab: &Lab,
+    answers: &[crate::model::channel::ChannelUser],
+    token: Option<&str>,
+    confirm: Confirm,
+) -> crate::error::Result<Planned<crate::engine::Configured>> {
+    let request = crate::engine::ChannelRequest {
+        channel: crate::model::channel::Channel::App,
+        token: token.map(str::to_owned),
+        answers: answers.to_vec(),
+    };
+    lab.engine
+        .configure_agent(&alice(), &lab.name, None, Some(request), &[], confirm)
+}
+
+/// The app channel's files enclos staged in `installers/` and left there.
+fn staged_app_files(lab: &Lab) -> Vec<String> {
+    let dir = lab.engine.layout.sandbox_installers("home");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("app-"))
+        .collect()
+}
+
+/// Grants the built-in agent `MOBILE_APP_TOKEN` in the policy, from a
+/// secret stored for it, with `confirm` (`Ask` leaves it pending while a
+/// session runs under the old rules).
+fn grant_app_token(lab: &Lab, confirm: Confirm) {
+    use crate::model::secret::{SecretRef, SecretValue};
+    let token: SecretRef = "home/app".parse().unwrap();
+    let value = SecretValue::new("0123abcd".into()).unwrap();
+    done(
+        lab.engine
+            .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.default]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, confirm)
+        .unwrap();
+}
+
+/// The app channel (ADR 0042, proposed): refused, with nothing run or
+/// staged, while its token is not the agent's own or when asked for
+/// people or a token variable the bridge decides instead; a dry run
+/// stages nothing; set up, the plugin is in the agent's home, turned on,
+/// told its socket, and nothing staged is left behind.
+#[test]
+fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
+    use crate::model::channel::ChannelUser;
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    // In /tmp: the socket's path must fit in 103 bytes, which macOS's own
+    // temporary folder, deep as it is, leaves no room for.
+    let root = super::Root {
+        parent: "/tmp".into(),
+        leaf: "e".to_owned(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let nothing_ran = |lab: &Lab| {
+        assert!(!calls().contains("plugins enable"), "{}", calls());
+        assert!(!calls().contains("MOBILE_APP"), "{}", calls());
+        assert!(
+            staged_app_files(lab).is_empty(),
+            "{:?}",
+            staged_app_files(lab)
+        );
+    };
+
+    // People to answer, or another token variable: the bridge decides
+    // both, so each is refused rather than ignored.
+    let users: Vec<ChannelUser> = vec!["111".parse().unwrap()];
+    let err = configure_app(&lab, &users, None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string().contains("`--allow-user` does not apply"),
+        "{err}"
+    );
+    let err = configure_app(&lab, &[], Some("MY_TOKEN"), Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string().contains("`--token-env` does not apply")
+            && err.to_string().contains("$MOBILE_APP_TOKEN"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    // No token granted: refused, saying how to make and grant one.
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("gives agent default no $MOBILE_APP_TOKEN")
+            && err
+                .to_string()
+                .contains("enclos secret set home/default-app")
+            && err.to_string().contains("[secrets.agents.default]"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    // Granted to the whole sandbox, every agent would hold it: the
+    // policy itself is refused, so one token is one agent's.
+    let shared: SecretRef = "home/shared-app".parse().unwrap();
+    let value = SecretValue::new("0123abcd".into()).unwrap();
+    done(
+        lab.engine
+            .secret_set(&alice(), &shared, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let sandbox_wide =
+        format!("{before}\n[secrets]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/shared-app\" }}\n");
+    let err = lab
+        .engine
+        .policy_edit(&alice(), &lab.name, &before, &sandbox_wide, Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Policy(e) if e.is_refused())
+            && err.to_string().contains("secrets.env.MOBILE_APP_TOKEN"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    grant_app_token(&lab, Confirm::Yes);
+    // A dry run names the copy and runs nothing, and stages nothing.
+    let Planned::DryRun(plan) = configure_app(&lab, &[], None, Confirm::DryRun).unwrap() else {
+        panic!("a dry run set the app channel up");
+    };
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.contains("run `cp '~/.hermes/plugins/enclos/plugin.yaml'")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.contains("plugins enable enclos")),
+        "{plan:?}"
+    );
+    nothing_ran(&lab);
+
+    let Planned::Done(configured) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
+        panic!("not a dry run");
+    };
+    let socket = lab.engine.layout.agent_app_socket("home", "default");
+    assert_eq!(
+        configured.channel,
+        Some(crate::engine::ChannelSet::App {
+            token: "MOBILE_APP_TOKEN".to_owned(),
+            socket: socket.clone(),
+        })
+    );
+    assert_eq!(
+        configured.settings,
+        ["MOBILE_APP_SOCKET", "MOBILE_APP_ALLOW_ALL"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/plugins/enclos/plugin.yaml")).unwrap(),
+        include_str!("../../../channels/hermes/enclos/plugin.yaml")
+    );
+    assert!(
+        calls().ends_with(&format!(
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n",
+            socket.display()
+        )),
+        "{}",
+        calls()
+    );
+    assert!(!calls().contains("0123abcd"), "{}", calls());
+    assert!(
+        staged_app_files(&lab).is_empty(),
+        "{:?}",
+        staged_app_files(&lab)
+    );
+}
+
+/// The app channel's token granted only by the pending policy waits for
+/// it: nothing runs, and nothing is staged, before `policy apply`.
+#[test]
+fn an_app_channel_whose_token_is_only_pending_is_refused() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    // A session under rules the grant changes keeps it pending.
+    let sleeping = super::sandbox::Sleeping::new();
+    let mut session = super::sandbox::session_of(&lab.engine, &lab.name, sleeping.process());
+    session.compiled = Some("/compiled/at-launch.sb".into());
+    super::sandbox::put(&lab.engine, &session);
+    grant_app_token(&lab, Confirm::Ask);
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("pending policy of sandbox home gives agent default $MOBILE_APP_TOKEN")
+            && err.to_string().contains("enclos policy apply home"),
+        "{err}"
+    );
+    let calls = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    assert!(!calls.contains("plugins enable"), "{calls}");
+    assert!(staged_app_files(&lab).is_empty());
+    drop(sleeping);
+}
+
+/// A socket path longer than a Unix socket's may be is refused before
+/// anything runs or is staged, saying to move ENCLOS_HOME.
+#[test]
+fn an_app_channel_whose_socket_path_is_too_long_is_refused() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let root = super::Root {
+        leaf: "e".repeat(80),
+        ..super::Root::usual()
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    grant_app_token(&lab, Confirm::Yes);
+    let socket = lab.engine.layout.agent_app_socket("home", "default");
+    assert!(socket.as_os_str().len() > 103, "{}", socket.display());
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("longer than a Unix socket's path may be")
+            && err.to_string().contains("ENCLOS_HOME"),
+        "{err}"
+    );
+    let calls = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    assert!(!calls.contains("plugins enable"), "{calls}");
+    assert!(staged_app_files(&lab).is_empty());
 }
 
 /// A session is given the port its gateway listens on, and says why when

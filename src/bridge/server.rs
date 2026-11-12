@@ -48,7 +48,7 @@ use enclos_protocol::device::{
     GroupState, MemberTurn, ToDevice, commands_for_devices, decode_from_device, split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
-use enclos_protocol::pairing::{check_proof, check_signature, decode, encode};
+use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
@@ -1293,7 +1293,14 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
             let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
-            if check_signature(&known.device_key, link.session.handshake_hash(), &sig).is_err() {
+            if check_signature(
+                &known.device_key,
+                Signed::Auth,
+                link.session.handshake_hash(),
+                &sig,
+            )
+            .is_err()
+            {
                 return Err(refuse(
                     Some(&known.id),
                     Some(&person),
@@ -1337,12 +1344,13 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
                 name,
                 device_key,
                 proof,
+                sig,
                 push,
             },
             None,
         ) => {
             let device = pair(
-                &store, &mut link, &caller, &noise_key, name, device_key, proof, push,
+                &store, &mut link, &caller, &noise_key, name, device_key, proof, sig, push,
             )?;
             let _ = store.log(Some(&device.id), Some(&person), "paired", None);
             device
@@ -1400,6 +1408,7 @@ fn pair(
     name: String,
     device_key: String,
     proof: String,
+    sig: String,
     push: Option<enclos_protocol::device::PushToken>,
 ) -> Result<Device, String> {
     let person = caller.login.as_str();
@@ -1422,6 +1431,12 @@ fn pair(
     else {
         return Err(refused(link, "bad_proof"));
     };
+    // The device holds the key it asks to pair: checked before the code is
+    // used, so a request that fails here leaves it for the real device
+    let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
+    if check_signature(&device_key, Signed::Pair, &hash, &sig).is_err() {
+        return Err(refused(link, "bad_signature"));
+    }
     let request = PairingRequest {
         name: name.clone(),
         person: person.to_owned(),
@@ -2493,7 +2508,7 @@ mod connection_end_tests {
             whois,
             store.clone(),
             crate::layout::Layout::at(folder.join("enclos")),
-            keys.private,
+            keys.private.to_vec(),
             vec![AgentEndpoint {
                 name: "lab/main".to_owned(),
                 runtime: "hermes".to_owned(),
@@ -2548,7 +2563,7 @@ mod connection_end_tests {
             .unwrap();
         Phone {
             id,
-            noise_private: noise.private,
+            noise_private: noise.private.to_vec(),
             signing,
         }
     }
@@ -2637,7 +2652,9 @@ mod connection_end_tests {
 
     fn connect_as(bridge: &Bridge, phone: &Phone, login: &str) -> (PhoneLink, Option<ToDevice>) {
         let mut device = handshake(bridge, &phone.noise_private, login).expect("no handshake");
-        let signature: Signature = phone.signing.sign(device.session.handshake_hash());
+        let signature: Signature = phone
+            .signing
+            .sign(&Signed::Auth.message(device.session.handshake_hash()));
         device.send(
             "auth-1",
             FromDevice::Auth {
@@ -2761,6 +2778,16 @@ mod connection_end_tests {
         code: &[u8],
         name: &str,
     ) -> (Option<PhoneLink>, Option<ToDevice>) {
+        ask_to_pair_signed(bridge, code, name, Signed::Pair)
+    }
+
+    /// [`ask_to_pair`], its signature made for `purpose`.
+    fn ask_to_pair_signed(
+        bridge: &Bridge,
+        code: &[u8],
+        name: &str,
+        purpose: Signed,
+    ) -> (Option<PhoneLink>, Option<ToDevice>) {
         let noise = generate_keypair().unwrap();
         let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
         let Some(mut device) = handshake(bridge, &noise.private, PERSON) else {
@@ -2773,11 +2800,34 @@ mod connection_end_tests {
                 name: name.to_owned(),
                 device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
                 proof: encode(&proof),
+                sig: {
+                    let signature: Signature =
+                        signing.sign(&purpose.message(device.session.handshake_hash()));
+                    encode(signature.to_der().as_bytes())
+                },
                 push: None,
             },
         );
         let answer = device.receive();
         (Some(device), answer)
+    }
+
+    #[test]
+    fn a_pairing_request_signed_for_another_purpose_is_refused_and_leaves_its_code() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        // An `auth` signature of the same session does not prove a pairing
+        let (_, answer) = ask_to_pair_signed(&bridge, b"code-1", "Pixel", Signed::Auth);
+        assert_eq!(
+            answer,
+            Some(ToDevice::PairRefused {
+                reason: "bad_signature".into()
+            })
+        );
+        assert_eq!(store.pairing_request(b"code-1").unwrap(), None);
+        assert!(store.devices().unwrap().is_empty());
     }
 
     #[test]
@@ -3167,6 +3217,11 @@ mod connection_end_tests {
                 name: "Pixel".to_owned(),
                 device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
                 proof: encode(&proof),
+                sig: {
+                    let signature: Signature =
+                        signing.sign(&Signed::Pair.message(device.session.handshake_hash()));
+                    encode(signature.to_der().as_bytes())
+                },
                 push: None,
             },
         );
