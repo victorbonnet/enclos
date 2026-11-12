@@ -32,6 +32,19 @@ const LOCAL_NAME_SUFFIXES: &[&str] = &[".local", ".home.arpa", ".internal", ".la
 /// settings), apps, and the usual personal `bin` folders.
 const HOME_REFUSED: &[&str] = &["Library", "Applications", "bin", "go/bin"];
 
+/// Whether `a` is, or is inside, `b`. On macOS without case: its usual file
+/// system does not tell `~/library` from `~/Library`, and a folder that does
+/// not exist yet keeps the case the agent wrote.
+fn within(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if cfg!(target_os = "macos") {
+        let lower =
+            |p: &std::path::Path| std::path::PathBuf::from(p.to_string_lossy().to_lowercase());
+        lower(a).starts_with(lower(b))
+    } else {
+        a.starts_with(b)
+    }
+}
+
 /// Why an agent-proposed write scope cannot be approved from the phone, if
 /// it cannot (ADR 0046). `target` and `home` are real paths; `path` is the
 /// host's `PATH`. The host's own `enclos policy edit` is not narrowed: there
@@ -70,17 +83,20 @@ pub(crate) fn phone_write_refusal(
             target.display()
         ));
     }
+    // Both ways: a grant on `~/go` covers `~/go/bin`.
     if target.starts_with(home)
-        && let Some(folder) = HOME_REFUSED.iter().find(|f| rest.starts_with(f))
+        && let Some(folder) = HOME_REFUSED
+            .iter()
+            .find(|f| within(&rest, Path::new(f)) || within(Path::new(f), &rest))
     {
         return Some(format!(
-            "{} is inside ~/{folder}, which holds programs or settings the host runs outside the sandbox{on_host}",
+            "{} is, holds or is inside ~/{folder}, which holds programs or settings the host runs outside the sandbox{on_host}",
             target.display()
         ));
     }
     if let Some(folder) = path
         .iter()
-        .find(|p| p.is_absolute() && (target.starts_with(p) || p.starts_with(target)))
+        .find(|p| p.is_absolute() && (within(target, p) || within(p, target)))
     {
         return Some(format!(
             "{} is, holds or is inside {}, a folder on the host's PATH, whose programs run outside the sandbox{on_host}",
@@ -220,7 +236,7 @@ impl Engine {
                     expected.fs.write.push(target.clone());
                 }
                 format!(
-                    "Allow every agent in {name} to write {target} and everything beneath it. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
+                    "Allow every agent in {name} to write {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
                 )
             }
             AccessKind::Read => {
