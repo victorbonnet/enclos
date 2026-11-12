@@ -12,7 +12,7 @@ pub fn bridge_keypair(path: &Path) -> std::io::Result<KeyPair> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.len() == 64 => {
             return Ok(KeyPair {
-                private: bytes[..32].to_vec(),
+                private: bytes[..32].to_vec().into(),
                 public: bytes[32..].to_vec(),
             });
         }
