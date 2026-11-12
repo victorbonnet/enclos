@@ -1,0 +1,14 @@
+[
+  {
+    "definition": {"id": "q", "text": "What name should the report use?", "choices": [], "multiple": false},
+    "text": "What name should the report use?\nReply with your answer, or reply \"skip\" to skip this question."
+  },
+  {
+    "definition": {"id": "q", "text": "How should I group the report?", "choices": ["By project (Recommended)", "By week"], "multiple": false},
+    "text": "How should I group the report?\n1. By project (Recommended)\n2. By week\nReply with an option's number or text, or reply \"skip\" to skip this question. Another message cancels it."
+  },
+  {
+    "definition": {"id": "q", "text": "Which sections?\nPick any.", "choices": ["Summary", "Coûts 🤖", "Timeline"], "multiple": true},
+    "text": "Which sections?\nPick any.\n1. Summary\n2. Coûts 🤖\n3. Timeline\nReply with the numbers or texts of one or more options, separated by commas, or reply \"skip\" to skip this question. Another message cancels it."
+  }
+]

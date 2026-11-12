@@ -2,8 +2,10 @@
 
 import asyncio
 import importlib
+import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -14,7 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from enclos import protocol, questions
+from enclos import protocol, questions, visible
 from enclos.outbox import Outbox
 
 
@@ -63,7 +65,7 @@ class QuestionProtocol(unittest.TestCase):
             self.decode("hello", token="t", capabilities="questions")
 
     def test_response_and_sync_are_typed_controls(self):
-        pasted = {"kind": "text", "text": "Line one\r\nLine two\tend"}
+        pasted = {"kind": "text", "text": "Line one\nLine two end"}
         self.assertEqual(self.decode("question.answer", conversation="c", question="q", answer=pasted)["answer"], pasted)
         self.assertEqual(self.decode("question.answer", conversation="c", question="q",
                                      answer={"kind": "choices", "indices": [0]})["type"], "question.answer")
@@ -72,7 +74,9 @@ class QuestionProtocol(unittest.TestCase):
                        {"kind": "choices", "indices": [1, 1]}, {"kind": "text", "text": "\0skipped"},
                        {"kind": "text", "text": "\0cancelled"},
                        {"kind": "text", "text": "hello\x85"}, {"kind": "skip", "text": "x"},
-                       {"kind": "text", "text": " "}, {"kind": "text", "text": "x" * 8192}):
+                       {"kind": "text", "text": " "}, {"kind": "text", "text": "x" * 8192},
+                       # A CR or a tab is not seen either: the app sends plain newlines.
+                       {"kind": "text", "text": "Line one\r\nLine two"}, {"kind": "text", "text": "tab\there"}):
             with self.subTest(answer=str(answer)[:100]), self.assertRaises(protocol.DecodeError):
                 self.decode("question.answer", conversation="c", question="q", answer=answer)
         with self.assertRaises(protocol.DecodeError):
@@ -101,11 +105,52 @@ class QuestionProtocol(unittest.TestCase):
         self.assertIn("answering a question does not change policy", path.read_text())
         questions.register_skill(object())
 
-    def test_missing_public_native_query_disables_native_cards(self):
+    def test_missing_public_native_query_disables_native_cards_and_says_so_once(self):
         fake_tools = types.ModuleType("tools")
         fake_tools.clarify_gateway = types.SimpleNamespace(resolve_gateway_clarify=lambda *_: True)
-        with patch.dict(sys.modules, {"tools": fake_tools}):
-            self.assertIsNone(questions._native())
+        with patch.dict(sys.modules, {"tools": fake_tools}), patch.object(questions, "_warned_native", False):
+            with self.assertLogs(questions.logger, "WARNING") as logs:
+                self.assertIsNone(questions._native())
+                self.assertIsNone(questions._native())
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn("get_pending", logs.output[0])
+            self.assertIn("SKIPPED", logs.output[0])
+
+    def test_hidden_characters_and_duplicate_labels_follow_the_protocol_rule(self):
+        # The characters of enclos-protocol's `visible` tests, and the same verdicts.
+        for code in (0x202E, 0x2066, 0x200B, 0x200E, 0xFEFF, 0x061C, 0x0007, 0x0085, 0x00AD,
+                     0x034F, 0x115F, 0x3164, 0xFFA0, 0x2800, 0x2028, 0x2029, 0x206A, 0xFFF9,
+                     0xFE00, 0xE0041, 0xE007F, 0xE0100, 0x200D):
+            self.assertTrue(visible.is_hidden(chr(code)), hex(code))
+            self.assertTrue(visible.has_hidden("a" + chr(code) + "b", True), hex(code))
+        for char in "a\u00e9\u00df\u4e2d\U0001f600 -\u06cc":
+            self.assertFalse(visible.is_hidden(char), char)
+        value = {"id": "q", "text": "Which?", "choices": ["Allow", "Deny"], "multiple": False}
+        for changed in ({**value, "choices": ["Deny\u202Ewolla", "Allow"]},
+                        {**value, "choices": ["Allow\u200B", "Allow"]},
+                        {**value, "choices": ["Allow\U000E0041", "Allow"]},
+                        {**value, "choices": ["\u2764", "\u2764\uFE0F"]},
+                        {**value, "choices": ["Allow\u2028"]},
+                        {**value, "choices": ["\u3164"]},
+                        {**value, "choices": ["Allow", "Allow"]},
+                        {**value, "choices": ["Two\nlines"]},
+                        {**value, "choices": ["Tab\there"]},
+                        {**value, "text": "Which\u2066?"}, {**value, "text": "Which\r\n?"},
+                        {**value, "text": "Which\t?"}):
+            with self.subTest(changed=str(changed)), self.assertRaises(ValueError):
+                questions.validate_definition(changed)
+        self.assertEqual(questions.validate_definition({**value, "text": "Which?\nPick one."})["text"],
+                         "Which?\nPick one.")
+        for text in ("ok\u200D", "a\tb", "a\r\nb", "\u00AD"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                questions.validate_answer({"kind": "text", "text": text}, value)
+        # Persian spelling, a joined emoji and an emoji's presentation selector are text.
+        for text in ("\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645", "\U0001F469\u200D\U0001F4BB",
+                     "\u2764\uFE0F"):
+            with self.subTest(text=text):
+                self.assertEqual(questions.validate_answer({"kind": "text", "text": text}, value)["text"], text)
+                self.assertEqual(questions.validate_definition({**value, "text": text})["text"], text)
+                questions.validate_definition({**value, "choices": [text, "Deny"]})
 
 
 class AdapterControls(unittest.IsolatedAsyncioTestCase):
@@ -138,6 +183,13 @@ class AdapterControls(unittest.IsolatedAsyncioTestCase):
             await adapter._on_line(protocol.encode_line(sync))
             adapter._questions.sync.assert_awaited_once_with(["q"])
             self.assertEqual(adapter._write.call_args.args[0]["of"], sync["id"])
+            adapter._questions.refused = AsyncMock()
+            adapter.name = "enclos"
+            adapter._outbox = types.SimpleNamespace(set_aside=lambda of: False)
+            adapter._answers = {}
+            refusal = protocol.error("bad_message", "Too many questions are waiting.", "ask-1")
+            await adapter._on_line(protocol.encode_line(refusal))
+            adapter._questions.refused.assert_awaited_once_with("ask-1", "bad_message")
         sys.modules.pop("enclos.adapter", None)
 
 
@@ -150,7 +202,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         self.adapter = types.SimpleNamespace(_outbox=Outbox(self.temporary.name),
                                              _write=AsyncMock(return_value=True),
                                              send=AsyncMock(return_value=types.SimpleNamespace(success=True)))
-        self.manager = questions.Manager(self.adapter, native=lambda: self.native)
+        self.manager = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send, native=lambda: self.native)
         self.manager.bridge_supports = True
         self.addAsyncCleanup(self.manager.close)
 
@@ -176,7 +228,8 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.response, "Second")
         self.assertEqual(self.updates()[-1]["of"], request["id"])
         self.assertEqual(self.updates()[-1]["answer"], {"kind": "choices", "indices": [1]})
-        self.assertTrue(entry.awaiting_text)
+        # A native card leaves Hermes's prose rule alone: typed prose cancels, not answers.
+        self.assertFalse(entry.awaiting_text)
         self.adapter.send.assert_not_awaited()
         await self.manager.answer(self.answer(card, {"kind": "choices", "indices": [0]}))
         self.assertEqual(entry.response, "Second")
@@ -223,6 +276,15 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         await self.manager.retire(card.native_id)
         self.assertEqual(card.state, "cancelled")
 
+    async def test_a_typed_answer_the_app_cannot_carry_is_still_answered(self):
+        # Hermes accepts any composer text; the agent has it, so the card is not cancelled.
+        entry, card = await self.ask()
+        self.native.resolve_gateway_clarify(card.native_id, "ok" + chr(0x202E) + "kc")
+        await self.manager.retire(card.native_id)
+        self.assertEqual(card.state, "answered")
+        self.assertEqual(self.updates()[-1]["state"], "answered")
+        self.assertNotIn("answer", self.updates()[-1])
+
     async def test_watcher_first_still_gets_exact_correlated_confirmation(self):
         entry, card = await self.ask(["One", "Two"])
         self.native.resolve_gateway_clarify(card.native_id, "One")
@@ -248,7 +310,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         await self.manager.sync([card.definition["id"]])
         self.assertEqual(self.updates()[-1]["state"], "skipped")
         self.assertNotIn("of", self.updates()[-1])
-        restarted = questions.Manager(self.adapter, native=lambda: self.native)
+        restarted = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send, native=lambda: self.native)
         await restarted.sync([card.definition["id"]])
         self.assertEqual(self.updates()[-1]["state"], "expired")
 
@@ -280,7 +342,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_expires_an_unseen_durable_ask_after_replay(self):
         entry, card = await self.ask(["One", "Two"])
-        restarted = questions.Manager(self.adapter, native=lambda: self.native)
+        restarted = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send, native=lambda: self.native)
         replay = restarted.prepare_replay()
         self.assertEqual([m["type"] for m in replay], ["question.ask", "question.update"])
         self.assertEqual(replay[-1]["state"], "expired")
@@ -294,7 +356,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         # Only the terminal update ACK arrived; the bridge already has canonical
         # answered state. It must ignore this later unsolicited expiry immutably.
         self.adapter._outbox.acknowledge(self.updates()[-1]["id"])
-        restarted = questions.Manager(self.adapter, native=lambda: self.native)
+        restarted = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send, native=lambda: self.native)
         replay = restarted.prepare_replay()
         self.assertEqual(replay[0], ask)
         self.assertEqual(replay[1]["state"], "expired")
@@ -304,7 +366,7 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
     async def test_full_replay_outbox_retries_orphan_expiry_after_ask_ack(self):
         entry, card = await self.ask(["One", "Two"])
         self.adapter._outbox._limit = 1
-        restarted = questions.Manager(self.adapter, native=lambda: self.native)
+        restarted = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send, native=lambda: self.native)
         restarted.bridge_supports = True
         self.addAsyncCleanup(restarted.close)
         replay = restarted.prepare_replay()
@@ -348,6 +410,56 @@ class QuestionDelivery(unittest.IsolatedAsyncioTestCase):
         self.manager.acknowledge(self.updates()[-1]["id"])
         self.assertNotIn(card.definition["id"], self.manager.cards)
 
+    def sent_text(self):
+        return "".join(call.args[1] for call in self.adapter.send.await_args_list)
+
+    async def test_a_refused_ask_is_shown_as_text_instead_of_waiting_unseen(self):
+        entry, card = await self.ask(["One", "Two"])
+        await self.manager.refused("not-an-ask")
+        self.adapter.send.assert_not_awaited()
+        await self.manager.refused(card.ask_id)
+        self.assertNotIn(card.definition["id"], self.manager.cards)
+        self.assertIn("1. One", self.sent_text())
+        self.assertIn("2. Two", self.sent_text())
+        # Hermes's own text fallback: a typed answer is captured.
+        self.assertTrue(entry.awaiting_text)
+        self.assertFalse(entry.event.is_set())
+        # The bridge never kept it, so nothing more is said about it.
+        before = len(self.updates())
+        await asyncio.sleep(0.15)
+        self.assertEqual(len(self.updates()), before)
+
+    async def test_a_call_that_does_not_match_its_entry_is_still_shown(self):
+        native_id = str(uuid.uuid4())
+        self.native.register(native_id, "another-session", "Which?", ["One"])
+        self.assertTrue(await self.manager.ask("c", "Which?", ["One"], native_id, self.scope))
+        self.assertFalse(self.manager.cards)
+        self.assertIn("1. One", self.sent_text())
+
+    async def test_duplicate_or_hidden_labels_never_become_a_card(self):
+        for choices in (["Allow", "Allow"], ["Allow\u202E", "Deny"]):
+            native_id = str(uuid.uuid4())
+            self.native.register(native_id, self.scope, "Which?", choices)
+            self.assertTrue(await self.manager.ask("c", "Which?", choices, native_id, self.scope))
+        self.assertFalse(self.manager.cards)
+        self.assertEqual(self.adapter.send.await_count, 2)
+
+    async def test_an_unreadable_native_entry_cancels_its_card(self):
+        entry, card = await self.ask(["One", "Two"])
+        del entry.event  # Hermes changed what an entry holds.
+        with self.assertLogs(questions.logger, "ERROR"):
+            await asyncio.sleep(0.15)
+        self.assertEqual(card.state, "cancelled")
+        self.assertEqual(self.updates()[-1]["state"], "cancelled")
+
+    async def test_closing_the_channel_cancels_the_native_wait_too(self):
+        entry, card = await self.ask(["One", "Two"])
+        await self.manager.close()
+        self.assertTrue(entry.event.is_set())
+        self.assertEqual(entry.response, self.native.CANCELLED)
+        self.assertEqual(card.state, "cancelled")
+        self.assertEqual(self.updates()[-1]["state"], "cancelled")
+
 
 @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
 class NativeHermesQuestions(QuestionDelivery):
@@ -364,6 +476,46 @@ class NativeHermesQuestions(QuestionDelivery):
         self.native = importlib.import_module("tools.clarify_gateway")
         self.addCleanup(self.native.clear_session, self.scope)
         self.manager.native = lambda: self.native
+
+    async def test_an_unreadable_native_entry_cancels_its_card(self):
+        entry, card = await self.ask(["One", "Two"])
+        event = entry.event
+        del entry.event  # Hermes changed what an entry holds.
+        with self.assertLogs(questions.logger, "ERROR"):
+            await asyncio.sleep(0.15)
+        entry.event = event  # So that Hermes's own cleanup can run.
+        self.assertEqual(card.state, "cancelled")
+
+    # What the channel relies on in Hermes: a change there fails here, in CI's
+    # `hermes-latest` job, rather than turning questions into text unnoticed.
+
+    def test_the_registry_has_every_native_function_the_channel_calls(self):
+        with patch.object(questions, "_warned_native", False):
+            self.assertIs(questions._native(), self.native)
+        entry = self.native.register("probe", self.scope, "Which?", ["One"], multi_select=False)
+        for field in ("session_key", "choices", "multi_select", "event", "response", "question"):
+            self.assertTrue(hasattr(entry, field), field)
+
+    def test_the_clarify_timeout_enclos_sets_is_the_key_hermes_reads(self):
+        source = (Path(__file__).resolve().parents[3] / "src" / "runtime" / "hermes.rs").read_text()
+        seconds = int(re.search(r"const CLARIFY_TIMEOUT_SECONDS: u32 = (\d+);", source).group(1))
+        self.assertIn('"agent.clarify_timeout"', source)
+        self.assertEqual(self.native.resolve_clarify_timeout({"agent": {"clarify_timeout": seconds}}), seconds)
+
+    def test_the_adapter_hooks_match_hermes(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        parameters = list(inspect.signature(BasePlatformAdapter.send_clarify).parameters)
+        self.assertEqual(parameters, ["self", "chat_id", "question", "choices", "clarify_id",
+                                      "session_key", "metadata"])
+        gateway = Path(os.environ["ENCLOS_HERMES_SOURCE"]) / "gateway"
+        calls = "".join(p.read_text(errors="replace") for p in gateway.rglob("*.py"))
+        self.assertIn("retire_clarify_card", calls)
+
+    def test_the_card_text_drops_exactly_hermess_skip_hint(self):
+        hint = questions._hermes_text("gateway.clarify.skip_hint", "")
+        self.assertTrue(hint)
+        self.assertEqual(questions._card_text("Which?\n" + hint), "Which?")
+
 
 if __name__ == "__main__":
     unittest.main()

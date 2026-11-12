@@ -8,6 +8,8 @@
 //! - [`plugin`]: the bridge and an agent's channel plugin.
 //! - [`device`], [`noise`], [`pairing`], [`preview`]: the bridge and a
 //!   paired device.
+//! - [`visible`]: text checked for hidden characters before a person
+//!   reads it.
 
 pub mod agent_name;
 pub mod approval;
@@ -22,6 +24,7 @@ pub mod policy;
 pub mod preview;
 pub mod question;
 pub mod routine;
+pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
 pub use ids::{ConversationId, IdError, MessageId, Person, QuestionId};
