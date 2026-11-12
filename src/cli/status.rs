@@ -12,7 +12,7 @@ use enclos::engine::{
 };
 use enclos::error::{Result, exit};
 use enclos::model::sandbox::{SandboxName, SandboxState};
-use enclos::model::{Timestamp, now};
+use enclos::model::{Timestamp, count, now};
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -189,7 +189,10 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
         facts.push("sessions on a replaced policy".into());
     }
     if s.gone_sessions > 0 {
-        facts.push(format!("{} sessions gone, not recorded", s.gone_sessions));
+        facts.push(format!(
+            "{} gone, not recorded",
+            count(s.gone_sessions, "session", "sessions")
+        ));
     }
     facts.push(format!("last connect {}", ago(s.last_connect, now)));
     facts.push(format!("last network {}", ago(s.last_network, now)));
@@ -318,13 +321,6 @@ fn tilde(path: &Path, user_home: Option<&str>) -> String {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
-    }
-}
-
-fn count(n: usize, one: &str, many: &str) -> String {
-    match n {
-        1 => format!("1 {one}"),
-        n => format!("{n} {many}"),
     }
 }
 
