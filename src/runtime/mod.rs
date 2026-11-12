@@ -473,17 +473,21 @@ pub trait RuntimeAdapter {
     /// plugin the runtime loads, the commands that turn it on once it is in
     /// place, and the settings that tell it its socket, `socket`, a path in
     /// the sandbox home that enclos's bridge connects to, and its `home`
-    /// conversation, the runtime's home channel (ADR 0044, proposed). The
-    /// agent's token is a secret the policy grants it as `MOBILE_APP_TOKEN`.
-    /// `token_file` is the core-owned protected per-agent secret file; a
-    /// file-consuming adapter uses this explicit path without inferring layout.
-    /// `None`: the runtime has no such channel.
+    /// conversation, the runtime's home channel (ADR 0044, proposed), and
+    /// `bridge_key`, the public key (SEC1, base64url) the bridge signs
+    /// runtime-approval decisions with, which the plugin checks each one
+    /// against (ADR 0060, proposed). The agent's token is a secret the
+    /// policy grants it as `MOBILE_APP_TOKEN`. `token_file` is the
+    /// core-owned protected per-agent secret file; a file-consuming adapter
+    /// uses this explicit path without inferring layout. `None`: the runtime
+    /// has no such channel.
     fn app_channel(
         &self,
         _agent: &RuntimeAgentName,
         _socket: &Path,
         _token_file: &Path,
         _home: &str,
+        _bridge_key: &str,
     ) -> Option<AppChannel> {
         None
     }

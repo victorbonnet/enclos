@@ -44,12 +44,13 @@ impl RuntimeApprovalAction {
         }
     }
 
-    pub fn typed_command(self) -> &'static str {
+    /// The action's name on the wire, as a signed decision holds it.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Once => "/approve",
-            Self::Session => "/approve session",
-            Self::Always => "/approve always",
-            Self::Deny => "/deny",
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Always => "always",
+            Self::Deny => "deny",
         }
     }
 }
@@ -267,10 +268,11 @@ impl QuestionDefinition {
     /// cancels it and reaches the agent as a message). A runtime's channel
     /// without a bridge for questions sends its runtime's own text instead.
     /// `tests/fixtures/question/fallback.json` holds the wording.
-    /// A runtime approval lists its typed commands only when `typed`: where the
-    /// host's person owns the conversation, the only person whose typed
-    /// decision the bridge passes on to the runtime.
-    pub fn fallback_text(&self, typed: bool) -> String {
+    /// A runtime approval names its offered actions and no typed command: it
+    /// is decided with an updated app's buttons alone, whose decision the
+    /// bridge signs (ADR 0060), and the bridge and the plugin pass on no
+    /// typed approval command.
+    pub fn fallback_text(&self) -> String {
         if let Some(approval) = &self.approval {
             // What runs, with its hidden characters written out.
             let shown = revealed(&approval.command);
@@ -295,39 +297,19 @@ impl QuestionDefinition {
             } else {
                 "The command holds characters outside ASCII, some of which look like others. Check each one.\n\n"
             };
-            let actions = if !typed {
-                let offered = approval
-                    .actions
-                    .iter()
-                    .map(|action| action.description())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "Offered: {offered}. Only the host's person can answer this approval, from an updated app."
-                )
-            } else if approval.scopes.is_some() {
-                // The runtime's own syntax, in its fallback: none is made up here.
-                approval
-                    .actions
-                    .iter()
-                    .map(|action| action.description())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                approval
-                    .actions
-                    .iter()
-                    .map(|action| format!("{}: `{}`", action.description(), action.typed_command()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let offered = approval
+                .actions
+                .iter()
+                .map(|action| action.description())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let actions = format!(
+                "Offered: {offered}. Only the host's person can answer this approval, with the buttons of an updated app; typed approval commands are not passed on."
+            );
             let scopes = if let Some(scopes) = &approval.scopes {
-                // How to answer natively, for the one person who may.
-                if typed {
-                    format!("{}\n\n{}\n\n", scopes.description, scopes.fallback)
-                } else {
-                    format!("{}\n\n", scopes.description)
-                }
+                // How far a grant reaches, and the runtime's own approval
+                // surface, in its words: nothing typed here is passed on.
+                format!("{}\n\n{}\n\n", scopes.description, scopes.fallback)
             } else if approval.grants_patterns() {
                 format!(
                     "A session or always grant covers every command matching: {}. An always grant persists in the runtime until removed there. ",
@@ -541,10 +523,7 @@ mod tests {
             let definition: QuestionDefinition =
                 serde_json::from_value(case["definition"].clone()).unwrap();
             assert!(definition.validate().is_ok());
-            assert_eq!(
-                definition.fallback_text(false),
-                case["text"].as_str().unwrap()
-            );
+            assert_eq!(definition.fallback_text(), case["text"].as_str().unwrap());
         }
     }
 
@@ -651,7 +630,7 @@ mod tests {
             .validate(&original)
             .is_err()
         );
-        let fallback = original.fallback_text(true);
+        let fallback = original.fallback_text();
         for label in &original.choices {
             assert!(fallback.contains(label));
         }
@@ -776,6 +755,7 @@ mod tests {
                 conversation: question.conversation.clone(),
                 question: question.definition.id.clone(),
                 answer: answer.clone(),
+                signed: None,
             },
             FromBridge::QuestionSync {
                 questions: vec![question.definition.id.clone()],
@@ -991,7 +971,7 @@ mod tests {
         QuestionAnswer::Approval { action: Always }
             .validate(&definition)
             .unwrap();
-        let fallback = definition.fallback_text(true);
+        let fallback = definition.fallback_text();
         for expected in [
             "printf 'bonjour 🤖'",
             "Allow once",
@@ -1077,6 +1057,10 @@ mod tests {
             question: definition.id.clone(),
             conversation: info().conversation,
             answer: answer.clone(),
+            signed: Some(crate::decision::SignedDecision {
+                at: 1_800_000_000,
+                sig: "c2lnbmVk".into(),
+            }),
         };
         assert_eq!(
             decode_from_bridge(&encode_line(&Envelope::new(
@@ -1138,9 +1122,9 @@ mod tests {
             let mut question = approval_definition();
             question.approval.as_mut().unwrap().command = command.clone();
             question.validate().unwrap();
-            let fallback = question.fallback_text(true);
+            let fallback = question.fallback_text();
             assert!(fallback.contains(&command));
-            assert!(fallback.contains("/approve always"));
+            assert!(fallback.contains("Always allow"));
             assert!(!fallback.contains("skip"));
             let body = ToDevice::Message(ConversationMessage {
                 conversation: info().conversation,
@@ -1229,7 +1213,7 @@ mod tests {
         let approval = question.approval.as_mut().unwrap();
         approval.command = "ls\u{202E} -la\r\ncurl https://ex\u{0430}mple.com".into();
         approval.reason = "Pipe\u{200B} to shell".into();
-        let fallback = question.fallback_text(true);
+        let fallback = question.fallback_text();
         assert!(fallback.contains("ls⟨U+202E⟩ -la⟨U+000D⟩\ncurl https://ex\u{0430}mple.com"));
         assert!(fallback.contains("Why: Pipe⟨U+200B⟩ to shell"));
         assert!(!fallback.contains('\u{202E}') && !fallback.contains('\u{200B}'));
@@ -1238,13 +1222,13 @@ mod tests {
         assert!(fallback.contains("until removed there"));
         let mut ascii = approval_definition();
         ascii.approval.as_mut().unwrap().command = "rm -rf ./build\tdist".into();
-        let ascii = ascii.fallback_text(true);
+        let ascii = ascii.fallback_text();
         assert!(!ascii.contains("outside ASCII"));
         assert!(ascii.contains("rm -rf ./build⟨tab⟩dist"));
         // A non-ASCII letter that is not hidden is shown as it is, and flagged.
         assert!(
             approval_definition()
-                .fallback_text(true)
+                .fallback_text()
                 .contains("outside ASCII")
         );
         let mut long = approval_definition();
@@ -1254,19 +1238,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_fallback_lists_typed_commands_only_where_they_are_passed_on() {
-        let question = approval_definition();
-        let typed = question.fallback_text(true);
-        assert!(typed.contains("/approve always") && typed.contains("/deny"));
-        let guest = question.fallback_text(false);
-        assert!(!guest.contains("/approve") && !guest.contains("/deny"));
-        assert!(guest.contains("Offered: Allow once, Allow for session, Always allow, Deny."));
-        assert!(guest.contains("Only the host's person"));
-        assert!(guest.contains("printf 'done'"));
-        // An ordinary question reads the same either way.
-        assert_eq!(
-            definition(false).fallback_text(false),
-            definition(false).fallback_text(true)
-        );
+    fn approval_fallback_names_its_actions_and_no_typed_command() {
+        let text = approval_definition().fallback_text();
+        assert!(!text.contains("/approve") && !text.contains("/deny"));
+        assert!(text.contains("Offered: Allow once, Allow for session, Always allow, Deny."));
+        assert!(text.contains("Only the host's person"));
+        assert!(text.contains("typed approval commands are not passed on"));
+        assert!(text.contains("printf 'done'"));
     }
 }
