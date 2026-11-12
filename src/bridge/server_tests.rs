@@ -1198,8 +1198,8 @@ fn who_sees_an_agent_is_one_rule_for_its_list_its_name_and_its_name_changes() {
         token: "fixture".into(),
     });
     for person in ["owner@example.com", "guest@example.com"] {
-        assert!(hub.can_see_agent(person, "lab/main"), "{person}");
-        assert!(!hub.can_see_agent(person, "lab/unlisted"), "{person}");
+        assert!(hub.sees_agent(person, "lab/main"), "{person}");
+        assert!(!hub.sees_agent(person, "lab/unlisted"), "{person}");
     }
 }
 
