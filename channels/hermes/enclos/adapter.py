@@ -83,6 +83,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        # By message id: a policy request's tool call waiting for the bridge.
+        self._answers: dict[str, asyncio.Future] = {}
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()

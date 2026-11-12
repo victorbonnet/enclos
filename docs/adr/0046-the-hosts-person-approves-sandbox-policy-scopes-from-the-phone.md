@@ -16,6 +16,8 @@ A proxy refusal becomes a request once: refusals from before the bridge's first 
 
 Requests and decisions survive reconnect and bridge restart. One device claims a decision atomically; an interrupted application is marked for host review, never replayed. Denying changes no policy. The plugin persists a description of the active policy and supplies it to future model turns; that description is advisory, and the backend and proxy still enforce the policy. Approval does not automatically replay an attempted action.
 
+[0054](0054-closing-a-policy-request-is-not-a-denial.md), proposed, adds a separate **Close request** action for pending and failed requests, including scopes unavailable for approval. Closing makes no new policy decision, uses the same host-person authority, and leaves any failed policy work for host review.
+
 The proxy identifies a sandbox, not an agent: its refusals never acquire an invented agent or conversation. Hermes reports concrete file tool refusals and offers `enclos_request_access` for other actions, including a shell's refused filesystem operation. Arbitrary shell syntax is not parsed for grants. This does not observe every OS refusal, and cannot approve a new kind of capability the engine does not support.
 
 Reason: an exact scope in a persistent policy is understandable and reusable, while accepting a command string on the host would turn agent text into authority. Keeping existing policy validation and restart rules avoids a second enforcement path. An additional per-device admin enrollment could narrow authority further, but this request uses the host person's already paired devices; the future general admin surface is separate (#166).

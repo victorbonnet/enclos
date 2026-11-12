@@ -8,6 +8,23 @@ use crate::{
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 use std::collections::HashMap;
 
+/// Why request `a` cannot be closed yet, if it cannot: a failed application
+/// may have left a pending policy change (`pending` says whether its
+/// sandbox has one), and the request is then the phone's only sign of it,
+/// so it stays until the host applies or discards that change. A sandbox
+/// whose policy cannot be read shows no such change, and closes.
+pub(super) fn close_blocked(
+    a: &Approval,
+    pending: impl FnOnce(&SandboxName) -> bool,
+) -> Option<String> {
+    let name = a.sandbox.parse::<SandboxName>().ok()?;
+    (a.state == "failed" && pending(&name)).then(|| {
+        format!(
+            "A policy change waits on the host for {name}. Apply it with `enclos policy apply {name}` or drop it with `enclos policy discard {name}`, then close this request."
+        )
+    })
+}
+
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
         && crate::net::host::AllowEntry::parse(&access.target)
@@ -195,26 +212,27 @@ impl Hub {
             )
             .as_bytes(),
         );
-        // Decided under this policy: not asked again until it changes. An
-        // agent is told so, not left waiting for a request nobody sees.
-        let told = |known: &Approval| -> Result<(), String> {
-            if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying") {
+        // Decided or closed under this policy: not asked again until it
+        // changes. An agent is told so, not left waiting for a request
+        // nobody sees.
+        let known = |old: &Approval| {
+            if agent.contains('/') && !matches!(old.state.as_str(), "pending" | "applying") {
                 Err(format!(
                     "A request for this scope was already {} under {sandbox}'s active policy. It is not asked again until the policy changes.",
-                    known.state
+                    old.state
                 ))
             } else {
                 Ok(())
             }
         };
-        if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
-            if known.state != "diagnostic" {
-                return told(&known);
+        if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
+            if old.state != "diagnostic" {
+                return known(&old);
             }
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
-            if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
-                return told(&known);
+            if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
+                return known(&old);
             }
         }
         let mut a = Approval {
@@ -367,6 +385,74 @@ impl Hub {
         Ok(())
     }
 
+    fn approval_authority(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), String> {
+        if self.known_host().as_deref() != Some(person) {
+            return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
+        }
+        // Recheck revocation immediately before the action, not just at the handshake.
+        if !store
+            .devices()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|d| d.id == device.id && d.person == person)
+        {
+            return Err("This device is no longer paired.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn close_access(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        id: &str,
+    ) -> Result<(), String> {
+        self.approval_authority(store, device, person)?;
+        // Checked and closed from one reading of its state. A request that
+        // changed in between, such as an application that failed just after
+        // the check and left a pending change, is read and checked again;
+        // states only move forward, so this ends.
+        for _ in 0..3 {
+            let a = store
+                .approval(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("Unknown policy request")?;
+            if let Some(why) = close_blocked(&a, |name| {
+                Engine::open(self.layout.clone())
+                    .policy(name)
+                    .is_ok_and(|view| view.pending.is_some())
+            }) {
+                return Err(why);
+            }
+            // The store transition also checks the state atomically against other devices.
+            let closed = store
+                .close_approval(id, &a.state, &device.id, person)
+                .map_err(|e| e.to_string())?;
+            if closed || !matches!(a.state.as_str(), "pending" | "failed") {
+                break;
+            }
+        }
+        let a = store
+            .approval(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Unknown policy request")?;
+        let applying = a.state == "applying";
+        self.deliver(person, ToDevice::Approval(a));
+        if applying {
+            return Err(
+                "This request is already being decided. Wait for the result before closing it."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn decide_access(
         self: &Arc<Self>,
         store: &Store,
@@ -376,18 +462,7 @@ impl Hub {
         revision: &str,
         approve: bool,
     ) -> Result<(), String> {
-        if self.known_host().as_deref() != Some(person) {
-            return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
-        }
-        // Recheck revocation immediately before the decision, not just at the handshake.
-        if !store
-            .devices()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|d| d.id == device.id && d.person == person)
-        {
-            return Err("This device is no longer paired.".into());
-        }
+        self.approval_authority(store, device, person)?;
         let mut a = store
             .approval(id)
             .map_err(|e| e.to_string())?

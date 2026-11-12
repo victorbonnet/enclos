@@ -752,6 +752,33 @@ impl Store {
         )? == 1)
     }
 
+    /// Closes attention only. The original request and policy decision stay intact.
+    /// The first write races with claim_approval; only one transition can win.
+    /// It closes only from `expected`, the state the caller checked: a
+    /// request that changed since (an application that failed just after
+    /// the check) is not closed without being checked again.
+    pub fn close_approval(
+        &self,
+        id: &str,
+        expected: &str,
+        device: &str,
+        person: &str,
+    ) -> rusqlite::Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE approvals SET state='closed' WHERE id=?1 AND state=?2 AND state IN ('pending','failed')",
+            [id, expected],
+        )? == 1;
+        if changed {
+            tx.execute(
+                "INSERT INTO log (at,device,person,event,reason) VALUES (?1,?2,?3,'approval.closed',?4)",
+                params![now(), device, person, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Opens the database at `path`, made for the user alone (`0600`): it
     /// holds every conversation, and later each device's keys.
     pub fn open(path: &Path) -> rusqlite::Result<Store> {

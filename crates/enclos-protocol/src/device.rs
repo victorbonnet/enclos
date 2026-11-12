@@ -73,6 +73,9 @@ pub enum FromDevice {
         revision: String,
         approve: bool,
     },
+    /// Removes a request from attention without granting or denying access.
+    #[serde(rename = "approval.close")]
+    ApprovalClose { request: String },
     #[serde(rename = "agents")]
     Agents,
     #[serde(rename = "conversation.new")]
@@ -148,6 +151,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "auth",
     "pair.request",
     "approval.decide",
+    "approval.close",
     "agents",
     "conversation.new",
     "group.new",
@@ -195,7 +199,12 @@ pub enum ToDevice {
     Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
     #[serde(rename = "authenticated")]
-    Authenticated { person: String },
+    Authenticated {
+        person: String,
+        /// Host features; independent of any agent runtime's capabilities.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
     #[serde(rename = "pair.refused")]
@@ -565,6 +574,50 @@ mod tests {
         // Nearly full: no piece but the last is left far below the limit
         let first = sealed_size(&message, &pieces[0]);
         assert!(first > MAX_DEVICE_MESSAGE - ID_AND_SEQ_ROOM - 8, "{first}");
+    }
+
+    #[test]
+    fn approval_close_device_message_round_trips() {
+        let fixture = br#"{"v":1,"id":"m-close","type":"approval.close","request":"r1"}"#;
+        let message = decode_from_device(fixture).unwrap();
+        assert_eq!(
+            message.body,
+            FromDevice::ApprovalClose {
+                request: "r1".into()
+            }
+        );
+        assert!(FROM_DEVICE_TYPES.contains(&"approval.close"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_line(&message)).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(fixture).unwrap()
+        );
+    }
+
+    #[test]
+    fn authenticated_host_capabilities_are_optional_and_round_trip() {
+        for (fixture, capabilities) in [
+            (
+                r#"{"v":1,"id":"m-auth","type":"authenticated","person":"owner@example.com"}"#,
+                vec![],
+            ),
+            (
+                r#"{"v":1,"id":"m-auth","type":"authenticated","person":"owner@example.com","capabilities":["approval.close"]}"#,
+                vec!["approval.close".to_owned()],
+            ),
+        ] {
+            let message = decode_to_device(fixture.as_bytes()).unwrap();
+            assert_eq!(
+                message.body,
+                ToDevice::Authenticated {
+                    person: "owner@example.com".into(),
+                    capabilities,
+                }
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&encode_line(&message)).unwrap(),
+                serde_json::from_str::<serde_json::Value>(fixture).unwrap()
+            );
+        }
     }
 
     fn command(name: &str, description: &str, args: Option<&str>) -> Command {

@@ -134,8 +134,8 @@ def register(ctx, adapters, socket_path, platform="enclos"):
             if not through:
                 return json.dumps({"error": "No enclos conversation is active."})
             message = request(conversation, kind, target, action, private)
-            # The bridge may refuse it (a scope already decided under this
-            # policy, too many pending): the agent is told, not left waiting.
+            # The bridge may refuse it (a scope already decided or closed
+            # under this policy, too many pending): the agent is told, not left waiting.
             waits = [asyncio.run_coroutine_threadsafe(submit(adapter, message), adapter._loop) for adapter in through]
             return json.dumps(outcome([w.result(timeout=ANSWER_SECONDS + 5) for w in waits]))
         except Exception as e:

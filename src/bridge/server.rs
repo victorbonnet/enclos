@@ -725,7 +725,8 @@ impl Hub {
                         let id = conversation.as_str();
                         if approvals::speaks_in(&store, &agent, id) {
                             // Refused or not, the plugin is answered, so its outbox
-                            // does not send the same request again forever.
+                            // does not send the same request again forever, and its
+                            // tool tells the agent why.
                             if let Err(e) =
                                 hub.request_access(&store, &agent, Some(id), access, &action)
                             {
@@ -1367,6 +1368,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
+        capabilities: vec!["approval.close".into()],
     })?;
     // Authenticated: no longer among the callers that are few at once
     drop(waiting);
@@ -1693,6 +1695,16 @@ fn run_session(
                     }))?;
                 } else {
                     link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
+            FromDevice::ApprovalClose { request } => {
+                match hub.close_access(store, device, person, &request) {
+                    Ok(()) => link.send(ToDevice::Ack { of: message.id })?,
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
                 }
             }
             FromDevice::Agents => {
