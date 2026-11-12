@@ -3439,7 +3439,11 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
     assert_eq!(
         configured.settings,
-        ["MOBILE_APP_SOCKET", "MOBILE_APP_ALLOW_ALL"]
+        [
+            "MOBILE_APP_SOCKET",
+            "MOBILE_APP_ALLOW_ALL",
+            "MOBILE_APP_HOME_CHANNEL"
+        ]
     );
     assert_eq!(
         std::fs::read_to_string(lab.home.join(".hermes/plugins/enclos/plugin.yaml")).unwrap(),
@@ -3447,7 +3451,7 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
     assert!(
         calls().ends_with(&format!(
-            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n",
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n",
             socket.display()
         )),
         "{}",
