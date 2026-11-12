@@ -35,15 +35,24 @@
   // the bridge: the one-time code stays on this phone.
   const query = location.hash.slice(1);
   const params = new URLSearchParams(query);
-  const host = params.get("host");
+  // The page vouches only for its own bridge: a link whose `url` is another
+  // bridge pairs with nothing here, and the host shown is the address the
+  // page came from, never the link's `host`, which anyone can write.
+  let ours = false;
+  try {
+    ours = new URL(params.get("url")).origin === location.origin;
+  } catch {
+    ours = false;
+  }
+  const host = location.hostname;
   const expires = Number(params.get("exp"));
   const link = "enclos://pair?" + query;
   const open = document.getElementById("open");
   const meta = document.getElementById("meta");
   const note = document.getElementById("note");
-  if (!host || !params.get("code") || !expires) {
+  if (!ours || !params.get("key") || !params.get("code") || !expires) {
     document.getElementById("title").textContent = "Nothing to pair";
-    document.getElementById("what").textContent = "This page opens a pairing link from enclos app pair; this one carries none. Run enclos app pair on the host and open the link it prints.";
+    document.getElementById("what").textContent = "This page opens a pairing link from enclos app pair for this host; this one carries none, or one for another address. Run enclos app pair on the host and open the link it prints.";
     open.hidden = true;
     document.getElementById("copy").hidden = true;
   } else {
