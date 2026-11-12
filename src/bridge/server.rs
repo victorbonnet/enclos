@@ -130,11 +130,6 @@ struct Hub {
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
-    /// The person the host belongs to, on the transport: whose the agents'
-    /// Home conversations are. Read again at each connection while unknown;
-    /// until then, the first person who connects has them, and stderr says
-    /// so.
-    host: Mutex<Option<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     /// One lock per agent, held while its plugin connection opens, never
@@ -215,6 +210,13 @@ impl Hub {
         host: Option<String>,
         silence: Duration,
     ) -> Hub {
+        // `host`: a person to name the host's person if the database names
+        // none yet, as a first pairing would (tests); `serve` names none.
+        if let Some(host) = &host
+            && let Ok(store) = Store::open(&store_path)
+        {
+            let _ = store.claim_host(host);
+        }
         let opening = agents
             .iter()
             .map(|a| (a.name.clone(), Mutex::new(())))
@@ -226,7 +228,6 @@ impl Hub {
             layout,
             bridge_private,
             agents,
-            host: Mutex::new(host),
             plugins: Mutex::new(HashMap::new()),
             opening,
             opening_all: AtomicBool::new(false),
@@ -246,42 +247,27 @@ impl Hub {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
 
-    /// The host's person, as far as the transport has said.
+    /// The host's person (ADR 0044): named by the first device paired at
+    /// the host's terminal, or by `enclos app host` since, and kept in the
+    /// bridge's database, never taken from the transport. `None` until a
+    /// device is paired.
     fn known_host(&self) -> Option<String> {
-        self.host.lock().expect("not poisoned").clone()
+        self.store().ok()?.host_person().ok().flatten()
     }
 
-    /// The agents' Homes, as `person` connects: the host's person's when the
-    /// transport names them (asked again while it has not: `tailscale
-    /// status` may have failed when the bridge started), taken back from
-    /// anyone who had one meanwhile; else `person`'s, the first to connect,
-    /// which stderr says.
-    fn ensure_homes(&self, store: &Store, person: &str) {
-        let host = {
-            let mut host = self.host.lock().expect("not poisoned");
-            if host.is_none() {
-                *host = self.transport.host_person();
-            }
-            host.clone()
+    /// Gives each agent's Home to the host's person, made if need be and
+    /// taken from anyone else. Nothing while no device has named them: a
+    /// Home made meanwhile has no owner, and keeps what comes for it.
+    fn ensure_homes(&self, store: &Store) {
+        let Ok(Some(host)) = store.host_person() else {
+            return;
         };
         for agent in &self.agents {
-            match host.as_deref() {
-                Some(host) => {
-                    if let Ok(true) = store.ensure_home(&agent.name, host, true) {
-                        eprintln!(
-                            "enclos app: {}'s Home is {host}'s, the host's person",
-                            agent.name
-                        );
-                    }
-                }
-                None => {
-                    if let Ok(true) = store.ensure_home(&agent.name, person, false) {
-                        eprintln!(
-                            "enclos app: {}'s Home goes to {person}, the first person to connect: the transport does not say whose host this is",
-                            agent.name
-                        );
-                    }
-                }
+            if let Ok(true) = store.ensure_home(&agent.name, &host, true) {
+                eprintln!(
+                    "enclos app: {}'s Home is {host}'s, the host's person",
+                    agent.name
+                );
             }
         }
     }
@@ -856,10 +842,11 @@ pub fn serve(
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let host = transport.host_person();
-    if host.is_none() {
+    if let Ok(store) = Store::open(&store_path)
+        && let Ok(None) = store.host_person()
+    {
         eprintln!(
-            "enclos app: the transport does not say whose host this is: each agent's Home goes to the first person who connects, until it does"
+            "enclos app: no device is paired yet: the first one paired with `enclos app pair` names the host's person, whose each agent's Home is"
         );
     }
     let hub = Arc::new(Hub::new(
@@ -869,7 +856,7 @@ pub fn serve(
         layout,
         bridge_private,
         agents,
-        host,
+        None,
         SILENCE,
     ));
     serve_on(listener, hub, RETRY);
@@ -893,10 +880,8 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         }
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
-    if let (Some(host), Ok(store)) = (hub.known_host(), hub.store()) {
-        for agent in &hub.agents {
-            let _ = store.ensure_home(&agent.name, &host, true);
-        }
+    if let Ok(store) = hub.store() {
+        hub.ensure_homes(&store);
     }
     // Turns left running when the bridge stopped: failed, and their
     // discussions ended (ADR 0045).
@@ -1263,7 +1248,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     drop(waiting);
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
-    hub.ensure_homes(&store, &person);
+    hub.ensure_homes(&store);
     let (sender, outbox) = channel();
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
@@ -1419,6 +1404,11 @@ fn pair(
             Some("the device left before the answer"),
         );
         return Err(e);
+    }
+    // The first device paired at the host's terminal names the host's
+    // person (ADR 0044), before the terminal reads it.
+    if let Ok(true) = store.claim_host(person) {
+        eprintln!("enclos app: {person} is the host's person: each agent's Home is theirs");
     }
     let _ = store.settle_pairing(&code, "paired", Some(&device.id));
     Ok(device)
@@ -2246,7 +2236,7 @@ mod connection_end_tests {
                 socket: socket.clone(),
                 token: TOKEN.to_owned(),
             }],
-            Some(PERSON.to_owned()),
+            None,
             silence,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2509,19 +2499,20 @@ mod connection_end_tests {
         code: &[u8],
         name: &str,
     ) -> (Option<PhoneLink>, Option<ToDevice>) {
-        ask_to_pair_signed(bridge, code, name, Signed::Pair)
+        ask_to_pair_signed(bridge, code, name, Signed::Pair, PERSON)
     }
 
-    /// [`ask_to_pair`], its signature made for `purpose`.
+    /// [`ask_to_pair`], its signature made for `purpose`, from `login`.
     fn ask_to_pair_signed(
         bridge: &Bridge,
         code: &[u8],
         name: &str,
         purpose: Signed,
+        login: &str,
     ) -> (Option<PhoneLink>, Option<ToDevice>) {
         let noise = generate_keypair().unwrap();
         let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
-        let Some(mut device) = handshake(bridge, &noise.private, PERSON) else {
+        let Some(mut device) = handshake(bridge, &noise.private, login) else {
             return (None, None);
         };
         let proof = enclos_protocol::pairing::proof(code, device.session.handshake_hash());
@@ -2550,7 +2541,7 @@ mod connection_end_tests {
         let store = Store::open(&bridge.store).unwrap();
         store.add_pairing(b"code-1", now() + 300).unwrap();
         // An `auth` signature of the same session does not prove a pairing
-        let (_, answer) = ask_to_pair_signed(&bridge, b"code-1", "Pixel", Signed::Auth);
+        let (_, answer) = ask_to_pair_signed(&bridge, b"code-1", "Pixel", Signed::Auth, PERSON);
         assert_eq!(
             answer,
             Some(ToDevice::PairRefused {
@@ -2594,6 +2585,67 @@ mod connection_end_tests {
             .unwrap()
             .as_deref()
             == Some(id.as_str())));
+    }
+
+    #[test]
+    fn the_first_device_paired_names_the_hosts_person_whatever_the_transport_says() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        // Connecting names nobody: no Home is given yet.
+        let phone = paired(&bridge, "n-pixel");
+        let (_connected, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        assert_eq!(store.host_person().unwrap(), None);
+        assert_eq!(store.owner("home.lab.main").unwrap(), None);
+        // The first paired at the terminal is the host's person, whoever
+        // the transport says the host belongs to, and has Home.
+        *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let terminal_1 = terminal(&bridge.store, b"code-1", "accept");
+        let (device, answer) = ask_to_pair_signed(
+            &bridge,
+            b"code-1",
+            "Pixel",
+            Signed::Pair,
+            "alice@example.com",
+        );
+        assert!(
+            matches!(answer, Some(ToDevice::PairAccepted { .. })),
+            "{answer:?}"
+        );
+        terminal_1.join().unwrap();
+        assert!(matches!(
+            device.unwrap().receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        assert!(eventually(|| store
+            .owner("home.lab.main")
+            .unwrap()
+            .as_deref()
+            == Some("alice@example.com")));
+        // A person paired after does not take it.
+        *bridge.whois_login.lock().unwrap() = PERSON.to_owned();
+        store.add_pairing(b"code-2", now() + 300).unwrap();
+        let terminal_2 = terminal(&bridge.store, b"code-2", "accept");
+        let (_, answer) = ask_to_pair(&bridge, b"code-2", "Phone");
+        assert!(
+            matches!(answer, Some(ToDevice::PairAccepted { .. })),
+            "{answer:?}"
+        );
+        terminal_2.join().unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            store.owner("home.lab.main").unwrap().as_deref(),
+            Some("alice@example.com")
+        );
     }
 
     #[test]
