@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::output;
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
-use enclos::bridge::keys::bridge_keypair;
+use enclos::bridge::keys::{approval_key, bridge_keypair};
 use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
@@ -72,6 +72,10 @@ enum AppVerb {
     Devices,
     /// Remove a paired device: it can no longer connect.
     Unpair { device: String },
+    /// Show the host's person, whose each agent's Home is: the person of
+    /// the first device paired. With a person, make it them instead; they
+    /// must have a paired device, and get every Home with what it holds.
+    Host { person: Option<String> },
     /// Who can reach the agents, from which devices, and when each was
     /// last seen.
     Status,
@@ -93,6 +97,7 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
         AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
         AppVerb::Unpair { device } => unpair(engine, by, &device),
+        AppVerb::Host { person } => host(engine, by, person),
         AppVerb::Log { lines } => log(engine, lines),
     }
 }
@@ -109,6 +114,11 @@ fn open_store(engine: &Engine) -> Result<Store> {
 fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
+    let approvals = approval_key(&engine.app_approval_key_path()).map_err(|e| {
+        failed(format!(
+            "cannot read or make the bridge's key for runtime approvals: {e}"
+        ))
+    })?;
     let mut agents = Vec::new();
     for (sandbox, agent, runtime) in engine.app_agents()? {
         match engine.app_endpoint(&sandbox, &agent) {
@@ -135,6 +145,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         engine.app_store_path(),
         engine.app_layout(),
         key.private.to_vec(),
+        approvals,
         agents,
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
@@ -166,6 +177,7 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
     let store = open_store(engine)?;
+    let host_before = store.host_person().map_err(|e| failed(e.to_string()))?;
     let code = random_bytes(16).map_err(|e| failed(format!("cannot make a code: {e}")))?;
     let expires = now() + 300;
     store
@@ -214,6 +226,12 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
+    if host_before.is_none() {
+        println!(
+            "It is the first device: {} becomes the host's person, whose each agent's Home is.",
+            shown(&request.person)
+        );
+    }
     print!(
         "{} ({transport} login: {}, node: {}) wants to pair. Accept? [y/N] ",
         shown(&request.name),
@@ -287,6 +305,54 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
         },
     )?;
     println!("Paired: device {device}.");
+    // The bridge names the first device's person before it says `paired`.
+    if host_before.is_none()
+        && let Ok(Some(host)) = store.host_person()
+    {
+        println!(
+            "{} is the host's person: each agent's Home is theirs (`enclos app host` changes it).",
+            shown(&host)
+        );
+    }
+    Ok(exit::OK)
+}
+
+fn host(engine: &Engine, by: &Actor, person: Option<String>) -> Result<u8> {
+    let store = open_store(engine)?;
+    let Some(person) = person else {
+        let host = store.host_person().map_err(|e| failed(e.to_string()))?;
+        match (output::json(), host) {
+            (true, host) => output::emit(&json!({"host_person": host})),
+            (false, Some(host)) => {
+                println!("{}: each agent's Home is theirs.", shown(&host));
+            }
+            (false, None) => println!(
+                "Nobody yet: the first device paired with `enclos app pair` names the host's person."
+            ),
+        }
+        return Ok(exit::OK);
+    };
+    let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+    if !devices.iter().any(|d| d.person == person) {
+        return Err(failed(format!(
+            "{} has no paired device: `enclos app devices` lists who has",
+            shown(&person)
+        )));
+    }
+    engine.app_access(
+        by,
+        "app host",
+        person.clone(),
+        |_| "the host's person: each agent's Home is theirs".to_owned(),
+        || store.set_host(&person).map_err(|e| failed(e.to_string())),
+    )?;
+    match output::json() {
+        true => output::emit(&json!({"host_person": person})),
+        false => println!(
+            "{} is the host's person: each agent's Home is theirs, with what it holds.",
+            shown(&person)
+        ),
+    }
     Ok(exit::OK)
 }
 
@@ -362,6 +428,7 @@ fn devices(engine: &Engine) -> Result<u8> {
 
 fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     let store = open_store(engine)?;
+    let person = store.device(device).ok().flatten().map(|d| d.person);
     // A connected device's session ends once its row is gone: the bridge
     // looks for it before each message
     engine.app_access(
@@ -381,6 +448,21 @@ fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     match output::json() {
         true => output::emit(&json!({"device": device, "removed": true})),
         false => println!("Device {device} removed: it can no longer connect."),
+    }
+    // The host's person stays so with no device left (ADR 0044): their
+    // Homes keep what comes, for when they pair again.
+    if let Some(person) = person
+        && store.host_person().ok().flatten().as_deref() == Some(person.as_str())
+        && !store
+            .devices()
+            .unwrap_or_default()
+            .iter()
+            .any(|d| d.person == person)
+    {
+        eprintln!(
+            "{} stays the host's person, with no paired device: each agent's Home keeps what comes until they pair again, or `enclos app host <person>` gives it to another.",
+            shown(&person)
+        );
     }
     Ok(exit::OK)
 }
@@ -519,18 +601,7 @@ fn chat(
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
         writer
-            .send_with_id(
-                id,
-                FromBridge::MessageIn {
-                    conversation: conversation.clone(),
-                    person: person.clone(),
-                    text: text.to_owned(),
-                    // Whoever types here is at the host itself, and could
-                    // change the runtime's approvals there anyway: their
-                    // approval commands pass.
-                    host: Some(true),
-                },
-            )
+            .send_with_id(id, typed_message(&conversation, &person, text))
             .map_err(plugin_error)?;
     }
     // End of input: close the connection itself, so the reading thread
@@ -541,6 +612,21 @@ fn chat(
         Ok(Ok(())) => Ok(exit::OK),
         Ok(Err(e)) => Err(failed(e)),
         Err(_) => Err(failed("the reading thread stopped".to_owned())),
+    }
+}
+
+/// What `person` typed in `app chat`, as the plugin gets it. Not from the
+/// host's person (`host: false`): this terminal speaks on the plugin's
+/// socket as any program holding the agent's token can, and the runtime's
+/// approval commands typed here are answered by the plugin and never run,
+/// like everyone's: a runtime approval is decided with a paired device's
+/// buttons alone (ADR 0060).
+fn typed_message(conversation: &ConversationId, person: &Person, text: &str) -> FromBridge {
+    FromBridge::MessageIn {
+        conversation: conversation.clone(),
+        person: person.clone(),
+        text: text.to_owned(),
+        host: Some(false),
     }
 }
 
@@ -804,6 +890,23 @@ mod tests {
             shown("Pixel\r\x1b[2Kok\u{202e}"),
             "Pixel\\u000d\\u001b[2Kok\\u202e"
         );
+    }
+
+    #[test]
+    fn what_is_typed_in_the_chat_is_not_the_hosts_persons() {
+        let conversation = ConversationId::new("c-1").unwrap();
+        let person = Person::new("alice@mac").unwrap();
+        for text in ["/approve always", "hello"] {
+            assert_eq!(
+                typed_message(&conversation, &person, text),
+                FromBridge::MessageIn {
+                    conversation: conversation.clone(),
+                    person: person.clone(),
+                    text: text.into(),
+                    host: Some(false),
+                }
+            );
+        }
     }
 
     #[test]

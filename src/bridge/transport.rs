@@ -76,15 +76,6 @@ impl Transport {
         }
     }
 
-    /// The person the host belongs to on the transport, as its login header
-    /// names people: whose the agents' Home conversations are. `None` when
-    /// it cannot be read.
-    pub fn host_person(self) -> Option<String> {
-        match self {
-            Transport::Tailscale => tailscale_status().and_then(|status| self_login(&status)),
-        }
-    }
-
     /// What the address looks like, for the message asking for it.
     pub fn address_form(self) -> &'static str {
         match self {
@@ -189,19 +180,6 @@ fn tailscale_status() -> Option<Vec<u8>> {
     })
 }
 
-/// The login of the host's own user in `tailscale status --json`:
-/// `Self.UserID`, looked up in `User`.
-fn self_login(status: &[u8]) -> Option<String> {
-    let status: serde_json::Value = serde_json::from_slice(status).ok()?;
-    let id = status.get("Self")?.get("UserID")?.as_u64()?;
-    let login = status
-        .get("User")?
-        .get(id.to_string())?
-        .get("LoginName")?
-        .as_str()?;
-    (!login.is_empty()).then(|| login.to_owned())
-}
-
 /// The address in `tailscale status --json`'s output, from `Self.DNSName`.
 fn dns_name_url(status: &[u8]) -> Option<String> {
     let status: serde_json::Value = serde_json::from_slice(status).ok()?;
@@ -298,13 +276,5 @@ mod tests {
         );
         assert_eq!(dns_name_url(br#"{"Self": {"DNSName": ""}}"#), None);
         assert_eq!(dns_name_url(b"not json"), None);
-    }
-
-    #[test]
-    fn the_host_person_is_the_login_of_its_own_user() {
-        let status = br#"{"Self": {"UserID": 42}, "User": {"42": {"LoginName": "victor@example.com"}, "7": {"LoginName": "alice@example.com"}}}"#;
-        assert_eq!(self_login(status).as_deref(), Some("victor@example.com"));
-        assert_eq!(self_login(br#"{"Self": {"UserID": 42}, "User": {}}"#), None);
-        assert_eq!(self_login(b"not json"), None);
     }
 }
