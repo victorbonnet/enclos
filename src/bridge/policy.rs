@@ -41,7 +41,7 @@ impl Hub {
         person: &str,
         sandbox: &str,
     ) -> Result<SandboxName, String> {
-        if self.host.as_deref() != Some(person) {
+        if self.known_host().as_deref() != Some(person) {
             return Err("Only the host's person can manage sandbox policy.".into());
         }
         if !store
