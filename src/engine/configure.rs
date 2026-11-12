@@ -483,7 +483,10 @@ impl Engine {
         let token_file = self
             .layout
             .agent_secrets_file(name.as_str(), agent.as_str());
-        let Some(app) = runtime.app_channel(agent, &socket, &token_file, &home) else {
+        // The public key the plugin checks each runtime-approval decision
+        // against (ADR 0060).
+        let bridge_key = self.app_approval_public_key(confirm)?;
+        let Some(app) = runtime.app_channel(agent, &socket, &token_file, &home, &bridge_key) else {
             return Err(session(format!(
                 "{shown} has no app channel enclos can set up"
             )));
