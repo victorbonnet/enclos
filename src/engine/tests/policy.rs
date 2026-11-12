@@ -10,7 +10,15 @@ pub(super) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
 }
 
 pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
-    let (dir, engine) = engine_with(vec![Box::new(backend)]);
+    with_sandbox_under(backend, &super::Root::usual())
+}
+
+/// [`with_sandbox_on`], enclos's folder at `root`.
+pub(super) fn with_sandbox_under(
+    backend: FakeBackend,
+    root: &super::Root,
+) -> (TempDir, Engine, SandboxName) {
+    let (dir, engine) = engine_under(vec![Box::new(backend)], root);
     done(engine.init(&alice(), Confirm::Yes).unwrap());
     let name: SandboxName = "home".parse().unwrap();
     let spec = crate::engine::SandboxSpec {
