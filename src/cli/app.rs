@@ -134,7 +134,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         port,
         engine.app_store_path(),
         engine.app_layout(),
-        key.private,
+        key.private.to_vec(),
         agents,
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;

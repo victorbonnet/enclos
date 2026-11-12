@@ -32,7 +32,8 @@ pub enum FromDevice {
         edit: crate::policy::PolicyApply,
     },
     /// First after the handshake of a paired device: its id on this host
-    /// and its hardware key's DER signature of the handshake hash.
+    /// and its hardware key's DER signature of the handshake hash for
+    /// `auth` ([`crate::pairing::Signed::Auth`]).
     #[serde(rename = "auth")]
     Auth { device: String, sig: String },
     /// First after the handshake of a device that is pairing.
@@ -43,6 +44,10 @@ pub enum FromDevice {
         device_key: String,
         /// HMAC-SHA256 of the handshake hash, keyed with the code.
         proof: String,
+        /// Its hardware key's DER signature of the handshake hash for
+        /// pairing ([`crate::pairing::Signed::Pair`]): it holds the key it
+        /// asks to pair.
+        sig: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push: Option<PushToken>,
     },
@@ -579,10 +584,23 @@ mod tests {
                 attachment: "a-1".into(),
                 offset: 45_000,
             },
+            FromDevice::PairRequest {
+                name: "Pixel".into(),
+                device_key: "a2V5".into(),
+                proof: "cHJvb2Y".into(),
+                sig: "c2ln".into(),
+                push: None,
+            },
         ] {
             let line = encode_line(&Envelope::new(id(), body.clone()));
             assert_eq!(decode_from_device(&line).unwrap().body, body);
         }
+        // A pairing request must carry the device key's signature.
+        let unsigned = br#"{"v":1,"id":"m","type":"pair.request","name":"Pixel","device_key":"a2V5","proof":"cHJvb2Y"}"#;
+        assert!(matches!(
+            decode_from_device(unsigned),
+            Err(DecodeError::Bad { .. })
+        ));
         let body = ToDevice::Message(ConversationMessage {
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
