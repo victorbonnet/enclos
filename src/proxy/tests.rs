@@ -1860,7 +1860,7 @@ fn diagnostic_provenance_keeps_private_probe_blocked_but_out_of_approvals() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("state.db");
     let lockfile = dir.path().join("state.lock");
-    let store = SqliteStateStore::new(&db, &lockfile);
+    let store = SqliteStateStore::new(&db, &lockfile, crate::state::Wait::Command);
     let lock = store.lock().unwrap();
     store.migrate(&lock).unwrap();
     let name: SandboxName = "home".parse().unwrap();
@@ -1881,7 +1881,7 @@ fn diagnostic_provenance_keeps_private_probe_blocked_but_out_of_approvals() {
     let tag = "a".repeat(64);
     store.begin_probe(&name, &tag).unwrap();
     drop(lock);
-    let log = SqliteStateStore::new(&db, &lockfile);
+    let log = SqliteStateStore::new(&db, &lockfile, crate::state::Wait::Command);
     let proxy = start_with(
         &["10.0.0.1".into()],
         Box::new(FakeResolver("10.0.0.1".parse().unwrap())),

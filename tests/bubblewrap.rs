@@ -77,15 +77,13 @@ impl Lab {
             _turn: turn,
         };
         lab.ok(&["init"]);
-        lab.ok(&[
-            "sandbox",
-            "create",
-            "lab",
-            "--backend",
-            "bubblewrap",
-            "--template",
-            "assistant",
-        ]);
+        // No `--backend`: bubblewrap is this host's default backend, which
+        // `init` wrote to config.toml.
+        lab.ok(&["sandbox", "create", "lab", "--template", "assistant"]);
+        assert_eq!(
+            lab.record("lab").backend,
+            enclos::model::sandbox::BackendKind::Bubblewrap
+        );
         lab
     }
 
@@ -131,8 +129,11 @@ impl Lab {
     fn record(&self, sandbox: &str) -> enclos::model::sandbox::SandboxRecord {
         use enclos::state::StateStore;
         let layout = self.layout();
-        let state =
-            enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = enclos::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            enclos::state::Wait::Command,
+        );
         state.get(&sandbox.parse().unwrap()).unwrap().unwrap()
     }
 
@@ -149,8 +150,11 @@ impl Lab {
     fn with_stand_in_hermes(&self) {
         use enclos::state::StateStore;
         let layout = self.layout();
-        let state =
-            enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = enclos::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            enclos::state::Wait::Command,
+        );
         let lock = state.lock().unwrap();
         let mut record = self.record("lab");
         record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);

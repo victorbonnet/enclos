@@ -75,6 +75,9 @@ fn inputs(dir: &Path, listen: bool) -> ProbeInputs {
         target: Some(4242),
         other_terminal: Some("/dev/ttys042".into()),
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: crate::backend::LaunchLimits::of_checked(&crate::model::policy::Resources {
             open_files: Some(256),
             ..Default::default()
