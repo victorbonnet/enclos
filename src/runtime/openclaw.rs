@@ -455,6 +455,7 @@ impl RuntimeAdapter for OpenClaw {
         socket: &Path,
         token_file: &Path,
         home: &str,
+        _bridge_key: &str,
     ) -> Option<AppChannel> {
         if !socket.is_absolute() || !token_file.is_absolute() {
             return None;
@@ -979,7 +980,7 @@ mod tests {
         // consume the path supplied by the core rather than infer its layout.
         let token = Path::new("/protected/another-layout/main.env");
         let app = OpenClaw
-            .app_channel(&first, socket, token, "home.lab.main")
+            .app_channel(&first, socket, token, "home.lab.main", "key")
             .unwrap();
         let other = OpenClaw
             .app_channel(
@@ -987,6 +988,7 @@ mod tests {
                 Path::new("/sandbox/home/.enclos-app/scout.sock"),
                 Path::new("/protected/another-layout/scout.env"),
                 "home.lab.scout",
+                "key",
             )
             .unwrap();
         assert_eq!(app.files, other.files);
@@ -1058,7 +1060,13 @@ mod tests {
         assert!(ENABLE_APP.ends_with("\"channels.enclos.accounts.$agent.enabled\" true"));
         assert!(
             OpenClaw
-                .app_channel(&first, Path::new("relative.sock"), token, "home.lab.main")
+                .app_channel(
+                    &first,
+                    Path::new("relative.sock"),
+                    token,
+                    "home.lab.main",
+                    "key"
+                )
                 .is_none()
         );
     }
