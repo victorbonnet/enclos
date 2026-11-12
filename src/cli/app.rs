@@ -525,18 +525,7 @@ fn chat(
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
         writer
-            .send_with_id(
-                id,
-                FromBridge::MessageIn {
-                    conversation: conversation.clone(),
-                    person: person.clone(),
-                    text: text.to_owned(),
-                    // Whoever types here is at the host itself, and could
-                    // change the runtime's approvals there anyway: their
-                    // approval commands pass.
-                    host: Some(true),
-                },
-            )
+            .send_with_id(id, typed_message(&conversation, &person, text))
             .map_err(plugin_error)?;
     }
     // End of input: close the connection itself, so the reading thread
@@ -547,6 +536,21 @@ fn chat(
         Ok(Ok(())) => Ok(exit::OK),
         Ok(Err(e)) => Err(failed(e)),
         Err(_) => Err(failed("the reading thread stopped".to_owned())),
+    }
+}
+
+/// What `person` typed in `app chat`, as the plugin gets it. Not from the
+/// host's person (`host: false`): this terminal speaks on the plugin's
+/// socket as any program holding the agent's token can, and the runtime's
+/// approval commands typed here are answered by the plugin and never run,
+/// like everyone's: a runtime approval is decided with a paired device's
+/// buttons alone (ADR 0060).
+fn typed_message(conversation: &ConversationId, person: &Person, text: &str) -> FromBridge {
+    FromBridge::MessageIn {
+        conversation: conversation.clone(),
+        person: person.clone(),
+        text: text.to_owned(),
+        host: Some(false),
     }
 }
 
@@ -810,6 +814,23 @@ mod tests {
             shown("Pixel\r\x1b[2Kok\u{202e}"),
             "Pixel\\u000d\\u001b[2Kok\\u202e"
         );
+    }
+
+    #[test]
+    fn what_is_typed_in_the_chat_is_not_the_hosts_persons() {
+        let conversation = ConversationId::new("c-1").unwrap();
+        let person = Person::new("alice@mac").unwrap();
+        for text in ["/approve always", "hello"] {
+            assert_eq!(
+                typed_message(&conversation, &person, text),
+                FromBridge::MessageIn {
+                    conversation: conversation.clone(),
+                    person: person.clone(),
+                    text: text.into(),
+                    host: Some(false),
+                }
+            );
+        }
     }
 
     #[test]
