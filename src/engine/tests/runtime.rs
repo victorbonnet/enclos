@@ -10,7 +10,8 @@ use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::runtime::RuntimeKind;
 use crate::runtime::RuntimeAgentName;
 use crate::runtime::{
-    HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable, hermes::Hermes,
+    AgentDeleteMode, HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable,
+    hermes::Hermes,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,7 @@ fn agents_need_a_runtime_first() {
 pub(super) struct TestRuntime {
     url: String,
     pub(super) sha256: String,
+    delete_mode: AgentDeleteMode,
 }
 
 impl TestRuntime {
@@ -114,6 +116,7 @@ impl TestRuntime {
         TestRuntime {
             url: format!("file://{}", installer.display()),
             sha256,
+            delete_mode: AgentDeleteMode::PauseRuntime,
         }
     }
 }
@@ -142,6 +145,15 @@ impl RuntimeAdapter for TestRuntime {
     }
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
         Hermes.create_agent(name)
+    }
+    fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
+        Hermes.delete_agent(name)
+    }
+    fn agent_delete_mode(&self) -> AgentDeleteMode {
+        self.delete_mode
+    }
+    fn agent_facts(&self, agent: &RuntimeAgentName) -> crate::runtime::AgentFacts {
+        Hermes.agent_facts(agent)
     }
     fn agent_files(&self, name: &AgentName) -> String {
         Hermes.agent_files(name)
@@ -988,6 +1000,93 @@ fn a_delete_runs_with_the_gateway_stopped_and_a_half_deleted_agent_is_deleted_ag
     );
     assert!(!profile("other").exists());
     assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+}
+
+#[test]
+fn a_native_delete_keeps_the_service_it_calls_and_refuses_without_it() {
+    use crate::runtime::ServiceName;
+    use crate::service::{ServiceManager, fake::FakeServices};
+    use std::io::BufRead;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    lab_with_profiles(&lab, &["writer", "reader"]);
+
+    // A real listener owned by the fake service manager: pausing the
+    // service kills it, and the native command then fails its connection.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let listener = format!(
+        "{}$|=1; my $s=listener(INADDR_LOOPBACK); print((sockaddr_in(getsockname($s)))[0], qq(\\n)); while(accept(my $c,$s)){{close $c;}}",
+        crate::test_ports::perl_listener()
+    );
+    let mut server = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", &listener])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
+    let stdout = server.stdout.take();
+    // Register before fallible setup so Lab also reaps the listener if
+    // reading/parsing its port or writing the fixture fails.
+    fake.jobs.borrow_mut().push((gateway.clone(), server));
+    let mut port = String::new();
+    std::io::BufReader::new(stdout.unwrap())
+        .read_line(&mut port)
+        .unwrap();
+    let port: u16 = port.trim().parse().unwrap();
+    assert!(
+        !(crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST).contains(&port)
+    );
+    std::fs::write(lab.home.join("gateway-port"), port.to_string()).unwrap();
+
+    let executable = lab.home.join(".local/bin/hermes");
+    let script = std::fs::read_to_string(&executable).unwrap().replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1 $2\" = \"profile delete\" ]; then\n  /usr/bin/nc -z 127.0.0.1 \"$(cat \"$HOME/gateway-port\")\" || exit 12\nfi\n",
+        1,
+    );
+    std::fs::write(executable, script).unwrap();
+    let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+    runtime.delete_mode = AgentDeleteMode::RuntimeService;
+    assert_eq!(Hermes.agent_delete_mode(), AgentDeleteMode::PauseRuntime);
+    let rm = |who: &str, confirm| {
+        lab.engine
+            .remove_agent_with(&alice(), &lab.name, &agent(who), false, confirm, &runtime)
+    };
+
+    let Planned::DryRun(plan) = rm("writer", Confirm::DryRun).unwrap() else {
+        panic!("a dry run removed the agent");
+    };
+    assert_eq!(
+        plan.changes,
+        ["delete agent home/writer and its files, with Hermes's own command"]
+    );
+    assert_eq!(
+        done(rm("writer", Confirm::Yes).unwrap()),
+        AgentRemoved::Deleted {
+            kind: RuntimeKind::Hermes
+        }
+    );
+    assert!(!lab.home.join(".hermes/profiles/writer").exists());
+    assert!(fake.stopped.borrow().is_empty());
+    assert_eq!(fake.started.borrow().len(), 1);
+    assert!(fake.jobs.borrow_mut()[0].1.try_wait().unwrap().is_none());
+    assert!(!lab.audit().contains("services remove"));
+    assert!(!lab.audit().contains("services start"));
+
+    // Unavailability is a native failure, with the record and files kept;
+    // removal never starts the service or substitutes an offline command.
+    fake.stop(&gateway).unwrap();
+    let error = rm("reader", Confirm::Yes).unwrap_err().to_string();
+    assert!(error.contains("exited with 12"), "{error}");
+    assert!(lab.home.join(".hermes/profiles/reader").exists());
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+    assert!(fake.started.borrow().is_empty());
 }
 
 #[test]

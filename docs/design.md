@@ -551,15 +551,17 @@ pub trait RuntimeAdapter {
     fn builtin_agent(&self) -> Option<BuiltinAgent>;                            // permanent identity, if any; not the runtime's selected default
     fn default_agent(&self, home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable>; // selected native target, read from installed state
     fn delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand>;
+    fn agent_delete_mode(&self) -> AgentDeleteMode;                             // pause the runtime or use its running native service
     fn finish_delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // finishes a delete that failed after the agent and its folder went: Hermes 0.23.0's `profile purge-identity`
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand>;
 
-    fn channel_token_file(&self, channel: Channel, agent: &RuntimeAgentName) -> Option<(HomePath, &'static str)>;
+    fn channel_token_files(&self, channel: Channel, agent: &RuntimeAgentName) -> Vec<(HomePath, &'static str)>;
     fn channel_token_is_plain(&self, channel: Channel, agent: &RuntimeAgentName, text: &str, field: &str) -> Result<bool, String>;
     fn inspect_settings(&self, files: &[settings::SettingsFile]) -> Result<Vec<settings::SettingsFinding>, String>;
     fn agent_secrets_source(&self, agent: &RuntimeAgentName, secrets_file: &Path) -> Option<Vec<SandboxCommand>>;
     fn set_setting(&self, agent: &RuntimeAgentName, key: &str, value: &str) -> Option<SandboxCommand>;
-    fn channel_settings(&self, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
+    fn set_secret_setting(&self, agent: &RuntimeAgentName, key: &str, variable: &str, target: SecretTarget) -> Option<SandboxCommand>;
+    fn channel_settings(&self, agent: &RuntimeAgentName, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
     fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path, home: &str) -> Option<AppChannel>;
 
     // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.

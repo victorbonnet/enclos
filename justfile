@@ -18,4 +18,7 @@ hermes-plugin:
 gitleaks-rule:
     sh tests/gitleaks_rule.sh
 
-ci: fmt clippy test deny hermes-plugin
+openclaw-launchers:
+    node --test src/runtime/openclaw/*.test.mjs
+
+ci: fmt clippy test deny hermes-plugin openclaw-launchers

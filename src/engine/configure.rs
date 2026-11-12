@@ -15,7 +15,7 @@ use crate::model::sandbox::SandboxName;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::proxy::decide::{Destination, allowed};
 use crate::runtime::settings::names_a_secret;
-use crate::runtime::{RuntimeAgentName, SandboxCommand, adapter};
+use crate::runtime::{RuntimeAgentName, SandboxCommand, SecretTarget, adapter};
 use std::path::PathBuf;
 
 /// One setting `runtime configure` gives an agent, written `KEY=VALUE`: a
@@ -116,9 +116,9 @@ impl Engine {
         let runtime = adapter(kind);
         let shown = kind.display_name();
         let session = |what: String| Error::Session { what };
-        let builtin = runtime.builtin_agent();
+        let default = self.default_agent(name)?;
         let agent = match agent {
-            Some(a) if builtin.is_some_and(|b| b.as_str() == a.as_str()) => {
+            Some(a) if default.as_ref().is_some_and(|b| b.as_str() == a.as_str()) => {
                 RuntimeAgentName::from(a)
             }
             Some(a) => {
@@ -129,11 +129,11 @@ impl Engine {
                 }
                 RuntimeAgentName::from(a)
             }
-            None => match builtin.and_then(|b| RuntimeAgentName::new(b.as_str())) {
+            None => match default {
                 Some(b) => b,
                 None => {
                     return Err(session(format!(
-                        "{shown} has no built-in agent: name the agent to set up, as `{name}/<agent>`"
+                        "{shown} has no selected default agent: name the agent to set up, as `{name}/<agent>`"
                     )));
                 }
             },
@@ -142,16 +142,6 @@ impl Engine {
             .layout
             .agent_secrets_file(name.as_str(), agent.as_str());
         let source = runtime.agent_secrets_source(&agent, &secrets_file);
-        if source.is_some()
-            && secrets_file
-                .to_str()
-                .is_none_or(|p| p.contains(['\'', '\n', '\r']))
-        {
-            return Err(session(format!(
-                "{} holds a quote or a line break, which the runtime's command that reads it cannot hold: set ENCLOS_HOME to a folder without them",
-                secrets_file.display()
-            )));
-        }
         let view = self.policy(name)?;
         let policy = &view.snapshot.policy;
         let mut commands = match source {
@@ -169,7 +159,26 @@ impl Engine {
         };
         let pending = view.pending.as_ref().map(|(_, p)| &p.policy);
         let set = |key: &str, value: &str| {
-            runtime.set_setting(&agent, key, value).ok_or_else(|| {
+            let variable = value
+                .strip_prefix("${")
+                .and_then(|v| v.strip_suffix('}'))
+                .filter(|v| is_variable_name(v));
+            let command = match variable {
+                Some(variable) => {
+                    let target = if policy
+                        .agent_secrets
+                        .get(agent.as_str())
+                        .is_some_and(|g| g.contains_key(variable))
+                    {
+                        SecretTarget::Agent
+                    } else {
+                        SecretTarget::Sandbox
+                    };
+                    runtime.set_secret_setting(&agent, key, variable, target)
+                }
+                None => runtime.set_setting(&agent, key, value),
+            };
+            command.ok_or_else(|| {
                 session(format!(
                     "{shown} has no command that sets a setting, so enclos sets none"
                 ))
@@ -324,7 +333,7 @@ impl Engine {
                 "name who the bot answers with `--allow-user <id>`: enclos sets up no bot that answers anyone".to_owned(),
             ));
         }
-        let Some(settings) = runtime.channel_settings(channel, &token, &answers) else {
+        let Some(settings) = runtime.channel_settings(agent, channel, &token, &answers) else {
             return Err(session(format!(
                 "{shown} has no {} channel enclos can set up",
                 channel.display_name()
@@ -332,7 +341,7 @@ impl Engine {
         };
         // A token the runtime's own setup wrote in plain text in the home,
         // which any agent there reads: refused until it is removed.
-        if let Some((file, variable)) = runtime.channel_token_file(channel, agent) {
+        for (file, variable) in runtime.channel_token_files(channel, agent) {
             let home = self.layout.sandbox_home(name.as_str());
             let text = crate::runtime::home::read_text(&home, &file, 1 << 20).map_err(|e| {
                 session(format!("cannot look for a plain bot token in {file}: {e}"))

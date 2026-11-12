@@ -1,0 +1,43 @@
+#!/bin/sh
+# Every entry point uses this sandbox's state and private upstream install.
+set -eu
+export OPENCLAW_HOME="$HOME"
+export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+export OPENCLAW_CONFIG_PATH="$HOME/.openclaw/openclaw.json"
+export OPENCLAW_SUPERVISOR_MODE=external
+export OPENCLAW_SERVICE_REPAIR_POLICY=external
+export OPENCLAW_NO_RESPAWN=1
+export OPENCLAW_DISABLE_BONJOUR=1
+export OPENCLAW_LOAD_SHELL_ENV=0
+export OPENCLAW_EXEC_SHELL_SNAPSHOT=0
+export NODE_USE_ENV_PROXY=1
+# Native Codex's system-root lookup failed with UnknownIssuer under Seatbelt.
+# Its supported public PEM override fixes TLS without opening the Keychain.
+# Preserve either explicit native or generic CA selection; Linux uses its own.
+if [ "$(uname -s)" = Darwin ] && [ -z "${CODEX_CA_CERTIFICATE:-}" ] &&
+    [ -z "${SSL_CERT_FILE:-}" ] && [ -r /etc/ssl/cert.pem ]; then
+    export CODEX_CA_CERTIFICATE=/etc/ssl/cert.pem
+fi
+# enclos assigns each sandbox one proxy port in 41000..41999. The native
+# gateway requires a positive port; its disjoint 43000..43999 port is stable
+# for this sandbox. The engine still verifies the actual listener's owner.
+proxy_port=${HTTP_PROXY##*:}
+case "$proxy_port" in
+    ''|*[!0-9]*) echo 'OpenClaw needs its enclos proxy port.' >&2; exit 2 ;;
+esac
+if [ "$proxy_port" -lt 41000 ] || [ "$proxy_port" -gt 41999 ]; then
+    echo 'OpenClaw needs an enclos proxy port in 41000..41999.' >&2
+    exit 2
+fi
+export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000))
+# An enclos owner helper, intercepted here rather than forwarded as a native
+# CLI option. It retains this same private state/port and carries no token.
+if [ "${1:-}" = --enclos-owner-delete ]; then
+    shift
+    exec "$HOME/.local/share/openclaw/tools/node/bin/node" "$HOME/bin/enclos-openclaw-delete.mjs" "$@"
+fi
+if [ "${1:-}" = gateway ] && [ "${2:-}" = run ]; then
+    shift 2
+    set -- gateway run --bind loopback --port "$OPENCLAW_GATEWAY_PORT" "$@"
+fi
+exec "$HOME/.local/share/openclaw/bin/openclaw" "$@"
