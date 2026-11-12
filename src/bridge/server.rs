@@ -80,10 +80,17 @@ pub struct AgentEndpoint {
 
 /// An open plugin connection.
 struct Plugin {
-    writer: PluginWriter,
     capabilities: Vec<Capability>,
     /// Tells this connection from a later one to the same agent.
     generation: u64,
+    /// Its writing side, locked apart from the other plugins: a plugin
+    /// that does not read holds only those writing to it.
+    out: Arc<Mutex<PluginOut>>,
+}
+
+/// What the bridge writes to a plugin, and what it gave it already.
+struct PluginOut {
+    writer: PluginWriter,
     /// The pending messages given to it already.
     sent: HashSet<String>,
 }
@@ -170,10 +177,12 @@ impl Hub {
         plugins.insert(
             agent.to_owned(),
             Plugin {
-                writer,
                 capabilities: hello.capabilities,
                 generation,
-                sent: HashSet::new(),
+                out: Arc::new(Mutex::new(PluginOut {
+                    writer,
+                    sent: HashSet::new(),
+                })),
             },
         );
         drop(plugins);
@@ -289,10 +298,16 @@ impl Hub {
             return Ok(());
         }
         self.plugin(agent)?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let Some(plugin) = plugins.get_mut(agent) else {
-            return Err(format!("{agent}'s app channel closed"));
+        // The plugins lock is let go before writing: a write waits for the
+        // plugin to read, up to the plugin leg's write timeout
+        let (out, generation) = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            let Some(plugin) = plugins.get(agent) else {
+                return Err(format!("{agent}'s app channel closed"));
+            };
+            (Arc::clone(&plugin.out), plugin.generation)
         };
+        let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
             if plugin.sent.contains(&message.id) {
                 continue;
@@ -307,7 +322,11 @@ impl Hub {
             if let Err(e) = plugin.writer.send_as(id, body) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
-                plugins.remove(agent);
+                drop(plugin);
+                let mut plugins = self.plugins.lock().expect("not poisoned");
+                if plugins.get(agent).map(|p| p.generation) == Some(generation) {
+                    plugins.remove(agent);
+                }
                 return Err(e.to_string());
             }
             plugin.sent.insert(message.id);
@@ -774,7 +793,12 @@ fn pair(
         }
         let left = match link.socket.read() {
             Ok(Message::Close(_)) => true,
-            Ok(_) => false,
+            // A ping counts as hearing from it: the person may take longer
+            // to answer than a session may stay silent
+            Ok(_) => {
+                link.heard = std::time::Instant::now();
+                false
+            }
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),
@@ -1018,7 +1042,7 @@ mod tests {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use tungstenite::client::IntoClientRequest;
 
@@ -1611,6 +1635,178 @@ mod tests {
         assert!(eventually(|| store.log_lines(10).unwrap().iter().any(
             |l| l.event == "disconnected" && l.reason.as_deref() == Some(SILENT)
         )));
+    }
+
+    /// A stand-in plugin at `socket` that answers the bridge's hello, then
+    /// does `then` with the connection; it takes up to two connections.
+    fn plugin_that(
+        socket: &Path,
+        then: impl Fn(BufReader<UnixStream>, UnixStream) + Send + Sync + 'static,
+    ) {
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut out = stream.try_clone().unwrap();
+                let mut lines = BufReader::new(stream);
+                let mut line = Vec::new();
+                lines.read_until(b'\n', &mut line).unwrap();
+                let id = MessageId::new(new_id().unwrap()).unwrap();
+                let hello = FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![],
+                };
+                out.write_all(&encode_line(&Envelope::new(id, hello)))
+                    .unwrap();
+                then(lines, out);
+            }
+        });
+    }
+
+    #[test]
+    fn a_plugin_that_never_reads_holds_no_other_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        // An agent that says hello, then reads nothing more
+        plugin_that(&bridge.socket, |lines, out| {
+            std::thread::sleep(Duration::from_secs(30));
+            drop((lines, out));
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut writing, _) = connect(&bridge, &phone);
+        start_conversation(&mut writing);
+        // Larger than the socket's buffers: the write waits for the plugin
+        say(&mut writing, "m-1", &"a".repeat(40_000));
+        std::thread::sleep(Duration::from_millis(500));
+        let (mut other, _) = connect(&bridge, &phone);
+        let started = std::time::Instant::now();
+        other.send("a-1", FromDevice::Agents);
+        while !matches!(other.receive(), Some(ToDevice::AgentsList { .. })) {}
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn typing_reaches_a_device_only_for_the_agents_own_conversations() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        // The person's conversation with another agent
+        store
+            .conversation("c-other", "lab", "other", PERSON)
+            .unwrap();
+        // On the person's message, lab/main says it types in both
+        plugin_that(&bridge.socket, |mut lines, mut out| {
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let message = decode_from_bridge(&line).unwrap();
+                line.clear();
+                if let FromBridge::MessageIn { .. } = message.body {
+                    for conversation in ["c-other", "c-1"] {
+                        let id = MessageId::new(new_id().unwrap()).unwrap();
+                        let typing = FromPlugin::Typing {
+                            conversation: ConversationId::new(conversation).unwrap(),
+                            on: true,
+                        };
+                        out.write_all(&encode_line(&Envelope::new(id, typing)))
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        say(&mut device, "m-1", "hello");
+        let typing = loop {
+            match device.receive() {
+                Some(ToDevice::Typing { conversation, .. }) => break conversation,
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        };
+        assert_eq!(typing.as_str(), "c-1");
+    }
+
+    #[test]
+    fn a_device_that_pings_while_the_person_decides_stays_connected() {
+        let folder = tempfile::tempdir().unwrap();
+        // The person answers later than a session may stay silent
+        let bridge = bridge_with(folder.path(), Duration::from_millis(1500));
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let path = bridge.store.clone();
+        let terminal = std::thread::spawn(move || {
+            let store = Store::open(&path).unwrap();
+            while store.pairing_request(b"code-1").unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(Duration::from_secs(3));
+            store.decide_pairing(b"code-1", "accept").unwrap();
+        });
+        let noise = generate_keypair().unwrap();
+        let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).unwrap();
+        let proof = enclos_protocol::pairing::proof(b"code-1", device.session.handshake_hash());
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
+                proof: encode(&proof),
+                push: None,
+            },
+        );
+        // Pings, as the app does, until the answer comes
+        let stream = device.socket.get_ref().try_clone().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let answer = loop {
+            device
+                .socket
+                .send(Message::Ping(Vec::new().into()))
+                .unwrap();
+            match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    break decode_to_device(&plain).unwrap().body;
+                }
+                Ok(Message::Close(_)) => panic!("closed"),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        terminal.join().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(
+            matches!(answer, ToDevice::PairAccepted { .. }),
+            "{answer:?}"
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        // Its session goes on
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the new device's session ended"),
+            }
+        }
     }
 
     #[test]
