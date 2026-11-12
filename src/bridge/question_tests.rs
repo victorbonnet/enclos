@@ -1284,7 +1284,7 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
     );
     for host in [None, Some("another-person@example.com".to_owned())] {
         let (_dir, hub, store, device, _rx) = fixture();
-        *hub.host.lock().unwrap() = host;
+        set_host(&hub, host.as_deref());
         let definition = approval_definition("unknown-host", false);
         store
             .ask_question(
@@ -1812,7 +1812,7 @@ fn an_unknown_host_passes_on_no_typed_runtime_approval() {
     assert!(!hub.refuses_typed_approval(OWNER, "/approve"));
     assert!(hub.refuses_typed_approval("guest@example.com", "/approve"));
     assert!(!hub.refuses_typed_approval("guest@example.com", "approve this plan"));
-    *hub.host.lock().unwrap() = None;
+    set_host(&hub, None);
     assert!(hub.refuses_typed_approval(OWNER, "/deny"));
 }
 
@@ -1985,4 +1985,18 @@ fn approval_history_reveals_hidden_characters_in_the_command() {
     assert!(text.contains("ls #⟨U+202E⟩fr- mr"), "{text}");
     assert!(!text.contains('\u{202E}'));
     assert!(text.contains("outside ASCII"));
+}
+
+/// Names `host` the host's person in the bridge's database, or nobody.
+fn set_host(hub: &Hub, host: Option<&str>) {
+    let store = hub.store().unwrap();
+    match host {
+        Some(person) => store.set_host(person).unwrap(),
+        None => {
+            rusqlite::Connection::open(&hub.store_path)
+                .unwrap()
+                .execute("DELETE FROM settings WHERE name = 'host_person'", [])
+                .unwrap();
+        }
+    }
 }
