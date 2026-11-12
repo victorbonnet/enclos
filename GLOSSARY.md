@@ -32,6 +32,10 @@ _Avoid_: tool approval or command approval (a runtime approval is a runtime's ow
 A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
 _Avoid_: policy request, question (a request for information), command approval
 
+**Signed decision**:
+A person's decision on a runtime approval as the bridge passes it to the agent's channel plugin, signed with a key no sandbox reads, which the plugin acts on alone.
+_Avoid_: approval token, typed approval
+
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file
@@ -122,6 +126,10 @@ _Avoid_: client, session (a sandbox's word)
 **Person**:
 Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
 _Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
+
+**Host's person**:
+The person each agent's Home conversation belongs to: the person of the first device paired at the host's terminal, until it is changed there.
+_Avoid_: owner (a conversation's word), admin
 
 **Share**:
 What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
