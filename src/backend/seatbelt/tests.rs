@@ -93,6 +93,10 @@ fn world() -> World {
     std::fs::write(user.join("work/project/private/key"), "secret").unwrap();
     std::fs::write(home.join("private/key"), "secret").unwrap();
     std::fs::write(data.join("state.db"), "state").unwrap();
+    // The bridge's database (ADR 0042), and its write-ahead log.
+    for file in ["app.db", "app.db-wal"] {
+        std::fs::write(data.join(file), "the bridge's").unwrap();
+    }
     std::fs::write(data.join("sandboxes/other/policy.toml"), "theirs").unwrap();
     std::fs::write(user.join("readable.txt"), "fine").unwrap();
     // A workspace the user reaches through a link of their own.
@@ -459,6 +463,15 @@ fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
     assert!(w.sh(&format!("cat '{}'", w.path("alice/readable.txt"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.ssh/id_ed25519"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.enclos/state.db"))));
+    for file in ["app.db", "app.db-wal"] {
+        assert!(
+            !w.sh(&format!(
+                "cat '{}'",
+                w.path(&format!("alice/.enclos/{file}"))
+            )),
+            "{file}"
+        );
+    }
     assert!(!w.sh(&format!(
         "cat '{}'",
         w.path("alice/.enclos/sandboxes/other/policy.toml")
