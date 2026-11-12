@@ -138,6 +138,7 @@ fn a_message_reads_as_its_fields_say() {
         conversation,
         person,
         text,
+        host,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
@@ -145,6 +146,10 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(conversation.as_str(), "c-42");
     assert_eq!(person.as_str(), "alice@example.com");
     assert_eq!(text, "What's the weather in Paris?");
+    assert_eq!(
+        host, None,
+        "a message.in without host comes from an older bridge"
+    );
 
     let message = decode_from_plugin(FROM_PLUGIN[2].1.as_bytes()).unwrap();
     let FromPlugin::MessageOut { kind, reply_to, .. } = message.body else {
@@ -297,7 +302,14 @@ fn an_unknown_type_is_told_apart_from_a_bad_message() {
 fn other_versions_wrong_ids_and_oversized_messages_are_refused() {
     assert_eq!(
         decode_from_bridge(br#"{"v":2,"id":"m1","type":"ack","of":"m0"}"#),
-        Err(DecodeError::Version(2))
+        Err(DecodeError::Version {
+            id: Some("m1".to_owned()),
+            v: 2
+        })
+    );
+    assert_eq!(
+        decode_from_bridge(br#"{"v":2,"type":"ack","of":"m0"}"#),
+        Err(DecodeError::Version { id: None, v: 2 })
     );
     assert!(matches!(
         decode_from_bridge(br#"{"id":"m1","type":"ack","of":"m0"}"#),
@@ -317,4 +329,57 @@ fn other_versions_wrong_ids_and_oversized_messages_are_refused() {
     ));
     let big = vec![b' '; MAX_MESSAGE_BYTES + 1];
     assert_eq!(decode_from_bridge(&big), Err(DecodeError::TooBig));
+}
+
+#[test]
+fn names_and_error_text_from_the_sandbox_hold_no_control_character() {
+    let hello = |runtime: &str, agent: &str| {
+        format!(
+            r#"{{"v":1,"id":"m1","type":"hello","runtime":{},"agent":{},"capabilities":[]}}"#,
+            serde_json::to_string(runtime).unwrap(),
+            serde_json::to_string(agent).unwrap()
+        )
+    };
+    assert!(decode_from_plugin(hello("hermes", "main").as_bytes()).is_ok());
+    let long = "a".repeat(129);
+    for (runtime, agent) in [
+        ("hermes\u{1b}[2J", "main"),
+        ("hermes", "main\n"),
+        ("", "main"),
+        ("hermes", ""),
+        (long.as_str(), "main"),
+    ] {
+        assert!(
+            matches!(
+                decode_from_plugin(hello(runtime, agent).as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ),
+            "{runtime:?} {agent:?}"
+        );
+    }
+
+    let error = |message: &str| {
+        format!(
+            r#"{{"v":1,"id":"m1","type":"error","code":"bad_message","message":{}}}"#,
+            serde_json::to_string(message).unwrap()
+        )
+    };
+    assert!(decode_from_plugin(error("A line over 1 MiB.").as_bytes()).is_ok());
+    assert!(decode_from_plugin(error("").as_bytes()).is_ok());
+    for message in ["red \u{1b}[31m", "two\nlines", "bell \u{7}"] {
+        assert!(
+            matches!(
+                decode_from_plugin(error(message).as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ),
+            "{message:?}"
+        );
+        assert!(
+            matches!(
+                decode_from_bridge(error(message).as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ),
+            "{message:?}"
+        );
+    }
 }

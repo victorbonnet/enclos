@@ -16,7 +16,9 @@ pub enum IdError {
     Control,
 }
 
-fn check(value: &str) -> Result<(), IdError> {
+/// The rule every id and name follows: not empty, at most
+/// [`MAX_ID_BYTES`], no control character.
+pub(crate) fn check(value: &str) -> Result<(), IdError> {
     if value.is_empty() {
         Err(IdError::Empty)
     } else if value.len() > MAX_ID_BYTES {

@@ -22,3 +22,7 @@ optional_env:
     description: "Conversation that cron jobs with no origin deliver to"
     prompt: "Home conversation id (or empty)"
     password: false
+  - name: MOBILE_APP_BRIDGE_KEY
+    description: "The public key the bridge signs runtime-approval decisions with, set by enclos runtime configure; without it, approvals have no app buttons"
+    prompt: "Bridge key (or empty)"
+    password: false

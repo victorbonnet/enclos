@@ -24,6 +24,18 @@ _Avoid_: missing feature, fallback mode
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
 _Avoid_: rules, permissions, config
 
+**Policy request**:
+A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+_Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision)
+
+**Runtime approval**:
+A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
+_Avoid_: policy request, question (a request for information), command approval
+
+**Signed decision**:
+A person's decision on a runtime approval as the bridge passes it to the agent's channel plugin, signed with a key no sandbox reads, which the plugin acts on alone.
+_Avoid_: approval token, typed approval
+
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file
@@ -98,6 +110,65 @@ _Avoid_: platform, integration
 **Bot**:
 The account on a channel through which the sandbox's runtime answers people, such as a Telegram bot.
 _Avoid_: agent (an agent is the runtime's identity, not the account)
+
+**Bridge**:
+The service of an install that the mobile app reaches through its transport, and that talks to each agent's channel plugin inside its sandbox.
+_Avoid_: daemon, server, gateway (the runtime's word), relay (the proxy's)
+
+**Transport**:
+What puts the bridge, which listens on the host's loopback only, on a network the person's devices are on, and tells the bridge who each caller is. Tailscale is the only one for now.
+_Avoid_: tunnel (the proxy's word), front, VPN (one kind of transport)
+
+**Paired device**:
+A phone or other device that a bridge accepts, because the host's user paired it there and it holds the key it was paired with.
+_Avoid_: client, session (a sandbox's word)
+
+**Person**:
+Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
+_Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
+
+**Host's person**:
+The person each agent's Home conversation belongs to: the person of the first device paired at the host's terminal, until it is changed there.
+_Avoid_: owner (a conversation's word), admin
+
+**Share**:
+What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
+_Avoid_: grant (a secret's or policy's word), permission
+
+**Conversation**:
+One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
+_Avoid_: session (a sandbox's word), chat, thread
+
+**Archived conversation**:
+A conversation other than Home that its owner has set aside from the active list, with its identity and history kept until restored.
+_Avoid_: deleted conversation, closed conversation
+
+**Home conversation**:
+An agent's permanent conversation for messages that have no other destination, including scheduled output and the runtime's notices.
+
+**Group**:
+A conversation between one person and several agents of one sandbox, which the bridge keeps and whose turns it runs. Each agent answers in turn, when addressed by its handle (`@main`), by `@all`, or by another member.
+_Avoid_: room (Hermes's word), channel (a messaging account), team
+
+**Artefact**:
+A page an agent makes for a person to open in the app from its conversation.
+_Avoid_: artifact, app (for a generated page)
+
+**Agent photo**:
+The picture that stands for an agent in the app, the same for every person shown the agent. The host's person chooses it; without one, the agent shows its initial.
+_Avoid_: profile picture, icon, avatar (the protocol's word, in `agent.avatar` and its fields, and nowhere else)
+
+**Agent command**:
+A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
+_Avoid_: command alone (enclos's own), shortcut, action
+
+**Routine**:
+A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
+_Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
+
+**Question**:
+An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
+_Avoid_: runtime approval, policy request (different authority)
 
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::Engine;
 use crate::error::{Error, Result};
+use crate::model::audit::Actor;
 use crate::model::channel::Channel;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::SecretValue;
@@ -80,11 +81,54 @@ impl Engine {
 
     /// The bridge's static key pair's file.
     pub fn app_key_path(&self) -> PathBuf {
-        self.layout.data().join("app-bridge.key")
+        self.layout.app_bridge_key()
+    }
+
+    /// The file of the key the bridge signs runtime-approval decisions
+    /// with (ADR 0060, proposed).
+    pub fn app_approval_key_path(&self) -> PathBuf {
+        self.layout.app_approval_key()
+    }
+
+    /// The public key (SEC1, base64url) the bridge signs runtime-approval
+    /// decisions with, which `runtime configure --channel app` gives the
+    /// plugin (ADR 0060, proposed): made when the bridge has none yet. A
+    /// dry run, which writes nothing, names it instead of making it.
+    pub fn app_approval_public_key(&self, confirm: super::Confirm) -> Result<String> {
+        let path = self.app_approval_key_path();
+        let key = match confirm {
+            super::Confirm::DryRun => crate::bridge::keys::existing_approval_key(&path),
+            _ => crate::bridge::keys::approval_key(&path).map(Some),
+        }
+        .map_err(|e| Error::Session {
+            what: format!(
+                "cannot read or make the bridge's key for runtime approvals, {}: {e}",
+                path.display()
+            ),
+        })?;
+        Ok(key.map_or_else(
+            || "<the bridge's key for runtime approvals, made when this runs>".to_owned(),
+            |key| key.public_text(),
+        ))
     }
 
     /// The bridge's own database: conversations and their messages.
     pub fn app_store_path(&self) -> PathBuf {
-        self.layout.data().join("app.db")
+        self.layout.app_store()
+    }
+
+    /// Runs `work`, a change to which devices reach the bridge (`app pair`,
+    /// `app unpair`), as an audited command: its intent is in the audit log
+    /// before the work starts, and when the log cannot be written the work
+    /// does not run (ADR 0010).
+    pub fn app_access<T>(
+        &self,
+        by: &Actor,
+        command: &str,
+        target: String,
+        summary: impl FnOnce(&T) -> String,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.write(by, command, Some(target), summary, |_| work())
     }
 }
