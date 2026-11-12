@@ -513,7 +513,7 @@ fn an_archive_storage_failure_is_not_a_refusal_and_keeps_the_database_words_on_t
     let error = archive_conversation(&hub, &store, owner, "c-full", true).unwrap_err();
     assert!(matches!(error, ArchiveError::Storage(_)), "{error:?}");
     let body = error.body(MessageId::new("a-1").unwrap());
-    assert_eq!(body.code, enclos_protocol::plugin::ErrorCode::Unknown);
+    assert_eq!(body.code, enclos_protocol::plugin::ErrorCode::Internal);
     assert_eq!(body.of.unwrap().as_str(), "a-1");
     assert!(
         !body.message.to_lowercase().contains("constraint"),
