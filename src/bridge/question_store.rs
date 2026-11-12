@@ -311,9 +311,8 @@ impl Store {
     }
 
     /// Creates the question and its readable introduction. A runtime
-    /// approval's introduction lists typed commands only when `host`, the
-    /// host's person, owns the conversation: no one else's typed decision is
-    /// passed on to the runtime.
+    /// approval is refused unless `host`, the host's person, owns the
+    /// conversation: no one else decides runtime approvals.
     pub fn ask_question(
         &self,
         origin: &str,
@@ -416,7 +415,7 @@ impl Store {
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO questions(id,conversation,agent,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,'pending',0,NULL,?5)", params![definition.id.as_str(),conversation.as_str(),origin,encoded,message_id])?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
-        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",params![message_id,conversation.as_str(),definition.fallback_text(host == Some(owner.as_str())),kind,now(),speaker,definition.id.as_str()])?;
+        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",params![message_id,conversation.as_str(),definition.fallback_text(),kind,now(),speaker,definition.id.as_str()])?;
         let question =
             question_in(&tx, definition.id.as_str())?.ok_or(QuestionStoreError::Unknown)?;
         let message = history_message(&tx, definition.id.as_str(), kind)?;
@@ -559,7 +558,7 @@ mod tests {
         let first = created.message.unwrap();
         assert_eq!(first.kind, "question");
         assert_eq!(first.question, Some(definition.id.clone()));
-        assert_eq!(first.text, definition.fallback_text(true));
+        assert_eq!(first.text, definition.fallback_text());
         assert_eq!(
             store
                 .ask_question(
@@ -1160,7 +1159,7 @@ mod runtime_approval_tests {
             assert_eq!(created.message.as_ref().unwrap().kind, "runtime_approval");
             assert_eq!(
                 created.message.as_ref().unwrap().text,
-                definition.fallback_text(true)
+                definition.fallback_text()
             );
             assert_eq!(
                 store

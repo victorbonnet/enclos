@@ -596,7 +596,11 @@ fn approval_close_requires_the_host_person_and_a_still_paired_device() {
             .unwrap_err(),
         "Unknown policy request"
     );
-    *hub.host.lock().unwrap() = None;
+    // Nobody named the host's person
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute("DELETE FROM settings WHERE name = 'host_person'", [])
+        .unwrap();
     assert!(
         hub.close_access(&store, &device, owner, "r1")
             .unwrap_err()

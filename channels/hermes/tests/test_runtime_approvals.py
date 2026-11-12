@@ -1,6 +1,7 @@
 """Runtime approvals: typed transport and optional pinned native-source/Event harness."""
 
 import asyncio
+import base64
 import collections
 import importlib
 import json
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import uuid
@@ -16,8 +18,41 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from enclos import protocol, questions, runtime_approvals, visible
+from enclos import decisions, protocol, questions, runtime_approvals, visible
 from enclos.outbox import Outbox
+
+try:
+    import cryptography  # noqa: F401  Hermes ships it; the stdlib-only CI job has none
+    HAS_CRYPTOGRAPHY = True
+except ImportError:
+    HAS_CRYPTOGRAPHY = False
+
+# Takes every decision as the bridge's: for the tests of what follows a check.
+ACCEPT = types.SimpleNamespace(check=lambda message, card: None)
+FIXTURE = Path(__file__).resolve().parents[3] / "crates" / "enclos-protocol" / "tests" / "fixtures" / "decision" / "approval.json"
+
+
+def signer(agent="lab/main"):
+    """A key pair standing in for the bridge's: its public key as the channel is
+    given it, and what signs a `question.answer` for a card as the bridge does
+    (ADR 0060), with any statement field changed by `changes`."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+    private = ec.generate_private_key(ec.SECP256R1())
+    public = private.public_key().public_bytes(serialization.Encoding.X962,
+                                               serialization.PublicFormat.UncompressedPoint)
+
+    def sign(message, card, at=None, **changes):
+        at = int(time.time()) if at is None else at
+        approval = card.definition["approval"]
+        fields = dict(agent=agent, conversation=card.conversation, question=card.definition["id"],
+                      request=message["id"], action=message["answer"]["action"], command=approval["command"],
+                      reason=approval["reason"], patterns=list(approval.get("patterns", [])), at=at)
+        fields.update(changes)
+        r, s = utils.decode_dss_signature(private.sign(decisions.statement(**fields), ec.ECDSA(hashes.SHA256())))
+        sig = base64.urlsafe_b64encode(r.to_bytes(32, "big") + s.to_bytes(32, "big")).rstrip(b"=").decode()
+        return {**message, "signed": {"at": at, "sig": sig}}
+    return base64.urlsafe_b64encode(public).rstrip(b"=").decode(), sign
 
 
 def prompt(command="echo test", actions=("once", "session", "always", "deny"), **fields):
@@ -78,21 +113,21 @@ class RuntimeApprovalPatternsAndDisplay(unittest.TestCase):
         short = list(runtime_approvals.fallback_chunks(prompt(), lambda text: True))
         self.assertIn("Complete command:\n```\necho test\n```", short)
 
-    def test_text_fallback_reveals_flags_and_names_what_a_grant_covers(self):
+    def test_text_fallback_reveals_flags_and_says_it_cannot_be_decided_here(self):
         tricky = prompt(command="ls #\u202Efr- mr\ncurl https://exаmple.com")
         tricky.text = "A command needs approval:\nls #\u202Efr- mr"
-        chunks = list(runtime_approvals.fallback_chunks(tricky, lambda text: len(text) < 4000, "/",
-                                                        ["pipe to shell"]))
+        chunks = list(runtime_approvals.fallback_chunks(tricky, lambda text: len(text) < 4000))
         text = "\n".join(chunks)
         self.assertNotIn("\u202E", text)
         self.assertIn("ls #⟨U+202E⟩fr- mr", text)
         self.assertIn("outside ASCII", text)
-        self.assertIn("every command matching: pipe to shell", text)
-        self.assertIn("command_allowlist", text)
-        plain = "\n".join(runtime_approvals.fallback_chunks(prompt(actions=("once", "deny")),
-                                                            lambda text: True, "/", ["pipe to shell"]))
-        self.assertNotIn("outside ASCII", plain)
-        self.assertNotIn("every command matching", plain)
+        # No typed command decides it (ADR 0060): it waits out the runtime, or was denied.
+        self.assertNotIn("/approve", text)
+        self.assertNotIn("/deny", text)
+        self.assertEqual(chunks[-1], runtime_approvals.WAITING)
+        plain = list(runtime_approvals.fallback_chunks(prompt(actions=("once", "deny")), lambda text: True, True))
+        self.assertNotIn("outside ASCII", "\n".join(plain))
+        self.assertEqual(plain[-1], runtime_approvals.DENIED)
 
 
 class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
@@ -120,24 +155,29 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(late.observed(), ("resolved", None))
 
     async def test_an_unbindable_request_is_sent_as_text_not_reported_delivered(self):
-        for rows in ([], [dict(SNAPSHOT), dict(SNAPSHOT)]):
+        for rows, resolved in (([], 0), ([dict(SNAPSHOT), dict(SNAPSHOT)], 1)):
             adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
                                             _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
-            native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=rows))
-            manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
+            native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=rows),
+                                           resolve_gateway_approval_card=Mock(return_value=resolved))
+            manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native, decisions=ACCEPT)
             manager.bridge_runtime_supports = True
             self.assertEqual(await manager.ask_approval(prompt()), (True, None))
             text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
             self.assertIn("echo test", text)
-            self.assertIn("/deny", text)
+            self.assertNotIn("/approve", text)
+            # Nothing in the app can decide it: denied at once, by its exact request.
+            native.resolve_gateway_approval_card.assert_called_once_with("session", "deny", "request-1")
+            self.assertTrue(text.endswith(runtime_approvals.DENIED if resolved else runtime_approvals.WAITING))
             self.assertFalse(manager.cards)
 
     async def test_an_unobservable_request_is_sent_as_text_not_reported_delivered(self):
         adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
                                         _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
-                                       observe_gateway_settle=Mock(return_value=False))
-        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
+                                       observe_gateway_settle=Mock(return_value=False),
+                                       resolve_gateway_approval_card=Mock(return_value=0))
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native, decisions=ACCEPT)
         manager.bridge_runtime_supports = True
         self.assertEqual(await manager.ask_approval(prompt()), (True, None))
         self.assertTrue(adapter.send.await_args_list)
@@ -148,7 +188,7 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
                                        observe_gateway_settle=Mock(return_value=True),
                                        resolve_gateway_approval_card=Mock(return_value=1))
-        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native, decisions=ACCEPT)
         manager.bridge_runtime_supports = True
         saved, question = await manager.ask_approval(prompt())
         self.assertTrue(saved)
@@ -172,7 +212,7 @@ class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
                                        observe_gateway_settle=Mock(return_value=True),
                                        resolve_gateway_approval_card=Mock(return_value=1))
-        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native, decisions=ACCEPT)
         manager.bridge_runtime_supports = True
         return manager, adapter, native
 
@@ -193,13 +233,15 @@ class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
         self.assertFalse([m for m in adapter._outbox.pending() if m["type"] == "question.update"])
         await manager.close()
 
-    async def test_an_ask_refused_otherwise_goes_as_typed_text(self):
+    async def test_an_ask_refused_otherwise_is_denied_with_its_command_shown(self):
         manager, adapter, native = self.manager()
         await manager.ask_approval(prompt())
         await manager.refused(adapter._outbox.pending()[0]["id"], "bad_message")
-        native.resolve_gateway_approval_card.assert_not_called()
-        self.assertIn("/approve always", self.sent(adapter))
+        # No typed command could decide it (ADR 0060): denied at once.
+        native.resolve_gateway_approval_card.assert_called_once_with("session", "deny", "request-1")
+        self.assertNotIn("/approve", self.sent(adapter))
         self.assertIn("echo test", self.sent(adapter))
+        self.assertTrue(self.sent(adapter).endswith(runtime_approvals.DENIED))
         self.assertFalse(manager.cards)
         # Another message's refusal changes nothing.
         await manager.refused("unrelated", "not_allowed")
@@ -238,7 +280,7 @@ class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
-    async def test_an_approval_command_from_anyone_but_the_hosts_person_never_reaches_hermes(self):
+    async def test_an_approval_command_from_anyone_never_reaches_hermes(self):
         config = types.ModuleType("gateway.config")
         config.Platform = config.PlatformConfig = Mock
         shared = types.ModuleType("gateway.platforms._shared")
@@ -276,15 +318,19 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             adapter._answers = {}
             adapter._interrupts = types.SimpleNamespace(admit=lambda event: None, complete=lambda event: None)
             adapter.name = "enclos"
-            # Python's split takes U+001F for whitespace, as Hermes does.
-            for text in ("/yolo", chr(0x1F) + "/approve always", "/approvals off", "/DENY"):
-                message = protocol._message("message.in", conversation="c", person="guest@example.com",
-                                            text=text, host=False)
+            # Python's split takes U+001F for whitespace, as Hermes does. The bridge's
+            # `host` is no proof (any program with the token sends it): the host's
+            # person's typed approval goes no further than anyone's (ADR 0060).
+            refused = [{"text": "/yolo", "host": False}, {"text": chr(0x1F) + "/approve always", "host": False},
+                       {"text": "/approvals off"}, {"text": "/DENY", "host": True},
+                       {"text": "/approve", "host": True}, {"text": "/approve"}]
+            for fields in refused:
+                message = protocol._message("message.in", conversation="c", person="guest@example.com", **fields)
                 await adapter._on_message(message)
                 adapter.handle_message.assert_not_awaited()
-                self.assertEqual(adapter.send.await_args.args[1], runtime_approvals.NOT_HOST_ANSWER)
+                self.assertEqual(adapter.send.await_args.args[1], runtime_approvals.TYPED_ANSWER)
                 self.assertEqual(adapter._write.call_args.args[0]["of"], message["id"])
-            passed = [{"text": "/approve", "host": True}, {"text": "/approve"}, {"text": "hello", "host": False}]
+            passed = [{"text": "hello", "host": True}, {"text": "hello", "host": False}, {"text": "/new"}]
             for fields in passed:
                 await adapter._on_message(protocol._message("message.in", conversation="c", person="p", **fields))
             self.assertEqual(adapter.handle_message.await_count, len(passed))
@@ -343,26 +389,183 @@ class RuntimeApprovalProtocol(unittest.TestCase):
 
 
 class RuntimeApprovalFallback(unittest.IsolatedAsyncioTestCase):
-    async def test_old_bridge_or_api_keeps_full_typed_native_fallback(self):
+    async def test_old_bridge_api_or_no_key_shows_the_command_and_offers_no_typed_decision(self):
         adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)))
         native = Mock(return_value=None)
         manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=native)
         self.assertFalse(manager.approvals_available)
-        self.assertEqual(await manager.ask_approval(prompt()), (True, None))
-        native.assert_not_called()
         manager.bridge_runtime_supports = True
+        # No key to check the bridge's decisions with: no buttons, whatever else.
         self.assertFalse(manager.approvals_available)
+        manager.decisions = ACCEPT
+        self.assertFalse(manager.approvals_available)  # no exact native API
         self.assertEqual(await manager.ask_approval(prompt()), (True, None))
         text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
-        for command in ("/approve", "/approve session", "/approve always", "/deny", "echo test"):
-            self.assertIn(command, text)
+        self.assertIn("echo test", text)
+        self.assertNotIn("/approve", text)
+        self.assertNotIn("/deny", text)
+        # Without Hermes's exact resolver, nothing here denies it: Hermes's timeout does.
+        self.assertTrue(text.endswith(runtime_approvals.WAITING))
         self.assertFalse(manager.cards)
         self.assertTrue(all(call.kwargs["metadata"]["is_approval_prompt"] for call in adapter.send.await_args_list))
 
 
+class SignedDecisionStatement(unittest.TestCase):
+    """The statement is the crate's, byte for byte: standard library only."""
+
+    def fixture(self):
+        return json.loads(FIXTURE.read_text())
+
+    def test_the_statement_is_the_crates(self):
+        f = self.fixture()
+        statement = decisions.statement(f["agent"], f["conversation"], f["question"], f["request"], f["action"],
+                                        f["command"], f["reason"], f["patterns"], f["at"])
+        self.assertEqual(statement.hex(), f["statement"])
+        # Each field's length goes first: two fields never read as one.
+        self.assertNotEqual(decisions.statement("a", "b", "q", "r", "once", "ab", "c", [], 1),
+                            decisions.statement("a", "b", "q", "r", "once", "a", "bc", [], 1))
+
+    def test_without_a_key_or_a_sandbox_the_channel_checks_nothing(self):
+        with self.assertLogs(decisions.logger, "WARNING"):
+            self.assertIsNone(decisions.load("", "lab", "main"))
+        with self.assertLogs(decisions.logger, "WARNING"):
+            self.assertIsNone(decisions.load(self.fixture()["bridge"], "", "main"))
+
+    @unittest.skipUnless(HAS_CRYPTOGRAPHY, "optional cryptography, which Hermes ships")
+    def test_the_crates_signature_verifies_and_a_bad_key_is_refused(self):
+        f = self.fixture()
+        verifier = decisions.load(f["bridge"], "lab", "coder")
+        self.assertEqual(verifier.agent, f["agent"])
+        card = types.SimpleNamespace(conversation=f["conversation"], definition={
+            "id": f["question"], "approval": {"command": f["command"], "reason": f["reason"], "patterns": f["patterns"]}})
+        message = {"id": f["request"], "answer": {"kind": "approval", "action": f["action"]},
+                   "signed": {"at": f["at"], "sig": f["sig"]}}
+        self.assertIsNone(verifier.check(message, card, now=lambda: f["at"] + 10))
+        self.assertIn("not fresh", verifier.check(message, card, now=lambda: f["at"] + 61))
+        self.assertIn("does not match", verifier.check({**message, "answer": {"kind": "approval", "action": "always"}},
+                                                       card, now=lambda: f["at"]))
+        with self.assertLogs(decisions.logger, "WARNING"):
+            self.assertIsNone(decisions.load("AAAA", "lab", "coder"))
+
+
+@unittest.skipUnless(HAS_CRYPTOGRAPHY, "optional cryptography, which Hermes ships")
+class SignedDecisions(unittest.IsolatedAsyncioTestCase):
+    """The channel resolves a runtime approval only on the bridge's signature of
+    that very decision: a forged, altered, replayed, stale or unsigned one is
+    refused, logged, and its approval denied (ADR 0060)."""
+
+    async def asyncSetUp(self):
+        key, self.sign = signer()
+        self.adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
+                                             _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock(return_value=True))
+        self.rows = [dict(SNAPSHOT)]
+        self.native = types.SimpleNamespace(list_gateway_approvals=Mock(side_effect=lambda session: list(self.rows)),
+                                            observe_gateway_settle=Mock(return_value=True),
+                                            resolve_gateway_approval_card=Mock(return_value=1))
+        self.manager = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send,
+                                         approvals_native=lambda: self.native,
+                                         decisions=decisions.load(key, "lab", "main"))
+        self.manager.bridge_runtime_supports = True
+        self.assertTrue(self.manager.approvals_available)
+        self.addAsyncCleanup(self.manager.close)
+
+    async def card(self, request_id="request-1"):
+        asked = prompt()
+        asked.request_id = request_id
+        if request_id != "request-1":
+            self.rows.append({**SNAPSHOT, "request_id": request_id})
+        saved, question = await self.manager.ask_approval(asked)
+        self.assertTrue(saved)
+        return self.manager.cards[question]
+
+    def answer(self, card, action="once"):
+        return protocol._message("question.answer", question=card.definition["id"], conversation="c",
+                                 answer={"kind": "approval", "action": action})
+
+    def written(self, kind):
+        return [call.args[0] for call in self.adapter._write.call_args_list if call.args[0]["type"] == kind]
+
+    async def assert_refused_and_denied(self, card, message):
+        with self.assertLogs(questions.logger, "WARNING"):
+            await self.manager.answer(message)
+        error = self.written("error")[-1]
+        self.assertEqual((error["code"], error["of"]), ("not_allowed", message["id"]))
+        self.assertEqual(error["message"], runtime_approvals.NOT_SIGNED)
+        self.native.resolve_gateway_approval_card.assert_called_with("session", "deny", card.native_id)
+        # The agent's report of a denial, not a receipt of anyone's request.
+        update = self.written("question.update")[-1]
+        self.assertEqual((update["state"], update["answer"]), ("answered", {"kind": "approval", "action": "deny"}))
+        self.assertNotIn("of", update)
+        self.assertNotIn(call_once(card), self.native.resolve_gateway_approval_card.call_args_list)
+
+    async def test_the_bridges_signed_decision_resolves_its_approval(self):
+        card = await self.card()
+        message = self.sign(self.answer(card, "session"), card)
+        await self.manager.answer(message)
+        self.native.resolve_gateway_approval_card.assert_called_once_with("session", "session", "request-1")
+        update = self.written("question.update")[-1]
+        self.assertEqual((update["of"], update["answer"]["action"]), (message["id"], "session"))
+        self.assertFalse(self.written("error"))
+
+    async def test_an_unsigned_decision_is_refused_and_its_approval_denied(self):
+        card = await self.card()
+        await self.assert_refused_and_denied(card, self.answer(card))
+
+    async def test_a_decision_signed_by_another_key_is_refused(self):
+        card = await self.card()
+        _, forge = signer()
+        await self.assert_refused_and_denied(card, forge(self.answer(card), card))
+
+    async def test_an_altered_decision_is_refused(self):
+        # Its action widened after signing, or signed over another command, scope,
+        # agent or conversation than the card's.
+        for change in ({"action": "always"}, {"command": "rm -rf ~"}, {"patterns": ["*"]},
+                       {"agent": "lab/other"}, {"conversation": "other"}):
+            with self.subTest(change=change):
+                card = await self.card(f"request-{len(self.rows) + 1}")
+                if "action" in change:
+                    message = self.sign(self.answer(card, "once"), card)
+                    message["answer"] = {"kind": "approval", "action": change["action"]}
+                else:
+                    message = self.sign(self.answer(card), card, **change)
+                await self.assert_refused_and_denied(card, message)
+
+    async def test_a_replayed_decision_resolves_nothing_more(self):
+        first = await self.card()
+        message = self.sign(self.answer(first), first)
+        await self.manager.answer(message)
+        self.native.resolve_gateway_approval_card.assert_called_once_with("session", "once", "request-1")
+        # The same decision again: the approval is closed, its state is replayed.
+        await self.manager.answer(message)
+        self.assertEqual(self.native.resolve_gateway_approval_card.call_count, 1)
+        self.assertEqual(self.written("question.update")[-1]["of"], message["id"])
+        # Presented for another approval, it does not match that one: refused, denied.
+        second = await self.card("request-2")
+        await self.assert_refused_and_denied(second, {**message, "question": second.definition["id"]})
+        # Signed long ago, it is not fresh.
+        third = await self.card("request-3")
+        await self.assert_refused_and_denied(third, self.sign(self.answer(third), third,
+                                                              at=int(time.time()) - decisions.MAX_AGE_SECONDS - 5))
+
+    async def test_a_decision_for_a_closed_approval_is_refused_and_denies_nothing(self):
+        card = await self.card()
+        card.entry.reason = "timeout"
+        await self.manager._settle(card, *card.entry.observed())
+        with self.assertLogs(questions.logger, "WARNING"):
+            await self.manager.answer(self.answer(card))
+        self.assertEqual(self.written("error")[-1]["code"], "not_allowed")
+        self.native.resolve_gateway_approval_card.assert_not_called()
+
+
+def call_once(card):
+    """The call that would have allowed `card` once."""
+    from unittest.mock import call
+    return call("session", "once", card.native_id)
+
+
 @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_LEGACY_SOURCE"), "optional old Hermes source")
 class NativeLegacyFallback(unittest.TestCase):
-    def test_old_native_signature_and_missing_exact_apis_use_typed_fallback(self):
+    def test_old_native_signature_and_missing_exact_apis_use_text_fallback(self):
         script = """
 import asyncio, os, sys
 from pathlib import Path
@@ -389,7 +592,8 @@ async def check():
     messages = adapter._outbox.pending()
     assert all(m['type'] == 'message.out' for m in messages)
     text = '\\n'.join(m['text'] for m in messages)
-    assert all(c in text for c in ['/approve', '/approve session', '/approve always', '/deny', 'echo not-executed'])
+    assert 'echo not-executed' in text and '/approve' not in text, text
+    assert text.endswith(runtime_approvals.WAITING), text
     assert not adapter._questions.cards
 asyncio.run(check())
 """
@@ -427,7 +631,9 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
         self.adapter._write = AsyncMock(return_value=True)
         self.adapter._check_title_soon = Mock()
         self.adapter._local_image = Mock(side_effect=AssertionError("approval text must remain literal"))
-        self.manager = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send)
+        key, self.sign = signer()
+        self.manager = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send,
+                                         decisions=decisions.load(key, "lab", "main"))
         self.manager.bridge_supports = self.manager.bridge_runtime_supports = True
         self.adapter._questions = self.manager
         self.assertIs(runtime_approvals.native_api(), self.native)
@@ -475,8 +681,9 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
         return card, result, worker
 
     def answer(self, card, action):
-        return protocol._message("question.answer", question=card.definition["id"], conversation="c",
-                                 answer={"kind": "approval", "action": action})
+        """The bridge's decision, signed as it signs it (ADR 0060)."""
+        return self.sign(protocol._message("question.answer", question=card.definition["id"], conversation="c",
+                                           answer={"kind": "approval", "action": action}), card)
 
     def updates(self):
         return [m for m in self.adapter._outbox.pending() if m["type"] == "question.update"]
@@ -576,9 +783,10 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(rest.endswith("\n" + fence))
                 parts.append(rest[:-(len(fence) + 1)])
         self.assertEqual("".join(parts), command)
-        self.assertEqual(messages[-1]["text"], "Reply with /deny.")
-        self.assertEqual(self.native.resolve_gateway_approval_card(self.scope, "once", result["request"]["request_id"]), 0)
-        self.native.resolve_gateway_approval_card(self.scope, "deny", result["request"]["request_id"])
+        # No card shows it and no typed command decides it (ADR 0060): denied at once.
+        self.assertEqual(messages[-1]["text"], runtime_approvals.DENIED)
+        await asyncio.to_thread(worker.join, 2)
+        self.assertEqual(result["decision"]["choice"], "deny")
 
     async def test_approval_send_preserves_markdown_image_and_notice_looking_command_literals(self):
         command = 'echo "![x](/test-only/image.png)"'

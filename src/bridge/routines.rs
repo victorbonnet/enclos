@@ -1205,11 +1205,16 @@ mod tests {
         assert!(store.log_lines(10).unwrap().is_empty());
     }
 
-    /// Breaks the bridge's database under `store` by dropping `table`.
-    fn drop_table(hub: &Hub, table: &str) {
+    /// Breaks the bridge's database under `store` by putting a `table` of
+    /// the wrong shape in place of `table`: dropped, it would be made again
+    /// the next time the database is opened, as reading the host's person
+    /// does.
+    fn break_table(hub: &Hub, table: &str) {
         rusqlite::Connection::open(&hub.store_path)
             .unwrap()
-            .execute_batch(&format!("PRAGMA foreign_keys = OFF; DROP TABLE {table};"))
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF; DROP TABLE {table}; CREATE TABLE {table} (broken INTEGER);"
+            ))
             .unwrap();
     }
 
@@ -1217,7 +1222,7 @@ mod tests {
     fn a_database_failure_is_answered_as_unknown_not_blamed_on_the_runtime() {
         // Before the request is sent: nothing reaches the runtime.
         let (_dir, hub, store, device, rx) = fixture();
-        drop_table(&hub, "members");
+        break_table(&hub, "members");
         let error = hub
             .routine_request(
                 &store,
@@ -1269,7 +1274,7 @@ mod tests {
             "connection",
             RoutineRequest::List { cursor: None },
         );
-        drop_table(&hub, "devices");
+        break_table(&hub, "devices");
         hub.routine_response(
             &store,
             AGENT,
