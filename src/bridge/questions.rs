@@ -397,6 +397,11 @@ impl Hub {
             self.known_host().as_deref(),
         )?;
         drop(requests);
+        // A question waits for the person: an archived conversation comes
+        // back to the active Inbox first (ADR 0049), or nobody would see it.
+        if let Err(e) = self.unarchive_for_request(store, conversation.as_str()) {
+            eprintln!("enclos app: a question's conversation could not be unarchived: {e}");
+        }
         self.publish_question(store, change);
         Ok(())
     }
