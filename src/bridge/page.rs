@@ -22,22 +22,37 @@ pub fn link_to_page(url: &str, link: &str) -> Option<String> {
     Some(format!("{}{PATH}#{query}", url.trim_end_matches('/')))
 }
 
+/// How long [`requested`] waits for the start of a request line.
+const REQUEST_WAIT: Duration = Duration::from_secs(2);
+
 /// Whether the connection asks for the pairing page, by its request line,
 /// read without taking it: anything else goes on to the WebSocket handshake.
+/// It waits at most [`REQUEST_WAIT`] for enough of the line, sent in one
+/// part or several; a client that sends nothing in that time, or closes,
+/// is not asking for the page. The stream's read timeout is left as it was.
 pub fn requested(stream: &TcpStream) -> bool {
+    let before = stream.read_timeout().ok().flatten();
+    let found = peek_request(stream);
+    let _ = stream.set_read_timeout(before);
+    found
+}
+
+fn peek_request(stream: &TcpStream) -> bool {
     let wanted = format!("GET {PATH} ");
     let mut head = [0u8; 16];
-    let start = Instant::now();
+    let deadline = Instant::now() + REQUEST_WAIT;
     loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
         match stream.peek(&mut head) {
             Ok(n) if n >= wanted.len() || n == 0 => {
                 return head[..n].starts_with(wanted.as_bytes())
                     || head[..n].starts_with(format!("GET {PATH}?").as_bytes());
             }
-            Ok(_) if start.elapsed() < Duration::from_secs(2) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => return false,
+            Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return false,
         }
     }
 }
@@ -114,5 +129,38 @@ mod tests {
         assert!(!requested(&server));
         let (server, _client) = served(b"GET /pairing HTTP/1.1\r\n\r\n");
         assert!(!requested(&server));
+    }
+
+    #[test]
+    fn a_request_line_sent_in_two_parts_is_the_page() {
+        let (server, mut client) = served(b"GET /pa");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            client.write_all(b"ir HTTP/1.1\r\n\r\n").unwrap();
+            client
+        });
+        assert!(requested(&server));
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn a_client_that_sends_nothing_goes_on_to_the_websocket_in_time() {
+        let (server, _client) = served(b"");
+        let timeout = Some(Duration::from_secs(30));
+        server.set_read_timeout(timeout).unwrap();
+        let start = Instant::now();
+        assert!(!requested(&server));
+        assert!(start.elapsed() < REQUEST_WAIT + Duration::from_secs(1));
+        // The handshake keeps its own timeout.
+        assert_eq!(server.read_timeout().unwrap(), timeout);
+    }
+
+    #[test]
+    fn a_client_that_closes_at_once_is_not_the_page() {
+        let (server, client) = served(b"");
+        drop(client);
+        let start = Instant::now();
+        assert!(!requested(&server));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
