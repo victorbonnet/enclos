@@ -46,6 +46,8 @@ const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.
 const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
 const APP_PLUGIN_RUNTIME_APPROVALS: &str =
     include_str!("../../channels/hermes/enclos/runtime_approvals.py");
+const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/decisions.py");
+const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
@@ -305,6 +307,7 @@ impl RuntimeAdapter for Hermes {
         agent: &RuntimeAgentName,
         socket: &Path,
         home: &str,
+        bridge_key: &str,
     ) -> Option<AppChannel> {
         // A plugin Hermes loads from the agent's own home, `plugins/` under
         // its `HERMES_HOME`, and only once `plugins enable` lists it in
@@ -327,6 +330,8 @@ impl RuntimeAdapter for Hermes {
                 file("lines.py", APP_PLUGIN_LINES)?,
                 file("questions.py", APP_PLUGIN_QUESTIONS)?,
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
+                file("decisions.py", APP_PLUGIN_DECISIONS)?,
+                file("visible.py", APP_PLUGIN_VISIBLE)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
@@ -352,6 +357,11 @@ impl RuntimeAdapter for Hermes {
                     "agent.clarify_timeout".to_owned(),
                     CLARIFY_TIMEOUT_SECONDS.to_string(),
                 ),
+                // Public: what the plugin checks each runtime-approval
+                // decision against (ADR 0060). Given here rather than by
+                // the bridge's `hello`, which any program with the agent's
+                // token can send.
+                ("MOBILE_APP_BRIDGE_KEY".to_owned(), bridge_key.to_owned()),
             ],
         })
     }
@@ -1128,7 +1138,9 @@ mod tests {
     fn the_app_channel_goes_in_the_agents_own_home_and_is_enabled_there() {
         let socket = Path::new("/h/.enclos-app/main.sock");
         let main = RuntimeAgentName::new("main").unwrap();
-        let app = Hermes.app_channel(&main, socket, "home.lab.main").unwrap();
+        let app = Hermes
+            .app_channel(&main, socket, "home.lab.main", "the-bridges-public-key")
+            .unwrap();
         let places: Vec<String> = app
             .files
             .iter()
@@ -1147,9 +1159,24 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/lines.py",
                 ".hermes/profiles/main/plugins/enclos/questions.py",
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
+                ".hermes/profiles/main/plugins/enclos/decisions.py",
+                ".hermes/profiles/main/plugins/enclos/visible.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );
+        // Every module of the plugin goes in: one left out fails the
+        // plugin's import, and the channel with it.
+        let modules =
+            std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("channels/hermes/enclos"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".py") || name.ends_with(".yaml"));
+        for module in modules {
+            assert!(
+                places.contains(&format!(".hermes/profiles/main/plugins/enclos/{module}")),
+                "{module} is not put in the sandbox"
+            );
+        }
         assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));
         assert_eq!(
             app.commands
@@ -1171,11 +1198,15 @@ mod tests {
                     "home.lab.main".to_owned()
                 ),
                 ("agent.clarify_timeout".to_owned(), "3600".to_owned()),
+                (
+                    "MOBILE_APP_BRIDGE_KEY".to_owned(),
+                    "the-bridges-public-key".to_owned()
+                ),
             ]
         );
         let default = RuntimeAgentName::new("default").unwrap();
         let app = Hermes
-            .app_channel(&default, socket, "home.lab.default")
+            .app_channel(&default, socket, "home.lab.default", "key")
             .unwrap();
         assert_eq!(
             app.files[0].0.as_path(),

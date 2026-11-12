@@ -54,6 +54,11 @@ def _stub_hermes() -> None:
         def __init__(self, **fields):
             self.__dict__.update(fields)
 
+        def get_command(self):
+            # Hermes's reading of a command message, in short.
+            text = self.text.lstrip()
+            return text.split(maxsplit=1)[0][1:].lower() if text.startswith("/") else None
+
     class MessageType:
         TEXT = "text"
 
