@@ -134,11 +134,12 @@ impl Hub {
         agent: &str,
         write: bool,
     ) -> Result<(), String> {
-        self.avatar_authority(store, device, person, agent, false)?;
+        self.avatar_authority(store, device, person, agent, false)
+            .map_err(|e| e.message().to_owned())?;
         if !self.can_see_agent(person, agent) {
             return Err("This agent is not shared with you.".into());
         }
-        if write && self.host.as_deref() != Some(person) {
+        if write && self.known_host().as_deref() != Some(person) {
             return Err("Only the host's person can change a shared agent name.".into());
         }
         Ok(())
@@ -201,7 +202,7 @@ impl Hub {
             // Never send shared metadata to a device that was unpaired while connected.
             let paired = store.devices().map_err(|e| storage_error(&of, e))?;
             let broadcast = name_message(&edit.agent, saved.clone(), String::new());
-            for (id, (person, sender)) in self.devices.lock().expect("not poisoned").iter() {
+            for (id, (person, sender, _)) in self.devices.lock().expect("not poisoned").iter() {
                 if self.can_see_agent(person, &edit.agent)
                     && paired
                         .iter()

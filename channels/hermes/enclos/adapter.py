@@ -2,7 +2,9 @@
 
 It listens on MOBILE_APP_SOCKET, a Unix socket in the sandbox home, for
 enclos's bridge, which must open with a `hello` holding the agent's token
-(MOBILE_APP_TOKEN, granted to this agent alone). Each conversation is a
+(MOBILE_APP_TOKEN). The token keeps the host's other programs out, and
+nothing more: the agent can read it too (docs/protocol.md, the plugin
+leg). Each conversation is a
 Hermes chat, so a cron job created in one delivers back to it. What the
 agent says is kept on disk until the bridge acknowledges it.
 
@@ -12,10 +14,12 @@ this channel's own variable, which `enclos runtime configure` turns on.
 """
 
 import asyncio
+import collections
 import logging
 import mimetypes
 import os
 import shutil
+import socket
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Optional
@@ -25,7 +29,7 @@ from gateway.platforms._shared import get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
-from . import protocol
+from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
 from . import routines
@@ -34,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "enclos"
 HELLO_TIMEOUT_SECONDS = 10
+# The bridge sends a message again, with its id, until it has the ack: the
+# ids of the last ones the runtime had, to drop one that comes again
+SEEN_MESSAGES = 1024
 
 # The connected adapters and their event loops, for the tool hooks, which
 # Hermes calls from the agent's worker threads.
@@ -71,6 +78,11 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        # Whether a failure to read a session's title was logged at info already.
+        self._title_failure_told = False
+        self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
+        # Routine controls in progress, kept so that none is collected early.
+        self._routine_tasks: set[asyncio.Task] = set()
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
@@ -83,8 +95,18 @@ class EnclosAdapter(BasePlatformAdapter):
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
             if os.path.exists(self._path):
                 os.unlink(self._path)
-            self._server = await asyncio.start_unix_server(self._on_connection, path=self._path)
-            os.chmod(self._path, 0o600)
+            # Bound and made the user's alone before it listens, so no
+            # connection gets in under the mode the process's umask gives
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(self._path)
+                os.chmod(self._path, 0o600)
+            except OSError:
+                listener.close()
+                raise
+            # A line as long as the protocol allows, not asyncio's 64 KiB.
+            self._server = await asyncio.start_unix_server(
+                self._on_connection, sock=listener, limit=lines.LIMIT)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
@@ -115,11 +137,19 @@ class EnclosAdapter(BasePlatformAdapter):
         try:
             first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_SECONDS)
             hello = protocol.decode_from_bridge(first)
-        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError):
+        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError, ValueError, RecursionError):
+            # ValueError: a first line over the limit; RecursionError: one
+            # nested too deep. Either way, said by whoever, without the token
             writer.close()
             return
         if hello["type"] != "hello" or not protocol.token_matches(hello.get("token"), self._token):
             logger.warning("[%s] A connection without the agent's token was closed", self.name)
+            writer.close()
+            return
+        # Checked again once the hello is in: two connections may both have
+        # passed the first check while waiting for theirs. Nothing awaits
+        # between this check and taking the slot, so only one takes it.
+        if self._bridge is not None:
             writer.close()
             return
         self._bridge = writer
@@ -134,13 +164,38 @@ class EnclosAdapter(BasePlatformAdapter):
             if listed:
                 await self._write(protocol.commands(listed))
             for message in self._outbox.pending():
+                reason = protocol.unsendable(message)
+                if reason:
+                    # Sent again after every hello, it would be refused every time
+                    logger.warning("[%s] Outbox: %s cannot be sent (%s); it was set aside",
+                                   self.name, message.get("id"), reason)
+                    self._outbox.set_aside(str(message.get("id")))
+                    continue
                 await self._write(message)
-            while line := await reader.readline():
-                await self._on_line(line)
+            while True:
+                try:
+                    line = await lines.read_line(reader)
+                except lines.TooLong as e:
+                    # Said at once, naming it when its first bytes do, then
+                    # the end: no message of the bridge's is this long, so
+                    # the connection is not one to go on with
+                    # (`docs/protocol.md`, Messages)
+                    logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
+                    await self._write(protocol.error("bad_message", str(e), e.message_id))
+                    break
+                if not line or not await self._on_line(line):
+                    break
         except ConnectionError:
             pass
+        except Exception:
+            # The runtime did not take a message: the bridge, not acknowledged,
+            # sends it again on its next connection
+            logger.exception("[%s] A message could not be handed to the runtime; the connection was closed",
+                             self.name)
         finally:
-            self._bridge = None
+            # Only the connection that holds the slot gives it back
+            if self._bridge is writer:
+                self._bridge = None
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -167,7 +222,9 @@ class EnclosAdapter(BasePlatformAdapter):
             if self.config is not None:
                 self.config.home_channel = channel
         except Exception:
-            logger.debug("[%s] Cannot set Home as the home channel", self.name, exc_info=True)
+            # Hermes internals, not a plugin API: when a release moves them,
+            # Hermes asks for /sethome again, and this line says why.
+            logger.info("[%s] Cannot set Home as the home channel", self.name, exc_info=True)
 
     async def _write(self, message: dict[str, Any]) -> bool:
         writer = self._bridge
@@ -181,12 +238,15 @@ class EnclosAdapter(BasePlatformAdapter):
             except ConnectionError:
                 return False
 
-    async def _on_line(self, line: bytes) -> None:
+    async def _on_line(self, line: bytes) -> bool:
+        """Acts on one line; False when the connection is to end."""
         try:
             message = protocol.decode_from_bridge(line)
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), e.message_id))
-            return
+            # A version this plugin does not speak ends the connection
+            # (docs/protocol.md, Errors); any other bad message does not
+            return e.code != "version"
         kind = message["type"]
         if kind == "ack":
             self._outbox.acknowledge(message["of"])
@@ -198,17 +258,39 @@ class EnclosAdapter(BasePlatformAdapter):
         elif kind == "conversation.rename":
             await self._rename(message["conversation"], message["title"])
         elif kind == "routine.request":
-            try:
-                result = await asyncio.to_thread(self._routines.handle, message)
-                await self._write(protocol._message("routine.response", of=message["id"], **result))
-            except routines.RoutineError as error:
-                await self._write(protocol.error(error.code, str(error), message["id"]))
+            # A routine control can wait on Hermes's cron lock, its model
+            # catalogue or its scheduler: it runs beside the connection, so
+            # the person's messages and the bridge's acks are read meanwhile.
+            task = asyncio.create_task(self._routine(message))
+            self._routine_tasks.add(task)
+            task.add_done_callback(self._routine_tasks.discard)
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
+            of = message.get("of")
+            if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
+                # The bridge cannot read it: sent again, it would be refused again
+                logger.warning("[%s] Outbox: %s was refused by the bridge; it was set aside", self.name, of)
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
+        return True
+
+    async def _routine(self, message: dict[str, Any]) -> None:
+        """Answers one routine control; the manager serializes them."""
+        try:
+            result = await asyncio.to_thread(self._routines.handle, message)
+            await self._write(protocol._message("routine.response", of=message["id"], **result))
+        except routines.RoutineError as error:
+            await self._write(protocol.error(error.code, str(error), message["id"]))
+        except Exception:
+            logger.warning("[%s] A routine control could not answer", self.name, exc_info=True)
+            await self._write(protocol.error(
+                "conflict", "The operation's outcome is unknown. Refresh before trying again.", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
+        if message["id"] in self._seen:
+            # The runtime has it: the ack was lost on the way
+            await self._write(protocol.ack(message["id"]))
+            return
         # enclos keeps the home channel (the agent's Home): /sethome is
         # answered here, not run, which would move it into this conversation.
         if protocol.is_home_command(message["text"]):
@@ -222,6 +304,11 @@ class EnclosAdapter(BasePlatformAdapter):
         await self.handle_message(MessageEvent(
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
             raw_message=message, timestamp=datetime.now(tz=UTC)))
+        # Only once the runtime has it: if handle_message raised, the bridge
+        # sends it again and it must not read as a duplicate
+        self._seen[message["id"]] = None
+        while len(self._seen) > SEEN_MESSAGES:
+            self._seen.popitem(last=False)
         await self._write(protocol.ack(message["id"]))
 
     def _routine_runtime(self):
@@ -284,9 +371,13 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def _send_files(self, chat_id: str, paths: list[tuple[str, Optional[str]]], text: str,
                           reply_to: Optional[str]) -> SendResult:
-        files = [a for a in (self._stage(p, n) for p, n in paths) if a]
+        staged = [(p, n, self._stage(p, n)) for p, n in paths]
+        files = [a for _, _, a in staged if a]
         if not files and not text:
             return SendResult(success=False, error="the file could not be sent")
+        # The person sees that a file is missing, not only the log.
+        text = protocol.with_files_not_sent(
+            text, [n or os.path.basename(p) for p, n, a in staged if not a])
         # Hermes delivers a reply's files apart from its text, without saying
         # what they answer: within minutes of the person's message, they answer
         # it; otherwise (a cron job's) they come on their own.
@@ -341,13 +432,28 @@ class EnclosAdapter(BasePlatformAdapter):
     ) -> SendResult:
         # A local markdown image (`![x](cache/generated/images/y.png)`), which
         # Hermes does not take for a file: sent as one, out of the text.
-        rest, images = protocol.local_images(content)
-        files = [(found, None) for found in (self._local_image(p) for _, p in images) if found]
+        # An image Hermes may not send stays in the text, as the agent wrote it.
+        sendable: dict[str, str] = {}
+
+        def take(path: str) -> bool:
+            found = self._local_image(path)
+            if found:
+                sendable[path] = found
+            return found is not None
+
+        rest, images = protocol.local_images(content, take)
+        files = [(sendable[p], None) for _, p in images]
         if files:
             return await self._send_files(chat_id, files, rest, reply_to)
         # Hermes about itself (gateway online, shutting down): a quiet line.
         notice = protocol.is_notice(content)
         message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
+        reason = protocol.unsendable(message)
+        if reason:
+            # The bridge would refuse it, and kept, it would come first in
+            # the outbox after every hello
+            logger.warning("[%s] A message for %r was not sent: %s", self.name, chat_id, reason)
+            return SendResult(success=False, error=f"the enclos app cannot carry this message: {reason}")
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
         await self._write(message)  # if it is not connected, it gets the message on its next hello
@@ -396,10 +502,23 @@ class EnclosAdapter(BasePlatformAdapter):
             self._canonicalize(source)
             key = build_session_key(source, profile=self._session_key_profile(source))
             store = getattr(self, "_session_store", None)
-            return store.peek_session_id(key) if store is not None else None
+            if store is None:
+                self._cannot_read_titles("the gateway has no session store")
+                return None
+            return store.peek_session_id(key)
         except Exception:
-            logger.debug("[%s] No session for %s", self.name, chat_id, exc_info=True)
+            self._cannot_read_titles(f"no session for {chat_id}")
             return None
+
+    def _cannot_read_titles(self, why: str) -> None:
+        """Titles are read through Hermes internals, not a plugin API: the first
+        failure is logged at info, so a Hermes release that moves them shows why
+        conversations stop getting names; later ones at debug."""
+        if not self._title_failure_told:
+            self._title_failure_told = True
+            logger.info("[%s] Cannot read session titles (%s); conversations keep no name from Hermes", self.name, why, exc_info=True)
+        else:
+            logger.debug("[%s] Cannot read session titles (%s)", self.name, why, exc_info=True)
 
     async def _session_db_call(self, method: str, *args: Any) -> Any:
         db = getattr(getattr(self, "gateway_runner", None), "_session_db", None)
@@ -417,7 +536,7 @@ class EnclosAdapter(BasePlatformAdapter):
             title = await self._session_db_call("get_session_title", session_id)
             source = await self._session_db_call("get_session_title_source", session_id)
         except Exception:
-            logger.debug("[%s] Cannot read the title of %s", self.name, chat_id, exc_info=True)
+            self._cannot_read_titles(f"the title of {chat_id}")
             return None
         return (title, source or "") if title else None
 
@@ -489,14 +608,16 @@ def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: 
         if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
             return None
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        if not chat_id or not _ADAPTERS:
+        # Without the call's id, its end cannot be matched to its start, and
+        # the app would show the step running for good: it is not sent.
+        if not chat_id or not tool_call_id or not _ADAPTERS:
             return None
         label = None
         if phase == "start":
             from agent.display import build_tool_preview
             label = build_tool_preview(tool_name, args if isinstance(args, dict) else {}, max_len=protocol.MAX_TOOL_LABEL_CHARS)
         message = protocol.tool(
-            chat_id, tool_call_id or f"{tool_name}-{id(args)}", tool_name, phase, label=label,
+            chat_id, tool_call_id, tool_name, phase, label=label,
             # Hermes says ok, error or blocked (a policy refused it).
             ok=None if phase == "start" else status in (None, "ok"),
             duration_ms=duration_ms if phase == "end" and isinstance(duration_ms, (int, float)) else None)
@@ -523,7 +644,7 @@ def _env_enablement() -> dict | None:
 
 
 def register(ctx) -> None:
-    approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"))
+    approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"), PLATFORM)
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config,

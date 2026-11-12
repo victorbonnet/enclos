@@ -38,6 +38,10 @@ class FromTheBridge(unittest.TestCase):
             (b'{"v":1,"id":"m1","type":"message.in","conversation":"c\\u0000","person":"p","text":"t"}', "bad_message"),
             (b"[1,2]", "bad_message"),
             (b" " * (protocol.MAX_MESSAGE_BYTES + 1), "bad_message"),
+            (b"[" * 100_000, "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"red \\u001b[31m"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","message":"two\\nlines"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"error","code":"bad_message","of":"","message":"x"}', "bad_message"),
         ]
         for line, code in cases:
             with self.subTest(line[:40]):
@@ -71,6 +75,13 @@ class Home(unittest.TestCase):
         for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.", ""]:
             with self.subTest(text[:20]):
                 self.assertFalse(protocol.is_notice(text))
+
+    def test_a_reply_that_starts_as_a_notice_reads_as_one(self):
+        # A notice is told by its first words only, as Hermes marks none: an
+        # agent's reply that starts with the same words is taken for one
+        # (a quiet line, and no title check). The choice, recorded.
+        self.assertTrue(protocol.is_notice(
+            "\u267b\ufe0f Gateway online \u2014 that is what the log said at 9:00."))
 
     def test_sethome_is_caught_however_written(self):
         for text in ["/sethome", "  /SetHome ", "/set-home now"]:
@@ -130,6 +141,21 @@ class ToTheBridge(unittest.TestCase):
         self.assertEqual(json.loads(line)["text"], "two\nlines")
 
 
+class Unsendable(unittest.TestCase):
+    def test_what_the_bridge_would_refuse_is_named(self):
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "fine", "m0")))
+        self.assertIsNone(protocol.unsendable(protocol.message_out("c-1", "x" * (protocol.MAX_MESSAGE_BYTES - 200))))
+        for message in (
+            protocol.message_out("", "hi"),
+            protocol.message_out("c" * 129, "hi"),
+            protocol.message_out("c-1\u0085", "hi"),
+            protocol.message_out("c-1", "hi", "m\u0000"),
+            protocol.message_out("c-1", "x" * protocol.MAX_MESSAGE_BYTES),
+        ):
+            with self.subTest(message["conversation"][:8]):
+                self.assertIsNotNone(protocol.unsendable(message))
+
+
 class Token(unittest.TestCase):
     def test_only_the_agents_token_matches(self):
         self.assertTrue(protocol.token_matches("t0ken", "t0ken"))
@@ -155,8 +181,12 @@ class Hint(unittest.TestCase):
     def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
         for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
                        "data images/fonts", "JavaScript", "external resources, forms and automatic navigation are blocked",
-                       "Tapped HTTP(S) links open the browser"):
+                       "A tapped HTTP(S) link opens the browser", "once the person confirms its address"):
             self.assertIn(detail, protocol.PLATFORM_HINT)
+
+    def test_it_says_what_an_image_shows_as_the_protocol_does(self):
+        # docs/protocol.md, "What the agent says is markdown", and the app's spec
+        self.assertIn("an image shows as its alt text, a link to it", protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
         self.assertLess(len(protocol.PLATFORM_HINT), 1000)
@@ -188,6 +218,19 @@ class Files(unittest.TestCase):
         self.assertEqual(found, [("Unicorn on the moon", "cache/generated/images/krea_1.png")])
         self.assertEqual(rest, "Here's your unicorn on the moon:\n\n"
                                "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
+
+    def test_a_local_image_that_cannot_be_sent_stays_in_the_text(self):
+        text = "Two:\n\n![a](images/a.png)\n\n![b](/etc/b.png)"
+        rest, found = protocol.local_images(text, lambda path: path == "images/a.png")
+        self.assertEqual(found, [("a", "images/a.png")])
+        self.assertEqual(rest, "Two:\n\n![b](/etc/b.png)")
+
+    def test_a_file_that_could_not_be_sent_is_said_in_the_text(self):
+        self.assertEqual(protocol.with_files_not_sent("Here", []), "Here")
+        self.assertEqual(protocol.with_files_not_sent("Here", ["a.pdf"]),
+                         "Here\n\n(A file could not be sent: a.pdf)")
+        self.assertEqual(protocol.with_files_not_sent("", ["a.pdf", "b.png"]),
+                         "(A file could not be sent: a.pdf)\n(A file could not be sent: b.png)")
 
 
 class CommandsTest(unittest.TestCase):
