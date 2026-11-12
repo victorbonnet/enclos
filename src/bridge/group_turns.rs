@@ -361,12 +361,17 @@ impl Hub {
         self.plugin(agent)?;
         let conversation = ConversationId::new(conversation).map_err(|e| e.to_string())?;
         let person = Person::new(person).map_err(|e| e.to_string())?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let writer = &mut plugins
-            .get_mut(agent)
-            .ok_or_else(|| format!("{agent}'s app channel closed"))?
-            .writer;
-        writer
+        // Written outside the plugins lock, through the plugin's own
+        let out = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            let plugin = plugins
+                .get(agent)
+                .ok_or_else(|| format!("{agent}'s app channel closed"))?;
+            Arc::clone(&plugin.out)
+        };
+        out.lock()
+            .expect("not poisoned")
+            .writer
             .send_as(
                 sent,
                 FromBridge::MessageIn {
