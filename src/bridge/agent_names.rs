@@ -68,7 +68,7 @@ fn storage_error(of: &str, e: rusqlite::Error) -> ErrorBody {
     eprintln!("enclos app: an agent name could not be read or saved: {e}");
     name_error(
         of,
-        ErrorCode::Unknown,
+        ErrorCode::Internal,
         "The agent name could not be read or saved. Try again later.",
     )
 }
@@ -83,14 +83,6 @@ fn name_message(agent: &str, metadata: NameMetadata, of: String) -> ToDevice {
 }
 
 impl Hub {
-    /// Whether `person` may see `agent`: what `agents.list` lists for them,
-    /// and so who may read its name and is told when it changes. Every
-    /// paired person sees every listed agent until sharing (ADR 0043)
-    /// narrows this one place.
-    pub(super) fn can_see_agent(&self, _person: &str, agent: &str) -> bool {
-        self.agents.iter().any(|a| a.name == agent)
-    }
-
     /// Another listed agent whose handle or address `name` reads as: a
     /// display name must not pass one agent off as another. Compared
     /// ignoring case, joiners ([`enclos_protocol::visible::bare`]: "main"
@@ -136,7 +128,7 @@ impl Hub {
     ) -> Result<(), String> {
         self.avatar_authority(store, device, person, agent, false)
             .map_err(|e| e.message().to_owned())?;
-        if !self.can_see_agent(person, agent) {
+        if !self.sees_agent(person, agent) {
             return Err("This agent is not shared with you.".into());
         }
         if write && self.known_host().as_deref() != Some(person) {
@@ -203,7 +195,7 @@ impl Hub {
             let paired = store.devices().map_err(|e| storage_error(&of, e))?;
             let broadcast = name_message(&edit.agent, saved.clone(), String::new());
             for (id, (person, sender, _)) in self.devices.lock().expect("not poisoned").iter() {
-                if self.can_see_agent(person, &edit.agent)
+                if self.sees_agent(person, &edit.agent)
                     && paired
                         .iter()
                         .any(|device| &device.id == id && &device.person == person)
