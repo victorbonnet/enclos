@@ -42,7 +42,7 @@ Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a
 
 ## The plugin leg
 
-The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
+The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open. The plugin has 10 s to answer the bridge's `hello`, and 10 s to read what the bridge writes; past either, the bridge ends that connection and opens a new one on its next try, and other agents' plugins do not wait for it.
 
 1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
 
@@ -63,7 +63,7 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 
 **A conversation's name.** The bridge keeps one name per conversation and who gave it. The runtime's (`conversation.title`, for one of its own agent's conversations) replaces the runtime's; the person's (`conversation.rename` from a device) replaces any, and the runtime's no longer replaces it until the person clears it. Whoever gives it, the bridge keeps a name on one line, drops the hidden characters (control, bidirectional, zero-width and the like, as `enclos_protocol::visible` lists them) and cuts it to 100 characters: it does not rely on the plugin's cut, which runs in the sandbox. The bridge passes the person's name on to the plugin, so the runtime can keep it too (Hermes: the session's title, with the user's authority). Hermes names every session on its own and tells no plugin, so its plugin reads the title after each reply, and a little later, and sends it when it changed.
 
-**What the agent does while it works.** A `tool` step is passed on live to the devices of the conversation's owner, for a conversation of the plugin's own agent, and not kept: a device that was away does not get it at the next `sync`. Hermes reports its tools to plugin hooks (`pre_tool_call`, `post_tool_call`) with the call's id, its arguments and its outcome; its plugin finds the conversation in the turn's session context, labels the step as Hermes does (`build_tool_preview`), and returns at once, as `pre_tool_call` may also block a tool. A label shows a command or a search as the agent wrote it, to the conversation's owner only.
+**What the agent does while it works.** A `tool` step is passed on live to the devices of the conversation's owner, for a conversation of the plugin's own agent, and not kept: a device that was away does not get it at the next `sync`. Hermes reports its tools to plugin hooks (`pre_tool_call`, `post_tool_call`) with the call's id, its arguments and its outcome; its plugin finds the conversation in the turn's session context, labels the step as Hermes does (`build_tool_preview`), and returns at once, as `pre_tool_call` may also block a tool. A label shows a command or a search as the agent wrote it, to the conversation's owner only. The plugin's cut runs in the sandbox, so the bridge makes its own before passing a step on: each field on one line, the label cut to 120 characters, the name to 64 and the call to 128, and the label's and name's hidden characters (control, bidirectional, zero-width and the like) written out as `⟨U+XXXX⟩`, so the line the person reads is the command that ran. The Hermes plugin drops a step that has no call id, as its end could not be matched to its start.
 
 ### Files
 
@@ -98,7 +98,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `declined` |
 
-The bridge checks `proof`, then shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer.
+The bridge checks `proof`, then shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer. The device chose its `name`, so the bridge keeps it plain before the terminal shows it: without the characters `enclos-protocol`'s `visible` rule calls hidden (controls, bidirectional and invisible marks), white space made single spaces, at most 64 characters. While the person decides, the device's pings count as hearing from it.
 
 ### Handshake
 
@@ -108,6 +108,8 @@ The bridge checks `proof`, then shows at the terminal the device's name, its tai
 2. checks `sig` with the device key it stored, and answers `authenticated` with the person the device speaks for;
 3. asks Tailscale who is calling, and refuses a person or a node other than the device's own;
 4. writes each refusal, with its reason, in the bridge's log (`enclos app log`).
+
+Any login of the tailnet gets as far as the first message, so the bridge keeps callers that are not authenticated yet few and short: at most 16 at once (one more is closed at once), 30 s from connecting to its first message, and no WebSocket message or frame larger than one Noise message (65,535 bytes). It logs at most 10 refusals per caller address and minute; past them, that address's connections are closed that minute without a log line or a question to Tailscale. The log keeps its newest 10,000 lines. Once authenticated, a session with nothing from the device, not even a ping, for 75 s ends: the enclos app pings every 30 s. When a device connects again while its old connection is still open, the new connection is the one messages go to.
 
 The hardware key never signs anything but handshake hashes, the pairing handshake's included. `pair.request` itself carries no signature: it proves the one-time code (`proof`), and the device key it names is the one whose signature the same handshake already carried.
 

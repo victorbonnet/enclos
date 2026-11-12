@@ -35,7 +35,7 @@ use enclos_protocol::device::{
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
-    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
+    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind, ToolStep,
 };
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
@@ -93,10 +93,17 @@ pub struct AgentEndpoint {
 
 /// An open plugin connection.
 struct Plugin {
-    writer: PluginWriter,
     capabilities: Vec<Capability>,
     /// Tells this connection from a later one to the same agent.
     generation: u64,
+    /// Its writing side, locked apart from the other plugins: a plugin
+    /// that does not read holds only those writing to it.
+    out: Arc<Mutex<PluginOut>>,
+}
+
+/// What the bridge writes to a plugin, and what it gave it already.
+struct PluginOut {
+    writer: PluginWriter,
     /// The pending messages given to it already.
     sent: HashSet<String>,
 }
@@ -199,10 +206,12 @@ impl Hub {
         plugins.insert(
             agent.to_owned(),
             Plugin {
-                writer,
                 capabilities: hello.capabilities,
                 generation,
-                sent: HashSet::new(),
+                out: Arc::new(Mutex::new(PluginOut {
+                    writer,
+                    sent: HashSet::new(),
+                })),
             },
         );
         drop(plugins);
@@ -289,10 +298,7 @@ impl Hub {
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
                     FromPlugin::Tool(step) => {
-                        if let Ok(Some(c)) = store.conversation_info(step.conversation.as_str())
-                            && format!("{}/{}", c.sandbox, c.agent) == agent
-                            && let Ok(Some(owner)) = store.owner(step.conversation.as_str())
-                        {
+                        if let Some((owner, step)) = tool_step(&store, &agent, step) {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
@@ -379,10 +385,16 @@ impl Hub {
             return Ok(());
         }
         self.plugin(agent)?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let Some(plugin) = plugins.get_mut(agent) else {
-            return Err(format!("{agent}'s app channel closed"));
+        // The plugins lock is let go before writing: a write waits for the
+        // plugin to read, up to the plugin leg's write timeout
+        let (out, generation) = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            let Some(plugin) = plugins.get(agent) else {
+                return Err(format!("{agent}'s app channel closed"));
+            };
+            (Arc::clone(&plugin.out), plugin.generation)
         };
+        let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
             if plugin.sent.contains(&message.id) {
                 continue;
@@ -397,7 +409,11 @@ impl Hub {
             if let Err(e) = plugin.writer.send_as(id, body) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
-                plugins.remove(agent);
+                drop(plugin);
+                let mut plugins = self.plugins.lock().expect("not poisoned");
+                if plugins.get(agent).map(|p| p.generation) == Some(generation) {
+                    plugins.remove(agent);
+                }
                 return Err(e.to_string());
             }
             plugin.sent.insert(message.id);
@@ -423,6 +439,46 @@ pub fn pieces(
             Ok((piece_id, text))
         })
         .collect()
+}
+
+/// The longest tool label passed on, in characters, before its hidden
+/// characters are written out.
+const MAX_TOOL_LABEL_CHARS: usize = 120;
+/// The longest tool name passed on, in characters, likewise.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+/// The longest call id passed on, in characters.
+const MAX_TOOL_CALL_CHARS: usize = 128;
+
+/// A tool step from `agent`'s plugin as the bridge passes it on, with the
+/// person to send it to: `None` unless its conversation is one of `agent`'s
+/// own. The plugin's cuts run in the sandbox, so the bridge makes its own:
+/// each field on one line and short, so the step fits one Noise message,
+/// and the label and name with their hidden characters written out
+/// ([`enclos_protocol::visible::revealed`]), so what the person reads is
+/// what ran.
+fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, ToolStep)> {
+    let c = store.conversation_info(step.conversation.as_str()).ok()??;
+    if format!("{}/{}", c.sandbox, c.agent) != agent {
+        return None;
+    }
+    let owner = store.owner(step.conversation.as_str()).ok()??;
+    let cut = |text: &str, max: usize| -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        words.join(" ").chars().take(max).collect()
+    };
+    let shown = |text: &str, max: usize| enclos_protocol::visible::revealed(&cut(text, max));
+    Some((
+        owner,
+        ToolStep {
+            call: cut(&step.call, MAX_TOOL_CALL_CHARS),
+            name: shown(&step.name, MAX_TOOL_NAME_CHARS),
+            label: step
+                .label
+                .as_deref()
+                .map(|l| shown(l, MAX_TOOL_LABEL_CHARS)),
+            ..step
+        },
+    ))
 }
 
 /// Serves on `127.0.0.1:port` until the process ends.
@@ -864,7 +920,12 @@ fn pair(
         }
         let left = match link.socket.read() {
             Ok(Message::Close(_)) => true,
-            Ok(_) => false,
+            // A ping counts as hearing from it: the person may take longer
+            // to answer than a session may stay silent
+            Ok(_) => {
+                link.heard = std::time::Instant::now();
+                false
+            }
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),
@@ -1347,12 +1408,20 @@ fn rename(
     hub.deliver_conversation(store, person, conversation.as_str());
     let name = format!("{sandbox}/{agent}");
     if hub.plugin(&name).is_ok() {
-        let mut plugins = hub.plugins.lock().expect("not poisoned");
-        if let Some(plugin) = plugins.get_mut(&name) {
-            let _ = plugin.writer.send(FromBridge::Rename {
-                conversation: conversation.clone(),
-                title: conversation_title(title),
-            });
+        // Written outside the plugins lock, as in forward
+        let out = {
+            let plugins = hub.plugins.lock().expect("not poisoned");
+            plugins.get(&name).map(|plugin| Arc::clone(&plugin.out))
+        };
+        if let Some(out) = out {
+            let _ = out
+                .lock()
+                .expect("not poisoned")
+                .writer
+                .send(FromBridge::Rename {
+                    conversation: conversation.clone(),
+                    title: conversation_title(title),
+                });
         }
     }
     Ok(())
@@ -1434,11 +1503,12 @@ mod connection_end_tests {
     use super::*;
     use enclos_protocol::device::decode_to_device;
     use enclos_protocol::noise::{Initiator, generate_keypair};
+    use enclos_protocol::plugin::ToolPhase;
     use enclos_protocol::plugin::decode_from_bridge;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use tungstenite::client::IntoClientRequest;
 
@@ -2039,6 +2109,178 @@ mod connection_end_tests {
         )));
     }
 
+    /// A stand-in plugin at `socket` that answers the bridge's hello, then
+    /// does `then` with the connection; it takes up to two connections.
+    fn plugin_that(
+        socket: &Path,
+        then: impl Fn(BufReader<UnixStream>, UnixStream) + Send + Sync + 'static,
+    ) {
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut out = stream.try_clone().unwrap();
+                let mut lines = BufReader::new(stream);
+                let mut line = Vec::new();
+                lines.read_until(b'\n', &mut line).unwrap();
+                let id = MessageId::new(new_id().unwrap()).unwrap();
+                let hello = FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![],
+                };
+                out.write_all(&encode_line(&Envelope::new(id, hello)))
+                    .unwrap();
+                then(lines, out);
+            }
+        });
+    }
+
+    #[test]
+    fn a_plugin_that_never_reads_holds_no_other_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        // An agent that says hello, then reads nothing more
+        plugin_that(&bridge.socket, |lines, out| {
+            std::thread::sleep(Duration::from_secs(30));
+            drop((lines, out));
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut writing, _) = connect(&bridge, &phone);
+        start_conversation(&mut writing);
+        // Larger than the socket's buffers: the write waits for the plugin
+        say(&mut writing, "m-1", &"a".repeat(40_000));
+        std::thread::sleep(Duration::from_millis(500));
+        let (mut other, _) = connect(&bridge, &phone);
+        let started = std::time::Instant::now();
+        other.send("a-1", FromDevice::Agents);
+        while !matches!(other.receive(), Some(ToDevice::AgentsList { .. })) {}
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn typing_reaches_a_device_only_for_the_agents_own_conversations() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        // The person's conversation with another agent
+        store
+            .conversation("c-other", "lab", "other", PERSON)
+            .unwrap();
+        // On the person's message, lab/main says it types in both
+        plugin_that(&bridge.socket, |mut lines, mut out| {
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let message = decode_from_bridge(&line).unwrap();
+                line.clear();
+                if let FromBridge::MessageIn { .. } = message.body {
+                    for conversation in ["c-other", "c-1"] {
+                        let id = MessageId::new(new_id().unwrap()).unwrap();
+                        let typing = FromPlugin::Typing {
+                            conversation: ConversationId::new(conversation).unwrap(),
+                            on: true,
+                        };
+                        out.write_all(&encode_line(&Envelope::new(id, typing)))
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        say(&mut device, "m-1", "hello");
+        let typing = loop {
+            match device.receive() {
+                Some(ToDevice::Typing { conversation, .. }) => break conversation,
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        };
+        assert_eq!(typing.as_str(), "c-1");
+    }
+
+    #[test]
+    fn a_device_that_pings_while_the_person_decides_stays_connected() {
+        let folder = tempfile::tempdir().unwrap();
+        // The person answers later than a session may stay silent
+        let bridge = bridge_with(folder.path(), Duration::from_millis(1500));
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let path = bridge.store.clone();
+        let terminal = std::thread::spawn(move || {
+            let store = Store::open(&path).unwrap();
+            while store.pairing_request(b"code-1").unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(Duration::from_secs(3));
+            store.decide_pairing(b"code-1", "accept").unwrap();
+        });
+        let noise = generate_keypair().unwrap();
+        let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).unwrap();
+        let proof = enclos_protocol::pairing::proof(b"code-1", device.session.handshake_hash());
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(signing.verifying_key().to_sec1_point(false).as_ref()),
+                proof: encode(&proof),
+                push: None,
+            },
+        );
+        // Pings, as the app does, until the answer comes
+        let stream = device.socket.get_ref().try_clone().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let answer = loop {
+            device
+                .socket
+                .send(Message::Ping(Vec::new().into()))
+                .unwrap();
+            match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    break decode_to_device(&plain).unwrap().body;
+                }
+                Ok(Message::Close(_)) => panic!("closed"),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        terminal.join().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(
+            matches!(answer, ToDevice::PairAccepted { .. }),
+            "{answer:?}"
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        // Its session goes on
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the new device's session ended"),
+            }
+        }
+    }
+
     #[test]
     fn a_message_sent_twice_reaches_the_agent_once() {
         let folder = tempfile::tempdir().unwrap();
@@ -2180,6 +2422,80 @@ mod connection_end_tests {
         *bridge.node.lock().unwrap() = "n-pixel".to_owned();
         let (_, first) = connect(&bridge, &phone);
         assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+    }
+
+    fn step(conversation: &str, call: &str, name: &str, label: Option<&str>) -> ToolStep {
+        ToolStep {
+            conversation: ConversationId::new(conversation).unwrap(),
+            call: call.to_owned(),
+            name: name.to_owned(),
+            label: label.map(str::to_owned),
+            phase: ToolPhase::Start,
+            ok: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_tool_step_goes_only_to_the_owner_of_the_agents_own_conversation() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-b", "lab", "b", "bob@example.com")
+            .unwrap();
+        let (owner, _) = tool_step(&store, "lab/a", step("c-a", "1", "terminal", None)).unwrap();
+        assert_eq!(owner, "alice@example.com");
+        // Agent lab/a cannot show a step in a conversation of lab/b, nor in
+        // one the bridge does not know.
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-b", "1", "terminal", None)),
+            None
+        );
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-x", "1", "terminal", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tool_step_is_cut_to_fit_and_shows_its_hidden_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        // Each field far above one Noise message.
+        let huge = "x".repeat(70_000);
+        let (_, cut) = tool_step(&store, "lab/a", step("c-a", &huge, &huge, Some(&huge))).unwrap();
+        assert_eq!(cut.call.chars().count(), MAX_TOOL_CALL_CHARS);
+        assert_eq!(cut.name.chars().count(), MAX_TOOL_NAME_CHARS);
+        assert_eq!(
+            cut.label.as_deref().map(|l| l.chars().count()),
+            Some(MAX_TOOL_LABEL_CHARS)
+        );
+        let sealed = encode_line(&Envelope::new(
+            MessageId::new("m-1").unwrap(),
+            ToDevice::Tool(cut),
+        ));
+        assert!(sealed.len() < 2_000);
+        // What the person reads is what runs: a reversed tail is written out,
+        // and a label stays on one line.
+        let (_, shown) = tool_step(
+            &store,
+            "lab/a",
+            step(
+                "c-a",
+                "1",
+                "term\u{200B}inal",
+                Some("rm -rf ~/\u{202E}txt.\nls"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(shown.name, "term⟨U+200B⟩inal");
+        assert_eq!(shown.label.as_deref(), Some("rm -rf ~/⟨U+202E⟩txt. ls"));
     }
 
     #[test]
