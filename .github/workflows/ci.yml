@@ -414,7 +414,9 @@ jobs:
       - run: cargo check --locked -p enclos-protocol --target aarch64-linux-android
 
   # The Hermes channel plugin's protocol and outbox, against the crate's
-  # fixtures; standard library only, no Hermes needed
+  # fixtures; standard library only, no Hermes needed. The checks of the
+  # bridge's signed decisions need `cryptography`, which Hermes ships: they
+  # skip here and run in hermes-latest.
   hermes-plugin:
     runs-on: ubuntu-24.04
     steps:
@@ -451,8 +453,8 @@ jobs:
           ENCLOS_HERMES_SOURCE: ${{ github.workspace }}/hermes-agent
         run: |
           hermes-agent/.venv/bin/python -I -m unittest discover -s channels/hermes/tests -v 2>&1 | tee unittest.log
-          if grep -n "skipped 'optional real Hermes" unittest.log; then
-            echo "::error::a real-Hermes test skipped although Hermes is checked out"
+          if grep -n "skipped 'optional \(real Hermes\|cryptography\)" unittest.log; then
+            echo "::error::a real-Hermes or signed-decision test skipped although Hermes is installed"
             exit 1
           fi
 

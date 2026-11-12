@@ -32,6 +32,10 @@ _Avoid_: tool approval or command approval (a runtime approval is a runtime's ow
 A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
 _Avoid_: policy request, question (a request for information), command approval
 
+**Signed decision**:
+A person's decision on a runtime approval as the bridge passes it to the agent's channel plugin, signed with a key no sandbox reads, which the plugin acts on alone.
+_Avoid_: approval token, typed approval
+
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file

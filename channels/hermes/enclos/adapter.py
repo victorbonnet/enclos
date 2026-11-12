@@ -33,6 +33,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
+from . import decisions
 from . import routines
 from . import questions
 from . import runtime_approvals
@@ -90,9 +91,13 @@ class EnclosAdapter(BasePlatformAdapter):
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
+        # What checks the bridge's signature of each runtime-approval decision
+        # (ADR 0060): its public key comes from `runtime configure`, never this
+        # socket, which the agent can speak on too.
         self._questions = questions.Manager(
             self._outbox, self._write, self.send,
-            command_prefix=lambda: getattr(self, "typed_command_prefix", "/"))
+            decisions=decisions.load(_setting(config, "bridge_key", "MOBILE_APP_BRIDGE_KEY"),
+                                     os.environ.get("ENCLOS_SANDBOX", ""), self._agent))
         # By message id: a policy request's tool call waiting for the bridge.
         self._answers: dict[str, asyncio.Future] = {}
 
@@ -334,12 +339,13 @@ class EnclosAdapter(BasePlatformAdapter):
         event = MessageEvent(
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
             raw_message=message, timestamp=datetime.now(tz=UTC))
-        # Only the host's person decides runtime approvals (ADR 0053). Hermes reads its
-        # approval commands from whoever it is told speaks, so one from anyone else is
-        # answered here, read with Hermes's own parser, and never reaches it. A bridge
-        # that does not say (`host` absent, an older one) filters them itself.
-        if message.get("host") is False and runtime_approvals.approval_command(event):
-            await self.send(message["conversation"], runtime_approvals.NOT_HOST_ANSWER, reply_to=message["id"])
+        # Hermes reads its approval commands from whoever it is told speaks, and a
+        # message carries no proof of its person: `host` is the bridge's word, which
+        # any program with the token can send. So none is passed on, read with
+        # Hermes's own parser: runtime approvals are decided with the app's buttons,
+        # whose decisions the bridge signs (ADR 0060).
+        if runtime_approvals.approval_command(event):
+            await self.send(message["conversation"], runtime_approvals.TYPED_ANSWER, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
         await self.handle_message(event)
