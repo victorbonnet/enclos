@@ -1,12 +1,10 @@
 //! New ids for messages and conversations: random, as UUIDs are, read from
 //! the system's random source.
 
-use std::io::Read;
-
 /// 16 random bytes in the 8-4-4-4-12 form of a UUID (version 4).
 pub fn new_id() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
