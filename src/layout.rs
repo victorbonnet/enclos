@@ -273,6 +273,12 @@ impl Layout {
         self.data.join("secrets.json")
     }
 
+    /// The bridge's database: its conversations and their messages (ADR
+    /// 0042, proposed). For the host alone.
+    pub fn app_store(&self) -> PathBuf {
+        self.data.join("app.db")
+    }
+
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
@@ -338,6 +344,9 @@ impl Layout {
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
+            // The bridge's (ADR 0042), which Seatbelt, reading the host
+            // broadly, would otherwise let a sandbox read.
+            self.app_store(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
         // stores: the two change together.
@@ -542,10 +551,27 @@ mod tests {
                 layout.state_db(),
                 layout.state_lock(),
                 layout.audit_log(),
-                layout.config_file()
+                layout.config_file(),
+                layout.app_store(),
             ]
         );
         assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
+    }
+
+    /// The bridge's database is hidden on every system: it holds every
+    /// agent's conversations.
+    #[test]
+    fn the_bridges_files_are_on_the_hidden_files() {
+        let layout = Layout::at("/data/enclos");
+        for os in [Os::Linux, Os::MacOs] {
+            let file = layout.app_store();
+            assert!(file.starts_with(layout.data()));
+            assert!(
+                layout.hidden_files_on(os).contains(&file),
+                "{os:?}: {}",
+                file.display()
+            );
+        }
     }
 
     #[test]
