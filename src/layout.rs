@@ -359,7 +359,11 @@ impl Layout {
             // The bridge's (ADR 0042), which Seatbelt, reading the host
             // broadly, would otherwise let a sandbox read.
             self.app_store(),
+            // The bridge's Noise key: a sandbox that read it could pass
+            // for the bridge to every paired device.
             self.app_bridge_key(),
+            // The key the bridge signs runtime-approval decisions with: a
+            // sandbox that read it could sign its own (ADR 0060).
             self.app_approval_key(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
