@@ -185,7 +185,11 @@ impl Hub {
         let policy = sandbox
             .parse::<SandboxName>()
             .ok()
-            .and_then(|n| Engine::open(self.layout.clone()).policy(&n).ok())
+            .and_then(|n| {
+                Engine::open(self.layout.clone(), crate::state::Wait::Background)
+                    .policy(&n)
+                    .ok()
+            })
             .map(|v| v.snapshot.id.to_string())
             .unwrap_or_default();
         let mut key = crate::policy::sha256_hex(
@@ -240,7 +244,10 @@ impl Hub {
             available: false,
             reason: None,
         };
-        preview(&Engine::open(self.layout.clone()), &mut a);
+        preview(
+            &Engine::open(self.layout.clone(), crate::state::Wait::Background),
+            &mut a,
+        );
         if !store.create_approval(&a).map_err(|e| e.to_string())? {
             return Ok(());
         }
@@ -259,7 +266,12 @@ impl Hub {
                 || (from_the_proxy(a)
                     && read
                         .entry(a.sandbox.clone())
-                        .or_insert_with(|| refusals(&Engine::open(self.layout.clone()), &a.sandbox))
+                        .or_insert_with(|| {
+                            refusals(
+                                &Engine::open(self.layout.clone(), crate::state::Wait::Background),
+                                &a.sandbox,
+                            )
+                        })
                         .as_ref()
                         .is_some_and(|r| only_probe_events(a, r))))
     }
@@ -285,7 +297,7 @@ impl Hub {
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         self.dismiss_probe_requests(store)?;
         let since = store.refusals_since().map_err(|e| e.to_string())?;
-        let engine = Engine::open(self.layout.clone());
+        let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
         let sandboxes: std::collections::HashSet<_> = self
             .agents
             .iter()
@@ -402,7 +414,7 @@ impl Hub {
             self.deliver(person, ToDevice::Approval(a));
             return Ok(());
         }
-        let engine = Engine::open(self.layout.clone());
+        let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
         if approve {
             preview(&engine, &mut a);
             if !a.available || a.revision != revision {
@@ -456,7 +468,9 @@ impl Hub {
         let Ok(name) = sandbox.parse::<SandboxName>() else {
             return;
         };
-        if let Ok(text) = Engine::open(self.layout.clone()).access_context(&name) {
+        if let Ok(text) =
+            Engine::open(self.layout.clone(), crate::state::Wait::Background).access_context(&name)
+        {
             // Written outside the plugins lock, each through its plugin's own
             let outs: Vec<_> = {
                 let plugins = self.plugins.lock().expect("not poisoned");

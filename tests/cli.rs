@@ -1160,20 +1160,134 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     assert_eq!(out.code(), 1);
 }
 
+/// Off macOS, a sandbox named with no `--backend` is made on bubblewrap,
+/// the default backend: created where this host runs it (CI's `bubblewrap`
+/// job shows that), else refused naming bubblewrap, never Seatbelt. Named
+/// with `--backend seatbelt`, it is refused.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn a_seatbelt_sandbox_is_refused_off_macos() {
+fn off_macos_a_sandbox_is_made_on_bubblewrap_unless_another_is_named() {
     let home = Home::new();
     home.init(1);
     let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    match out.code() {
+        0 => assert!(
+            out.stdout().contains("Created sandbox home (bubblewrap,"),
+            "{}",
+            out.stdout()
+        ),
+        _ => {
+            assert_eq!(out.code(), 2, "{}", out.stderr());
+            assert!(
+                out.stderr().contains("uses the bubblewrap backend"),
+                "{}",
+                out.stderr()
+            );
+        }
+    }
+    assert!(!out.stderr().contains("seatbelt"), "{}", out.stderr());
+
+    let out = home.run(&[
+        "sandbox",
+        "create",
+        "lab",
+        "--backend",
+        "seatbelt",
+        "--template",
+        "assistant",
+    ]);
     assert_eq!(out.code(), 2, "{}", out.stderr());
-    assert!(out.stderr().contains("cannot run"), "{}", out.stderr());
     assert!(
-        home.run(&["sandbox", "list"])
+        out.stderr()
+            .contains("uses the seatbelt backend, which this host cannot run"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.run(&["sandbox", "list"]).ok().stdout().contains("lab"));
+}
+
+/// Off macOS, `sandbox create --template autonomous` takes bubblewrap, which
+/// does not build the template yet: the create is refused, by the policy's
+/// grant of the whole filesystem, or by the backend's probe where bubblewrap
+/// cannot run here, and no sandbox is made (ADR 0058).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_autonomous_sandbox_is_refused() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("is not built on the bubblewrap backend yet")
+            || out.stderr().contains("uses the bubblewrap backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        !home
+            .run(&["sandbox", "list"])
             .ok()
             .stdout()
-            .contains("No sandboxes yet")
+            .contains("keeper")
     );
+}
+
+/// The backend this system does not run.
+#[cfg(target_os = "macos")]
+const OTHER_BACKEND: &str = "bubblewrap";
+#[cfg(not(target_os = "macos"))]
+const OTHER_BACKEND: &str = "seatbelt";
+
+/// With no `--backend`, `sandbox create` takes the default backend
+/// `config.toml` names, as `init` wrote it or as the user changed it; one
+/// it cannot read is named, with nothing made.
+#[test]
+fn a_sandbox_is_made_on_the_default_backend_config_toml_names() {
+    let home = Home::new();
+    home.init(1);
+    let config = home.root.join("config.toml");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains("default_backend"), "{written}");
+
+    std::fs::write(
+        &config,
+        format!("schema_version = 1\ndefault_backend = \"{OTHER_BACKEND}\"\n"),
+    )
+    .unwrap();
+    for args in [
+        &["sandbox", "create", "home", "--template", "assistant"][..],
+        &[
+            "--dry-run",
+            "sandbox",
+            "create",
+            "home",
+            "--template",
+            "assistant",
+        ],
+    ] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 2, "{args:?}: {}", out.stderr());
+        assert!(
+            out.stderr()
+                .contains(&format!("uses the {OTHER_BACKEND} backend")),
+            "{args:?}: {}",
+            out.stderr()
+        );
+    }
+
+    std::fs::write(&config, "schema_version = 1\ndefault_backend = \"jail\"\n").unwrap();
+    let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("config.toml names no default backend")
+            && out.stderr().contains("unknown backend `jail`")
+            && out.stderr().contains("--backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.root.join("sandboxes/home").exists());
 }
 
 /// Where each column of a table line starts: after two spaces or more.
@@ -1714,7 +1828,7 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
     assert_eq!(out.code(), 0, "{}", out.stderr());
     assert!(
-        out.stderr().contains("left 1 processes running"),
+        out.stderr().contains("left 1 process running"),
         "{}",
         out.stderr()
     );
@@ -2630,8 +2744,11 @@ fn the_rarer_commands_print_one_document_piped() {
 fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
     use enclos::state::StateStore;
     let layout = enclos::layout::Layout::at(&home.root);
-    let state =
-        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = enclos::state::sqlite::SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        enclos::state::Wait::Command,
+    );
     let lock = state.lock().unwrap();
     let mut record = state.get(&name.parse().unwrap()).unwrap().unwrap();
     record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);
@@ -3458,6 +3575,39 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
         out.stderr()
     );
     assert!(!home.root.join("sandboxes/lab").exists());
+}
+
+/// `sandbox create --template autonomous` says, on standard error, that
+/// the sandbox may change or remove the user's own files (ADR 0058),
+/// and `policy show` names the whole filesystem, the read-only paths and
+/// every port.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_autonomous_sandbox_is_created_with_a_warning_and_shows_what_it_may_do() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    out.ok();
+    assert!(
+        out.stderr()
+            .contains("warning: the autonomous template lets the sandbox write wherever you can"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        out.stdout().contains("template autonomous"),
+        "{}",
+        out.stdout()
+    );
+    let shown = home.run(&["policy", "show", "keeper"]).ok().stdout();
+    assert!(shown.contains("writable:   /"), "{shown}");
+    assert!(shown.contains("read-only:"), "{shown}");
+    assert!(shown.contains("~/.zshrc"), "{shown}");
+    assert!(shown.contains("any public address on any port"), "{shown}");
+    // Another template says nothing of it.
+    let out = home.run(&["sandbox", "create", "lab", "--template", "assistant"]);
+    out.ok();
+    assert!(!out.stderr().contains("autonomous"), "{}", out.stderr());
 }
 
 /// `state check` finds nothing in a new sandbox, names what differs once a

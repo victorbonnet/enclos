@@ -44,7 +44,7 @@ One immutable, fully resolved version of a sandbox's policy, identified by its c
 _Avoid_: revision, policy file
 
 **Network mode**:
-Which destinations a sandbox may reach: `public`, any public address on the web ports as well as what its policy lists, or `allowlist`, only what its policy lists.
+Which destinations a sandbox may reach: `public`, any public address on the web ports (or on every port, when its policy says so) as well as what its policy lists, or `allowlist`, only what its policy lists.
 _Avoid_: open mode, internet access
 
 **Active policy**:
@@ -56,7 +56,7 @@ A policy snapshot saved for a sandbox because the user declined the restart it n
 _Avoid_: draft, staged policy
 
 **Template**:
-A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant` or `coding`.
+A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant`, `coding` or `autonomous`.
 _Avoid_: preset, base policy
 
 **Runtime**:
@@ -202,6 +202,10 @@ _Avoid_: reserved path, private mount
 **Protected path**:
 A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
 _Avoid_: system path, reserved path
+
+**Read-only path**:
+A path a sandbox may read but not change, although its write grants cover it, such as a shell's startup file.
+_Avoid_: write deny, protected path (enclos's own paths)
 
 **Escape probe**:
 A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call refused outside too, that it gets as far there as the sandbox refuses it, such as to the filesystem; for what the host cannot reach either, that it is there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.

@@ -1,5 +1,5 @@
-//! `config.toml`: host-wide settings. Only written by `enclos init` so far;
-//! reading it comes with the first setting a command uses.
+//! `config.toml`: host-wide settings. Written by `enclos init`; `sandbox
+//! create` reads its default backend.
 
 use crate::model::sandbox::BackendKind;
 
@@ -50,6 +50,21 @@ pub fn backend_named(text: &str) -> Result<BackendNamed, String> {
     )
 }
 
+/// The default backend `text`, a `config.toml`, names: none when it names
+/// none; why not when it does not parse, or names something else than a
+/// backend.
+pub fn default_backend(text: &str) -> Result<Option<BackendKind>, String> {
+    let table = text.parse::<toml::Table>().map_err(|e| e.to_string())?;
+    match table.get("default_backend") {
+        None => Ok(None),
+        Some(toml::Value::String(name)) => name.parse().map(Some).map_err(|e| format!("{e}")),
+        Some(other) => Err(format!(
+            "`default_backend` is {}, not the name of a backend",
+            other.type_str()
+        )),
+    }
+}
+
 /// `text` with its placeholder line replaced by `kind`, as [`initial`] would
 /// have written it.
 pub fn with_backend(text: &str, kind: BackendKind) -> String {
@@ -77,5 +92,19 @@ mod tests {
         let edited = none.replace("# default_backend", "# mine");
         assert_eq!(backend_named(&edited), Ok(BackendNamed::NotNamed));
         assert!(backend_named("not = [toml").is_err());
+    }
+
+    #[test]
+    fn reads_the_default_backend_it_names() {
+        for kind in [BackendKind::Seatbelt, BackendKind::Bubblewrap] {
+            assert_eq!(default_backend(&initial(Some(kind))), Ok(Some(kind)));
+        }
+        assert_eq!(default_backend(&initial(None)), Ok(None));
+        assert_eq!(default_backend(""), Ok(None));
+        let unknown = default_backend("default_backend = \"jail\"\n").unwrap_err();
+        assert!(unknown.contains("unknown backend `jail`"), "{unknown}");
+        let number = default_backend("default_backend = 1\n").unwrap_err();
+        assert!(number.contains("not the name of a backend"), "{number}");
+        assert!(default_backend("not = [toml").is_err());
     }
 }
