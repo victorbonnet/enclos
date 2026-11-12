@@ -1526,7 +1526,7 @@ fn run_session(
                 read(hub, store, person, &conversation, seq)?;
             }
             FromDevice::Sync { since } => {
-                if hub.host.as_deref() == Some(person) {
+                if hub.known_host().as_deref() == Some(person) {
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         link.send(ToDevice::Approval(a))?;
                     }

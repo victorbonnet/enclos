@@ -388,7 +388,9 @@ fn approval_refusals_are_collected_from_the_first_collection_on() {
 #[test]
 fn approval_requests_name_only_the_agents_own_conversations_or_groups() {
     let (_dir, _hub, store) = approval_hub();
-    store.ensure_home("lab/main", "owner@example.com").unwrap();
+    store
+        .ensure_home("lab/main", "owner@example.com", true)
+        .unwrap();
     let home = crate::bridge::store::home_id("lab/main");
     assert!(approvals::speaks_in(&store, "lab/main", &home));
     assert!(!approvals::speaks_in(&store, "lab/coder", &home));
