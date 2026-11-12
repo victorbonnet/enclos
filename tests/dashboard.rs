@@ -117,7 +117,11 @@ impl Lab {
 
     fn state(&self) -> enclos::state::sqlite::SqliteStateStore {
         let layout = enclos::layout::Layout::at(self.root.path());
-        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock())
+        enclos::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            enclos::state::Wait::Command,
+        )
     }
 
     /// Records Hermes as `lab`'s runtime, as `runtime install` would, and

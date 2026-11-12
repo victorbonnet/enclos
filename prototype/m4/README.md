@@ -2,7 +2,7 @@
 
 Throwaway code that answers the first questions of the mobile app channel ([victorbonnet/enclos#145](https://github.com/victorbonnet/enclos/issues/145), "To verify"), before enclos's code depends on them. Nothing here is enclos code: a minimal Hermes channel plugin, `enclos`, that listens on a Unix socket in the sandbox home, and a bridge script that the host runs to talk to it.
 
-**Status: not run yet.** The plugin was written against Hermes's source (main, `9302ba9e`, 2026-11-03: `hermes_cli/plugins.py`, `gateway/platform_registry.py`, `plugins/platforms/ntfy/`) and never loaded by a real Hermes. `bridge.py` was checked only against a stand-in agent that echoes each line. Every result below is to be filled in from a run.
+**Status: answered on a Mac by the channel itself, not by this code.** This plugin was written against Hermes's source (main, `9302ba9e`, 2026-11-03: `hermes_cli/plugins.py`, `gateway/platform_registry.py`, `plugins/platforms/ntfy/`) and never loaded by a real Hermes; `bridge.py` was checked only against a stand-in agent that echoes each line. The questions were answered instead by the first runs of enclos's own channel plugin (`channels/hermes/`, written into the sandbox by `enclos runtime configure --channel app`) and its bridge, which follow the same design: see Results. Linux stays open.
 
 ## Questions
 
@@ -13,7 +13,7 @@ Throwaway code that answers the first questions of the mobile app channel ([vict
 | Q3 | Does a cron job created in a conversation deliver back to that conversation through the plugin? | Step 5 |
 | Q4 | Does `hermes plugins enable` need to run for a plugin in the home, or is dropping it there enough? | Step 2 |
 
-Linux questions (Landlock's right to make a socket in the home, a socket reached across the sandbox's network namespace) wait for bubblewrap sandboxes from milestone 3; the same steps answer them there. Whether Hermes keeps memory per person (for sharing) is a later prototype.
+Linux questions (Landlock's right to make a socket in the home, a socket reached across the sandbox's network namespace) are still open; the same steps answer them on a host where milestone 3's bubblewrap sandboxes run. Whether Hermes keeps memory per person (for sharing) is a later prototype.
 
 ## Files
 
@@ -82,11 +82,11 @@ A Unix socket's path is at most 104 bytes on macOS. The socket goes in `~/.enclo
 
 ## Results
 
-Not run yet. Record here, for each question, what was shown, with the macOS and Hermes versions, as `prototype/m1` does; then move what is settled out of the issue's "To verify" list.
+Shown on a Mac (macOS 27.2) in a sandbox `lab` with the agents `main` and `coder`, from 2026-11-05 to 2026-11-08, with Hermes from its main branch as the Hermes installer served it then (Hermes records no version on disk; `docs/design.md` §14). Read from the gateway's logs, Hermes's cron records and the sandbox home afterwards. Not with this prototype's code: with enclos's channel plugin and bridge (above), which answer the same questions.
 
 | # | Result |
 | --- | --- |
-| Q1 | |
-| Q2 | |
-| Q3 | |
-| Q4 | |
+| Q1 | **macOS: yes.** Under Seatbelt the gateway bound each agent's socket in the sandbox home (`~/.enclos-app/main.sock`, `coder.sock`, mode `0600`), and the bridge on the host connected to it and exchanged messages both ways (the log's `[Enclos] Listening for the bridge`, `Bridge connected`, and replies sent to the bridge's conversations). **Linux: open** (Landlock's right to make the socket in the home, the host reaching it across the sandbox's network namespace). |
+| Q2 | **Not tried as asked.** The channel takes the other way: a copy of the plugin in each agent's own home (`~/.hermes/profiles/<agent>/plugins/enclos/`), which loaded for both agents. Whether one copy in the built-in agent's home serves every agent stays unknown, and nothing depends on it now. |
+| Q3 | **Yes.** Three cron jobs asked for in conversations of the channel (2026-11-05 and 2026-11-06) were stored with `origin` naming the `enclos` platform and that conversation's id, and `deliver: origin`; each ran, and Hermes logged it `delivered to enclos:<conversation> via live adapter` and recorded the delivery as `delivered`. |
+| Q4 | **Enabling works; dropping alone was not tried.** `runtime configure` runs `hermes -p <agent> plugins enable enclos`, which lists `enclos` under `plugins.enabled` in the agent's `config.yaml`, and the plugin then loads. Hermes's source loads a home plugin only once it is enabled; that a plugin merely dropped there stays off was not checked. |

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use super::Engine;
 use super::import::{Archive, LeftCopy};
+use super::pause::Restart;
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
 use crate::model::agent::{AgentName, AgentRecord};
@@ -217,8 +218,10 @@ impl Engine {
 
     /// Adds an agent: the runtime creates it inside the sandbox, and enclos
     /// records it. An agent the runtime already has, made inside the
-    /// sandbox, is only recorded (ADR 0023). Nothing else changes: the
-    /// policy and the proxy are the sandbox's (ADR 0024).
+    /// sandbox, is only recorded (ADR 0023). Then the runtime's installed
+    /// services start again, so that they serve it, which asks for
+    /// confirmation first. The policy and the proxy, the sandbox's, do not
+    /// change (ADR 0024).
     pub fn add_agent(
         &self,
         by: &Actor,
@@ -262,8 +265,12 @@ impl Engine {
             });
         }
         let files = runtime.agent_files(&agent);
+        // The runtime's services may serve only the agents that existed as
+        // they started, as Hermes's gateway does: they start again once
+        // this one exists (design §9).
+        let restart = self.plan_restart(name)?;
         if confirm == Confirm::DryRun {
-            let changes = match &adoption {
+            let mut changes: Vec<String> = match &adoption {
                 Adoption::Adopt => vec![format!(
                     "record agent {name}/{agent}, which {shown} already has in the sandbox"
                 )],
@@ -281,10 +288,14 @@ impl Engine {
                         .collect()
                 }
             };
+            changes.extend(restart.plan(&format!("{name}/{agent}")));
             return Ok(Planned::DryRun(Plan {
                 changes,
                 ..Plan::default()
             }));
+        }
+        if confirm == Confirm::Ask {
+            restart.confirm(&format!("adding agent {name}/{agent}"))?;
         }
         let how = match adoption {
             Adoption::Adopt => Added::Adopted,
@@ -317,6 +328,7 @@ impl Engine {
             }
         };
         let record = self.record_agent(by, name, &agent, kind, &how)?;
+        self.restart_for(by, name, &agent, restart, "adding")?;
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,
@@ -409,6 +421,24 @@ impl Engine {
                 ),
             }
         })
+    }
+
+    /// Restarts the runtime's services `restart` names once `agent` is
+    /// recorded, `adding` saying how it came: when they cannot start again,
+    /// the agent stays added and the error says how to start them.
+    pub(super) fn restart_for(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        restart: Restart,
+        adding: &str,
+    ) -> Result<()> {
+        self.restart_runtime(by, name, restart, &format!("for agent add {name}/{agent}"))
+            .map_err(|error| Error::FailedAfter {
+                error: Box::new(error),
+                done: format!("{adding} agent {name}/{agent}"),
+            })
     }
 
     /// A command named `agent` on the sandbox's PATH, if there is one: the

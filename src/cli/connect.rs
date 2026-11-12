@@ -22,6 +22,7 @@ use enclos::engine::Engine;
 use enclos::engine::{Left, ServiceWait, SessionEnd, printable_line};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
+use enclos::model::count;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
 
@@ -140,8 +141,8 @@ pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
                 .map(|m| format!("{} ({})", m.pid, printable_line(&m.command)))
                 .collect();
             say!(
-                "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",
-                left.len(),
+                "enclos: the command exited, but it left {} running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",
+                count(left.len(), "process", "processes"),
                 pids.join(", "),
                 sandbox
             );

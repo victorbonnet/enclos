@@ -38,7 +38,7 @@
             <button class="copy-button" id="copy-install" type="button" hidden>Copy</button>
           </div>
           <span id="copy-status" class="sr-only" role="status"></span>
-          <p class="today">Today: Hermes on macOS. Next: Linux, OpenClaw. <span id="release-state"></span></p>
+          <p class="today">Today: Hermes on macOS and Linux. Next: OpenClaw. <span id="release-state"></span></p>
         </div>
 
         <figure class="terminal">
@@ -55,7 +55,7 @@ work  stopped   Hermes, logged in
   policy v1 · last connect 2d ago · last network 2d ago
   AGENT    LAST ACTIVE      SIZE
   default  2d ago         6.3 MB</code></pre>
-          <figcaption>Example output, shortened.</figcaption>
+          <figcaption>Example output on macOS, shortened.</figcaption>
         </figure>
       </section>
 
@@ -90,10 +90,10 @@ allow_add = ["api.telegram.org"]</code></pre>
   (subpath "/Users/alice/work"))
 (allow network-outbound
   (remote tcp "localhost:41001"))</code></pre>
-            <figcaption>What Seatbelt enforces, shortened.</figcaption>
+            <figcaption>What Seatbelt enforces on macOS, shortened.</figcaption>
           </figure>
         </div>
-        <p class="today">Today: Seatbelt on macOS. Next: bubblewrap on Linux. Portable by design, not yet shown.</p>
+        <p class="today">Today: Seatbelt on macOS and bubblewrap on Linux. Moving a policy from one to the other is not yet shown.</p>
         <a class="text-link" href="./policy-compilation.html">How a policy compiles <span aria-hidden="true">→</span></a> <a class="text-link" href="./policy-compilation.html#settings">Every setting <span aria-hidden="true">→</span></a>
       </section>
 
@@ -119,20 +119,24 @@ allow_add = ["api.telegram.org"]</code></pre>
         <article class="win">
           <h2>Lightweight sandboxes</h2>
           <p>No virtual machine, no Docker. A sandbox uses your operating system’s own isolation and starts at once, with its own home and proxy.</p>
-          <p class="today">Today: Seatbelt. Next: bubblewrap on Linux.</p>
+          <p class="today">Today: Seatbelt on macOS and bubblewrap on Linux.</p>
         </article>
       </section>
 
       <section class="start wrap" id="start" aria-labelledby="start-heading">
         <div>
           <h2 id="start-heading">Up in a few minutes.</h2>
-          <p>You need an Apple silicon Mac on macOS 15 or later, an account with a model provider Hermes supports, and about 2.5 GB free per sandbox.</p>
+          <p>You need an Apple silicon Mac on macOS 15 or later, or Linux on x86_64 or arm64 (Ubuntu 24.04 or 26.04, Debian 13, 64-bit Raspberry Pi OS) with systemd 254 or later, bubblewrap and user namespaces. You also need an account with a model provider Hermes supports, and about 2.5 GB free per sandbox.</p>
+          <p>On Linux, install bubblewrap first (<code>sudo apt install bubblewrap</code>); Ubuntu 24.04 also needs an AppArmor rule for it. See the <a href="./getting-started.html#linux">Linux requirements</a>.</p>
           <a class="text-link" href="./getting-started.html">Getting started guide <span aria-hidden="true">→</span></a>
         </div>
         <div class="terminal">
           <pre><code><span class="command">curl -fsSL https://enclos.dev/install.sh | bash</span>
 <span class="command">enclos init</span>
+
+<span class="comment"># Seatbelt on macOS, bubblewrap on Linux</span>
 <span class="command">enclos sandbox create lab --template assistant</span>
+
 <span class="command">enclos runtime install hermes --sandbox lab</span>
 
 <span class="comment"># sign in with your model provider</span>
