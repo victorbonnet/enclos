@@ -26,12 +26,21 @@ def native_api():
 
 
 # Hermes's commands that decide or skip approvals: answering one, and turning the
-# gate off for a session (`/yolo`) or for good (`/approvals off`).
+# gate off for a session (`/yolo`) or for good (`/approvals off`). None is passed on,
+# whoever the bridge says sent it: runtime approvals are decided with the app's
+# buttons, whose decisions the bridge signs (ADR 0060).
 APPROVAL_COMMANDS = frozenset(("approve", "deny", "yolo", "approvals"))
-NOT_HOST_ANSWER = ("Only the host's person decides runtime approvals, so this command was not passed "
-                   "to the agent.")
+TYPED_ANSWER = ("Runtime approvals are decided with the enclos app's buttons, so this command was not "
+                "passed to the agent.")
 NOT_ANSWERABLE = ("A command needed runtime approval. Only the host's person decides runtime approvals, "
                   "and this conversation is not theirs, so it cannot be answered here: the command was denied.")
+NOT_SIGNED = ("This decision does not carry the bridge's signature, so the agent's channel refused it and "
+              "denied the command. If it happens again, run `enclos runtime configure <sandbox>/<agent> "
+              "--channel app` on the host.")
+NO_BUTTONS = ("This runtime approval cannot be decided in the app: it has no buttons here, and typed "
+              "approval commands are not passed to the agent.")
+DENIED = NO_BUTTONS + " It was denied."
+WAITING = NO_BUTTONS + " The runtime denies it when it stops waiting."
 
 
 def approval_command(event):
@@ -111,10 +120,11 @@ def _bounded(text, render, fits):
 _WIDEST_HEADING = "Command, part 9999 of 9999:\n"
 
 
-def fallback_chunks(prompt, fits, prefix="/", named=()):
+def fallback_chunks(prompt, fits, denied=False):
     # Every command part is a complete literal Markdown block, including when a
     # long backtick/tilde run or JSON escapes changes the available byte budget.
-    # Hidden characters are written out, so what is shown is what runs.
+    # Hidden characters are written out, so what is shown is what runs. No typed
+    # command decides it (ADR 0060): the last part says it was `denied`, or will be.
     text = revealed(prompt.text)
     if fits(text):
         yield text
@@ -129,15 +139,7 @@ def fallback_chunks(prompt, fits, prefix="/", named=()):
             yield f"Command, part {number} of {len(parts)}:\n" + _fenced(part)
     if not prompt.command.isascii():
         yield "The command holds characters outside ASCII, some of which look like others. Check each one."
-    offered = [row[1] for row in prompt.actions]
-    if named and any(action in PATTERN_GRANTS for action in offered):
-        yield from _bounded("; ".join(named), lambda part: (
-            "A session or always grant covers every command matching: " + part
-            + ". An always grant persists in the Hermes profile until removed from its command_allowlist."), fits)
-    commands = {"once": f"{prefix}approve", "session": f"{prefix}approve session",
-                "always": f"{prefix}approve always", "deny": f"{prefix}deny"}
-    choices = " · ".join(commands[action] for action in offered if action in commands)
-    yield f"Reply with {choices}."
+    yield DENIED if denied else WAITING
 
 
 @dataclass

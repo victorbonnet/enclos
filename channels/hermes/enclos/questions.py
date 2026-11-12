@@ -191,11 +191,11 @@ class Card:
 class Manager:
     """Questions of one channel. `outbox` keeps what the bridge has not acknowledged,
     `write` sends a message to the connected bridge, `send` delivers chat text, and
-    `command_prefix` gives the prefix of the runtime's typed commands, which a runtime
-    approval sent as text names."""
+    `decisions` checks the bridge's signature of each runtime-approval decision
+    (`decisions.Verifier`, ADR 0060): without it, runtime approvals have no buttons."""
 
     def __init__(self, outbox, write, send, native=_native,
-                 approvals_native=runtime_approvals.native_api, command_prefix=lambda: "/"):
+                 approvals_native=runtime_approvals.native_api, decisions=None):
         self.outbox = outbox
         self.write = write
         self.send = send
@@ -203,7 +203,7 @@ class Manager:
         self.bridge_supports = False
         self.bridge_runtime_supports = False
         self.approvals_native = approvals_native
-        self.command_prefix = command_prefix
+        self.decisions = decisions
         self.approval_ids: set[str] = set()
         self.cards: dict[str, Card] = {}
         self.tasks: set[asyncio.Task] = set()
@@ -215,7 +215,8 @@ class Manager:
 
     @property
     def approvals_available(self):
-        return self.bridge_runtime_supports and self.approvals_native() is not None
+        return (self.bridge_runtime_supports and self.decisions is not None
+                and self.approvals_native() is not None)
 
     def can_deliver(self, message):
         if not message["type"].startswith("question."):
@@ -247,19 +248,32 @@ class Manager:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    async def approval_text_fallback(self, prompt, named=()):
+    async def approval_text_fallback(self, prompt, denied=False):
+        """The approval as text, for a runtime approval no card shows: the command
+        whole, and that the app cannot decide it (typed approval commands are not
+        passed on), so that it was denied (`denied`), or is when the runtime stops
+        waiting."""
         def fits(text):
             return len(protocol.encode_line(protocol.message_out(prompt.chat_id, text))) <= MAX_APPROVAL_FRAME_BYTES
-        for chunk in runtime_approvals.fallback_chunks(prompt, fits, self.command_prefix(), named):
+        for chunk in runtime_approvals.fallback_chunks(prompt, fits, denied):
             result = await self.send(prompt.chat_id, chunk,
                 metadata={**(prompt.metadata or {}), "is_approval_prompt": True})
             if not result.success:
                 return False
         return True
 
+    async def _unshown(self, prompt):
+        """No card shows `prompt`, and nothing else in the app can decide it: it is
+        denied at once where Hermes resolves its exact request, else when Hermes
+        stops waiting; the person reads which, with the command."""
+        native = self.approvals_native() if getattr(prompt, "request_id", None) else None
+        denied = native is not None and native.resolve_gateway_approval_card(
+            prompt.session_key, "deny", prompt.request_id) == 1
+        return await self.approval_text_fallback(prompt, denied)
+
     async def ask_approval(self, prompt):
         if not self.approvals_available or not getattr(prompt, "request_id", None):
-            return await self.approval_text_fallback(prompt), None
+            return await self._unshown(prompt), None
         native = self.approvals_native()
         matching = [row for row in native.list_gateway_approvals(prompt.session_key)
                     if row.get("request_id") == prompt.request_id]
@@ -268,19 +282,18 @@ class Manager:
             # sees as delivered: Hermes believes the whole command was shown.
             logger.warning("Runtime approval %s has %d native matches; sending it as text",
                            prompt.request_id, len(matching))
-            return await self.approval_text_fallback(prompt), None
-        named = runtime_approvals.patterns(matching[0])
+            return await self._unshown(prompt), None
         definition = runtime_approvals.definition(prompt, protocol.new_id(), matching[0])
         try:
             validate_definition(definition)
         except ValueError as error:
-            logger.warning("Runtime approval %s cannot be a card (%s); sending it as text", prompt.request_id, error)
-            return await self.approval_text_fallback(prompt, named), None
+            logger.warning("Runtime approval %s cannot be a card (%s); it is denied", prompt.request_id, error)
+            return await self._unshown(prompt), None
         binding = runtime_approvals.Binding(native, prompt, prompt.request_id, prompt.session_key, matching[0])
         if not binding.observe(asyncio.get_running_loop()):
             logger.warning("Runtime approval %s settled before it could be observed; sending it as text",
                            prompt.request_id)
-            return await self.approval_text_fallback(prompt, named), None
+            return await self._unshown(prompt), None
         ask = protocol.message("question.ask", conversation=prompt.chat_id, question=definition)
         card = Card(definition, prompt.chat_id, prompt.request_id, prompt.session_key, binding, native, ask["id"])
         self.cards[definition["id"]] = card
@@ -445,6 +458,13 @@ class Manager:
             await self.write(protocol.error("bad_message", str(error), message["id"]))
             return
         if card.definition.get("approval"):
+            # Acted on only with the bridge's signature of this very decision
+            # (ADR 0060): the agent can speak on this socket too.
+            why = ("this channel has no key to check it with" if self.decisions is None
+                   else self.decisions.check(message, card))
+            if why is not None:
+                await self._refuse_decision(card, message["id"], why)
+                return
             await self._answer_approval(card, answer, message["id"])
             return
         if card.state != "pending":
@@ -465,6 +485,17 @@ class Manager:
             await self._settle(card, state, confirmed, of=message["id"])
         else:
             await self._settle(card, *self._observed(card), of=message["id"])
+
+    async def _refuse_decision(self, card, request_id, why):
+        """A decision without the bridge's signature, forged, altered or replayed: it
+        is refused and logged, and its approval, while it waits, is denied, so that
+        what was asked does not run on the word of whoever spoke on this socket."""
+        logger.warning("A decision on runtime approval %s was refused: %s; the command is denied",
+                       card.definition["id"], why)
+        await self.write(protocol.error("not_allowed", runtime_approvals.NOT_SIGNED, request_id))
+        if card.state == "pending" and self._live(card) and card.entry.resolve("deny"):
+            # The agent's report, not the person's: no receipt of their request.
+            await self._settle(card, "answered", {"kind": "approval", "action": "deny"})
 
     async def _answer_approval(self, card, answer, request_id):
         if card.state != "pending":
@@ -487,9 +518,8 @@ class Manager:
         """The bridge refused the message `of`. A refused ask (a conversation it does not
         know, too many questions waiting) would leave the agent waiting on a question
         nobody sees: the card is dropped and the question goes as Hermes's text. A refused
-        runtime approval would leave Hermes waiting the same way: where the conversation's
-        person cannot decide runtime approvals (`not_allowed`), it is denied at once, and
-        the text says why; otherwise it goes as Hermes's typed text."""
+        runtime approval would leave Hermes waiting the same way, and nothing else in the
+        app can decide it: it is denied at once, and the text says why."""
         card = next((c for c in self.cards.values() if c.ask_id == of), None)
         if card is None:
             return
@@ -499,11 +529,11 @@ class Manager:
         if card.definition.get("approval"):
             if not self._live(card):
                 return
+            denied = card.entry.resolve("deny")
             if code == "not_allowed":
-                card.entry.resolve("deny")
                 await self.send(card.conversation, runtime_approvals.NOT_ANSWERABLE)
             else:
-                await self.approval_text_fallback(card.entry.prompt, card.definition["approval"].get("patterns", ()))
+                await self.approval_text_fallback(card.entry.prompt, denied)
             return
         if self._live(card):
             entry = card.entry
@@ -557,8 +587,10 @@ class Manager:
             if card.state == "pending" and self._live(card):
                 if card.definition.get("approval"):
                     if not self.approvals_available:
-                        await self.approval_text_fallback(card.entry.prompt,
-                                                          card.definition["approval"].get("patterns", ()))
+                        # This bridge cannot decide it, and expires its card: denied.
+                        if card.entry.resolve("deny"):
+                            await self._settle(card, "answered", {"kind": "approval", "action": "deny"})
+                        await self.approval_text_fallback(card.entry.prompt, card.state != "pending")
                 elif not self.available:
                     await self.text_fallback(card.conversation, card.entry.question, card.entry.choices,
                                              card.native_id)
