@@ -1,6 +1,8 @@
 # Hermes routines: implementation evidence
 
-Inspected 2026-11-09, against local Hermes commit [`e5ea5fd9cc`](https://github.com/NousResearch/hermes-agent/tree/e5ea5fd9cc). No production routine was created, changed or executed during research.
+Inspected 2026-11-09, against local Hermes commit [`e5ea5fd9cc`](https://github.com/NousResearch/hermes-agent/tree/e5ea5fd9cc) (a v0.22.5 canary). No production routine was created, changed or executed during research.
+
+Rechecked 2026-11-11 against [v0.23.1](https://github.com/NousResearch/hermes-agent/tree/v0.23.1), the latest release then (`git ls-remote --tags`), by reading its source: `cron/jobs.py` still has `create_job` (with `deliver`, `origin`, `script`, `enabled_toolsets`, `workdir`, `no_agent`), `get_job`, `list_jobs`, `update_job`, `pause_job`, `resume_job`, `remove_job`, `use_cron_store`, `_jobs_lock` and its `fcntl` lock, and still validates a working directory's existence; `cron/scheduler_provider.py` still has `CronScheduler.claim_fire` and `fire_claimed`, and `run_one_job` sets up the profile's own secret scope; `gateway/run_adapters.py` creates a secondary profile's adapters inside that profile's runtime scope, so the adapter's routine manager captures its own agent's home. The plugin's tests against a real store ran on the `e5ea5fd9cc` checkout, not on v0.23.1. When a release renames one of these, the plugin turns the `routines` capability off and logs which one.
 
 ## Mobile behaviour
 
