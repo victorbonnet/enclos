@@ -41,6 +41,7 @@ const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbo
 const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
 const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.py");
 const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
+const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
@@ -300,6 +301,7 @@ impl RuntimeAdapter for Hermes {
                 file("routines.py", APP_PLUGIN_ROUTINES)?,
                 file("lines.py", APP_PLUGIN_LINES)?,
                 file("questions.py", APP_PLUGIN_QUESTIONS)?,
+                file("visible.py", APP_PLUGIN_VISIBLE)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
@@ -1090,9 +1092,23 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/routines.py",
                 ".hermes/profiles/main/plugins/enclos/lines.py",
                 ".hermes/profiles/main/plugins/enclos/questions.py",
+                ".hermes/profiles/main/plugins/enclos/visible.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );
+        // Every module of the plugin goes in: one left out fails the
+        // plugin's import, and the channel with it.
+        let modules =
+            std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("channels/hermes/enclos"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".py") || name.ends_with(".yaml"));
+        for module in modules {
+            assert!(
+                places.contains(&format!(".hermes/profiles/main/plugins/enclos/{module}")),
+                "{module} is not put in the sandbox"
+            );
+        }
         assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));
         assert_eq!(
             app.commands
