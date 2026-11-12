@@ -9,9 +9,10 @@ use serde_json::{Value, json};
 use super::home::{read_text, unreadable};
 use super::settings::{Held, SettingsFile, SettingsFinding, dotenv_line, names_a_secret};
 use super::{
-    AgentDeleteMode, AgentFacts, DiskPart, HomeFile, HomePath, Installer, ListenerPorts, NotRead,
-    RuntimeAdapter, RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService,
-    SandboxCommand, SecretFileFormat, SecretFiles, SecretTarget, ServiceName, Unreadable, ValueAt,
+    AgentDeleteMode, AgentFacts, AppChannel, DiskPart, HomeFile, HomePath, Installer,
+    ListenerPorts, NotRead, RuntimeAdapter, RuntimeAgentName, RuntimeFacts, RuntimeListener,
+    RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles, SecretTarget, ServiceName,
+    Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -25,6 +26,9 @@ const CONFIG: &str = ".openclaw/openclaw.json";
 const MAX_CONFIG: u64 = 256 * 1024;
 const MAX_AGENTS: usize = 512;
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+const APP_PLUGIN: &str = ".enclos-openclaw";
+const INSTALL_APP: &str = "exec \"$HOME/bin/openclaw\" plugins install --link \"$HOME/.enclos-openclaw\" --force --no-enable --accept-capabilities";
+const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind --agent \"$agent\" --bind \"enclos:$agent\" --json\n\"$HOME/bin/openclaw\" config set channels.enclos.enabled true\nexec \"$HOME/bin/openclaw\" config set \"channels.enclos.accounts.$agent.enabled\" true";
 
 fn at(path: &str) -> HomePath {
     HomePath::new(path).expect("a literal home-relative path")
@@ -431,7 +435,79 @@ impl RuntimeAdapter for OpenClaw {
                 agent.as_str(),
             ]));
         }
+        if key == format!("channels.enclos.accounts.{agent}.enabled") && value == "true" {
+            // The canonical native binder preserves unrelated route entries,
+            // reports another agent's conflicting claim and stops on failure.
+            // Account activation follows both binding and channel enablement.
+            return Some(SandboxCommand::from_words(&[
+                "sh",
+                "-c",
+                ENABLE_APP,
+                "enclos-enable-app",
+                agent.as_str(),
+            ]));
+        }
         Some(setting(key, value))
+    }
+    fn app_channel(
+        &self,
+        agent: &RuntimeAgentName,
+        socket: &Path,
+        token_file: &Path,
+        home: &str,
+        _bridge_key: &str,
+    ) -> Option<AppChannel> {
+        if !socket.is_absolute() || !token_file.is_absolute() {
+            return None;
+        }
+        let plugin = at(APP_PLUGIN);
+        let state = socket.parent()?.join("openclaw-state").join(agent.as_str());
+        let account = json!({"enabled":false, "agentId":agent.as_str(), "socket":socket.to_str()?,
+            "tokenFile":token_file.to_str()?, "home":home, "stateDir":state.to_str()?})
+        .to_string();
+        Some(AppChannel {
+            // One package per sandbox; every account has its own socket,
+            // protected JSON credential consumer and durable state directory.
+            files: vec![
+                (
+                    plugin.child("package.json")?,
+                    include_str!("../../channels/openclaw/package.json"),
+                ),
+                (
+                    plugin.child("openclaw.plugin.json")?,
+                    include_str!("../../channels/openclaw/openclaw.plugin.json"),
+                ),
+                (
+                    plugin.child("index.js")?,
+                    include_str!("../../channels/openclaw/index.js"),
+                ),
+                (
+                    plugin.child("channel.js")?,
+                    include_str!("../../channels/openclaw/channel.js"),
+                ),
+                (
+                    plugin.child("protocol.js")?,
+                    include_str!("../../channels/openclaw/protocol.js"),
+                ),
+                (
+                    plugin.child("transport.js")?,
+                    include_str!("../../channels/openclaw/transport.js"),
+                ),
+            ],
+            // Configure with the Gateway stopped: this native CLI version's
+            // live owner-writer path cannot select unresolved auth SecretRefs.
+            // Native install/link merges registration with existing plugin
+            // paths; this plan never replaces the shared load-path list.
+            commands: vec![SandboxCommand::from_words(&["sh", "-c", INSTALL_APP])],
+            settings: vec![
+                (format!("channels.enclos.accounts.{agent}"), account),
+                ("plugins.entries.enclos.enabled".into(), "true".into()),
+                (
+                    format!("channels.enclos.accounts.{agent}.enabled"),
+                    "true".into(),
+                ),
+            ],
+        })
     }
     fn set_secret_setting(
         &self,
@@ -883,6 +959,106 @@ mod tests {
             }])
             .unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn app_accounts_share_one_package_and_keep_explicit_credentials_and_state_separate() {
+        let first = agent("main");
+        let second = agent("scout");
+        let socket = Path::new("/sandbox/home/.enclos-app/main.sock");
+        // Deliberately unrelated to the socket's ancestors: the adapter must
+        // consume the path supplied by the core rather than infer its layout.
+        let token = Path::new("/protected/another-layout/main.env");
+        let app = OpenClaw
+            .app_channel(&first, socket, token, "home.lab.main", "key")
+            .unwrap();
+        let other = OpenClaw
+            .app_channel(
+                &second,
+                Path::new("/sandbox/home/.enclos-app/scout.sock"),
+                Path::new("/protected/another-layout/scout.env"),
+                "home.lab.scout",
+                "key",
+            )
+            .unwrap();
+        assert_eq!(app.files, other.files);
+        let package: Value = serde_json::from_str(
+            app.files
+                .iter()
+                .find(|(path, _)| path.as_path().ends_with("package.json"))
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let mut declared: std::collections::BTreeSet<_> = package["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| Path::new(APP_PLUGIN).join(file.as_str().unwrap()))
+            .collect();
+        declared.insert(Path::new(APP_PLUGIN).join("package.json"));
+        let embedded = app
+            .files
+            .iter()
+            .map(|(path, _)| path.as_path().to_path_buf())
+            .collect();
+        assert_eq!(declared, embedded);
+        assert!(
+            app.files
+                .iter()
+                .all(|(path, text)| path.as_path().starts_with(APP_PLUGIN) && !text.is_empty())
+        );
+        let account: Value = serde_json::from_str(&app.settings[0].1).unwrap();
+        let other_account: Value = serde_json::from_str(&other.settings[0].1).unwrap();
+        assert_eq!(account["tokenFile"], token.to_str().unwrap());
+        assert_eq!(account["socket"], socket.to_str().unwrap());
+        assert_eq!(account["agentId"], "main");
+        assert_eq!(account["home"], "home.lab.main");
+        assert_eq!(account["enabled"], false);
+        assert_ne!(account["stateDir"], other_account["stateDir"]);
+        assert!(!app.settings[0].1.contains("MOBILE_APP_TOKEN"));
+        assert!(
+            app.settings
+                .iter()
+                .all(|(key, value)| OpenClaw.set_setting(&first, key, value).is_some())
+        );
+        let install = app.commands[0].shown();
+        assert!(install.contains("plugins install --link"));
+        assert!(install.contains("--no-enable --accept-capabilities"));
+        assert!(
+            !app.settings
+                .iter()
+                .any(|(key, _)| key == "bindings" || key == "plugins.load.paths")
+        );
+        assert_eq!(
+            app.settings.last().unwrap(),
+            &(
+                "channels.enclos.accounts.main.enabled".into(),
+                "true".into()
+            )
+        );
+        let activate = OpenClaw
+            .set_setting(&first, &app.settings.last().unwrap().0, "true")
+            .unwrap()
+            .shown();
+        assert!(activate.contains("agents bind --agent"));
+        assert!(activate.contains("enclos:$agent"));
+        assert!(
+            ENABLE_APP.find("agents bind").unwrap()
+                < ENABLE_APP.find("channels.enclos.enabled true").unwrap()
+        );
+        assert!(ENABLE_APP.ends_with("\"channels.enclos.accounts.$agent.enabled\" true"));
+        assert!(
+            OpenClaw
+                .app_channel(
+                    &first,
+                    Path::new("relative.sock"),
+                    token,
+                    "home.lab.main",
+                    "key"
+                )
+                .is_none()
+        );
     }
 
     #[test]

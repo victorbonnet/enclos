@@ -306,6 +306,7 @@ impl RuntimeAdapter for Hermes {
         &self,
         agent: &RuntimeAgentName,
         socket: &Path,
+        _token_file: &Path,
         home: &str,
         bridge_key: &str,
     ) -> Option<AppChannel> {
@@ -1138,8 +1139,15 @@ mod tests {
     fn the_app_channel_goes_in_the_agents_own_home_and_is_enabled_there() {
         let socket = Path::new("/h/.enclos-app/main.sock");
         let main = RuntimeAgentName::new("main").unwrap();
+        let token_file = Path::new("/protected/secrets/main.env");
         let app = Hermes
-            .app_channel(&main, socket, "home.lab.main", "the-bridges-public-key")
+            .app_channel(
+                &main,
+                socket,
+                token_file,
+                "home.lab.main",
+                "the-bridges-public-key",
+            )
             .unwrap();
         let places: Vec<String> = app
             .files
@@ -1206,7 +1214,7 @@ mod tests {
         );
         let default = RuntimeAgentName::new("default").unwrap();
         let app = Hermes
-            .app_channel(&default, socket, "home.lab.default", "key")
+            .app_channel(&default, socket, token_file, "home.lab.default", "key")
             .unwrap();
         assert_eq!(
             app.files[0].0.as_path(),

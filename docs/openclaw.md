@@ -208,6 +208,23 @@ stacked PRs add it through `runtime configure … --channel app`, using a distin
 granted `MOBILE_APP_TOKEN` per agent and the existing paired-device bridge. See
 the [M5 feature matrix and order](m5-openclaw.md#implementation-order).
 
+For this native version, stop the managed Gateway before channel installation or
+reconfiguration: its live CLI configuration writer cannot authenticate file
+SecretRefs. `runtime configure` can run with the proxy alone. Keep the distinct
+per-agent `MOBILE_APP_TOKEN` grants in force, then run:
+
+```bash
+enclos --yes sandbox stop claw
+enclos runtime configure claw/main --channel app
+enclos runtime configure claw/scout --channel app
+enclos connect claw -- openclaw health
+```
+
+One linked plugin package lives at `~/.enclos-openclaw` in the sandbox; native
+accounts have separate sockets, protected credential paths and durable state.
+The canonical binder preserves unrelated bindings and rejects another agent's
+claim on the exact route. Accounts are enabled only after binding succeeds.
+
 The completed channel stack supplies direct/Home/group conversations, native
 events, files/static HTML, titles, exact cancellation and negotiated native
 approval scopes through the existing app. It does not expose Gateway admin

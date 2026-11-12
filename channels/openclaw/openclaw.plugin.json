@@ -1,0 +1,36 @@
+{
+  "id": "enclos",
+  "name": "enclos app",
+  "description": "Token-authenticated conversations through the host's enclos bridge.",
+  "channels": ["enclos"],
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} },
+  "channelConfigs": {
+    "enclos": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "defaultAccount": { "type": "string" },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["agentId", "socket", "tokenFile", "home"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "agentId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$" },
+                "socket": { "type": "string" },
+                "tokenFile": { "type": "string" },
+                "stateDir": { "type": "string" },
+                "home": { "type": "string", "minLength": 1, "maxLength": 128 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
