@@ -58,7 +58,8 @@ impl Engine {
     /// sandbox reads and never writes, as an audited step that records the
     /// archive's SHA-256; the runtime's own import then extracts it inside
     /// the sandbox, under its policy, so the host never does; and enclos
-    /// records the agent. enclos copies no host login in (ADR 0022): what
+    /// records the agent, then starts the runtime's installed services
+    /// again, as `agent add` does. enclos copies no host login in (ADR 0022): what
     /// the archive holds is the runtime's export to decide. Nothing in it
     /// widens the policy: what the imported configuration reaches shows in
     /// `enclos net log`, and what was refused in `enclos net denied`.
@@ -108,6 +109,9 @@ impl Engine {
             )));
         }
         let source = Source::open(&self.layout, from)?;
+        // As for `agent add`: the runtime's services start again once the
+        // imported agent exists.
+        let restart = self.plan_restart(name)?;
         if confirm == Confirm::DryRun {
             let version = self.policy(name)?.version.version;
             let Archive { path, sha256 } = source.hash()?;
@@ -126,9 +130,15 @@ impl Engine {
                         command.shown()
                     ),
                     format!("record agent {name}/{agent} as imported from that archive"),
-                ],
+                ]
+                .into_iter()
+                .chain(restart.plan(&format!("{name}/{agent}")))
+                .collect(),
                 ..Plan::default()
             }));
+        }
+        if confirm == Confirm::Ask {
+            restart.confirm(&format!("importing agent {name}/{agent}"))?;
         }
         // Staging is audited on its own, so the archive and its hash are in
         // the audit log before the runtime runs, whatever happens after.
@@ -220,6 +230,7 @@ impl Engine {
                 Added::Imported { copy_left, .. } => with_copy_left(e, copy_left.clone()),
                 _ => e,
             })?;
+        self.restart_for(by, name, &agent, restart, "importing")?;
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,

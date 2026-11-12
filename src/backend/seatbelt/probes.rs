@@ -361,7 +361,12 @@ fn folder_probes(i: &ProbeInputs, refusal: &Refusal) -> Vec<Probe> {
     )];
     // A workspace not made yet has nothing to rename: see
     // `missing_workspaces`.
-    let workspaces = i.workspaces.iter().filter(|w| w.is_dir());
+    // `/`, which a grant of the whole filesystem names (ADR 0058), is never
+    // renamed by anyone, so it has no probe.
+    let workspaces = i
+        .workspaces
+        .iter()
+        .filter(|w| w.is_dir() && *w != Path::new("/"));
     for folder in std::iter::once(&i.home).chain(workspaces) {
         list.push(folder_probe(
             format!("rename {}", folder.display()),
@@ -467,8 +472,16 @@ fn clone_probe(folder: &Path, tag: u32) -> Probe {
 /// The proxy port on `[::1]`. On macOS 26.5.2 the Seatbelt rule was shown
 /// to open the port there too, so the proxy listens there; whatever the
 /// sandbox reaches at that address must be the proxy.
-fn ipv6_loopback_probe(port: u16) -> Probe {
-    let url = format!("--proxy 'http://[::1]:{port}' https://probe.enclos.invalid:8443/");
+///
+/// The probe asks for an unlisted port, which the proxy refuses; where the
+/// policy opens every port (ADR 0058), it asks for 127.0.0.1 instead, which
+/// the proxy refuses in every mode.
+fn ipv6_loopback_probe(port: u16, every_port: bool) -> Probe {
+    let target = match every_port {
+        false => "https://probe.enclos.invalid:8443/",
+        true => "https://127.0.0.1:8443/",
+    };
+    let url = format!("--proxy 'http://[::1]:{port}' {target}");
     let script = format!("{}; echo \" $?\"", curl_through_proxy(&url));
     Probe {
         route: "network",
@@ -610,7 +623,7 @@ impl OwnProbes for SeatbeltProbes {
     }
 
     fn network(&self, i: &ProbeInputs) -> Vec<Probe> {
-        let mut list = vec![ipv6_loopback_probe(i.proxy_port)];
+        let mut list = vec![ipv6_loopback_probe(i.proxy_port, i.every_port)];
         list.extend(listen_probes(i.listen, i.proxy_port));
         list
     }
@@ -781,6 +794,29 @@ fn login_keychain(i: &ProbeInputs) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPv6 loopback probe asks for an unlisted port, which the proxy
+    /// refuses, or for loopback where the policy opens every port, which it
+    /// refuses in every mode (ADR 0058).
+    #[test]
+    fn the_ipv6_loopback_probe_asks_for_what_the_proxy_refuses() {
+        let usual = ipv6_loopback_probe(41001, false);
+        assert!(
+            usual
+                .script
+                .contains("--proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/"),
+            "{}",
+            usual.script
+        );
+        let every = ipv6_loopback_probe(41001, true);
+        assert!(
+            every
+                .script
+                .contains("--proxy 'http://[::1]:41001' https://127.0.0.1:8443/"),
+            "{}",
+            every.script
+        );
+    }
     use crate::probes::{Run, outcome};
     use std::process::Command;
 
@@ -804,6 +840,9 @@ mod tests {
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
+            read_only: Vec::new(),
+            program: Vec::new(),
+            every_port: false,
             limits: Default::default(),
         }
     }
