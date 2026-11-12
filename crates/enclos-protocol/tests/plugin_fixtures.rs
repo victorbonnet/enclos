@@ -3,7 +3,8 @@
 //! same JSON.
 
 use enclos_protocol::plugin::{
-    Capability, ErrorCode, FromBridge, FromPlugin, OutKind, decode_from_bridge, decode_from_plugin,
+    Capability, ErrorCode, FromBridge, FromPlugin, OutKind, ToolPhase, decode_from_bridge,
+    decode_from_plugin,
 };
 use enclos_protocol::{DecodeError, Envelope, MAX_MESSAGE_BYTES, encode_line};
 
@@ -47,6 +48,14 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "conversation_title",
         include_str!("fixtures/plugin/from_plugin_conversation_title.json"),
+    ),
+    (
+        "tool_start",
+        include_str!("fixtures/plugin/from_plugin_tool_start.json"),
+    ),
+    (
+        "tool_end",
+        include_str!("fixtures/plugin/from_plugin_tool_end.json"),
     ),
 ];
 
@@ -136,6 +145,23 @@ fn a_message_reads_as_its_fields_say() {
         panic!("not a conversation.title: {:?}", message.body);
     };
     assert_eq!(title, "Paris weather this week");
+
+    let message = decode_from_plugin(FROM_PLUGIN[6].1.as_bytes()).unwrap();
+    let FromPlugin::Tool(start) = message.body else {
+        panic!("not a tool: {:?}", message.body);
+    };
+    assert_eq!(
+        (start.phase, start.label.as_deref(), start.ok),
+        (ToolPhase::Start, Some("weather Paris this week"), None)
+    );
+    let message = decode_from_plugin(FROM_PLUGIN[7].1.as_bytes()).unwrap();
+    let FromPlugin::Tool(end) = message.body else {
+        panic!("not a tool: {:?}", message.body);
+    };
+    assert_eq!(
+        (end.call, end.phase, end.ok, end.duration_ms),
+        (start.call, ToolPhase::End, Some(true), Some(1840))
+    );
 }
 
 #[test]

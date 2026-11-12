@@ -28,7 +28,9 @@ use enclos_protocol::device::{
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
-use enclos_protocol::plugin::{Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutKind};
+use enclos_protocol::plugin::{
+    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutKind, ToolStep,
+};
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
@@ -275,6 +277,13 @@ impl Hub {
                             hub.deliver_conversation(&store, &owner, id);
                         }
                     }
+                    // A tool the agent runs, for one of its own agent's
+                    // conversations: passed on live, not kept.
+                    FromPlugin::Tool(step) => {
+                        if let Some((owner, step)) = tool_step(&store, &agent, step) {
+                            hub.deliver(&owner, ToDevice::Tool(step));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -385,6 +394,46 @@ pub fn pieces(
             Ok((piece_id, text))
         })
         .collect()
+}
+
+/// The longest tool label passed on, in characters, before its hidden
+/// characters are written out.
+const MAX_TOOL_LABEL_CHARS: usize = 120;
+/// The longest tool name passed on, in characters, likewise.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+/// The longest call id passed on, in characters.
+const MAX_TOOL_CALL_CHARS: usize = 128;
+
+/// A tool step from `agent`'s plugin as the bridge passes it on, with the
+/// person to send it to: `None` unless its conversation is one of `agent`'s
+/// own. The plugin's cuts run in the sandbox, so the bridge makes its own:
+/// each field on one line and short, so the step fits one Noise message,
+/// and the label and name with their hidden characters written out
+/// ([`enclos_protocol::visible::revealed`]), so what the person reads is
+/// what ran.
+fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, ToolStep)> {
+    let c = store.conversation_info(step.conversation.as_str()).ok()??;
+    if format!("{}/{}", c.sandbox, c.agent) != agent {
+        return None;
+    }
+    let owner = store.owner(step.conversation.as_str()).ok()??;
+    let cut = |text: &str, max: usize| -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        words.join(" ").chars().take(max).collect()
+    };
+    let shown = |text: &str, max: usize| enclos_protocol::visible::revealed(&cut(text, max));
+    Some((
+        owner,
+        ToolStep {
+            call: cut(&step.call, MAX_TOOL_CALL_CHARS),
+            name: shown(&step.name, MAX_TOOL_NAME_CHARS),
+            label: step
+                .label
+                .as_deref()
+                .map(|l| shown(l, MAX_TOOL_LABEL_CHARS)),
+            ..step
+        },
+    ))
 }
 
 /// Serves on `127.0.0.1:port` until the process ends.
@@ -1159,6 +1208,7 @@ mod tests {
     use super::*;
     use enclos_protocol::device::decode_to_device;
     use enclos_protocol::noise::{Initiator, generate_keypair};
+    use enclos_protocol::plugin::ToolPhase;
     use enclos_protocol::plugin::decode_from_bridge;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
@@ -2116,6 +2166,80 @@ mod tests {
         *bridge.node.lock().unwrap() = "n-pixel".to_owned();
         let (_, first) = connect(&bridge, &phone);
         assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+    }
+
+    fn step(conversation: &str, call: &str, name: &str, label: Option<&str>) -> ToolStep {
+        ToolStep {
+            conversation: ConversationId::new(conversation).unwrap(),
+            call: call.to_owned(),
+            name: name.to_owned(),
+            label: label.map(str::to_owned),
+            phase: ToolPhase::Start,
+            ok: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_tool_step_goes_only_to_the_owner_of_the_agents_own_conversation() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-b", "lab", "b", "bob@example.com")
+            .unwrap();
+        let (owner, _) = tool_step(&store, "lab/a", step("c-a", "1", "terminal", None)).unwrap();
+        assert_eq!(owner, "alice@example.com");
+        // Agent lab/a cannot show a step in a conversation of lab/b, nor in
+        // one the bridge does not know.
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-b", "1", "terminal", None)),
+            None
+        );
+        assert_eq!(
+            tool_step(&store, "lab/a", step("c-x", "1", "terminal", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tool_step_is_cut_to_fit_and_shows_its_hidden_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        // Each field far above one Noise message.
+        let huge = "x".repeat(70_000);
+        let (_, cut) = tool_step(&store, "lab/a", step("c-a", &huge, &huge, Some(&huge))).unwrap();
+        assert_eq!(cut.call.chars().count(), MAX_TOOL_CALL_CHARS);
+        assert_eq!(cut.name.chars().count(), MAX_TOOL_NAME_CHARS);
+        assert_eq!(
+            cut.label.as_deref().map(|l| l.chars().count()),
+            Some(MAX_TOOL_LABEL_CHARS)
+        );
+        let sealed = encode_line(&Envelope::new(
+            MessageId::new("m-1").unwrap(),
+            ToDevice::Tool(cut),
+        ));
+        assert!(sealed.len() < 2_000);
+        // What the person reads is what runs: a reversed tail is written out,
+        // and a label stays on one line.
+        let (_, shown) = tool_step(
+            &store,
+            "lab/a",
+            step(
+                "c-a",
+                "1",
+                "term\u{200B}inal",
+                Some("rm -rf ~/\u{202E}txt.\nls"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(shown.name, "term⟨U+200B⟩inal");
+        assert_eq!(shown.label.as_deref(), Some("rm -rf ~/⟨U+202E⟩txt. ls"));
     }
 
     #[test]

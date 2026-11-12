@@ -37,6 +37,10 @@ HELLO_TIMEOUT_SECONDS = 10
 # ids of the last ones the runtime had, to drop one that comes again
 SEEN_MESSAGES = 1024
 
+# The connected adapters and their event loops, for the tool hooks, which
+# Hermes calls from the agent's worker threads.
+_ADAPTERS: "set[EnclosAdapter]" = set()
+
 
 def _setting(config: Optional[PlatformConfig], key: str, env: str) -> str:
     extra = (getattr(config, "extra", None) or {}) if config else {}
@@ -96,11 +100,14 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
         self._mark_connected()
+        self._loop = asyncio.get_running_loop()
+        _ADAPTERS.add(self)
         self._wire_plugin_handlers(None)
         logger.info("[%s] Listening for the bridge", self.name)
         return True
 
     async def disconnect(self) -> None:
+        _ADAPTERS.discard(self)
         self._mark_disconnected()
         if self._bridge:
             self._bridge.close()
@@ -349,6 +356,42 @@ class EnclosAdapter(BasePlatformAdapter):
         return {"name": chat_id, "type": "dm"}
 
 
+# The tools the agent runs. Hermes reports a tool's start and end to plugin
+# hooks, with its name, arguments, call id and outcome, but not which chat it
+# is for: that is the turn's session context, which the hooks run in. Hooks
+# fire for every platform, the CLI and cron alike: only this channel's are
+# kept. `pre_tool_call` is also a policy hook (a slow or failing one blocks the
+# tool), so both only hand the step to the adapter's loop and return None.
+
+def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: Optional[str] = None,
+               status: Optional[str] = None, duration_ms: Any = None, **_: Any) -> None:
+    try:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+            return None
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        # Without the call's id, its end cannot be matched to its start, and
+        # the app would show the step running for good: it is not sent.
+        if not chat_id or not tool_call_id or not _ADAPTERS:
+            return None
+        label = None
+        if phase == "start":
+            from agent.display import build_tool_preview
+            label = build_tool_preview(tool_name, args if isinstance(args, dict) else {}, max_len=protocol.MAX_TOOL_LABEL_CHARS)
+        message = protocol.tool(
+            chat_id, tool_call_id, tool_name, phase, label=label,
+            # Hermes says ok, error or blocked (a policy refused it).
+            ok=None if phase == "start" else status in (None, "ok"),
+            duration_ms=duration_ms if phase == "end" and isinstance(duration_ms, (int, float)) else None)
+        # Every connected adapter: the bridge keeps a step only for a
+        # conversation of its connection's agent.
+        for adapter in list(_ADAPTERS):
+            adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
+    except Exception:
+        logger.debug("[enclos] A tool step was not passed on", exc_info=True)
+    return None
+
+
 def _env_enablement() -> dict | None:
     """On for an agent whose secrets give it a socket and a token."""
     socket_path = _setting(None, "socket", "MOBILE_APP_SOCKET")
@@ -373,3 +416,5 @@ def register(ctx) -> None:
         allow_all_env="MOBILE_APP_ALLOW_ALL",
         emoji="📱",
         platform_hint=protocol.PLATFORM_HINT)
+    ctx.register_hook("pre_tool_call", lambda **kwargs: _tool_step("start", **kwargs))
+    ctx.register_hook("post_tool_call", lambda **kwargs: _tool_step("end", **kwargs))
