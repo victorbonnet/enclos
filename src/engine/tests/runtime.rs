@@ -3137,6 +3137,42 @@ fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
     assert!(done(configure(&users, Confirm::Yes).unwrap()).reachable);
 }
 
+/// The app channel gives the plugin the public key the bridge signs
+/// runtime-approval decisions with (ADR 0060): made by the first run that
+/// needs it, the user's alone, kept after, and named, not made, by a dry
+/// run. (A whole `runtime configure --channel app` here would need a socket
+/// path shorter than a test's folder gives on macOS.)
+#[test]
+fn the_app_channel_gives_the_plugin_the_bridges_approval_key() {
+    let (_dir, engine) = super::engine_with(Vec::new());
+    let key = engine.app_approval_key_path();
+    let named = engine.app_approval_public_key(Confirm::DryRun).unwrap();
+    assert!(named.contains("made when this runs"), "{named}");
+    assert!(!key.exists());
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    let public = engine.app_approval_public_key(Confirm::Yes).unwrap();
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        public,
+        crate::bridge::keys::approval_key(&key)
+            .unwrap()
+            .public_text()
+    );
+    // Again, and in a dry run: the same key, never a new one the plugins
+    // would not know.
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::Yes).unwrap(),
+        public
+    );
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::DryRun).unwrap(),
+        public
+    );
+}
+
 /// A token granted only by the pending policy waits for it: nothing
 /// runs before `policy apply`.
 #[test]
@@ -3425,6 +3461,8 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
         "{plan:?}"
     );
     nothing_ran(&lab);
+    // Nor makes the bridge's key for runtime approvals (ADR 0060): it names it.
+    assert!(!lab.engine.app_approval_key_path().exists());
 
     let Planned::Done(configured) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
         panic!("not a dry run");
@@ -3439,15 +3477,25 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
     assert_eq!(
         configured.settings,
-        ["MOBILE_APP_SOCKET", "MOBILE_APP_ALLOW_ALL"]
+        [
+            "MOBILE_APP_SOCKET",
+            "MOBILE_APP_ALLOW_ALL",
+            "MOBILE_APP_HOME_CHANNEL",
+            "agent.clarify_timeout",
+            "MOBILE_APP_BRIDGE_KEY"
+        ]
     );
+    // The public key of the bridge's key for runtime approvals, made now.
+    let public = crate::bridge::keys::approval_key(&lab.engine.app_approval_key_path())
+        .unwrap()
+        .public_text();
     assert_eq!(
         std::fs::read_to_string(lab.home.join(".hermes/plugins/enclos/plugin.yaml")).unwrap(),
         include_str!("../../../channels/hermes/enclos/plugin.yaml")
     );
     assert!(
         calls().ends_with(&format!(
-            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n",
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n-p default config set agent.clarify_timeout 3600\n-p default config set MOBILE_APP_BRIDGE_KEY {public}\n",
             socket.display()
         )),
         "{}",
