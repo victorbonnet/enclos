@@ -590,14 +590,14 @@ mod tests {
     #[test]
     fn current_conversation_owner_controls_pending_snapshots_including_claimed_home() {
         let (_dir, store, _) = fixture();
-        store.ensure_home("lab/coder", "").unwrap();
+        store.ensure_home("lab/coder", "", false).unwrap();
         let home = ConversationId::new(home_id("lab/coder")).unwrap();
         let definition = definition("home-question");
         store
             .ask_question("lab/coder", &home, &definition, "home-ask")
             .unwrap();
         assert!(store.pending_questions_for("owner").unwrap().is_empty());
-        store.ensure_home("lab/coder", "owner").unwrap();
+        store.ensure_home("lab/coder", "owner", false).unwrap();
         assert_eq!(
             store.question(&definition.id).unwrap().unwrap().owner,
             "owner"

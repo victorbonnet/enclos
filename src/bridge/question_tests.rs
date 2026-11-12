@@ -44,26 +44,21 @@ fn fixture() -> (
     Receiver<ToDevice>,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Arc::new(Hub {
-        transport: Transport::Tailscale,
-        store_path: dir.path().join("app.db"),
-        layout: crate::layout::Layout::at(dir.path().join("enclos")),
-        bridge_private: vec![],
-        agents: vec![AgentEndpoint {
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        Arc::new(|_: &str| Err("no transport in this test".to_owned())),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![AgentEndpoint {
             name: AGENT.into(),
             runtime: "hermes".into(),
             socket: dir.path().join("plugin.sock"),
             token: "secret".into(),
         }],
-        host: Some(OWNER.into()),
-        plugins: Mutex::new(HashMap::new()),
-        routines: Mutex::new(Default::default()),
-        questions: Mutex::new(Default::default()),
-        commands: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
-        stops: Mutex::new(Default::default()),
-        devices: Mutex::new(HashMap::new()),
-    });
+        Some(OWNER.into()),
+        SILENCE,
+    ));
     let store = hub.store().unwrap();
     store.conversation("owned", "lab", "coder", OWNER).unwrap();
     store
@@ -90,13 +85,14 @@ fn phone(hub: &Hub, store: &Store, id: &str, person: &str) -> (Device, Receiver<
         push_token: None,
         paired: now(),
         seen: None,
+        node: None,
     };
     store.add_device(&device).unwrap();
     let (tx, rx) = channel();
     hub.devices
         .lock()
         .unwrap()
-        .insert(id.into(), (person.into(), tx));
+        .insert(id.into(), (person.into(), tx, 0));
     (device, rx)
 }
 
@@ -997,6 +993,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
         let mut link = Link {
             socket,
             session: bridge_session,
+            heard: std::time::Instant::now(),
         };
         let store = server_hub.store().unwrap();
         run_session(&server_hub, &store, &mut link, &device, OWNER, &rx)

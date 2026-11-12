@@ -425,12 +425,23 @@ impl Hub {
             ..request
         };
         let rpc = rpc_id(&device.id, person, &original);
-        // A live writer and its epoch are held through registration and send. No offline queue or reconnect retry.
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let mut requests = self.questions.lock().expect("not poisoned");
+        // No offline queue or reconnect retry. The answer is registered under
+        // the agent's current connection and written through its plugin's own
+        // lock, never with the plugins lock held: a plugin slow to read holds
+        // up only those writing to it.
         let current = self
             .question_authority(store, device, person, &request.question)
             .map_err(|_| failure(original.clone(), ErrorCode::NotFound, "No such question."))?;
+        let found = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            plugins.get(&current.info.agent).map(|plugin| {
+                (
+                    Arc::clone(&plugin.out),
+                    plugin.capabilities.contains(&Capability::Questions),
+                )
+            })
+        };
+        let mut requests = self.questions.lock().expect("not poisoned");
         request
             .answer
             .validate(&current.info.definition)
@@ -449,7 +460,6 @@ impl Hub {
             }
             let response = response.clone();
             drop(requests);
-            drop(plugins);
             self.deliver_question_device(store, &device.id, person, &request.question, response);
             return Ok(());
         }
@@ -467,7 +477,6 @@ impl Hub {
         if current.info.state != QuestionState::Pending || current.info.revision != request.revision
         {
             drop(requests);
-            drop(plugins);
             self.deliver_question_device(
                 store,
                 &device.id,
@@ -485,14 +494,14 @@ impl Hub {
         }
         // Until the answer is written to the channel, a refusal is certain:
         // nothing was sent, and answering again is safe (`agent_unavailable`).
-        let Some((writer, capabilities)) = plugins.get_mut(&current.info.agent) else {
+        let Some((out, questions)) = found else {
             return Err(failure(
                 original,
                 ErrorCode::AgentUnavailable,
                 "The agent is disconnected. Nothing was sent; answer again when it is back.",
             ));
         };
-        if !capabilities.contains(&Capability::Questions) {
+        if !questions {
             return Err(failure(
                 original,
                 ErrorCode::Unsupported,
@@ -535,14 +544,15 @@ impl Hub {
             },
         );
         drop(requests);
-        if let Err(error) = writer.send_with_id(
+        let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::QuestionAnswer {
                 conversation: current.info.conversation,
                 question: request.question.clone(),
                 answer: request.answer,
             },
-        ) {
+        );
+        if let Err(error) = sent {
             let mut requests = self.questions.lock().expect("not poisoned");
             let pending = requests.pending.remove(rpc.as_str());
             let error = failure(
@@ -588,7 +598,7 @@ impl Hub {
             .iter()
             .any(|d| d.id == device && d.person == person);
         if paired
-            && let Some((owner, sender)) = self.devices.lock().expect("not poisoned").get(device)
+            && let Some((owner, sender, _)) = self.devices.lock().expect("not poisoned").get(device)
             && owner == person
         {
             let _ = sender.send(response);
@@ -625,7 +635,7 @@ impl Hub {
         });
         let paired = store.devices().unwrap_or_default();
         let devices = self.devices.lock().expect("not poisoned");
-        for (device, (person, sender)) in devices.iter() {
+        for (device, (person, sender, _)) in devices.iter() {
             if person == &current.owner
                 && paired
                     .iter()
