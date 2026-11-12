@@ -10,9 +10,9 @@
 use std::time::{Duration, Instant};
 
 /// The messages an agent may have stored at once, after a quiet time.
-pub const BURST: f64 = 30.0;
+pub const BURST: f64 = 120.0;
 /// How many more it may have stored each minute, past the burst.
-pub const PER_MINUTE: f64 = 30.0;
+pub const PER_MINUTE: f64 = 60.0;
 
 /// One agent's room for messages: a token bucket of [`BURST`], filled at
 /// [`PER_MINUTE`].
@@ -54,11 +54,13 @@ mod tests {
     fn a_burst_is_stored_then_one_message_at_the_pace() {
         let start = Instant::now();
         let mut pace = Pace::new(start);
-        for _ in 0..BURST as usize {
+        // 120 at once, as docs/protocol.md says
+        for _ in 0..120 {
             assert_eq!(pace.take(start), Ok(()));
         }
+        // then 60 a minute: one a second
         let wait = pace.take(start).unwrap_err();
-        assert_eq!(wait, Duration::from_secs_f64(60.0 / PER_MINUTE));
+        assert_eq!(wait, Duration::from_secs(1));
         // Half the wait is not enough; all of it is.
         assert!(pace.take(start + wait / 2).is_err());
         assert_eq!(pace.take(start + wait), Ok(()));
