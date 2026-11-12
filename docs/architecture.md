@@ -81,6 +81,12 @@ Every client calls the `Engine` in `src/engine.rs`. A command that changes anyth
 
 A sandbox's policy is resolved from four layers: built-in defaults, a template (`minimal` or `assistant`), the runtime adapter's endpoints, and the sandbox's own `policy.toml`. The result is an immutable snapshot identified by its hash ([ADR 0018](adr/0018-immutable-policy-snapshots.md)), and the backend compiles it into a `.sb` file under `sandboxes/<name>/compiled/`. [Policy compilation](policy-compilation.md) follows a policy through each step.
 
+## A second runtime in milestone 5
+
+[The OpenClaw plan](m5-openclaw.md) deepens three existing seams: the runtime adapter describes native commands, identities, observations, settings and service behavior; the runtime's channel plugin translates native conversations/events/controls into enclos's protocol; the bridge keeps its runtime-neutral history, metadata, groups and authority. The engine retains protected I/O, process identity, secret-store access, policy, state and audit. Native parsing and command spelling stay in the adapter/plugin, so callers do not learn each runtime's configuration or account model.
+
+The planned changes distinguish a removable native default from a permanent built-in agent, make observation and secret-consumer formats runtime-specific, and declare trusted listener selection without widening loopback access. A capability is advertised only after the installed runtime/plugin fulfills its contract; unsafe or unavailable native controls are explicit. The source findings are not runtime probe results. Implementation and acceptance start on macOS; Linux-specific work and live acceptance remain the final step on the new host. The Hermes examples above describe the existing implementation, and do not claim that OpenClaw has already passed those gates.
+
 ## A session, step by step
 
 `enclos connect lab -- main`, which runs Hermes's own command for the agent `main`:
