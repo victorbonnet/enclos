@@ -290,6 +290,9 @@ pub enum Capability {
     Routines,
     Questions,
     RuntimeApprovals,
+    /// Independent native approval scopes plus their persistence/fallback
+    /// descriptions; extends, rather than replaces, RuntimeApprovals.
+    RuntimeApprovalScopes,
     #[serde(other)]
     Unknown,
 }

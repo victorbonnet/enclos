@@ -1293,8 +1293,16 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
             break message;
         }
     };
+    let mut device_capabilities = Vec::new();
     let device = match (first.body, known) {
-        (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
+        (
+            FromDevice::Auth {
+                device,
+                sig,
+                capabilities,
+            },
+            Some(known),
+        ) if known.id == device => {
             let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
             if check_signature(
                 &known.device_key,
@@ -1317,6 +1325,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
                     &format!("the device is {}'s, and {person} is calling", known.person),
                 ));
             }
+            device_capabilities = capabilities;
             match &known.node {
                 Some(node) if *node == caller.node_id => {}
                 Some(_) => {
@@ -1376,6 +1385,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
     hub.ensure_homes(&store);
     let (sender, outbox) = channel();
+    hub.question_device_capabilities(&device.id, &device_capabilities);
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
         .lock()
@@ -1391,6 +1401,8 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
         let mut devices = hub.devices.lock().expect("not poisoned");
         if devices.get(&device.id).map(|d| d.2) == Some(this) {
             devices.remove(&device.id);
+            drop(devices);
+            hub.question_device_capabilities(&device.id, &[]);
         }
     }
     let _ = store.device_seen(&device.id);
@@ -1817,7 +1829,9 @@ fn run_session(
                     .pending_questions_for(person)
                     .map_err(|e| e.to_string())?
                 {
-                    if hub.shows_question(person, &question.info.definition) {
+                    if hub.question_supported_by_device(&device.id, &question.info.definition)
+                        && hub.shows_question(person, &question.info.definition)
+                    {
                         link.send(ToDevice::Question {
                             question: question.info,
                         })?;
@@ -1843,6 +1857,7 @@ fn run_session(
                         && let Some(current) =
                             store.question(question).map_err(|e| e.to_string())?
                         && current.owner == person
+                        && hub.question_supported_by_device(&device.id, &current.info.definition)
                         && hub.shows_question(person, &current.info.definition)
                     {
                         link.send(ToDevice::Question {
@@ -2695,6 +2710,7 @@ mod connection_end_tests {
             FromDevice::Auth {
                 device: phone.id.clone(),
                 sig: encode(signature.to_der().as_bytes()),
+                capabilities: Vec::new(),
             },
         );
         let first = device.receive();

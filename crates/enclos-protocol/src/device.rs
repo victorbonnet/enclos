@@ -51,7 +51,14 @@ pub enum FromDevice {
     /// and its hardware key's DER signature of the handshake hash for
     /// `auth` ([`crate::pairing::Signed::Auth`]).
     #[serde(rename = "auth")]
-    Auth { device: String, sig: String },
+    Auth {
+        device: String,
+        sig: String,
+        /// Optional per-connection capabilities. Old auth packets default
+        /// to none; old bridges ignore this additive field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
+    },
     /// First after the handshake of a device that is pairing.
     #[serde(rename = "pair.request")]
     PairRequest {
@@ -687,6 +694,7 @@ mod tests {
             FromDevice::Auth {
                 device: "d1".into(),
                 sig: "c2ln".into(),
+                capabilities: vec![Capability::RuntimeApprovalScopes],
             },
             FromDevice::Agents,
             FromDevice::MessageSend {
@@ -891,4 +899,11 @@ mod tests {
         // A Noise transport message is 65,535 bytes, its tag 16 of them.
         assert!(line.len() <= 65_535 - 16, "{} bytes", line.len());
     }
+}
+
+#[test]
+fn old_auth_packets_negotiate_no_native_scope_extension() {
+    let old = br#"{"v":1,"id":"auth","type":"auth","device":"phone","sig":"sig"}"#;
+    assert!(matches!(decode_from_device(old).unwrap().body,
+            FromDevice::Auth { capabilities, .. } if capabilities.is_empty()));
 }

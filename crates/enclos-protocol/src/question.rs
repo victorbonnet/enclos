@@ -71,6 +71,21 @@ pub struct RuntimeApprovalDefinition {
     /// either is offered, so the person sees how far the grant reaches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Opt-in native scope semantics, requiring `runtime_approval_scopes`
+    /// on both plugin and device legs. Absent: the legacy Hermes-shaped
+    /// scope contract, including Always requiring Session and the patterns
+    /// a session or always grant covers, still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<RuntimeApprovalScopes>,
+}
+
+/// Native persistence and fallback instructions, displayed literally by
+/// structured clients. The runtime supplies them with its exact offered
+/// actions; the bridge does not synthesize native command syntax.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeApprovalScopes {
+    pub description: String,
+    pub fallback: String,
 }
 
 impl RuntimeApprovalDefinition {
@@ -85,10 +100,17 @@ impl RuntimeApprovalDefinition {
         if revealed(&self.command).len() > MAX_QUESTION_BYTES {
             return Err("The display command is too long to show in full.".into());
         }
+        if let Some(scopes) = &self.scopes {
+            text(&scopes.description, "Native scope description", true)?;
+            text(&scopes.fallback, "Native approval instructions", true)?;
+            bounded(scopes, MAX_ANSWER_BYTES, "Native approval scopes")?;
+        }
         if !self.actions.contains(&Deny)
             || (self.actions != [Deny] && !self.actions.contains(&Once))
             || self.actions.windows(2).any(|pair| pair[0] >= pair[1])
-            || (self.actions.contains(&Always) && !self.actions.contains(&Session))
+            || (self.scopes.is_none()
+                && self.actions.contains(&Always)
+                && !self.actions.contains(&Session))
             || (self.smart_denied && self.actions.iter().any(|a| !matches!(a, Once | Deny)))
         {
             return Err("Runtime approval actions must be ordered, distinct and permitted by the native gate.".into());
@@ -107,7 +129,9 @@ impl RuntimeApprovalDefinition {
         for pattern in &self.patterns {
             text(pattern, "Approval pattern", false)?;
         }
-        if self.grants_patterns() && self.patterns.is_empty() {
+        // Under native scopes the runtime's own description says how far a
+        // grant reaches; otherwise its patterns must.
+        if self.scopes.is_none() && self.grants_patterns() && self.patterns.is_empty() {
             return Err(
                 "A session or always grant must name the runtime patterns it covers.".into(),
             );
@@ -282,7 +306,11 @@ impl QuestionDefinition {
             let actions = format!(
                 "Offered: {offered}. Only the host's person can answer this approval, with the buttons of an updated app; typed approval commands are not passed on."
             );
-            let scopes = if approval.grants_patterns() {
+            let scopes = if let Some(scopes) = &approval.scopes {
+                // How far a grant reaches, and the runtime's own approval
+                // surface, in its words: nothing typed here is passed on.
+                format!("{}\n\n{}\n\n", scopes.description, scopes.fallback)
+            } else if approval.grants_patterns() {
                 format!(
                     "A session or always grant covers every command matching: {}. An always grant persists in the runtime until removed there. ",
                     approval.patterns.join("; ")
@@ -833,6 +861,7 @@ mod tests {
                 ],
                 smart_denied: false,
                 patterns: vec!["recursive delete".into()],
+                scopes: None,
             }),
         }
     }
@@ -922,6 +951,57 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.approval.as_mut().unwrap().command = "hello\r\nworld\tend".into();
         invalid.validate().unwrap();
+    }
+
+    #[test]
+    fn independent_native_scopes_require_explicit_semantics_and_keep_native_fallback() {
+        use RuntimeApprovalAction::{Always, Deny, Once};
+        let mut definition = approval_definition();
+        let approval = definition.approval.as_mut().unwrap();
+        approval.actions = vec![Once, Always, Deny];
+        assert!(
+            approval.validate().is_err(),
+            "legacy scopes still require Session"
+        );
+        approval.scopes = Some(RuntimeApprovalScopes {
+            description: "Always remembers this exact argv and working directory.".into(),
+            fallback: "Use the runtime's native approval surface for request native-7.".into(),
+        });
+        definition.validate().unwrap();
+        QuestionAnswer::Approval { action: Always }
+            .validate(&definition)
+            .unwrap();
+        let fallback = definition.fallback_text();
+        for expected in [
+            "printf 'bonjour 🤖'",
+            "Allow once",
+            "Always allow",
+            "Deny",
+            "exact argv",
+            "native-7",
+        ] {
+            assert!(fallback.contains(expected), "{fallback}");
+        }
+        assert!(!fallback.contains("/approve") && !fallback.contains("pattern"));
+        let encoded = serde_json::to_vec(&definition).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<QuestionDefinition>(&encoded).unwrap(),
+            definition
+        );
+        let approval = definition.approval.as_mut().unwrap();
+        approval.smart_denied = true;
+        assert!(
+            approval.validate().is_err(),
+            "scope metadata never widens smart denial"
+        );
+        approval.smart_denied = false;
+        for invalid in ["", " \n", "bad\0value"] {
+            approval.scopes.as_mut().unwrap().description = invalid.into();
+            assert!(approval.validate().is_err());
+        }
+        approval.scopes.as_mut().unwrap().description = "native persistence".into();
+        approval.scopes.as_mut().unwrap().fallback = "x".repeat(MAX_ANSWER_BYTES);
+        assert!(approval.validate().is_err());
     }
 
     #[test]
