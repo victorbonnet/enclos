@@ -181,7 +181,6 @@ fn hub_with(
         store_path: dir.join("app.db"),
         bridge_private: vec![0; 32],
         agents: Vec::new(),
-        host: Mutex::new(None),
         plugins: Mutex::new(HashMap::new()),
         generations: AtomicU64::new(0),
         devices: Mutex::new(devices),
