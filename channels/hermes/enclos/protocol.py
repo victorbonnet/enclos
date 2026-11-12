@@ -7,6 +7,7 @@ an unknown `type` is told apart from a known one with bad fields.
 
 import hmac
 import json
+import re
 import uuid
 from typing import Any
 
@@ -14,8 +15,10 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("hello", "message.in", "ack", "error")
-CAPABILITIES = ("notify", "typing")
+FROM_BRIDGE_TYPES = ("hello", "message.in", "conversation.rename", "ack", "error")
+CAPABILITIES = ("notify", "typing", "titles")
+# The longest conversation title sent (Hermes' own limit is 100 characters).
+MAX_TITLE_CHARS = 100
 
 # What the runtime tells the agent about this channel, in its system prompt
 # (Hermes: the platform's `platform_hint`): where the person is, and what the
@@ -99,6 +102,9 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
             _check_text(message.get("text"), "text")
+        elif kind == "conversation.rename":
+            _check_id(message.get("conversation"), "conversation")
+            _check_text(message.get("title"), "title")
         elif kind == "ack":
             _check_id(message.get("of"), "of")
         elif kind == "error":
@@ -161,6 +167,18 @@ def message_out(conversation: str, text: str, reply_to: str | None = None) -> di
 
 def typing(conversation: str, on: bool) -> dict[str, Any]:
     return _message("typing", conversation=conversation, on=on)
+
+
+def title(conversation: str, text: str) -> dict[str, Any]:
+    """The runtime's name for a conversation, on one line, at most MAX_TITLE_CHARS."""
+    one_line = " ".join(text.split())[:MAX_TITLE_CHARS]
+    return _message("conversation.title", conversation=conversation, title=one_line)
+
+
+def runtime_title(text: str) -> str:
+    """A Hermes session title as the app should show it: without the ` #2`
+    Hermes adds to keep its titles unique, which says nothing to the person."""
+    return re.sub(r"\s+#\d+$", "", " ".join(text.split()))
 
 
 def ack(of: str) -> dict[str, Any]:

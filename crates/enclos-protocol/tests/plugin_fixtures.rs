@@ -17,6 +17,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_bridge_message_in.json"),
     ),
     ("ack", include_str!("fixtures/plugin/from_bridge_ack.json")),
+    (
+        "conversation_rename",
+        include_str!("fixtures/plugin/from_bridge_conversation_rename.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -39,6 +43,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "error",
         include_str!("fixtures/plugin/from_plugin_error.json"),
+    ),
+    (
+        "conversation_title",
+        include_str!("fixtures/plugin/from_plugin_conversation_title.json"),
     ),
 ];
 
@@ -109,6 +117,25 @@ fn a_message_reads_as_its_fields_say() {
         panic!("not an error: {:?}", message.body);
     };
     assert_eq!(error.code, ErrorCode::AgentUnavailable);
+
+    let message = decode_from_bridge(FROM_BRIDGE[3].1.as_bytes()).unwrap();
+    let FromBridge::Rename {
+        conversation,
+        title,
+    } = message.body
+    else {
+        panic!("not a conversation.rename: {:?}", message.body);
+    };
+    assert_eq!(
+        (conversation.as_str(), title.as_str()),
+        ("c-42", "Weather in Paris")
+    );
+
+    let message = decode_from_plugin(FROM_PLUGIN[5].1.as_bytes()).unwrap();
+    let FromPlugin::Title { title, .. } = message.body else {
+        panic!("not a conversation.title: {:?}", message.body);
+    };
+    assert_eq!(title, "Paris weather this week");
 }
 
 #[test]

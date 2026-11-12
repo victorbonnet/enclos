@@ -55,8 +55,12 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? (reserved; version 1 defines none, and a receiver ignores it) | A person's message to the agent |
 | `message.out` | plugin | `conversation`, `text`, `kind` (`reply` or `notify`), `reply_to`? | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work) |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
+| `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
+| `conversation.rename` | bridge | `conversation`, `title` (empty: no name) | The person named the conversation, or cleared its name |
 | `ack` | either | `of` (the acknowledged `id`) | Received and stored |
 | `error` | either | `of`?, `code`, `message` | See [Errors](#errors) |
+
+**A conversation's name.** The bridge keeps one name per conversation and who gave it. The runtime's (`conversation.title`, for one of its own agent's conversations) replaces the runtime's; the person's (`conversation.rename` from a device) replaces any, and the runtime's no longer replaces it until the person clears it. Whoever gives it, the bridge keeps a name on one line, drops the hidden characters (control, bidirectional, zero-width and the like, as `enclos_protocol::visible` lists them) and cuts it to 100 characters: it does not rely on the plugin's cut, which runs in the sandbox. The bridge passes the person's name on to the plugin, so the runtime can keep it too (Hermes: the session's title, with the user's authority). Hermes names every session on its own and tells no plugin, so its plugin reads the title after each reply, and a little later, and sends it when it changed.
 
 **What the agent says is markdown.** The `text` of a `message.out` is CommonMark with GitHub's tables, strikethrough and bare links; a device draws it, and fetches and runs nothing in it: an image shows as its alt text, a link to it, and is never loaded; HTML shows as its text; and only `http`, `https` and `mailto` links open (the app's [ADR 0002](https://github.com/victorbonnet/enclos-app/blob/main/docs/adr/0002-messages-are-markdown-drawn-by-the-app.md), proposed). A plugin tells its runtime so (Hermes: the platform's `platform_hint`), so that the agent formats when it helps. What a person sends (`message.in`) is plain text, shown as typed.
 
@@ -108,9 +112,11 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `agents.list` | bridge | `agents`: `[{"agent":"lab/main","runtime":"hermes","capabilities":[…],"abilities":["read","chat"]}]` | The list, filtered to what is shared with the person |
 | `conversation.new` | device | `conversation`, `agent` | Start one; its owner is the device's person |
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
+| `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
+| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts or its name changes |
 | `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq` | A message of a conversation, sent and received alike, in order |
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
-| `sync` | device | `since` (a `seq`, or 0) | Every `message` of the person's conversations after `since`, then `synced` |
+| `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, then every `message` of them after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
 | `status.report` | bridge | as `enclos app status --json` | |
@@ -143,8 +149,9 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `attachments` | It takes and sends files; version 1 defines none yet |
 | `approval` | It asks before running something; reserved, no messages in version 1 |
 | `abort` | It can stop an answer; reserved, no messages in version 1 |
+| `titles` | It names conversations (`conversation.title`) and keeps the person's names |
 
-Hermes and OpenClaw are meant to have `notify` and `typing`. A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
+Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin also has `titles`. A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 
 ## Errors
 

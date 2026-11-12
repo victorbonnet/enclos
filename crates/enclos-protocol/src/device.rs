@@ -45,6 +45,13 @@ pub enum FromDevice {
         conversation: ConversationId,
         text: String,
     },
+    /// Names the conversation; an empty `title` clears the name, and the
+    /// runtime may name it again.
+    #[serde(rename = "conversation.rename")]
+    ConversationRename {
+        conversation: ConversationId,
+        title: String,
+    },
     #[serde(rename = "sync")]
     Sync { since: i64 },
     #[serde(rename = "push.token")]
@@ -61,6 +68,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "agents",
     "conversation.new",
     "message.send",
+    "conversation.rename",
     "sync",
     "push.token",
     "ack",
@@ -80,6 +88,10 @@ pub enum ToDevice {
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
+    /// One of the person's conversations: each at `sync`, before the
+    /// messages, and again whenever its name changes.
+    #[serde(rename = "conversation")]
+    Conversation(ConversationInfo),
     #[serde(rename = "message")]
     Message(ConversationMessage),
     #[serde(rename = "typing")]
@@ -100,6 +112,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "pair.accepted",
     "pair.refused",
     "agents.list",
+    "conversation",
     "message",
     "typing",
     "synced",
@@ -121,6 +134,19 @@ pub struct AgentInfo {
     pub runtime: String,
     pub capabilities: Vec<Capability>,
     pub abilities: Vec<String>,
+}
+
+/// A conversation: its agent, and its name when it has one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    pub conversation: ConversationId,
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Who named it: `agent` (its runtime), or `person`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titled_by: Option<String>,
 }
 
 /// One message of a conversation, sent or received alike.

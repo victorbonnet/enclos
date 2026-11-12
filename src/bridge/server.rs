@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use enclos_protocol::device::{
-    AgentInfo, ConversationMessage, FromDevice, ToDevice, decode_from_device, split_text,
+    AgentInfo, ConversationInfo, ConversationMessage, FromDevice, ToDevice, decode_from_device,
+    split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
@@ -35,7 +36,10 @@ use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
-use super::store::{Added, Device, From, PairingRequest, Store, now};
+use super::store::{
+    Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
+    conversation_title, now,
+};
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
 
@@ -144,6 +148,16 @@ impl Hub {
         }
     }
 
+    /// Sends conversation `id`, with its name, to every connected device of
+    /// `person`: after its name changed.
+    fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
+        if let Ok(Some(c)) = store.conversation_info(id)
+            && let Some(info) = conversation_info(c)
+        {
+            self.deliver(person, ToDevice::Conversation(info));
+        }
+    }
+
     /// The agent's plugin connection, opened if it is not; its reader runs
     /// in a thread of its own, storing what the agent says and passing it
     /// on to the conversation's owner.
@@ -240,6 +254,25 @@ impl Hub {
                             && format!("{sandbox}/{with}") == agent
                         {
                             hub.deliver(&owner, ToDevice::Typing { conversation, on });
+                        }
+                    }
+                    // The runtime's name for one of this agent's own
+                    // conversations: kept unless the person named it, cut
+                    // and cleaned in `Store::name` (`conversation_title`).
+                    FromPlugin::Title {
+                        conversation,
+                        title,
+                    } => {
+                        let id = conversation.as_str();
+                        let mine = matches!(
+                            store.conversation_info(id),
+                            Ok(Some(c)) if format!("{}/{}", c.sandbox, c.agent) == agent
+                        );
+                        if mine
+                            && let Ok(true) = store.name(id, &title, BY_AGENT)
+                            && let Ok(Some(owner)) = store.owner(id)
+                        {
+                            hub.deliver_conversation(&store, &owner, id);
                         }
                     }
                     _ => {}
@@ -932,6 +965,8 @@ fn run_session(
                 store
                     .conversation(conversation.as_str(), sandbox, name, person)
                     .map_err(|e| e.to_string())?;
+                // The person's other devices learn of it too.
+                hub.deliver_conversation(store, person, conversation.as_str());
             }
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
@@ -942,7 +977,19 @@ fn run_session(
                     link.send(answer)?;
                 }
             }
+            FromDevice::ConversationRename {
+                conversation,
+                title,
+            } => {
+                rename(hub, store, person, &conversation, &title)?;
+            }
             FromDevice::Sync { since } => {
+                // Every conversation first, named or empty, then the messages.
+                for c in store.conversations(person).map_err(|e| e.to_string())? {
+                    if let Some(info) = conversation_info(c) {
+                        link.send(ToDevice::Conversation(info))?;
+                    }
+                }
                 let mut last = since;
                 for m in store.since(person, since).map_err(|e| e.to_string())? {
                     let agent = store
@@ -976,6 +1023,65 @@ fn run_session(
             _ => {}
         }
     }
+}
+
+/// A conversation for a device: `None` for an id the protocol refuses.
+fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
+    Some(ConversationInfo {
+        conversation: ConversationId::new(c.id).ok()?,
+        agent: format!("{}/{}", c.sandbox, c.agent),
+        title: c.title,
+        titled_by: c.titled_by,
+    })
+}
+
+/// The person names one of their conversations (or clears its name): stored,
+/// sent to their devices, and passed to the agent's plugin, so the runtime
+/// keeps the name and names it no more. A plugin that cannot be reached
+/// changes nothing: the bridge's name is the one the app shows. The name is
+/// cut and cleaned as [`conversation_title`] says, wherever it goes.
+fn rename(
+    hub: &Arc<Hub>,
+    store: &Store,
+    person: &str,
+    conversation: &ConversationId,
+    title: &str,
+) -> Result<(), String> {
+    let Some((sandbox, agent, owner)) = store
+        .conversation_of(conversation.as_str())
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    if owner != person {
+        return Ok(());
+    }
+    if !store
+        .name(conversation.as_str(), title, BY_PERSON)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
+    hub.deliver_conversation(store, person, conversation.as_str());
+    let name = format!("{sandbox}/{agent}");
+    if hub.plugin(&name).is_ok() {
+        // Written outside the plugins lock, as in forward
+        let out = {
+            let plugins = hub.plugins.lock().expect("not poisoned");
+            plugins.get(&name).map(|plugin| Arc::clone(&plugin.out))
+        };
+        if let Some(out) = out {
+            let _ = out
+                .lock()
+                .expect("not poisoned")
+                .writer
+                .send(FromBridge::Rename {
+                    conversation: conversation.clone(),
+                    title: conversation_title(title),
+                });
+        }
+    }
+    Ok(())
 }
 
 /// A person's message: stored once, echoed to the person's devices with
@@ -1179,12 +1285,17 @@ mod tests {
         }
 
         /// The next message, `None` once the bridge closed the connection.
+        /// A conversation's details (`conversation`, sent when one starts
+        /// or is named) are passed over: these tests are about messages.
         fn receive(&mut self) -> Option<ToDevice> {
             loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
                         let plain = self.session.decrypt(&bytes).unwrap();
-                        return Some(decode_to_device(&plain).unwrap().body);
+                        match decode_to_device(&plain).unwrap().body {
+                            ToDevice::Conversation(_) => continue,
+                            body => return Some(body),
+                        }
                     }
                     Ok(Message::Close(_)) => return None,
                     Ok(_) => {}

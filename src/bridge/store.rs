@@ -29,8 +29,60 @@ pub struct Message {
     pub at: i64,
 }
 
+/// A conversation, with its name when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    pub id: String,
+    pub sandbox: String,
+    pub agent: String,
+    pub title: Option<String>,
+    /// [`BY_AGENT`] or [`BY_PERSON`], when it has a name.
+    pub titled_by: Option<String>,
+}
+
+/// A conversation named by its runtime.
+pub const BY_AGENT: &str = "agent";
+/// A conversation named by its owner.
+pub const BY_PERSON: &str = "person";
+
+/// The longest name a conversation keeps, in characters.
+pub const MAX_TITLE_CHARS: usize = 100;
+
+/// A conversation's name as the bridge keeps it, whoever gave it: on one
+/// line, without hidden characters ([`enclos_protocol::visible`]), and at
+/// most [`MAX_TITLE_CHARS`]. The plugin's own cut runs in the sandbox, so
+/// the bridge does not rely on it: a name sent to devices must fit one
+/// Noise message, and must not read as another conversation's.
+pub fn conversation_title(text: &str) -> String {
+    let one_line: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let visible = enclos_protocol::visible::stripped(&one_line, false);
+    let words: Vec<&str> = visible.split_whitespace().collect();
+    let cut: String = words.join(" ").chars().take(MAX_TITLE_CHARS).collect();
+    cut.trim_end().to_owned()
+}
+
 pub struct Store {
     db: Connection,
+}
+
+/// Brings a database made by an earlier bridge up to [`SCHEMA`]: columns
+/// added since, which `CREATE TABLE IF NOT EXISTS` does not add.
+fn upgrade(db: &Connection) -> rusqlite::Result<()> {
+    let mut query = db.prepare("SELECT name FROM pragma_table_info('conversations')")?;
+    let columns = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (column, kind) in [("title", "TEXT"), ("titled_by", "TEXT")] {
+        if !columns.iter().any(|c| c == column) {
+            db.execute_batch(&format!(
+                "ALTER TABLE conversations ADD COLUMN {column} {kind}"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 const SCHEMA: &str = "
@@ -39,7 +91,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     sandbox TEXT NOT NULL,
     agent TEXT NOT NULL,
     owner TEXT NOT NULL,
-    created INTEGER NOT NULL
+    created INTEGER NOT NULL,
+    title TEXT,
+    titled_by TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,6 +251,7 @@ impl Store {
             .map_err(to_sqlite)?;
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        upgrade(&db)?;
         for (table, column, declaration) in ADDED_COLUMNS {
             add_column(&db, table, column, declaration)?;
         }
@@ -205,6 +260,70 @@ impl Store {
              CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
         )?;
         Ok(Store { db })
+    }
+
+    /// The person's conversations, the oldest first.
+    pub fn conversations(&self, owner: &str) -> rusqlite::Result<Vec<Conversation>> {
+        let mut query = self.db.prepare(
+            "SELECT id, sandbox, agent, title, titled_by FROM conversations WHERE owner = ?1 ORDER BY created, id",
+        )?;
+        let rows = query.query_map(params![owner], |row| {
+            Ok(Conversation {
+                id: row.get(0)?,
+                sandbox: row.get(1)?,
+                agent: row.get(2)?,
+                title: row.get(3)?,
+                titled_by: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Names a conversation, saying who named it ([`BY_AGENT`] or
+    /// [`BY_PERSON`]); whether its name changed. The person's name replaces
+    /// any, and an empty one clears it, so the runtime may name it again;
+    /// the runtime's never replaces the person's. The name is kept as
+    /// [`conversation_title`] gives it.
+    pub fn name(&self, id: &str, title: &str, by: &str) -> rusqlite::Result<bool> {
+        let title = conversation_title(title);
+        let title = title.as_str();
+        let changed = match (by, title.is_empty()) {
+            (BY_PERSON, true) => self.db.execute(
+                "UPDATE conversations SET title = NULL, titled_by = NULL WHERE id = ?1 AND title IS NOT NULL",
+                params![id],
+            )?,
+            (BY_PERSON, false) => self.db.execute(
+                "UPDATE conversations SET title = ?2, titled_by = ?3 WHERE id = ?1
+                 AND (title IS NOT ?2 OR titled_by IS NOT ?3)",
+                params![id, title, BY_PERSON],
+            )?,
+            (_, true) => 0,
+            _ => self.db.execute(
+                "UPDATE conversations SET title = ?2, titled_by = ?3 WHERE id = ?1
+                 AND titled_by IS NOT ?4 AND title IS NOT ?2",
+                params![id, title, by, BY_PERSON],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
+    /// A known conversation, with its name.
+    pub fn conversation_info(&self, id: &str) -> rusqlite::Result<Option<Conversation>> {
+        self.db
+            .query_row(
+                "SELECT id, sandbox, agent, title, titled_by FROM conversations WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Conversation {
+                        id: row.get(0)?,
+                        sandbox: row.get(1)?,
+                        agent: row.get(2)?,
+                        title: row.get(3)?,
+                        titled_by: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Records a conversation, owned by `owner`; one already known keeps
@@ -609,6 +728,92 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_persons_name_wins_over_the_runtimes() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        let title = |s: &Store| {
+            let c = s.conversation_info("c-1").unwrap().unwrap();
+            (c.title, c.titled_by)
+        };
+        assert_eq!(title(&store), (None, None));
+        // The runtime names it, and renames it.
+        assert!(store.name("c-1", "Weather", BY_AGENT).unwrap());
+        assert!(!store.name("c-1", "Weather", BY_AGENT).unwrap());
+        assert!(store.name("c-1", "Paris weather", BY_AGENT).unwrap());
+        // The person's name replaces it, and the runtime's no longer does.
+        assert!(store.name("c-1", " Trip ", BY_PERSON).unwrap());
+        assert!(!store.name("c-1", "Paris weather", BY_AGENT).unwrap());
+        assert_eq!(title(&store), (Some("Trip".into()), Some(BY_PERSON.into())));
+        // Cleared by the person: the runtime may name it again.
+        assert!(store.name("c-1", "", BY_PERSON).unwrap());
+        assert_eq!(title(&store), (None, None));
+        assert!(store.name("c-1", "Paris weather", BY_AGENT).unwrap());
+        assert_eq!(
+            store.conversations(owner).unwrap()[0].title.as_deref(),
+            Some("Paris weather")
+        );
+        assert!(store.conversations("someone@else").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_name_is_kept_on_one_visible_line_of_at_most_100_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@example.com")
+            .unwrap();
+        let title = |s: &Store| s.conversation_info("c-1").unwrap().unwrap().title;
+        // An agent's name far above one Noise message is cut.
+        assert!(store.name("c-1", &"w".repeat(70_000), BY_AGENT).unwrap());
+        assert_eq!(title(&store), Some("w".repeat(MAX_TITLE_CHARS)));
+        // A person's too.
+        assert!(store.name("c-1", &"p".repeat(500), BY_PERSON).unwrap());
+        assert_eq!(title(&store), Some("p".repeat(MAX_TITLE_CHARS)));
+        // Lines are joined and hidden characters dropped: a name cannot read
+        // as another one.
+        let tricky = "Trip\n to\u{2028}Paris \u{202E}fdp.exe\u{200B}";
+        assert!(store.name("c-1", tricky, BY_PERSON).unwrap());
+        assert_eq!(title(&store), Some("Trip to Paris fdp.exe".into()));
+        // A name made of hidden characters only is no name.
+        assert!(store.name("c-1", "\u{202E}\u{2066}\n", BY_PERSON).unwrap());
+        assert_eq!(title(&store), None);
+        // Joined emoji and Persian spelling are kept.
+        let kept = "\u{0645}\u{06CC}\u{200C}\u{0647} \u{2764}\u{FE0F}";
+        assert_eq!(conversation_title(kept), kept);
+    }
+
+    #[test]
+    fn a_database_from_an_earlier_bridge_gains_the_name_columns() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, sandbox TEXT NOT NULL,
+                 agent TEXT NOT NULL, owner TEXT NOT NULL, created INTEGER NOT NULL);
+                 INSERT INTO conversations VALUES ('c-1', 'lab', 'main', 'victor@example.com', 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.name("c-1", "Weather", BY_AGENT).unwrap());
+        // Opening it again changes nothing.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .conversation_info("c-1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Weather")
+        );
+    }
 
     #[test]
     fn the_database_is_the_users_alone() {
