@@ -161,8 +161,8 @@ impl Hub {
                 {
                     return self.request_access(store, agent, conversation, access, action);
                 }
-                if let Some(person) = &self.host {
-                    self.deliver(person, ToDevice::Approval(existing));
+                if let Some(person) = self.known_host() {
+                    self.deliver(&person, ToDevice::Approval(existing));
                 }
             }
             return Ok(());
@@ -233,8 +233,8 @@ impl Hub {
         if !store.create_approval(&a).map_err(|e| e.to_string())? {
             return Ok(());
         }
-        if let Some(person) = &self.host {
-            self.deliver(person, ToDevice::Approval(a));
+        if let Some(person) = self.known_host() {
+            self.deliver(&person, ToDevice::Approval(a));
         }
         Ok(())
     }
@@ -258,9 +258,9 @@ impl Hub {
         for a in store.approvals().map_err(|e| e.to_string())? {
             if self.is_probe(&a, &mut read)
                 && let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())?
-                && let Some(person) = &self.host
+                && let Some(person) = self.known_host()
             {
-                self.deliver(person, ToDevice::Approval(closed));
+                self.deliver(&person, ToDevice::Approval(closed));
             }
         }
         Ok(())
@@ -348,7 +348,7 @@ impl Hub {
         revision: &str,
         approve: bool,
     ) -> Result<(), String> {
-        if self.host.as_deref() != Some(person) {
+        if self.known_host().as_deref() != Some(person) {
             return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
         }
         // Recheck revocation immediately before the decision, not just at the handshake.
@@ -429,15 +429,24 @@ impl Hub {
             return;
         };
         if let Ok(text) = Engine::open(self.layout.clone()).access_context(&name) {
-            let mut plugins = self.plugins.lock().expect("not poisoned");
-            for (agent, plugin) in plugins.iter_mut() {
-                if agent.split('/').next() == Some(sandbox)
-                    && plugin.capabilities.contains(&Capability::Approval)
-                {
-                    let _ = plugin
-                        .writer
-                        .send(FromBridge::PolicyContext { text: text.clone() });
-                }
+            // Written outside the plugins lock, each through its plugin's own
+            let outs: Vec<_> = {
+                let plugins = self.plugins.lock().expect("not poisoned");
+                plugins
+                    .iter()
+                    .filter(|(agent, plugin)| {
+                        agent.split('/').next() == Some(sandbox)
+                            && plugin.capabilities.contains(&Capability::Approval)
+                    })
+                    .map(|(_, plugin)| Arc::clone(&plugin.out))
+                    .collect()
+            };
+            for out in outs {
+                let _ = out
+                    .lock()
+                    .expect("not poisoned")
+                    .writer
+                    .send(FromBridge::PolicyContext { text: text.clone() });
             }
         }
         self.open_plugins();

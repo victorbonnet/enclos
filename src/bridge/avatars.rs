@@ -124,8 +124,8 @@ impl Hub {
             .filter(|a| self.sees_agent(person, &a.name))
             .map(|a| AgentInfo {
                 avatar: photos.get(&a.name).cloned().unwrap_or_default(),
-                can_edit_avatar: self.host.as_deref() == Some(person),
-                can_manage_routines: self.host.as_deref() == Some(person),
+                can_edit_avatar: self.known_host().as_deref() == Some(person),
+                can_manage_routines: self.known_host().as_deref() == Some(person),
                 agent: a.name.clone(),
                 runtime: a.runtime.clone(),
                 capabilities: plugins
@@ -160,7 +160,7 @@ impl Hub {
                 "This agent is no longer listed by its host.".into(),
             ));
         }
-        if write && self.host.as_deref() != Some(person) {
+        if write && self.known_host().as_deref() != Some(person) {
             return Err(PhotoError::NotAllowed(
                 "Only the host's person can change a shared agent photo.".into(),
             ));

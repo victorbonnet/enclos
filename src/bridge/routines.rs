@@ -185,7 +185,7 @@ impl Hub {
         person: &str,
         agent: &str,
     ) -> Result<(), String> {
-        if self.host.as_deref() != Some(person) {
+        if self.known_host().as_deref() != Some(person) {
             return Err("Only the host's person can manage routines.".into());
         }
         self.avatar_authority(store, device, person, agent, false)

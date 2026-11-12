@@ -76,6 +76,13 @@ class Home(unittest.TestCase):
             with self.subTest(text[:20]):
                 self.assertFalse(protocol.is_notice(text))
 
+    def test_a_reply_that_starts_as_a_notice_reads_as_one(self):
+        # A notice is told by its first words only, as Hermes marks none: an
+        # agent's reply that starts with the same words is taken for one
+        # (a quiet line, and no title check). The choice, recorded.
+        self.assertTrue(protocol.is_notice(
+            "\u267b\ufe0f Gateway online \u2014 that is what the log said at 9:00."))
+
     def test_sethome_is_caught_however_written(self):
         for text in ["/sethome", "  /SetHome ", "/set-home now"]:
             self.assertTrue(protocol.is_home_command(text), text)
@@ -211,6 +218,19 @@ class Files(unittest.TestCase):
         self.assertEqual(found, [("Unicorn on the moon", "cache/generated/images/krea_1.png")])
         self.assertEqual(rest, "Here's your unicorn on the moon:\n\n"
                                "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
+
+    def test_a_local_image_that_cannot_be_sent_stays_in_the_text(self):
+        text = "Two:\n\n![a](images/a.png)\n\n![b](/etc/b.png)"
+        rest, found = protocol.local_images(text, lambda path: path == "images/a.png")
+        self.assertEqual(found, [("a", "images/a.png")])
+        self.assertEqual(rest, "Two:\n\n![b](/etc/b.png)")
+
+    def test_a_file_that_could_not_be_sent_is_said_in_the_text(self):
+        self.assertEqual(protocol.with_files_not_sent("Here", []), "Here")
+        self.assertEqual(protocol.with_files_not_sent("Here", ["a.pdf"]),
+                         "Here\n\n(A file could not be sent: a.pdf)")
+        self.assertEqual(protocol.with_files_not_sent("", ["a.pdf", "b.png"]),
+                         "(A file could not be sent: a.pdf)\n(A file could not be sent: b.png)")
 
 
 class CommandsTest(unittest.TestCase):
