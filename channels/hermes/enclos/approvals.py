@@ -9,6 +9,9 @@ import os
 from pathlib import Path
 from . import protocol
 
+# How long the tool waits for the bridge to keep or refuse a request.
+ANSWER_SECONDS = 10
+
 
 def save_context(socket: str, text: str) -> None:
     path = socket + ".policy-context"
@@ -25,6 +28,28 @@ def request(conversation: str, kind: str, target: str, action: str = "", private
     return protocol._message("approval.request", conversation=conversation,
         access={"kind": kind, "target": target, "private": private},
         action=(action or f"{kind.capitalize()} {target}")[:240])
+
+
+def answered(answers: dict, message: dict) -> None:
+    """Settles the wait for the message a bridge `ack` or `error` names.
+
+    The bridge sends an `error` before the `ack` of a request it refused, so
+    the first answer wins: the error's text, or None when it kept it.
+    """
+    future = answers.pop(message.get("of"), None) if message["type"] == "ack" else answers.get(message.get("of"))
+    if future is not None and not future.done():
+        future.set_result(message["message"] if message["type"] == "error" else None)
+
+
+def outcome(answers: list) -> dict:
+    """The tool's answer from each connection's: None (kept), an error's
+    text, or TimeoutError (the bridge did not answer in time)."""
+    if any(a is None for a in answers):
+        return {"status": "requested", "message": "Waiting for approval in the person's inbox. Access has not been granted. Do not retry until the active policy context grants it."}
+    refused = [a for a in answers if isinstance(a, str)]
+    if refused and len(refused) == len(answers):
+        return {"error": "The request was not filed: " + " ".join(dict.fromkeys(refused))}
+    return {"status": "queued", "message": "The request is saved, but the bridge has not answered yet, so it may not be in the person's inbox. Access has not been granted. Do not retry until the active policy context grants it."}
 
 
 def blocked_file(tool_name, args, result, error_message=""):
@@ -89,6 +114,18 @@ def register(ctx, adapters, socket_path, platform="enclos"):
             raise RuntimeError("The request outbox is full; the request was not saved.")
         await adapter._write(message)
 
+    async def submit(adapter, message):
+        """Sends a request and waits for the bridge to keep or refuse it."""
+        answer = asyncio.get_running_loop().create_future()
+        adapter._answers[message["id"]] = answer
+        try:
+            await enqueue(adapter, message)
+            return await asyncio.wait_for(asyncio.shield(answer), ANSWER_SECONDS)
+        except asyncio.TimeoutError:
+            return TimeoutError()
+        finally:
+            adapter._answers.pop(message["id"], None)
+
     def ask(args, **_):
         kind, target, action, private = args.get("kind"), args.get("target"), args.get("action", ""), args.get("private", False)
         try:
@@ -97,9 +134,10 @@ def register(ctx, adapters, socket_path, platform="enclos"):
             if not through:
                 return json.dumps({"error": "No enclos conversation is active."})
             message = request(conversation, kind, target, action, private)
-            for adapter in through:
-                asyncio.run_coroutine_threadsafe(enqueue(adapter, message), adapter._loop).result(timeout=5)
-            return json.dumps({"status": "requested", "message": "Waiting for approval in the person's inbox. Access has not been granted. Do not retry until the active policy context grants it."})
+            # The bridge may refuse it (a scope already decided under this
+            # policy, too many pending): the agent is told, not left waiting.
+            waits = [asyncio.run_coroutine_threadsafe(submit(adapter, message), adapter._loop) for adapter in through]
+            return json.dumps(outcome([w.result(timeout=ANSWER_SECONDS + 5) for w in waits]))
         except Exception as e:
             return json.dumps({"error": str(e)})
 
