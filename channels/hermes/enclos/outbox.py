@@ -6,9 +6,12 @@ name and renamed, so a crash never leaves half a message.
 """
 
 import json
+import logging
 import os
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _NAME = re.compile(r"^(\d{12})-([0-9a-f-]{36})\.json$")
 
@@ -48,10 +51,30 @@ class Outbox:
         for _, _, name in self._entries():
             try:
                 with open(os.path.join(self._folder, name), encoding="utf-8") as f:
-                    messages.append(json.load(f))
-            except (OSError, json.JSONDecodeError):
-                continue
+                    message = json.load(f)
+                if not isinstance(message, dict):
+                    raise ValueError("not a JSON object")
+                messages.append(message)
+            except (OSError, ValueError) as e:
+                logger.warning("[Enclos] Outbox: %s cannot be read (%s); it was set aside", name, e)
+                self._set_aside(name)
         return messages
+
+    def set_aside(self, message_id: str) -> bool:
+        """Takes a message out of the queue without sending it, keeping its
+        file under another name for whoever looks into it."""
+        for _, entry_id, name in self._entries():
+            if entry_id == message_id:
+                self._set_aside(name)
+                return True
+        return False
+
+    def _set_aside(self, name: str) -> None:
+        # A name `_NAME` does not match: neither sent nor counted
+        try:
+            os.replace(os.path.join(self._folder, name), os.path.join(self._folder, f"{name}.set-aside"))
+        except OSError as e:
+            logger.warning("[Enclos] Outbox: %s could not be set aside: %s", name, e)
 
     def acknowledge(self, message_id: str) -> bool:
         for _, entry_id, name in self._entries():
