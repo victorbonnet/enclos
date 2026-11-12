@@ -32,6 +32,9 @@ fn inputs(dir: &Path) -> ProbeInputs {
         target: Some(4242),
         other_terminal: None,
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: Default::default(),
     }
 }

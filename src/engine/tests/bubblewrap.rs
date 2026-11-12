@@ -90,7 +90,11 @@ exit 99"#,
         );
         let backend = Bubblewrap::at(&at("bwrap"), &at("systemd-run"), Some(at("enclos")));
         let layout = Layout::at(at("enclos-home"));
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         let socket = layout.proxy_socket("lab");
         // The proxy only tells its listener to listen: an interpreter starting
