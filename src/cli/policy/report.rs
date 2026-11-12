@@ -39,6 +39,7 @@ pub(super) fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "not_here": report.not_here,
         "not_probed": report.notes.not_probed,
         "listens": report.listens,
+        "open_by_policy": report.open_by_policy,
         "baseline": report.notes.baseline_key,
         "not_enforced": super::super::output::not_enforced(&report.not_enforced),
     });
@@ -107,6 +108,9 @@ fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
     }
     if report.listens {
         line(report.notes.listening.to_owned());
+    }
+    for open in &report.open_by_policy {
+        line((*open).to_owned());
     }
     for notice in &report.notices {
         line(format!("The probes' sessions said: {notice}"));
@@ -234,6 +238,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            open_by_policy: Vec::new(),
             notes: notes_on(Baseline::DenyDefault),
             notices: Vec::new(),
             not_enforced: Vec::new(),
@@ -493,6 +498,7 @@ mod tests {
                 host_services,
                 not_here,
                 listens,
+                open_by_policy: Vec::new(),
                 notes: notes_on(baseline),
                 notices: Vec::new(),
                 not_enforced: Vec::new(),
