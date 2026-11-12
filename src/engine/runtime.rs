@@ -13,7 +13,7 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
 use crate::model::runtime::RuntimeKind;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::policy::file::PolicyFile;
 use crate::runtime::{RuntimeAdapter, adapter};
 
@@ -55,8 +55,9 @@ struct InstallPlan {
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
     proxy_runs: bool,
-    /// The host, as the plan names it: where the installer is downloaded.
-    host: &'static str,
+    /// The sandbox's backend: its host, as the plan names it, where the
+    /// installer is downloaded, and who reaches what the sandbox listens on.
+    backend: BackendKind,
 }
 
 impl Engine {
@@ -241,7 +242,7 @@ impl Engine {
             listen_kept_off: asks && !listening,
             also,
             proxy_runs: self.proxy_runs(name)?,
-            host: record.backend.host(),
+            backend: record.backend,
         })
     }
 
@@ -311,7 +312,8 @@ impl InstallPlan {
         }
         if self.listens {
             changes.push(format!(
-                "let sandbox {name} listen on TCP for {kind} (ADR 0028): any port but enclos's proxy ports, on every address, and anything in it can serve the network"
+                "let sandbox {name} listen for {kind} (ADR 0028), {}",
+                self.backend.listening()
             ));
         }
         if self.listen_kept_off {
@@ -323,7 +325,7 @@ impl InstallPlan {
         changes.push(format!(
             "download the {kind} installer from {} on {}, as it is served now (ADR 0029), and record its SHA-256",
             runtime.installer().url,
-            self.host
+            self.backend.host()
         ));
         if !self.proxy_runs {
             changes.push(format!("start the proxy of sandbox {name}"));

@@ -968,7 +968,11 @@ fn a_removal_whose_lock_then_times_out_leaves_the_entry_naming_it() {
 
     // Another command takes the lock while the services are removed,
     // and keeps it past the wait.
-    let other = SqliteStateStore::new(engine.layout.state_db(), engine.layout.state_lock());
+    let other = SqliteStateStore::new(
+        engine.layout.state_db(),
+        engine.layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let held = Rc::new(RefCell::new(None));
     let holder = Rc::clone(&held);
     *fake.on_stop.borrow_mut() = Some(Box::new(move |_: &ServiceLabel| {
@@ -1124,7 +1128,11 @@ fn every_spelling_of_the_enclos_folder_names_the_same_services() {
     std::os::unix::fs::symlink(dir.path().join("enclos"), &link).unwrap();
     let other = |alias: PathBuf| {
         let layout = Layout::at(alias);
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         Engine::new(layout, Box::new(state), Box::new(audit), Vec::new())
             .with_services(Box::new(Rc::clone(&fake)))
@@ -1185,6 +1193,38 @@ fn a_launch_told_to_end_before_its_proxy_runs_starts_nothing() {
         .unwrap_err();
     assert!(err.to_string().contains("told to end before"), "{err}");
     assert!(engine.state.sessions(&name, true).unwrap().is_empty());
+    assert_eq!(engine.audit(None).unwrap().len(), entries);
+}
+
+/// A `launch` waits for the state lock longer than a command does, as the
+/// proxy recording itself does, and still ends as soon as it is told to.
+#[test]
+fn a_launch_told_to_end_while_it_waits_for_the_lock_starts_nothing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, engine, _, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+    stand_in_proxy(&engine, &name);
+    let entries = engine.audit(None).unwrap().len();
+    let held = engine.state.lock().unwrap();
+    let ended = Arc::new(AtomicBool::new(false));
+    let teller = {
+        let ended = Arc::clone(&ended);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ended.store(true, Ordering::Relaxed);
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = engine
+        .launch_until(&alice(), &name, "gateway", &ended)
+        .unwrap_err();
+    teller.join().unwrap();
+    drop(held);
+    assert!(err.to_string().contains("told to end before"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+    let sessions = engine.state.sessions(&name, true).unwrap();
+    assert!(sessions.iter().all(|s| s.kind == SessionKind::Proxy));
     assert_eq!(engine.audit(None).unwrap().len(), entries);
 }
 
@@ -1285,7 +1325,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
     };
     assert!(
         plan.changes
-            .contains(&format!("stop session {id} (proxy, 1 processes)")),
+            .contains(&format!("stop session {id} (proxy, 1 process)")),
         "{plan:?}"
     );
     let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
@@ -1297,7 +1337,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
     let finished = entries.last().unwrap().finished.as_ref().unwrap();
     assert_eq!(
         finished.outcome.message,
-        "removed 1 services, stopped 1 sessions"
+        "removed 1 service, stopped 1 session"
     );
     assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
 }

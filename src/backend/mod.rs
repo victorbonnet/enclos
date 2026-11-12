@@ -88,6 +88,13 @@ pub struct SandboxContext {
     /// What enclos stages for an install or an import, which the sandbox
     /// reads and never writes.
     pub installers: PathBuf,
+    /// enclos's own program, as it was started: the services run it
+    /// outside every sandbox, so a policy whose grants cover it, by any
+    /// path that leads to it, must still keep it unchanged (ADR 0058).
+    /// `None` when enclos cannot tell where its program is, and then a
+    /// grant that could hold it is refused; [`SandboxContext::new`] knows
+    /// of none, which the engine replaces with its own.
+    pub program: Option<Vec<PathBuf>>,
 }
 
 impl SandboxContext {
@@ -109,6 +116,7 @@ impl SandboxContext {
             holder_socket: layout.holder_socket(name.as_str()),
             inward_socket: layout.inward_socket(name.as_str()),
             installers: layout.sandbox_installers(name.as_str()),
+            program: Some(Vec::new()),
         }
     }
 }
