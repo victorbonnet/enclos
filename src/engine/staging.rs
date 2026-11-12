@@ -91,14 +91,15 @@ impl Engine {
 
     /// Stages `files` in the sandbox's `installers/` folder and returns the
     /// command that copies each into its place in the home, from inside
-    /// the sandbox, under its policy, as an install's own files are.
-    /// `tag` keeps them apart from an install's, and from another agent's.
+    /// the sandbox, under its policy, as an install's own files are, and
+    /// the staged files, for the caller to remove once it has run. `tag`
+    /// keeps them apart from an install's, and from another agent's.
     pub(super) fn stage_home_copy(
         &self,
         name: &SandboxName,
         files: &[(HomePath, &str)],
         tag: &str,
-    ) -> Result<SandboxCommand> {
+    ) -> Result<(SandboxCommand, Vec<PathBuf>)> {
         let dir = self.layout.sandbox_installers(name.as_str());
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
         let mut staged = Vec::new();
@@ -118,7 +119,7 @@ impl Engine {
             .collect();
         let script = copy_into_home_script(&copies);
         let words: Vec<OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
-        Ok(SandboxCommand::new(words).reading(staged))
+        Ok((SandboxCommand::new(words).reading(staged.clone()), staged))
     }
 }
 
