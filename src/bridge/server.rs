@@ -445,7 +445,9 @@ impl Hub {
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
             && let Ok(name) = sandbox.parse()
-            && let Ok(text) = crate::engine::Engine::open(self.layout.clone()).access_context(&name)
+            && let Ok(text) =
+                crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
+                    .access_context(&name)
         {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
@@ -1647,9 +1649,12 @@ fn run_session(
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
                     .and_then(|name| {
-                        crate::engine::Engine::open(hub.layout.clone())
-                            .mobile_policy_preview(&name, &base, &change)
-                            .map_err(|e| e.to_string())
+                        crate::engine::Engine::open(
+                            hub.layout.clone(),
+                            crate::state::Wait::Background,
+                        )
+                        .mobile_policy_preview(&name, &base, &change)
+                        .map_err(|e| e.to_string())
                     });
                 match result {
                     Ok(mut preview) => {
