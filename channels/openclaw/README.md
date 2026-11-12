@@ -104,7 +104,19 @@ never a path or symlink. There are at most ten files and 25 MiB total per messag
 The prompt explains markdown, files and the app's static HTML behavior. The app
 continues to own rendering and blocking scripts/network assets in artefacts.
 
-Titles/rename, routines, questions, runtime approvals and typed
+Routines use the public Gateway service's lifecycle-scoped `getCron()` facade.
+Only explicitly agent-owned jobs enter its bounded inventory; supported full
+definitions are read-only. `options.operations=["get"]` hides creation and
+mutation controls. Native unknown fields and external destinations are never
+rewritten. Unsupported native schedules or incomplete definitions report
+`unsupported`. The public facade does not provide atomic definition
+preconditions for changes/removal/manual runs or complete agent-targeted
+creation, so all writes are refused before scheduler access. See the
+[source evidence](../../docs/research/openclaw-routines.md).
+Read-only inventory/details are M5's agreed scope; mutation parity is tracked
+in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
+
+Titles/rename, structured questions, runtime approvals and typed
 interruption remain separate work. Unsupported controls return `unsupported`.
 Structured native
 control modules can gate live sends and durable replay with `canDeliver`; the

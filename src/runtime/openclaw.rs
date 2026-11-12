@@ -498,6 +498,10 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/media.js"),
                 ),
                 (
+                    plugin.child("routines.js")?,
+                    include_str!("../../channels/openclaw/routines.js"),
+                ),
+                (
                     plugin.child("openclaw.plugin.json")?,
                     include_str!("../../channels/openclaw/openclaw.plugin.json"),
                 ),
