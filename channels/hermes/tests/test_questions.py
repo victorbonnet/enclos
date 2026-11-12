@@ -186,6 +186,7 @@ class AdapterControls(unittest.IsolatedAsyncioTestCase):
             adapter._questions.refused = AsyncMock()
             adapter.name = "enclos"
             adapter._outbox = types.SimpleNamespace(set_aside=lambda of: False)
+            adapter._answers = {}
             refusal = protocol.error("bad_message", "Too many questions are waiting.", "ask-1")
             await adapter._on_line(protocol.encode_line(refusal))
             adapter._questions.refused.assert_awaited_once_with("ask-1", "bad_message")

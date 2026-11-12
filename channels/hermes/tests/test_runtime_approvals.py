@@ -273,6 +273,7 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             adapter.send = AsyncMock()
             adapter._write = AsyncMock(return_value=True)
             adapter._questions = types.SimpleNamespace(refused=AsyncMock())
+            adapter._answers = {}
             adapter.name = "enclos"
             # Python's split takes U+001F for whitespace, as Hermes does.
             for text in ("/yolo", chr(0x1F) + "/approve always", "/approvals off", "/DENY"):

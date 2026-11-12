@@ -34,6 +34,8 @@ fn access_approval_refuses_absolute_paths_that_run_code_outside_the_sandbox() {
         home.join("Library/LaunchAgents"),
         home.join("bin"),
         home.join("go/bin"),
+        // Holds ~/go/bin, which a service's PATH does not name.
+        home.join("go"),
         home.join("project/.git/hooks"),
         // enclos's own files, inside the home too: refused by validation.
         dir.path().join("enclos"),
@@ -68,6 +70,10 @@ fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
         // Holds a PATH folder: its programs could be replaced.
         "/Users/alice/tools",
         "/Users/alice",
+        // Holds a refused home folder, whether or not it is on PATH.
+        "/Users/alice/go",
+        "/Users/alice/Library/LaunchAgents",
+        "/Users/alice/bin/tool",
         "/Users/other/work",
         "/Volumes/Disk",
         "/Volumes/Disk/.Trashes",
@@ -87,6 +93,20 @@ fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
         "/media/me/disk/projects",
     ] {
         assert_eq!(phone_write_refusal(Path::new(allowed), home, &path), None);
+    }
+    // A folder that does not exist yet keeps the agent's case; macOS's
+    // usual file system does not tell it from the refused one.
+    if cfg!(target_os = "macos") {
+        for refused in [
+            "/Users/alice/library/LaunchAgents",
+            "/Users/alice/GO",
+            "/Users/alice/Tools/Bin",
+        ] {
+            assert!(
+                phone_write_refusal(Path::new(refused), home, &path).is_some(),
+                "{refused}"
+            );
+        }
     }
 }
 
@@ -129,6 +149,13 @@ fn access_approval_shows_the_scope_it_writes() {
     assert_eq!(
         plan.scope,
         crate::policy::paths::real_path(&real).display().to_string()
+    );
+    // The narrowing refuses a hidden folder as the target, not the hidden
+    // entries beneath an approved one: the preview says so.
+    assert!(
+        plan.change.contains("hidden files and folders included"),
+        "{}",
+        plan.change
     );
 }
 
