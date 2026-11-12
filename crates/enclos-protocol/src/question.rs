@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::visible::revealed;
 use crate::{ConversationId, QuestionId};
 
 pub const MAX_CHOICES: usize = 12;
@@ -53,6 +54,9 @@ impl RuntimeApprovalAction {
     }
 }
 
+/// At most this many runtime patterns name what a session or always grant covers.
+pub const MAX_APPROVAL_PATTERNS: usize = 16;
+
 /// Only the native runtime supplies the already-redacted display command and allowed scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeApprovalDefinition {
@@ -61,13 +65,25 @@ pub struct RuntimeApprovalDefinition {
     pub actions: Vec<RuntimeApprovalAction>,
     #[serde(default)]
     pub smart_denied: bool,
+    /// The runtime's own names of the patterns a session or always grant
+    /// covers: every command matching one, not only this one. Required when
+    /// either is offered, so the person sees how far the grant reaches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
 }
 
 impl RuntimeApprovalDefinition {
     pub fn validate(&self) -> Result<(), String> {
         use RuntimeApprovalAction::{Always, Deny, Once, Session};
-        text(&self.command, "Display command")?;
-        text(&self.reason, "Approval reason")?;
+        // Hidden characters stay: the command is shown with them written out,
+        // so the person reads what runs.
+        command_text(&self.command, "Display command")?;
+        command_text(&self.reason, "Approval reason")?;
+        // The command is shown with its hidden characters written out; that
+        // longer form must still fit, or the runtime keeps its text fallback.
+        if revealed(&self.command).len() > MAX_QUESTION_BYTES {
+            return Err("The display command is too long to show in full.".into());
+        }
         if !self.actions.contains(&Deny)
             || (self.actions != [Deny] && !self.actions.contains(&Once))
             || self.actions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -76,7 +92,36 @@ impl RuntimeApprovalDefinition {
         {
             return Err("Runtime approval actions must be ordered, distinct and permitted by the native gate.".into());
         }
+        if self.patterns.len() > MAX_APPROVAL_PATTERNS
+            || self
+                .patterns
+                .iter()
+                .enumerate()
+                .any(|(i, p)| self.patterns[..i].contains(p))
+        {
+            return Err(format!(
+                "A runtime approval names at most {MAX_APPROVAL_PATTERNS} distinct patterns."
+            ));
+        }
+        for pattern in &self.patterns {
+            text(pattern, "Approval pattern", false)?;
+        }
+        if self.grants_patterns() && self.patterns.is_empty() {
+            return Err(
+                "A session or always grant must name the runtime patterns it covers.".into(),
+            );
+        }
         Ok(())
+    }
+
+    /// Whether an offered action grants more than this one command.
+    pub fn grants_patterns(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                RuntimeApprovalAction::Session | RuntimeApprovalAction::Always
+            )
+        })
     }
 }
 
@@ -119,9 +164,29 @@ pub struct QuestionInfo {
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<QuestionAnswer>,
+    /// Whether this settlement is the one a paired device submitted,
+    /// matched by its request. False while pending and for a state the
+    /// agent's channel reports on its own, which a card shows as the
+    /// agent's report rather than the person's choice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
-fn text(value: &str, field: &str) -> Result<(), String> {
+/// Nonblank text without hidden characters ([`crate::visible`]); `lines`
+/// allows newlines, and nothing else that is not seen (no tab or CR).
+fn text(value: &str, field: &str, lines: bool) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be blank."));
+    }
+    if crate::visible::has_hidden(value, lines) {
+        return Err(format!("{field} holds a hidden or control character."));
+    }
+    Ok(())
+}
+
+/// A runtime approval's command or reason: not blank, and no control
+/// character but line breaks and tabs.
+fn command_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} must not be blank."));
     }
@@ -144,7 +209,7 @@ fn bounded(value: &impl Serialize, limit: usize, field: &str) -> Result<(), Stri
 
 impl QuestionDefinition {
     pub fn validate(&self) -> Result<(), String> {
-        text(&self.text, "Question")?;
+        text(&self.text, "Question", true)?;
         if let Some(approval) = &self.approval {
             approval.validate()?;
             if !self.choices.is_empty() || self.multiple {
@@ -159,22 +224,38 @@ impl QuestionDefinition {
         if self.multiple && self.choices.is_empty() {
             return Err("Multiple selection requires choices.".into());
         }
-        for label in &self.choices {
-            text(label, "Choice label")?;
+        for (index, label) in self.choices.iter().enumerate() {
+            text(label, "Choice label", false)?;
+            let bare = crate::visible::bare(label);
+            if self.choices[..index]
+                .iter()
+                .any(|other| crate::visible::bare(other) == bare)
+            {
+                return Err("Choice labels must be distinct.".into());
+            }
         }
         bounded(self, MAX_QUESTION_BYTES, "Question")
     }
 
-    /// Old apps display ordinary text and answer through the runtime's text interceptor.
-    pub fn fallback_text(&self) -> String {
+    /// The readable question, for an app without question controls. Its
+    /// reply goes through the runtime's text interceptor (Hermes: an
+    /// option's number or text, or "skip"; other text on a choice question
+    /// cancels it and reaches the agent as a message). A runtime's channel
+    /// without a bridge for questions sends its runtime's own text instead.
+    /// `tests/fixtures/question/fallback.json` holds the wording.
+    /// A runtime approval lists its typed commands only when `typed`: where the
+    /// host's person owns the conversation, the only person whose typed
+    /// decision the bridge passes on to the runtime.
+    pub fn fallback_text(&self, typed: bool) -> String {
         if let Some(approval) = &self.approval {
+            // What runs, with its hidden characters written out.
+            let shown = revealed(&approval.command);
             // A command may contain markdown fences. Pick the shorter safe fence;
             // its two copies add at most roughly one command's length to the frame.
             let (marker, length) = ['`', '~']
                 .into_iter()
                 .map(|marker| {
-                    let run = approval
-                        .command
+                    let run = shown
                         .split(|c| c != marker)
                         .map(str::len)
                         .max()
@@ -184,21 +265,42 @@ impl QuestionDefinition {
                 .min_by_key(|(_, length)| *length)
                 .expect("two fence markers");
             let fence = marker.to_string().repeat(length);
-            let command = format!("{fence}sh\n{}\n{fence}", approval.command);
-            let actions = approval
-                .actions
-                .iter()
-                .map(|action| format!("{}: `{}`", action.description(), action.typed_command()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let scopes = if approval.actions.contains(&RuntimeApprovalAction::Session) {
-                "Session and always grants apply to the runtime's pattern; always persists in the runtime. "
-            } else {
+            let command = format!("{fence}sh\n{shown}\n{fence}");
+            let warning = if approval.command.is_ascii() {
                 ""
+            } else {
+                "The command holds characters outside ASCII, some of which look like others. Check each one.\n\n"
+            };
+            let actions = if typed {
+                approval
+                    .actions
+                    .iter()
+                    .map(|action| format!("{}: `{}`", action.description(), action.typed_command()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                let offered = approval
+                    .actions
+                    .iter()
+                    .map(|action| action.description())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Offered: {offered}. Only the host's person can answer this approval, from an updated app."
+                )
+            };
+            let scopes = if approval.grants_patterns() {
+                format!(
+                    "A session or always grant covers every command matching: {}. An always grant persists in the runtime until removed there. ",
+                    approval.patterns.join("; ")
+                )
+            } else {
+                String::new()
             };
             return format!(
-                "{}\n\n{command}\n\nWhy: {}\n\n{actions}\n\n{scopes}The sandbox policy still applies.",
-                self.text, approval.reason
+                "{}\n\n{command}\n\n{warning}Why: {}\n\n{actions}\n\n{scopes}The sandbox policy still applies.",
+                self.text,
+                revealed(&approval.reason)
             );
         }
         let mut result = self.text.clone();
@@ -208,9 +310,9 @@ impl QuestionDefinition {
         result.push_str(if self.choices.is_empty() {
             "\nReply with your answer, or reply \"skip\" to skip this question."
         } else if self.multiple {
-            "\nChoose one or more options. Reply with their numbers separated by commas, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with the numbers or texts of one or more options, separated by commas, or reply \"skip\" to skip this question. Another message cancels it."
         } else {
-            "\nReply with an option's number, its text, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with an option's number or text, or reply \"skip\" to skip this question. Another message cancels it."
         });
         result
     }
@@ -244,7 +346,7 @@ impl QuestionAnswer {
                     }
                 }
             }
-            Self::Text { text: value } => text(value, "Answer")?,
+            Self::Text { text: value } => text(value, "Answer", true)?,
             Self::Skip => {}
             Self::Approval { .. } => unreachable!("approval answers were checked above"),
         }
@@ -271,11 +373,16 @@ impl QuestionInfo {
         {
             return Err("This terminal state does not belong to this kind of control.".into());
         }
+        if self.confirmed && self.state == QuestionState::Pending {
+            return Err("A pending question has no confirmed answer.".into());
+        }
+        // An answer the runtime accepted that this contract cannot carry
+        // (text with a hidden character, say) is answered without one.
         match (&self.state, &self.answer) {
             (QuestionState::Answered, Some(answer)) if !matches!(answer, QuestionAnswer::Skip) => {
                 answer.validate(&self.definition)?;
             }
-            (QuestionState::Answered, _) | (_, Some(_)) => {
+            (_, Some(_)) => {
                 return Err("Question state and answer disagree.".into());
             }
             (_, None) => {}
@@ -316,6 +423,89 @@ mod tests {
             state: QuestionState::Pending,
             revision: 0,
             answer: None,
+            confirmed: false,
+        }
+    }
+
+    #[test]
+    fn hidden_characters_and_duplicate_labels_are_refused() {
+        let original = definition(false);
+        // A label that reads as another, or two that read alike: the person
+        // could not tell what they choose.
+        for choices in [
+            vec!["Deny\u{202E}wolla".to_owned(), "Allow".into()],
+            vec!["Allow\u{200B}".to_owned(), "Allow".into()],
+            vec!["Allow".to_owned(), "Allow".into()],
+            vec!["Allow\u{E0041}".to_owned(), "Allow".into()],
+            vec!["\u{2764}".to_owned(), "\u{2764}\u{FE0F}".into()],
+            vec!["Allow\u{2028}".to_owned()],
+            vec!["\u{3164}".to_owned()],
+            vec!["Two\nlines".to_owned()],
+            vec!["Tab\there".to_owned()],
+        ] {
+            let invalid = QuestionDefinition {
+                choices,
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{:?}", invalid.choices);
+        }
+        for text in ["Which\u{2066}?", "Which\r\n?", "Which\t?", "\u{FEFF}Which?"] {
+            let invalid = QuestionDefinition {
+                text: text.into(),
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{text:?}");
+        }
+        assert!(
+            QuestionDefinition {
+                text: "Which one?\nPick carefully.".into(),
+                ..original.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        for text in ["ok\u{200D}", "a\tb", "a\r\nb", "\u{00AD}"] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_err(),
+                "{text:?}"
+            );
+        }
+        // Persian spelling, a joined emoji and an emoji's presentation
+        // selector are ordinary text, in a question, a label or an answer.
+        for text in [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_ok(),
+                "{text:?}"
+            );
+            let joined = QuestionDefinition {
+                text: text.into(),
+                choices: vec![text.into(), "Deny".into()],
+                ..original.clone()
+            };
+            assert!(joined.validate().is_ok(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_text_matches_the_shared_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/question/fallback.json")).unwrap();
+        for case in fixture.as_array().unwrap() {
+            let definition: QuestionDefinition =
+                serde_json::from_value(case["definition"].clone()).unwrap();
+            assert!(definition.validate().is_ok());
+            assert_eq!(
+                definition.fallback_text(false),
+                case["text"].as_str().unwrap()
+            );
         }
     }
 
@@ -422,7 +612,7 @@ mod tests {
             .validate(&original)
             .is_err()
         );
-        let fallback = original.fallback_text();
+        let fallback = original.fallback_text(true);
         for label in &original.choices {
             assert!(fallback.contains(label));
         }
@@ -442,13 +632,42 @@ mod tests {
             .validate()
             .is_err()
         );
+        // Answered, with nothing this contract can carry: the runtime has
+        // the answer, the card says so without its text.
         assert!(
             QuestionInfo {
                 state: QuestionState::Answered,
                 ..pending.clone()
             }
             .validate()
+            .is_ok()
+        );
+        assert!(
+            QuestionInfo {
+                confirmed: true,
+                ..pending.clone()
+            }
+            .validate()
             .is_err()
+        );
+        let confirmed = QuestionInfo {
+            state: QuestionState::Skipped,
+            confirmed: true,
+            ..pending.clone()
+        };
+        assert!(confirmed.validate().is_ok());
+        let encoded = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(encoded["confirmed"], true);
+        assert_eq!(
+            serde_json::from_value::<QuestionInfo>(encoded).unwrap(),
+            confirmed
+        );
+        // Unconfirmed is the default, and not written.
+        assert!(
+            serde_json::to_value(&pending)
+                .unwrap()
+                .get("confirmed")
+                .is_none()
         );
         assert!(
             QuestionInfo {
@@ -622,6 +841,7 @@ mod tests {
                     RuntimeApprovalAction::Deny,
                 ],
                 smart_denied: false,
+                patterns: vec!["recursive delete".into()],
             }),
         }
     }
@@ -827,7 +1047,7 @@ mod tests {
             let mut question = approval_definition();
             question.approval.as_mut().unwrap().command = command.clone();
             question.validate().unwrap();
-            let fallback = question.fallback_text();
+            let fallback = question.fallback_text(true);
             assert!(fallback.contains(&command));
             assert!(fallback.contains("/approve always"));
             assert!(!fallback.contains("skip"));
@@ -869,5 +1089,93 @@ mod tests {
         let mut too_large = approval_definition();
         too_large.approval.as_mut().unwrap().command = "x".repeat(MAX_QUESTION_BYTES);
         assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn session_and_always_grants_name_the_patterns_they_cover() {
+        use RuntimeApprovalAction::{Deny, Once, Session};
+        let original = approval_definition().approval.unwrap();
+        for patterns in [
+            vec![],
+            vec!["".into()],
+            vec!["recursive\u{202E} delete".into()],
+            vec!["a".into(), "a".into()],
+            (0..=MAX_APPROVAL_PATTERNS)
+                .map(|i| format!("p{i}"))
+                .collect(),
+        ] {
+            assert!(
+                RuntimeApprovalDefinition {
+                    patterns,
+                    ..original.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            RuntimeApprovalDefinition {
+                actions: vec![Once, Session, Deny],
+                patterns: vec![],
+                ..original.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        // Once and Deny grant nothing beyond this command.
+        RuntimeApprovalDefinition {
+            actions: vec![Once, Deny],
+            patterns: vec![],
+            ..original
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn approval_fallback_reveals_hidden_characters_and_flags_non_ascii() {
+        let mut question = approval_definition();
+        let approval = question.approval.as_mut().unwrap();
+        approval.command = "ls\u{202E} -la\r\ncurl https://ex\u{0430}mple.com".into();
+        approval.reason = "Pipe\u{200B} to shell".into();
+        let fallback = question.fallback_text(true);
+        assert!(fallback.contains("ls⟨U+202E⟩ -la⟨U+000D⟩\ncurl https://ex\u{0430}mple.com"));
+        assert!(fallback.contains("Why: Pipe⟨U+200B⟩ to shell"));
+        assert!(!fallback.contains('\u{202E}') && !fallback.contains('\u{200B}'));
+        assert!(fallback.contains("outside ASCII"));
+        assert!(fallback.contains("every command matching: recursive delete"));
+        assert!(fallback.contains("until removed there"));
+        let mut ascii = approval_definition();
+        ascii.approval.as_mut().unwrap().command = "rm -rf ./build\tdist".into();
+        let ascii = ascii.fallback_text(true);
+        assert!(!ascii.contains("outside ASCII"));
+        assert!(ascii.contains("rm -rf ./build⟨tab⟩dist"));
+        // A non-ASCII letter that is not hidden is shown as it is, and flagged.
+        assert!(
+            approval_definition()
+                .fallback_text(true)
+                .contains("outside ASCII")
+        );
+        let mut long = approval_definition();
+        // Each three-byte hidden character takes twelve once written out.
+        long.approval.as_mut().unwrap().command = "\u{200B}".repeat(MAX_QUESTION_BYTES / 9);
+        assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn approval_fallback_lists_typed_commands_only_where_they_are_passed_on() {
+        let question = approval_definition();
+        let typed = question.fallback_text(true);
+        assert!(typed.contains("/approve always") && typed.contains("/deny"));
+        let guest = question.fallback_text(false);
+        assert!(!guest.contains("/approve") && !guest.contains("/deny"));
+        assert!(guest.contains("Offered: Allow once, Allow for session, Always allow, Deny."));
+        assert!(guest.contains("Only the host's person"));
+        assert!(guest.contains("printf 'done'"));
+        // An ordinary question reads the same either way.
+        assert_eq!(
+            definition(false).fallback_text(false),
+            definition(false).fallback_text(true)
+        );
     }
 }
