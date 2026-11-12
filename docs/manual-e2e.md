@@ -88,19 +88,22 @@ enclos doctor
 ## 4. Agents
 
 ```bash
-enclos agent add lab/main
-enclos agent add lab/scout
+enclos agent add lab/main; echo "exit $?"           # the setup started the gateway: needs confirmation
+enclos --yes agent add lab/main
+enclos connect lab -- hermes -p main chat -q 'Say hi'
+enclos --yes agent add lab/scout
 enclos agent add lab/Bad_Name; echo "exit $?"
 enclos agent list lab
 enclos connect lab -- hermes profile create helper   # made inside, not through enclos
 enclos agent list lab
-enclos agent add lab/helper
+enclos --yes agent add lab/helper
 enclos agent rm lab/scout; echo "exit $?"           # needs confirmation
 enclos --yes agent rm lab/scout
 enclos agent rm lab/helper --keep-data --yes
 enclos agent list lab
 ```
 
+- [ ] `agent add lab/main` without `--yes` exits 3, saying it restarts the sandbox's service gateway and ends a chat in progress; with it, `enclos logs lab` shows the gateway starting again, and `main` answers the chat rather than `Gateway connection failed`.
 - [ ] `agent list`: `lab/default  built in`, `lab/main`, `lab/scout`. `Bad_Name` is refused before anything runs (exit 1), with the naming rule.
 - [ ] After `profile create`, both the end of the `connect` session (on stderr) and `agent list` say `lab/helper: Hermes has this agent; enclos does not track it`, with the command to track it.
 - [ ] `agent add lab/helper` says `Tracked agent lab/helper, which Hermes already had`.
@@ -110,7 +113,7 @@ If you have your own Hermes, bring an agent from it. Its cron jobs come along an
 
 ```bash
 mkdir -p ~/exports && hermes profile export default -o ~/exports/mine.tar.gz
-enclos agent add lab/mine --from ~/exports/mine.tar.gz
+enclos --yes agent add lab/mine --from ~/exports/mine.tar.gz
 enclos connect lab -- hermes -p mine
 ```
 
@@ -471,11 +474,12 @@ Throughout the guide: paths are under `/home/<you>`, not `/Users/<you>`; `sed -i
 ```bash
 enclos init
 enclos doctor; echo "exit $?"
-enclos sandbox create lab --backend bubblewrap --template assistant
+enclos sandbox create lab --template assistant
 enclos sandbox create scout --backend bubblewrap --template minimal
 ```
 
 - [ ] `init` records `bubblewrap` as the default backend and seatbelt as not available here.
+- [ ] `lab`, made with no `--backend`, is on bubblewrap, as `scout` is (`enclos sandbox list`).
 - [ ] `doctor` says bubblewrap runs here, names the systemd version it found against 254, says what the backend enforces, and exits 0. On Raspberry Pi OS, whose kernel has no Landlock, it says that writes are held by the mounts alone and that any program the sandbox can read can run. Its Host section names the bubblewrap version against 0.9.0, lingering as you noted it, and whether a Secret Service answers; on Raspberry Pi OS, Landlock and the `memory` controller as degraded, each with what is not enforced, the risk and the fix, and the `cpu` controller delegated.
 
 ### 5 and 6: sessions in a cgroup, and `policy test`
