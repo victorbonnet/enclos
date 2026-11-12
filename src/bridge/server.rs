@@ -397,7 +397,9 @@ impl Hub {
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
             && let Ok(name) = sandbox.parse()
-            && let Ok(text) = crate::engine::Engine::open(self.layout.clone()).access_context(&name)
+            && let Ok(text) =
+                crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
+                    .access_context(&name)
         {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
