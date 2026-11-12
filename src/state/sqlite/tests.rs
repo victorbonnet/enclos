@@ -7,7 +7,11 @@ use crate::model::sandbox::BackendKind;
 
 pub(super) fn store() -> (TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = SqliteStateStore::new(dir.path().join("state.db"), dir.path().join("state.lock"));
+    let store = SqliteStateStore::new(
+        dir.path().join("state.db"),
+        dir.path().join("state.lock"),
+        crate::state::Wait::Command,
+    );
     (dir, store)
 }
 
@@ -95,6 +99,65 @@ fn a_write_that_reads_first_waits_for_a_write_in_progress() {
     assert_eq!(applied.unwrap().unwrap().version, 2);
 }
 
+/// A write no person waits on outlasts a write lock held 12 seconds, as a
+/// commit that waits on a stalled disk holds it; a command's write still
+/// fails after its 10. Every length here is a tenth of the real one. The
+/// lock is held until the command's write has given up too: SQLite counts
+/// its own sleeps, which a loaded machine stretches.
+#[test]
+fn a_background_write_waits_out_a_lock_held_past_a_commands_wait() {
+    const SCALE: u32 = 10;
+    assert_eq!(Wait::Command.limit(), Duration::from_secs(10));
+    assert_eq!(Wait::Background.limit(), Duration::from_secs(60));
+    let held = Duration::from_secs(12) / SCALE;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    drop(lock);
+    let waiting = |wait: Wait| SqliteStateStore {
+        write_wait: wait.limit() / SCALE,
+        ..store.clone()
+    };
+    let (command, background) = (waiting(Wait::Command), waiting(Wait::Background));
+
+    let holder = Connection::open(&store.db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let write = |store: SqliteStateStore, name: &'static str| {
+        std::thread::spawn(move || {
+            let done = store.put(&StateLock::for_tests(), &record(name));
+            (done, started.elapsed())
+        })
+    };
+    let (command, background) = (write(command, "cmd"), write(background, "bg"));
+    let (done, after) = command.join().unwrap();
+    std::thread::sleep(held.saturating_sub(started.elapsed()));
+    let released = started.elapsed();
+    holder.execute_batch("COMMIT").unwrap();
+
+    assert!(
+        matches!(
+            &done,
+            Err(StateError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(e, _),
+                ..
+            }) if e.code == rusqlite::ErrorCode::DatabaseBusy
+        ),
+        "{done:?}"
+    );
+    assert!(
+        after >= Wait::Command.limit() / SCALE,
+        "failed after {after:?}"
+    );
+    let (done, after) = background.join().unwrap();
+    done.unwrap();
+    assert!(
+        after >= released && released >= held,
+        "written after {after:?}, the lock released after {released:?}"
+    );
+    assert!(store.get(&"bg".parse().unwrap()).unwrap().is_some());
+}
+
 /// Each call opens its own connection, so it is often the only one open as
 /// it closes. Closing must leave the write-ahead log in place: copying it
 /// into `state.db` and deleting it holds the whole database through two
@@ -118,6 +181,114 @@ fn a_connection_closing_alone_leaves_the_log_in_place() {
     );
 }
 
+/// The variable that has [`reads_the_state_when_asked`] read the
+/// `state.db` it names.
+const READER_DB: &str = "ENCLOS_TEST_READER_DB";
+
+/// What [`another_process_never_makes_a_read_kept_open_wait`] runs in a
+/// child, as another enclos command: reads the state, a connection at a
+/// time, until killed, with a file `reading` beside it once it has read.
+/// Passes at once otherwise.
+#[test]
+fn reads_the_state_when_asked() {
+    let Some(db) = std::env::var_os(READER_DB) else {
+        return;
+    };
+    let db = PathBuf::from(db);
+    let store = SqliteStateStore::new(&db, db.with_file_name("state.lock"), Wait::Command);
+    store.list().unwrap();
+    std::fs::write(db.with_file_name("reading"), "").unwrap();
+    loop {
+        let _ = store.list();
+    }
+}
+
+/// The proxy reads the active policy for each connection, while other
+/// commands open and close their own. A connection that opens while none is
+/// open rebuilds the log's index from the whole log and holds every read
+/// off until it is done; with a connection kept open in the proxy's
+/// process, none rebuilds it, so no read waits. Its reads here wait for no
+/// lock at all, and fail if they would.
+#[test]
+fn another_process_never_makes_a_read_kept_open_wait() {
+    let (_dir, store) = store();
+    let name: SandboxName = "home".parse().unwrap();
+    {
+        let lock = store.lock().unwrap();
+        store.migrate(&lock).unwrap();
+        let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+        let by = Actor {
+            user: "alice".into(),
+            host: "mac".into(),
+        };
+        store
+            .create_sandbox(&lock, &record("home"), &snap, &by)
+            .unwrap();
+        // A log of about 2 MB, as a proxy's network log makes it.
+        store
+            .open()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000)
+                 INSERT INTO net_events
+                   (at, sandbox, host, port, method, verdict, bytes_up, bytes_down, duration_ms)
+                 SELECT '2026-01-02T03:04:05Z', 'home', printf('%d.example.com', i), 443,
+                        'CONNECT', 'allowed', 0, 0, 0 FROM n",
+            )
+            .unwrap();
+    }
+    let reader = SqliteStateStore {
+        write_wait: Duration::ZERO,
+        ..store.clone()
+    };
+    let _open = reader.keep_open().unwrap();
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        crate::lifecycle::marker::spawn_unmarked(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state::sqlite::tests::reads_the_state_when_asked",
+                    "--test-threads=1",
+                ])
+                .env(READER_DB, &store.db)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .unwrap(),
+    );
+    let started = Instant::now();
+    while !store.db.with_file_name("reading").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none() && started.elapsed() < Duration::from_secs(30),
+            "the other process did not read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    let mut reads = 0;
+    while started.elapsed() < Duration::from_secs(1) {
+        let read = reader.active_policy(&name);
+        assert!(
+            matches!(read, Ok(Some(_))),
+            "read {reads}, after {:?}: {read:?}",
+            started.elapsed()
+        );
+        reads += 1;
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the other process stopped reading"
+    );
+}
+
 #[test]
 fn reads_before_init_say_to_run_init() {
     let (_dir, store) = store();
@@ -130,7 +301,11 @@ fn reads_before_init_say_to_run_init() {
 fn lock_fails_when_the_folder_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing");
-    let store = SqliteStateStore::new(missing.join("state.db"), missing.join("state.lock"));
+    let store = SqliteStateStore::new(
+        missing.join("state.db"),
+        missing.join("state.lock"),
+        crate::state::Wait::Command,
+    );
     assert!(matches!(
         store.lock(),
         Err(StateError::NotInitialized { .. })
