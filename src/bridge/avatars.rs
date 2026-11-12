@@ -104,7 +104,7 @@ fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToDevice {
 
 impl Hub {
     /// Whether `person` is shown `agent`: the one rule `agents.list`, a
-    /// photo's reading and its broadcast share. Every paired person sees
+    /// photo's or a name's reading, and their broadcasts share. Every paired person sees
     /// every listed agent until sharing (ADR 0043, proposed) narrows it.
     pub(super) fn sees_agent(&self, _person: &str, agent: &str) -> bool {
         self.agents.iter().any(|a| a.name == agent)
