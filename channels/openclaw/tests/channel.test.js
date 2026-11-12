@@ -207,19 +207,21 @@ test('typing, exact tool events, native commands and policy requests keep their 
   const ctx = { sessionKey: native.calls.dispatch[0].route.sessionKey, agentId: 'main' };
   assert.deepEqual(hooks.get('before_prompt_build')({}, ctx), { prependContext: policy.text });
   assert.equal(hooks.get('before_prompt_build')({}, { ...ctx, agentId: 'scout' }), undefined);
-  hooks.get('after_tool_call')({ toolName: 'read', toolCallId: 'denied-call', params: { path: '/tmp/denied' }, error: 'EPERM: operation not permitted' }, ctx);
+  const deniedPath = path.join(path.dirname(account.socket), 'denied');
+  const requestedPath = path.join(path.dirname(account.socket), 'requested');
+  hooks.get('after_tool_call')({ toolName: 'read', toolCallId: 'denied-call', params: { path: deniedPath }, error: 'EPERM: operation not permitted' }, ctx);
   const observed = await owner.next('approval.request');
-  assert.deepEqual(observed.access, { kind: 'read', target: '/tmp/denied', private: false });
+  assert.deepEqual(observed.access, { kind: 'read', target: deniedPath, private: false });
   let live = true;
   const tool = toolFactory.create({ ...ctx, messageChannel: 'enclos', assertInvocationCurrent() { if (!live) throw new Error('retired invocation'); } });
   assert.equal(toolFactory.create({ sessionKey: 'unrelated', assertInvocationCurrent() {} }), null);
-  const result = await tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read the requested file' });
+  const result = await tool.execute('tool-call', { kind: 'read', target: requestedPath, action: 'Read the requested file' });
   const request = await owner.next('approval.request');
   assert.equal(request.id, result.details.request); assert.equal(result.details.status, 'requested');
-  assert.deepEqual(request.access, { kind: 'read', target: '/tmp/requested', private: false });
+  assert.deepEqual(request.access, { kind: 'read', target: requestedPath, private: false });
   assert.equal(channel.running.get('main').transport.state.policyContext, policy.text);
   live = false;
-  await assert.rejects(tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read it again' }), /retired invocation/);
+  await assert.rejects(tool.execute('tool-call', { kind: 'read', target: requestedPath, action: 'Read it again' }), /retired invocation/);
 });
 
 test('files enter the native context and an HTML artefact leaves through ordinary media', async t => {

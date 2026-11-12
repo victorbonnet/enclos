@@ -1,0 +1,163 @@
+# M5 OpenClaw verification
+
+This record distinguishes implemented contracts from live acceptance. The stack
+starts at [enclos #227](https://github.com/victorbonnet/enclos/pull/227) and
+[enclos-app #44](https://github.com/victorbonnet/enclos-app/pull/44).
+[Issue #218](https://github.com/victorbonnet/enclos/issues/218) remains open.
+Linux live acceptance stays last on the new host; no Pi run is required.
+
+## Agreed capability boundary
+
+M5 ships complete native question text and trusted native credential-request
+instructions. It does not advertise structured questions or manufacture a second
+question tool. Rich question controls are tracked in
+[#225](https://github.com/victorbonnet/enclos/issues/225).
+
+Routines expose native inventory and supported full definitions read-only.
+`options.operations=["get"]` hides unavailable controls. Conditional mutations,
+complete agent-targeted creation and manual-run authority are tracked in
+[#226](https://github.com/victorbonnet/enclos/issues/226). No read/compare followed
+by an unconditional scheduler mutation substitutes for native revision checks.
+
+Native approvals negotiate independent offered scopes and preserve OpenClaw's
+persistence description. Once/Always/Deny does not invent Session. Structured
+cards require the exact native request and current account/conversation/person;
+unsupported requests retain native fallback. Consent receipts record native
+resolution, not execution success.
+
+The original live observations and counts below were recorded before this rebase,
+using source commit `59941ad1`. They remain historical evidence. The stack now
+includes the newer core and policy-request closure. Its deletion lifecycle is
+explicitly adapter-selected, its listener selection retains namespace checks,
+and its provider facts remain runtime-decoded. Fresh rebase verification is
+recorded separately; previous green checks are not a claim about rewritten heads.
+
+## Rebase verification
+
+The requested bases are enclos #227 (`753fc700`) and enclos-app #44 (`4e53b966`).
+The complete rebased source passed **1,758 Rust tests**: 1,514 library, 78 CLI
+unit, 102 CLI integration, 20 documentation, 38 protocol and six shared fixtures.
+Clippy, formatting and dependency policy passed. One first-run fake-proxy
+fixture met an unrelated older listener on port 41001; the unchanged suite
+passed on retry and that process was left untouched.
+
+The installed-SDK suite passed **67 tests**, the launchers **six**, and pinned
+Hermes compatibility **102**, with one optional legacy-source skip. The deletion
+fixture's port helper was then tightened and its focused real-listener test
+passed again. Android #45/#46 passed APK/unit/lint with 102/103 tests, no new
+warnings, and all remote checks on the new base.
+
+A new binary from `529c7f131e8a99018db66c6a8546703f91f2cf27` exercised the
+supported fixture-state schema upgrade (11 to 12), offline native agent
+creation, managed startup and real core/native agent deletion. The exact Gateway
+session and process identity survived deletion, and the disposable agent was
+absent in both core and native state. Main/scout authentication, channel
+configuration and settings were preserved. No model call, routine execution or
+native approval decision was requested by this check.
+
+The existing cron inventory retained two jobs. Its whole read-view digest also
+contains volatile execution/presentation fields, so it is not evidence of
+canonical before/after definition equality. No such equality is claimed by this
+rebase probe; the earlier disabled-fixture routine evidence below remains tied
+to its original run.
+
+## Live macOS evidence, 2026-11-09
+
+The disposable test used Seatbelt, an enclos-managed proxy and launchd services,
+OpenClaw **2026.11.2** (`b556fdf`), private Node **24.22.1** and native Codex
+**0.164.0**. The official local-prefix installer SHA-256 was
+`2218bac9796a5da99f6be8e7cc838420e282aca7897bea80a8f40dab0f6bfc3d`.
+Native ChatGPT subscription device login completed inside the disposable state.
+No credential values or provider profile files form part of this record.
+
+| Check | Observed result |
+| --- | --- |
+| Official installation | Production `runtime install openclaw` completed through a recorded confined session, using private runtime/Node paths and no native host service. |
+| Native agents | Main/scout were discovered and adopted; a third disposable agent was created and removed through enclos. Native configuration, workspace/session paths and core metadata confirmed deletion. |
+| Gateway authentication | Protected JSON file SecretRefs authenticated the managed local Gateway. Its secret value was absent from ordinary settings and service startup environment. |
+| Managed lifecycle | Clean stop/restart reported no survivors for the test session; authenticated model use worked after restart. |
+| Actual model | Production launcher returned exactly `M5_OK` in 14.23 seconds; native terminal receipt reported zero successful tool calls. |
+| macOS certificate roots | Original native model failed with `UnknownIssuer`. The supported public CA bundle restored verified TLS; executable regression failed before the launcher fix and passed after. Explicit CA overrides remain honored. |
+| Managed channel setup | After scoped cleanup of the earlier manual prototype, both agents configured through actual `runtime configure --channel app`. One linked package, separate token/state paths and exact native bindings were verified; no hand-written managed setup. |
+| Actual app channel | Wrong token refused; main/scout `/help` replies correlated. Main returned exact `M5_CHANNEL_OK` through the final native channel. |
+| Native read-only routines | Native inventory and unsupported heartbeat details behaved explicitly. A main-owned agent-turn fixture, disabled from creation with no delivery, returned its complete 51-byte prompt and daily interval, with `editable=false`. Scout excluded it and returned `not_found`. |
+
+The prototype's earlier, narrower observations remain in
+[its evidence record](../prototype/m5/README.md). Those observations do not become
+broader claims merely because later implementation exists.
+
+## Repeatable implementation checks
+
+Run `just ci` from the stack tip with Rust and Node 24 or later. It checks the
+workspace, dependency policy, Hermes plugin, OpenClaw launchers, emitted entry
+point and channel tests. The channel uses only Node's standard library and public
+OpenClaw SDK entry points; generated JavaScript ships with the Rust binary.
+
+Native SDK tests additionally require the exact tested package:
+
+```sh
+ENCLOS_OPENCLAW_PACKAGE=/path/to/openclaw \
+  node --test channels/openclaw/tests/*.test.js
+```
+
+Without this variable, native-package tests explicitly skip. Standard transport,
+protocol, routing, files and authority tests still run. CI installs the tested
+2026.11.2 SDK package in a disposable prefix and runs the native tests too.
+Changing the tested runtime version requires updating and re-running the native
+contract probes; the runtime installer itself remains official/as served.
+
+## Final stack checks
+
+The combined source passed **1,564 Rust tests**: 1,331 library, 67 CLI-unit,
+100 CLI-integration, 24 documentation, 36 protocol and six shared fixtures.
+Workspace Clippy, formatting and `cargo deny` passed. Destructive runner-only
+host-service/member probes were not enabled on this Mac.
+
+The final OpenClaw suite passed **67 tests with zero skips** against the installed
+SDK; six launcher/owner-helper tests also passed. Hermes Python 3.13 verification
+ran 103 cases: **102 passed, one optional legacy-source skip**. This includes
+18 native routine, 14 native question and eight native approval checks, plus all
+six exact-interruption cases (three fixtures and three using the pinned real
+public helper). The pinned checkout was completed with its tracked cron source;
+no dependency installation or native provider/service call was needed.
+
+Android companions [#45](https://github.com/victorbonnet/enclos-app/pull/45) and
+[#46](https://github.com/victorbonnet/enclos-app/pull/46) passed offline debug APK
+builds, 95/96 unit tests and lint with no new warnings, and all remote CI checks.
+The FFI encryption boundary transports opaque JSON bytes; no native ABI or
+pinned-core update was required for these optional protocol fields.
+
+One Ubuntu 26.04 CI run hit an occupied proxy test port; neighboring stack runs
+passed. The newly added encrypted-sync fixture now uses the existing allocator
+that excludes proxy ports. The exact occupant was not captured, so this is a
+confirmed fixture-invariant correction rather than proof of the collision's
+origin. A focused encrypted connection test passed after the change.
+
+## Remaining live acceptance
+
+Use [the operator guide](openclaw.md), the existing [manual test](manual-e2e.md)
+and [M5's acceptance gates](m5-openclaw.md#acceptance-gates). Keep every result
+attached to its actual tested version and environment.
+
+- [ ] Two independently installed OpenClaw sandboxes, two agents each, alongside
+  a functioning Hermes sandbox; separate state, ports and native defaults.
+- [ ] Distinct Telegram bots, allowed-person delivery and unlisted-person refusal;
+  missing/rotated secret references and no credential disclosure in audit/logs.
+- [ ] Paired Android direct/Home/group flows: continuation, names/photos, read
+  state, archives, files/static HTML, commands, typing/tool events and titles.
+- [ ] Exact cancellation and policy requests on the real phone, including stale
+  controls, reconnects, another conversation and a later run.
+- [x] Live native read-only inventory/details, unsupported heartbeat refusal and
+  exact foreign-agent exclusion through the managed channel.
+- [ ] Routine display on the phone, unsupported schedule handling and scheduled
+  delivery while the phone/bridge is away and after restart.
+- [ ] Native approval cards, actual offered scopes, two-device races, external
+  settlement, expiry/restart and older-peer complete fallback; question text.
+- [ ] Dashboard handoff, status/doctor/logs, proxy allow/deny, audit verification
+  and restart/reload/member cleanup within documented lifecycle guarantees.
+- [ ] New Linux host: real bubblewrap/systemd, secret store, relay/socket/proxy,
+  dashboard/auth and configured lingering across logout/reboot. Run dangerous
+  escape/member probes only in disposable CI/VMs.
+
+Until these gates pass, report **macOS acceptance incomplete; Linux pending**.
+Do not close M5 based on source tests, installation or one successful model call.

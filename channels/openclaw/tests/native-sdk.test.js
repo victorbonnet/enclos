@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { createChannel, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { commandCatalog } from '../features.js';
 import { stageMedia } from '../media.js';
@@ -16,7 +17,7 @@ const installed = process.env.ENCLOS_OPENCLAW_PACKAGE;
 // disposable native state root before importing any SDK runtime, not just a
 // temporary session-store filename.
 if (installed) {
-  const state = mkdtempSync('/private/tmp/enclos-native-sdk-');
+  const state = mkdtempSync(path.join(tmpdir(), 'enclos-native-sdk-'));
   process.env.OPENCLAW_STATE_DIR = state;
   process.env.OPENCLAW_CONFIG_PATH = path.join(state, 'openclaw.json');
   after(() => rmSync(state, { recursive: true, force: true }));
@@ -112,7 +113,7 @@ test('the installed scoped media loader preserves HTML and rejects an unrelated 
     sdk: { loadMedia: loader.loadWebMediaRaw, mediaRoots: roots.getAgentScopedMediaLocalRoots } });
   assert.equal(attachment.mime, 'text/html'); assert.equal(attachment.name, 'page.html');
   assert.equal(readFileSync(path.join(workspace, 'media', attachment.file), 'utf8'), html);
-  const outside = mkdtempSync('/private/tmp/enclos-sdk-outside-'); t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const outside = mkdtempSync(path.join(tmpdir(), 'enclos-sdk-outside-')); t.after(() => rmSync(outside, { recursive: true, force: true }));
   const excluded = path.join(outside, 'outside.txt'); writeFileSync(excluded, 'fixture');
   await assert.rejects(loader.loadWebMediaRaw(excluded, { localRoots: [workspace] }));
 });
@@ -145,7 +146,7 @@ test('the installed native fallback retains every question and respects existing
 
 test('installed native session workers read, rename and clear only the selected title', { skip: !installed }, async t => {
   const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/session-store-runtime.js')));
-  const folder = mkdtempSync('/private/tmp/enclos-native-title-'); t.after(() => rmSync(folder, { recursive: true, force: true }));
+  const folder = mkdtempSync(path.join(tmpdir(), 'enclos-native-title-')); t.after(() => rmSync(folder, { recursive: true, force: true }));
   const storePath = path.join(folder, 'sessions.json'), sessionKey = 'agent:main:enclos:main:direct:test-owned';
   const entry = { sessionId: '32b35e61-28fb-4b21-bdb5-e8fbb521a18c', updatedAt: 42, autoLabel: 'Native generated title' };
   await sdk.upsertSessionEntry({ agentId: 'main', sessionKey, storePath, entry });
@@ -170,7 +171,7 @@ test('installed native session workers read, rename and clear only the selected 
 
 test('installed native inbound dispatch retains each exact upstream run abort signal', { skip: !installed }, async t => {
   const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/channel-inbound.js')));
-  const folder = mkdtempSync('/private/tmp/enclos-native-abort-');
+  const folder = mkdtempSync(path.join(tmpdir(), 'enclos-native-abort-'));
   const cfg = { agents: { ownership: 'explicit', entries: { main: { workspace: folder } } }, session: { store: path.join(folder, 'sessions.json') } };
   const seen = new Map(), ended = [], running = [], failures = [];
   const one = new AbortController(), two = new AbortController(), three = new AbortController();

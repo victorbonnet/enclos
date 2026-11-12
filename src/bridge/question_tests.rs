@@ -1041,7 +1041,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
     responder.read_hello(&initiator.hello().unwrap()).unwrap();
     let (answer, bridge_session) = responder.answer().unwrap();
     let mut device_session = initiator.finish(&answer).unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
     let address = listener.local_addr().unwrap();
     let server_hub = Arc::clone(&hub);
     let thread = std::thread::spawn(move || {
