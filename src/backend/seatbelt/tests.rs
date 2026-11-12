@@ -93,9 +93,16 @@ fn world() -> World {
     std::fs::write(user.join("work/project/private/key"), "secret").unwrap();
     std::fs::write(home.join("private/key"), "secret").unwrap();
     std::fs::write(data.join("state.db"), "state").unwrap();
-    // The bridge's: its database, its Noise key and its key for signed
-    // runtime-approval decisions (ADR 0060).
-    for file in ["app.db", "app-bridge.key", "app-approvals.key"] {
+    // The bridge's: its database (ADR 0042) and its write-ahead log, its
+    // Noise key and a file the key is written to first, and its key for
+    // signed runtime-approval decisions (ADR 0060).
+    for file in [
+        "app.db",
+        "app.db-wal",
+        "app-bridge.key",
+        "app-bridge.key.0123.new",
+        "app-approvals.key",
+    ] {
         std::fs::write(data.join(file), "the bridge's").unwrap();
     }
     std::fs::write(data.join("sandboxes/other/policy.toml"), "theirs").unwrap();
@@ -242,7 +249,13 @@ fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
     assert!(w.sh(&format!("cat '{}'", w.path("alice/readable.txt"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.ssh/id_ed25519"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.enclos/state.db"))));
-    for file in ["app.db", "app-bridge.key", "app-approvals.key"] {
+    for file in [
+        "app.db",
+        "app.db-wal",
+        "app-bridge.key",
+        "app-bridge.key.0123.new",
+        "app-approvals.key",
+    ] {
         assert!(
             !w.sh(&format!(
                 "cat '{}'",
