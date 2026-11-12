@@ -543,7 +543,7 @@ pub trait RuntimeAdapter {
     fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
     fn listener(&self) -> Option<RuntimeListener>;                             // ADR 0028: the service whose port sandbox sessions reach
     fn dashboard(&self) -> Option<RuntimeDashboard> { None }                   // ADR 0040: the command serving its dashboard on 127.0.0.1:0, which `enclos dashboard` runs where the host cannot reach the sandbox
-    fn secrets_folder_var(&self) -> Option<&'static str>;                       // protected service-secret folder, not secret values in startup env
+    fn secret_files(&self) -> Option<SecretFiles>;                              // explicit sandbox/agent file formats and optional folder variable
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath>;      // ADR 0031: watched service settings
     fn agent_settings_files(&self, agent: &RuntimeAgentName) -> Vec<HomePath>;
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool;
@@ -555,6 +555,8 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand>;
 
     fn channel_token_file(&self, channel: Channel, agent: &RuntimeAgentName) -> Option<(HomePath, &'static str)>;
+    fn channel_token_is_plain(&self, channel: Channel, agent: &RuntimeAgentName, text: &str, field: &str) -> Result<bool, String>;
+    fn inspect_settings(&self, files: &[settings::SettingsFile]) -> Result<Vec<settings::SettingsFinding>, String>;
     fn agent_secrets_source(&self, agent: &RuntimeAgentName, secrets_file: &Path) -> Option<Vec<SandboxCommand>>;
     fn set_setting(&self, agent: &RuntimeAgentName, key: &str, value: &str) -> Option<SandboxCommand>;
     fn channel_settings(&self, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;

@@ -344,7 +344,7 @@ impl Engine {
         let Some(kind) = self.record(name)?.runtime else {
             return Ok(());
         };
-        match crate::runtime::adapter(kind).secrets_folder_var() {
+        match crate::runtime::adapter(kind).secret_files() {
             Some(_) => Ok(()),
             None => Err(Error::Policy(crate::policy::PolicyError::Invalid {
                 problems: vec![crate::policy::Problem::Refused(format!(

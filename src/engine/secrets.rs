@@ -13,7 +13,7 @@ use crate::model::policy::Policy;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::{SecretRecord, SecretRef, SecretValue, StoreName};
-use crate::runtime::adapter;
+use crate::runtime::{SecretFileFormat, adapter};
 use crate::secrets::{SecretError, SecretStore};
 
 /// One way a policy gives a secret: as `variable`, to the whole sandbox,
@@ -406,7 +406,7 @@ impl Engine {
                 })?;
         }
         let values = self.secret_env(policy)?;
-        let Some(var) = adapter(kind).secrets_folder_var() else {
+        let Some(delivery) = adapter(kind).secret_files() else {
             if !policy.agent_secrets.is_empty() {
                 return Err(Error::SecretsFileRefused {
                     sandbox: name.to_string(),
@@ -419,27 +419,12 @@ impl Engine {
             return Ok(values);
         };
         let folder = self.layout.sandbox_secrets_dir(name.as_str());
-        let mut files = vec![(SANDBOX_SECRETS_FILE.to_owned(), values, Reader::Dotenv)];
+        let mut files = vec![(SANDBOX_SECRETS_FILE.to_owned(), values, delivery.sandbox)];
         for (agent, grants) in &policy.agent_secrets {
             let file = format!("{agent}{}", crate::layout::AGENT_SECRETS_SUFFIX);
-            files.push((file, self.granted_values(grants)?, Reader::Command));
+            files.push((file, self.granted_values(grants)?, delivery.agent));
         }
-        // Every value checked before any file is written, so a refused
-        // start leaves the files as they were.
-        for (_, values, _) in &files {
-            check_writable(name, values)?;
-        }
-        let mut written = Vec::new();
-        for (file, values, reader) in &files {
-            write_secrets_file(name, &folder, file, values, *reader)?;
-            written.push(file.clone());
-        }
-        // What an earlier start wrote for an agent no longer granted any.
-        remove_files_but(&folder, &written)?;
-        // Not a secret, but where the secrets are.
-        let named = SecretValue::new(folder.display().to_string())
-            .expect("a folder's path is text with no NUL");
-        Ok(vec![(var.to_owned(), named)])
+        write_service_secret_files(name, &folder, &files, delivery.folder_variable)
     }
 
     /// The variables with which a service reaches the stores `policy`
@@ -514,6 +499,36 @@ impl Engine {
 /// every agent (ADR 0034).
 const SANDBOX_SECRETS_FILE: &str = ".env";
 
+type SecretFileValues = (String, Vec<(String, SecretValue)>, SecretFileFormat);
+
+/// Publishes a declared protected-file plan. A plan without a folder
+/// variable returns no startup variables, never its values as a fallback.
+fn write_service_secret_files(
+    name: &SandboxName,
+    folder: &Path,
+    files: &[SecretFileValues],
+    folder_variable: Option<&str>,
+) -> Result<Vec<(String, SecretValue)>> {
+    // Validate the whole plan before replacing any existing file.
+    for (_, values, format) in files {
+        check_writable(name, values, *format)?;
+    }
+    let mut written = Vec::new();
+    for (file, values, format) in files {
+        write_secrets_file(name, folder, file, values, *format)?;
+        written.push(file.clone());
+    }
+    remove_files_but(folder, &written)?;
+    Ok(folder_variable
+        .into_iter()
+        .map(|var| {
+            let named = SecretValue::new(folder.display().to_string())
+                .expect("a folder's path is text with no NUL");
+            (var.to_owned(), named)
+        })
+        .collect())
+}
+
 /// Removes the files of `folder` not named in `kept`.
 fn remove_files_but(folder: &Path, kept: &[String]) -> Result<()> {
     let io = |path: &Path| {
@@ -556,25 +571,17 @@ fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<Grant> {
     sandbox.chain(agents).collect()
 }
 
-/// Who reads a secrets file back, which decides how a value is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reader {
-    /// The sandbox's `.env`, which python-dotenv and Hermes's own reader
-    /// (`agent.secret_scope.load_env_file`) both read: each value
-    /// double-quoted with its `\` and `"` escaped, which both take back as
-    /// it was (checked against Hermes 0.22.4's).
-    Dotenv,
-    /// An agent's file, which Hermes reads through its `secrets.command`
-    /// (`agent/secret_sources/command.py`, Hermes 0.22.5): it strips one
-    /// surrounding pair of quotes and undoes no escape, so each value is
-    /// double-quoted as it is.
-    Command,
-}
-
 /// Refuses a value holding a line break or `${`: every reader splits lines,
 /// and python-dotenv expands `${…}` with no escape for it, so the readers
 /// would take different values.
-fn check_writable(name: &SandboxName, values: &[(String, SecretValue)]) -> Result<()> {
+fn check_writable(
+    name: &SandboxName,
+    values: &[(String, SecretValue)],
+    format: SecretFileFormat,
+) -> Result<()> {
+    if format == SecretFileFormat::Json {
+        return Ok(());
+    }
     let unreadable = |v: &SecretValue| {
         let v = v.expose();
         v.contains('\n') || v.contains('\r') || v.contains("${")
@@ -592,7 +599,7 @@ fn check_writable(name: &SandboxName, values: &[(String, SecretValue)]) -> Resul
 
 /// Writes `values` as `file` of `folder`, which only the user reads:
 /// the folder 0700, the file 0600, written whole beside it and then renamed
-/// over it, each value as `reader` takes it back. Refused, before anything
+/// over it, each value as `format` takes it back. Refused, before anything
 /// is written: a value [`check_writable`] refuses, and a folder that is a
 /// link, never followed.
 fn write_secrets_file(
@@ -600,13 +607,13 @@ fn write_secrets_file(
     folder: &Path,
     file: &str,
     values: &[(String, SecretValue)],
-    reader: Reader,
+    format: SecretFileFormat,
 ) -> Result<()> {
     let refused = |why: String| Error::SecretsFileRefused {
         sandbox: name.to_string(),
         why,
     };
-    check_writable(name, values)?;
+    check_writable(name, values, format)?;
     if std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(refused(format!(
             "{} is a link, which secrets are never written through; remove it",
@@ -626,16 +633,27 @@ fn write_secrets_file(
         .map_err(io(folder))?;
     std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700)).map_err(io(folder))?;
     let mut text = zeroize::Zeroizing::new(String::new());
-    for (variable, value) in values {
-        text.push_str(variable);
-        text.push_str("=\"");
-        for c in value.expose().chars() {
-            if reader == Reader::Dotenv && (c == '\\' || c == '"') {
-                text.push('\\');
+    if format == SecretFileFormat::Json {
+        // The map borrows values; the only serialized buffer is zeroed on
+        // drop, as with dotenv. JSON preserves newlines and `${` literally.
+        let values: std::collections::BTreeMap<&str, &str> = values
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.expose()))
+            .collect();
+        *text = serde_json::to_string(&values).expect("string values serialize as JSON");
+        text.push('\n');
+    } else {
+        for (variable, value) in values {
+            text.push_str(variable);
+            text.push_str("=\"");
+            for c in value.expose().chars() {
+                if format == SecretFileFormat::EscapedDotenv && (c == '\\' || c == '"') {
+                    text.push('\\');
+                }
+                text.push(c);
             }
-            text.push(c);
+            text.push_str("\"\n");
         }
-        text.push_str("\"\n");
     }
     let new = folder.join(format!("{file}.new"));
     let file = folder.join(file);
@@ -682,7 +700,7 @@ mod tests {
             &folder,
             SANDBOX_SECRETS_FILE,
             &values,
-            Reader::Dotenv,
+            SecretFileFormat::EscapedDotenv,
         )
         .unwrap();
         write_secrets_file(
@@ -690,7 +708,7 @@ mod tests {
             &folder,
             SANDBOX_SECRETS_FILE,
             &values,
-            Reader::Dotenv,
+            SecretFileFormat::EscapedDotenv,
         )
         .unwrap();
         let text = std::fs::read_to_string(folder.join(".env")).unwrap();
@@ -706,12 +724,84 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("secrets");
         let values = vec![("B".to_owned(), value("a'b\\c\"d$HOME #e"))];
-        write_secrets_file(&home(), &folder, "main.env", &values, Reader::Command).unwrap();
+        write_secrets_file(
+            &home(),
+            &folder,
+            "main.env",
+            &values,
+            SecretFileFormat::QuotedDotenv,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(folder.join("main.env")).unwrap();
         assert_eq!(text, "B=\"a'b\\c\"d$HOME #e\"\n");
         // Hermes's rule (`unquote_dotenv_value`): one surrounding pair off.
         let (_, raw) = text.trim_end().split_once('=').unwrap();
         assert_eq!(&raw[1..raw.len() - 1], "a'b\\c\"d$HOME #e");
+    }
+
+    #[test]
+    fn json_secret_files_preserve_exact_strings_with_private_atomic_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("secrets");
+        let raw = "a'b\\c\"d\n${HOME}\r\t🦞";
+        write_secrets_file(
+            &home(),
+            &folder,
+            "main.env",
+            &[("TOKEN".to_owned(), value(raw))],
+            SecretFileFormat::Json,
+        )
+        .unwrap();
+        let file = folder.join("main.env");
+        let parsed: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(parsed.get("TOKEN").unwrap(), raw);
+        assert_eq!(
+            std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!folder.join("main.env.new").exists());
+        write_secrets_file(&home(), &folder, "main.env", &[], SecretFileFormat::Json).unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn declared_json_delivery_has_no_startup_secret_fallback_and_removes_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("secrets");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("removed.env"), "obsolete").unwrap();
+        let files = vec![
+            (
+                ".env".into(),
+                vec![("API_KEY".into(), value("sandbox"))],
+                SecretFileFormat::Json,
+            ),
+            (
+                "main.env".into(),
+                vec![("BOT_TOKEN".into(), value("agent"))],
+                SecretFileFormat::Json,
+            ),
+        ];
+        let startup = write_service_secret_files(&home(), &folder, &files, None).unwrap();
+        assert!(
+            startup.is_empty(),
+            "a file consumer received startup variables"
+        );
+        assert!(!folder.join("removed.env").exists());
+        for (file, field, expected) in [
+            (".env", "API_KEY", "sandbox"),
+            ("main.env", "BOT_TOKEN", "agent"),
+        ] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(folder.join(file)).unwrap()).unwrap();
+            assert_eq!(parsed[field].as_str(), Some(expected));
+        }
     }
 
     /// A line break or `${` would be read differently by Hermes's two
@@ -726,7 +816,7 @@ mod tests {
                 &folder,
                 SANDBOX_SECRETS_FILE,
                 &[("T".to_owned(), value(bad))],
-                Reader::Dotenv,
+                SecretFileFormat::EscapedDotenv,
             )
             .unwrap_err();
             assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
@@ -751,7 +841,7 @@ mod tests {
             &folder,
             SANDBOX_SECRETS_FILE,
             &[("T".to_owned(), value("v"))],
-            Reader::Dotenv,
+            SecretFileFormat::EscapedDotenv,
         )
         .unwrap_err();
         assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");

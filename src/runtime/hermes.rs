@@ -15,7 +15,8 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
     ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles, ServiceName, Signal, Unreadable,
+    ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -234,6 +235,23 @@ impl RuntimeAdapter for Hermes {
             set("secrets.command.override_existing", "true")?,
             set("secrets.command.enabled", "true")?,
         ])
+    }
+
+    fn channel_token_is_plain(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+        text: &str,
+        field: &str,
+    ) -> Result<bool, String> {
+        Ok(super::settings::holds_variable(text, field))
+    }
+
+    fn inspect_settings(
+        &self,
+        files: &[super::settings::SettingsFile],
+    ) -> Result<Vec<super::settings::SettingsFinding>, String> {
+        Ok(super::settings::dotenv_yaml_findings(files))
     }
 
     fn set_setting(
@@ -527,11 +545,15 @@ impl RuntimeAdapter for Hermes {
         reads && on
     }
 
-    fn secrets_folder_var(&self) -> Option<&'static str> {
+    fn secret_files(&self) -> Option<SecretFiles> {
         // Hermes loads `$HERMES_MANAGED_DIR/.env` into its own environment,
         // last and with override, when the folder exists
         // (`hermes_cli/managed_scope.py`, `env_loader._apply_managed_env`).
-        Some("HERMES_MANAGED_DIR")
+        Some(SecretFiles {
+            folder_variable: Some("HERMES_MANAGED_DIR"),
+            sandbox: SecretFileFormat::EscapedDotenv,
+            agent: SecretFileFormat::QuotedDotenv,
+        })
     }
 
     fn listener(&self) -> Option<RuntimeListener> {
