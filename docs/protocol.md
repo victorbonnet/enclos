@@ -42,7 +42,7 @@ Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a
 
 ## The plugin leg
 
-The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
+The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open. The plugin has 10 s to answer the bridge's `hello`, and 10 s to read what the bridge writes; past either, the bridge ends that connection and opens a new one on its next try, and other agents' plugins do not wait for it.
 
 1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
 
@@ -89,7 +89,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `declined` |
 
-The bridge checks `proof`, then shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer.
+The bridge checks `proof`, then shows at the terminal the device's name, its tailnet person and node (WhoIs), and asks to confirm. Only then does it store the device: both public keys, the person, the node, `push_key`, and writes an audit entry. A code works once, whatever the answer. The device chose its `name`, so the bridge keeps it plain before the terminal shows it: without the characters `enclos-protocol`'s `visible` rule calls hidden (controls, bidirectional and invisible marks), white space made single spaces, at most 64 characters. While the person decides, the device's pings count as hearing from it.
 
 ### Handshake
 
@@ -99,6 +99,8 @@ The bridge checks `proof`, then shows at the terminal the device's name, its tai
 2. checks `sig` with the device key it stored, and answers `authenticated` with the person the device speaks for;
 3. asks Tailscale who is calling, and refuses a person or a node other than the device's own;
 4. writes each refusal, with its reason, in the bridge's log (`enclos app log`).
+
+Any login of the tailnet gets as far as the first message, so the bridge keeps callers that are not authenticated yet few and short: at most 16 at once (one more is closed at once), 30 s from connecting to its first message, and no WebSocket message or frame larger than one Noise message (65,535 bytes). It logs at most 10 refusals per caller address and minute; past them, that address's connections are closed that minute without a log line or a question to Tailscale. The log keeps its newest 10,000 lines. Once authenticated, a session with nothing from the device, not even a ping, for 75 s ends: the enclos app pings every 30 s. When a device connects again while its old connection is still open, the new connection is the one messages go to.
 
 The hardware key never signs anything but handshake hashes, the pairing handshake's included. `pair.request` itself carries no signature: it proves the one-time code (`proof`), and the device key it names is the one whose signature the same handshake already carried.
 
