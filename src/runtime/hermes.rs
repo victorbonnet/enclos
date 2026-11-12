@@ -13,10 +13,10 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
-    ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles, ServiceName, Signal, Unreadable,
-    ValueAt,
+    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, ListenerPorts,
+    NotRead, ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts,
+    RuntimeListener, RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles, ServiceName,
+    Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -565,6 +565,7 @@ impl RuntimeAdapter for Hermes {
         // `hermes_cli/gateway_client.py`).
         Some(RuntimeListener {
             service: GATEWAY,
+            ports: ListenerPorts::Ephemeral,
             // Its web dashboard, on the same listener. Bound to loopback,
             // Hermes asks no login for it, by its code
             // (`listener_auth_required` in `gateway/run_api.py`).
@@ -849,6 +850,7 @@ mod tests {
     fn the_listening_service_is_one_of_its_services() {
         let listener = Hermes.listener().unwrap();
         assert_eq!(listener.service.as_str(), "gateway");
+        assert_eq!(listener.ports, ListenerPorts::Ephemeral);
         assert!(Hermes.services().iter().any(|s| s.name == listener.service));
     }
 

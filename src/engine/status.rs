@@ -313,7 +313,7 @@ fn dashboard(
     if !runs {
         return Fact::Absent;
     }
-    match service_listener(store, name, service, &Network::Host) {
+    match service_listener(store, name, service, &Network::Host, listener.ports) {
         Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
         Err(NoPort::NotRunning(_)) => Fact::Absent,
         Err(why) => Fact::CannotTell(why.to_string()),

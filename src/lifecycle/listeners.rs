@@ -87,24 +87,44 @@ pub fn ephemeral_ports() -> Result<RangeInclusive<u16>, String> {
 /// 127.0.0.1 at that port, and a session would reach that one. None or
 /// several such ports is never a guess.
 pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<u16, NotOnePort> {
+    one_port_matching(held, ephemeral, true)
+}
+
+/// A configured-port service's one positive TCP port at 127.0.0.1, out of
+/// the sockets its process holds. Other addresses and port 0 do not count;
+/// multiple ports are refused. This selects a candidate only: the caller
+/// must still verify ownership and reject reserved proxy ports.
+pub fn one_loopback_port(held: &[SocketAddr]) -> Result<u16, NotOnePort> {
+    one_port_matching(held, &(1..=u16::MAX), false)
+}
+
+fn one_port_matching(
+    held: &[SocketAddr],
+    candidates: &RangeInclusive<u16>,
+    ephemeral: bool,
+) -> Result<u16, NotOnePort> {
     let mut ports: Vec<u16> = held
         .iter()
         .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
         .map(SocketAddr::port)
-        .filter(|port| ephemeral.contains(port))
+        .filter(|port| candidates.contains(port))
         .collect();
     ports.sort_unstable();
     ports.dedup();
     match ports.as_slice() {
-        [] => Err(NotOnePort::None(format!(
+        [] if ephemeral => Err(NotOnePort::None(format!(
             "it holds no TCP listener at 127.0.0.1 in the ephemeral ports, {} to {}",
-            ephemeral.start(),
-            ephemeral.end()
+            candidates.start(),
+            candidates.end()
         ))),
+        [] => Err(NotOnePort::None(
+            "it holds no positive TCP listener at 127.0.0.1".to_owned(),
+        )),
         [port] => Ok(*port),
         several => Err(NotOnePort::Several(format!(
-            "it listens on {} ephemeral ports at 127.0.0.1 ({}), so which is its own cannot be told",
+            "it listens on {} {}ports at 127.0.0.1 ({}), so which is its own cannot be told",
             several.len(),
+            if ephemeral { "ephemeral " } else { "" },
             several
                 .iter()
                 .map(u16::to_string)
@@ -128,6 +148,36 @@ pub enum NotOnePort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_listener_selects_one_positive_ipv4_loopback_port() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        for port in [1024, 18789, 61374, u16::MAX] {
+            assert_eq!(
+                one_loopback_port(&[a(&format!("127.0.0.1:{port}"))]),
+                Ok(port)
+            );
+        }
+        for at in [
+            "127.0.0.1:0",
+            "127.0.0.2:18789",
+            "0.0.0.0:18789",
+            "[::1]:18789",
+        ] {
+            assert!(
+                matches!(one_loopback_port(&[a(at)]), Err(NotOnePort::None(_))),
+                "{at}"
+            );
+        }
+        assert!(matches!(
+            one_loopback_port(&[a("127.0.0.1:18789"), a("127.0.0.1:61374")]),
+            Err(NotOnePort::Several(_))
+        ));
+        assert_eq!(
+            one_loopback_port(&[a("127.0.0.1:18789"), a("127.0.0.1:18789")]),
+            Ok(18789)
+        );
+    }
 
     #[test]
     fn the_service_port_is_the_one_ephemeral_port_at_127_0_0_1() {
