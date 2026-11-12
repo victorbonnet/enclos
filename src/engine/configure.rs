@@ -453,7 +453,10 @@ impl Engine {
         }
         // The agent's Home conversation, as the bridge names it (ADR 0044).
         let home = crate::bridge::store::home_id(&format!("{name}/{agent}"));
-        let Some(app) = runtime.app_channel(agent, &socket, &home) else {
+        // The public key the plugin checks each runtime-approval decision
+        // against (ADR 0060).
+        let bridge_key = self.app_approval_public_key(confirm)?;
+        let Some(app) = runtime.app_channel(agent, &socket, &home, &bridge_key) else {
             return Err(session(format!(
                 "{shown} has no app channel enclos can set up"
             )));

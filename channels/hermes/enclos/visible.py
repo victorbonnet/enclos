@@ -21,6 +21,7 @@ _SINGLE = frozenset(
 _RANGES = (
     (0x180B, 0x180F), (0x2028, 0x202E), (0x2060, 0x206F), (0xFE00, 0xFE0D),
     (0xFFF0, 0xFFFB), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF),
+    (0xE000, 0xF8FF), (0xFDD0, 0xFDEF), (0xF0000, 0x10FFFF),
 )
 
 
@@ -35,7 +36,7 @@ def is_hidden(c: str) -> bool:
     o = ord(c)
     return (
         o < 0x20 or 0x7F <= o <= 0x9F or o in _JOINERS or o in _SINGLE
-        or any(lo <= o <= hi for lo, hi in _RANGES)
+        or any(lo <= o <= hi for lo, hi in _RANGES) or o & 0xFFFE == 0xFFFE
     )
 
 
