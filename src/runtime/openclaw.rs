@@ -474,10 +474,6 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/package.json"),
                 ),
                 (
-                    plugin.child("openclaw.plugin.json")?,
-                    include_str!("../../channels/openclaw/openclaw.plugin.json"),
-                ),
-                (
                     plugin.child("index.js")?,
                     include_str!("../../channels/openclaw/index.js"),
                 ),
@@ -486,16 +482,26 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/channel.js"),
                 ),
                 (
+                    plugin.child("transport.js")?,
+                    include_str!("../../channels/openclaw/transport.js"),
+                ),
+                (
                     plugin.child("protocol.js")?,
                     include_str!("../../channels/openclaw/protocol.js"),
                 ),
                 (
-                    plugin.child("transport.js")?,
-                    include_str!("../../channels/openclaw/transport.js"),
+                    plugin.child("features.js")?,
+                    include_str!("../../channels/openclaw/features.js"),
+                ),
+                (
+                    plugin.child("media.js")?,
+                    include_str!("../../channels/openclaw/media.js"),
+                ),
+                (
+                    plugin.child("openclaw.plugin.json")?,
+                    include_str!("../../channels/openclaw/openclaw.plugin.json"),
                 ),
             ],
-            // Configure with the Gateway stopped: this native CLI version's
-            // live owner-writer path cannot select unresolved auth SecretRefs.
             // Native install/link merges registration with existing plugin
             // paths; this plan never replaces the shared load-path list.
             commands: vec![SandboxCommand::from_words(&["sh", "-c", INSTALL_APP])],

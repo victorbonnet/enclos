@@ -3,8 +3,9 @@
 One channel package runs inside a sandbox's OpenClaw gateway. Each configured
 account belongs to an agent and listens on that agent's Unix socket. The host's
 bridge dials in and presents the agent's token; the sandbox gains no outbound
-route to the host. This first implementation advertises baseline text delivery
-only. Unsolicited output is baseline, not a capability.
+route to the host. Text and unsolicited output are baseline. Typing, native
+command discovery, files, exact tool events and sandbox policy requests are negotiated
+only when their native adapters/hooks have been registered.
 
 The package is tested against **OpenClaw 2026.11.2**. `PluginRuntime.version` is
 checked before activation: an untested version gets an actionable failure. The
@@ -85,10 +86,29 @@ State is bounded: 1,000 unacknowledged replies, 10,000 ingress receipts, 4,096
 conversation routes and 16 MiB total. A full registry refuses new work rather
 than deleting deduplication evidence. A corrupted state file refuses startup.
 
-Titles/rename, native command catalog, typing/tool steps, files/HTML, policy
-requests, routines, questions, approvals and typed interruption are separate
-capabilities to implement and verify. They are not advertised here; an unsupported
-control returns `unsupported`. The prompt hint reflects text-only delivery.
+Typing follows the native dispatcher and is cleared on settlement/error. The
+command catalog comes from the installed public native registry. Tool events
+retain native call ids and session attribution and disclose no raw tool arguments;
+observation never changes a native guard or result. Absolute `read`/`write`/`edit`
+permission failures may request that exact path, while `enclos_request_access`
+requests an explicit typed scope through a V2 invocation guard. No shell text is
+parsed. Requests grant nothing. Bounded, persisted `policy.context` is added to
+matching future native prompts; the bridge retains approval authority.
+
+The native scoped media loader reads permitted local files, preserving native
+local-root/reader policy. Remote output URLs are not fetched automatically. Files
+are copied into the existing media folder with opaque names before a reply is
+queued; HTML is an ordinary `text/html` attachment whose bytes are preserved.
+Inbound metadata names only a bounded regular file of that same media folder,
+never a path or symlink. There are at most ten files and 25 MiB total per message.
+The prompt explains markdown, files and the app's static HTML behavior. The app
+continues to own rendering and blocking scripts/network assets in artefacts.
+
+Titles/rename, routines, questions, runtime approvals and typed
+interruption remain separate work. Unsupported controls return `unsupported`.
+Structured native
+control modules can gate live sends and durable replay with `canDeliver`; the
+retained bridge hello excludes its token.
 
 ## Validation
 

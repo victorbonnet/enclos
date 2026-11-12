@@ -2,7 +2,9 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
-import { checkedId } from './protocol.js';
+import { checkedId, message, ProtocolError } from './protocol.js';
+import { commandCatalog, registerFeatures } from './features.js';
+import { inboundMedia, mediaFolder, stageMedia } from './media.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -38,9 +40,12 @@ function target(raw, account) {
   return checkedId(!value || value === 'home' ? account.home : value, 'conversation');
 }
 
-export function createChannel() {
+export function createChannel(sdk = {}) {
   let runtime;
   const running = new Map();
+  const sessionRoutes = new Map();
+  let hooks = { tools: false, policy: false };
+  const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
     const now = resolveAccount(currentConfig(cfg), account.accountId);
@@ -55,6 +60,17 @@ export function createChannel() {
     runtime = value;
   }
 
+  function findTurn(ctx) {
+    if (!ctx?.sessionKey) return undefined;
+    const turn = sessionRoutes.get(ctx.sessionKey);
+    if (!turn || (ctx.agentId && ctx.agentId !== turn.active.account.agentId) ||
+        (ctx.accountId && ctx.accountId !== turn.active.account.accountId) ||
+        (ctx.messageChannel && ctx.messageChannel !== 'enclos')) return undefined;
+    return turn;
+  }
+  const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
+  function registerFull(api) { hooks = registerFeatures(api, { findTurn, assertTurn, running }); }
+
   async function startAccount(ctx) {
     if (!runtime || runtime.version !== TESTED_OPENCLAW) throw new Error(`enclos requires the tested OpenClaw ${TESTED_OPENCLAW} plugin runtime`);
     const channel = ctx.channelRuntime ?? runtime.channel;
@@ -64,17 +80,32 @@ export function createChannel() {
     const account = resolveAccount(ctx.cfg, ctx.accountId);
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
+    if (hasMedia) mediaFolder(account);
     let transport;
     transport = new ChannelTransport(account, {
+      supportsAttachments: hasMedia,
+      capabilities: ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : [])],
+      onHello(_hello, owner) {
+        if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
+      },
+      onControl(control, owner) {
+        if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
+        if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
+        const before = owner.state.policyContext;
+        owner.state.policyContext = control.text;
+        try { owner.save(); } catch (error) { owner.state.policyContext = before; throw error; }
+      },
       async onMessage(incoming, route) {
         const cfg = currentConfig(ctx.cfg);
         const assertAuthority = () => assertCurrent(cfg, account, transport);
         assertAuthority();
+        const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: incoming.conversation }, dmScope: 'per-account-channel-peer' });
         if (nativeRoute.agentId !== account.agentId || nativeRoute.matchedBy === 'default') throw new Error('enclos account needs an explicit native binding to its agent');
         const sessionKey = channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos',
           accountId: account.accountId, peer: { kind: 'direct', id: route.peer }, dmScope: 'per-account-channel-peer' });
+        sessionRoutes.set(sessionKey, { active: running.get(account.accountId), conversation: incoming.conversation });
         const isCommand = channel.text?.hasControlCommand?.(incoming.text, cfg) ?? incoming.text.trimStart().startsWith('/');
         const ingress = await channel.inbound.ingress.resolve({
           channelId: 'enclos', accountId: account.accountId,
@@ -103,25 +134,32 @@ export function createChannel() {
             routeSessionKey: sessionKey, dispatchSessionKey: sessionKey, persistedSessionKey: sessionKey, dmScope: 'per-account-channel-peer' },
           reply: { to: incoming.conversation, originatingTo: incoming.conversation, nativeChannelId: incoming.conversation, sourceReplyDeliveryMode: 'direct' },
           message: { body: incoming.text, rawBody: incoming.text, bodyForAgent: incoming.text, commandBody: incoming.text, inboundEventKind: 'user_request' },
+          media,
           command: { kind: isCommand ? 'text-slash' : 'normal', body: incoming.text, authorized: isCommand && ingress.commandAccess?.authorized === true },
           channelIngress: ingress,
         });
-        await channel.inbound.dispatch({
+        const typing = on => { if (!transport.closed) transport.write(message('typing', { conversation: incoming.conversation, on })); };
+        try { await channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
+          dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
           delivery: { async deliver(payload) {
             assertAuthority();
-            if (payload.mediaUrl || payload.mediaUrls?.length) throw new Error('enclos OpenClaw channel media is not enabled yet');
-            if (payload.text) return { messageId: transport.send(incoming.conversation, payload.text,
-              { replyTo: incoming.id, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            const urls = [...new Set([...(payload.mediaUrl ? [payload.mediaUrl] : []), ...(payload.mediaUrls ?? [])])];
+            if (urls.length && !hasMedia) throw new Error('enclos OpenClaw channel media is not enabled');
+            const attachments = urls.length ? await stageMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }) : [];
+            assertAuthority();
+            if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
+              { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
           } },
-        });
+        }); } finally { typing(false); }
       },
     });
-    running.set(account.accountId, { transport, channel, account });
+    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg });
     const stop = async () => {
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
+      for (const [key, turn] of sessionRoutes) if (turn.active?.transport === transport) sessionRoutes.delete(key);
       await transport.close();
       ctx.setStatus?.({ accountId: account.accountId, running: false, connected: false });
     };
@@ -147,10 +185,23 @@ export function createChannel() {
     return { channel: 'enclos', to, messageId: id };
   }
 
+  async function sendMedia(ctx) {
+    if (!hasMedia) throw new Error('native media support is unavailable');
+    const account = resolveAccount(ctx.cfg, ctx.accountId), active = running.get(account.accountId);
+    if (!active) throw new Error('enclos account is not running');
+    const assertAuthority = () => { ctx.signal?.throwIfAborted(); ctx.assertDirectAdapterHandoff?.(); assertCurrent(ctx.cfg, account, active.transport); };
+    assertAuthority();
+    const attachments = await stageMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority });
+    await ctx.onPlatformSendDispatch?.(); assertAuthority();
+    const to = target(ctx.to, { ...account, home: active.transport.home });
+    const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
+    return { channel: 'enclos', to, messageId: id };
+  }
+
   const plugin = {
     id: 'enclos',
     meta: { id: 'enclos', label: 'enclos app', selectionLabel: 'enclos app', docsPath: '/channels/enclos', blurb: 'Conversations through the host\'s enclos bridge.' },
-    capabilities: { chatTypes: ['direct'], media: false, nativeCommands: false, blockStreaming: false, reply: true },
+    capabilities: { chatTypes: ['direct'], media: hasMedia, nativeCommands: false, blockStreaming: false, reply: true },
     reload: { configPrefixes: ['channels.enclos', 'bindings'] },
     config: {
       listAccountIds: cfg => Object.keys(cfg.channels?.enclos?.accounts ?? {}).sort(),
@@ -164,11 +215,12 @@ export function createChannel() {
       describeAccount: account => ({ accountId: account.accountId, enabled: account.enabled, configured: true }),
     },
     gateway: { startAccount },
-    outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText },
+    outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText, ...(hasMedia ? { sendMedia } : {}) },
     messaging: {
       targetPrefixes: ['enclos'], targetIdComparison: 'case-sensitive',
       normalizeTarget(raw) { try { return checkedId(raw.startsWith('enclos:') ? raw.slice(7) : raw); } catch { return undefined; } },
       inferTargetChatType: () => 'direct',
+      resolveInboundAttachmentRoots: ({ cfg, accountId }) => [path.join(path.dirname(resolveAccount(cfg, accountId).socket), 'media')],
       async resolveOutboundSessionRoute(params) {
         const account = resolveAccount(params.cfg, params.accountId);
         if (account.agentId !== params.agentId) return null;
@@ -189,10 +241,12 @@ export function createChannel() {
     agentPrompt: {
       inboundFormattingHints: () => ({ text_markup: 'markdown', rules: [
         'The person is using the enclos mobile app. Use CommonMark, fenced code and narrow tables.',
-        'This channel currently sends text. Do not claim a file or interactive control was delivered.',
+        hasMedia ? 'For a file, write it to a permitted local path and send MEDIA:/absolute/path/file. Images and files travel through the app channel, never a host URL.' : 'This channel currently sends text. Do not claim a file was delivered.',
+        'For a static HTML artefact, use a self-contained UTF-8 .html file with inline CSS and data images/fonts. Scripts, remote assets, forms and automatic navigation are unavailable; deliberate HTTP(S) links open the browser.',
+        'If sandbox policy refuses access, request the exact scope with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
         'Remote markdown images are links; HTML in text is literal. Home is the bridge-owned permanent destination for output without another conversation.',
       ] }),
     },
   };
-  return { plugin, setRuntime, running };
+  return { plugin, setRuntime, registerFull, running };
 }
