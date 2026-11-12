@@ -235,6 +235,35 @@ fn an_installer_can_create_folders_in_its_home_with_mkdir_p() {
 }
 
 #[test]
+fn openclaw_host_state_is_hidden_while_sandbox_local_state_is_writable() {
+    let w = world();
+    let policy = crate::policy::resolve(
+        "extends = \"assistant\"\n[filesystem]\nread_deny_add = [\"~/.openclaw-work\"]\n",
+        None,
+    )
+    .unwrap()
+    .policy;
+    w.enforce(&policy);
+    // These are harmless fixtures in a temporary home, never the host's
+    // actual OpenClaw state. Reading outside is each denial's control.
+    for root in [".openclaw", ".openclaw-dev", ".openclaw-work"] {
+        let folder = w.ctx.user_home.join(root);
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("openclaw.json");
+        std::fs::write(&file, "fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fixture");
+        assert!(w.refused(&format!("/bin/cat '{}'", file.display())));
+    }
+    assert!(w.sh(
+        "/bin/mkdir -p \"$HOME/.openclaw\" && printf local > \"$HOME/.openclaw/openclaw.json\""
+    ));
+    assert_eq!(
+        w.out("/bin/cat \"$HOME/.openclaw/openclaw.json\""),
+        (true, "local".into())
+    );
+}
+
+#[test]
 fn the_sandbox_writes_only_in_its_home() {
     let w = world();
     assert!(w.sh("echo ok > \"$HOME/written\""));
