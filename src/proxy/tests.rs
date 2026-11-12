@@ -1886,7 +1886,7 @@ fn diagnostic_provenance_keeps_private_probe_blocked_but_out_of_approvals() {
         &["10.0.0.1".into()],
         Box::new(FakeResolver("10.0.0.1".parse().unwrap())),
         crate::net::addr::classify,
-        |proxy| proxy.log = Box::new(log),
+        |proxy| proxy.log = Box::new(crate::state::sqlite::NetLogWriter::start(log)),
     );
     let (_, reply) = send(
         proxy.addr.clone(),
