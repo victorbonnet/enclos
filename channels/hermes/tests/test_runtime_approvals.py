@@ -1,6 +1,7 @@
 """Runtime approvals: typed transport and optional pinned native-source/Event harness."""
 
 import asyncio
+import collections
 import importlib
 import json
 import os
@@ -123,7 +124,7 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
             adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)),
                                             _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
             native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=rows))
-            manager = questions.Manager(adapter, approvals_native=lambda: native)
+            manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
             manager.bridge_runtime_supports = True
             self.assertEqual(await manager.ask_approval(prompt()), (True, None))
             text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
@@ -136,7 +137,7 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
                                         _outbox=Outbox(tempfile.mkdtemp()), _write=AsyncMock())
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
                                        observe_gateway_settle=Mock(return_value=False))
-        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
         manager.bridge_runtime_supports = True
         self.assertEqual(await manager.ask_approval(prompt()), (True, None))
         self.assertTrue(adapter.send.await_args_list)
@@ -147,7 +148,7 @@ class RuntimeApprovalBinding(unittest.IsolatedAsyncioTestCase):
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
                                        observe_gateway_settle=Mock(return_value=True),
                                        resolve_gateway_approval_card=Mock(return_value=1))
-        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
         manager.bridge_runtime_supports = True
         saved, question = await manager.ask_approval(prompt())
         self.assertTrue(saved)
@@ -171,7 +172,7 @@ class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
         native = types.SimpleNamespace(list_gateway_approvals=Mock(return_value=[dict(SNAPSHOT)]),
                                        observe_gateway_settle=Mock(return_value=True),
                                        resolve_gateway_approval_card=Mock(return_value=1))
-        manager = questions.Manager(adapter, approvals_native=lambda: native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=lambda: native)
         manager.bridge_runtime_supports = True
         return manager, adapter, native
 
@@ -266,6 +267,7 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             adapter_module = importlib.import_module("enclos.adapter")
             adapter = adapter_module.EnclosAdapter.__new__(adapter_module.EnclosAdapter)
             adapter._last_in = {}
+            adapter._seen = collections.OrderedDict()
             adapter.build_source = Mock()
             adapter.handle_message = AsyncMock()
             adapter.send = AsyncMock()
@@ -342,7 +344,7 @@ class RuntimeApprovalFallback(unittest.IsolatedAsyncioTestCase):
     async def test_old_bridge_or_api_keeps_full_typed_native_fallback(self):
         adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)))
         native = Mock(return_value=None)
-        manager = questions.Manager(adapter, approvals_native=native)
+        manager = questions.Manager(getattr(adapter, "_outbox", None), getattr(adapter, "_write", None), adapter.send, approvals_native=native)
         self.assertFalse(manager.approvals_available)
         self.assertEqual(await manager.ask_approval(prompt()), (True, None))
         native.assert_not_called()
@@ -378,7 +380,7 @@ async def check():
     adapter._outbox = Outbox(sys.argv[4] + '/outbox')
     adapter._write = AsyncMock(return_value=True)
     adapter._check_title_soon = Mock()
-    adapter._questions = questions.Manager(adapter)
+    adapter._questions = questions.Manager(adapter._outbox, adapter._write, adapter.send)
     adapter._questions.bridge_runtime_supports = True
     result = await adapter.send_exec_approval(chat_id='c', command='echo not-executed', session_key='old')
     assert result.success
@@ -423,7 +425,7 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
         self.adapter._write = AsyncMock(return_value=True)
         self.adapter._check_title_soon = Mock()
         self.adapter._local_image = Mock(side_effect=AssertionError("approval text must remain literal"))
-        self.manager = questions.Manager(self.adapter)
+        self.manager = questions.Manager(self.adapter._outbox, self.adapter._write, self.adapter.send)
         self.manager.bridge_supports = self.manager.bridge_runtime_supports = True
         self.adapter._questions = self.manager
         self.assertIs(runtime_approvals.native_api(), self.native)

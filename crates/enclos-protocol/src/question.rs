@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::visible::{has_hidden, revealed};
+use crate::visible::revealed;
 use crate::{ConversationId, QuestionId};
 
 pub const MAX_CHOICES: usize = 12;
@@ -75,8 +75,10 @@ pub struct RuntimeApprovalDefinition {
 impl RuntimeApprovalDefinition {
     pub fn validate(&self) -> Result<(), String> {
         use RuntimeApprovalAction::{Always, Deny, Once, Session};
-        text(&self.command, "Display command")?;
-        text(&self.reason, "Approval reason")?;
+        // Hidden characters stay: the command is shown with them written out,
+        // so the person reads what runs.
+        command_text(&self.command, "Display command")?;
+        command_text(&self.reason, "Approval reason")?;
         // The command is shown with its hidden characters written out; that
         // longer form must still fit, or the runtime keeps its text fallback.
         if revealed(&self.command).len() > MAX_QUESTION_BYTES {
@@ -102,10 +104,7 @@ impl RuntimeApprovalDefinition {
             ));
         }
         for pattern in &self.patterns {
-            text(pattern, "Approval pattern")?;
-            if has_hidden(pattern, false) {
-                return Err("An approval pattern holds a hidden character.".into());
-            }
+            text(pattern, "Approval pattern", false)?;
         }
         if self.grants_patterns() && self.patterns.is_empty() {
             return Err(
@@ -165,9 +164,29 @@ pub struct QuestionInfo {
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<QuestionAnswer>,
+    /// Whether this settlement is the one a paired device submitted,
+    /// matched by its request. False while pending and for a state the
+    /// agent's channel reports on its own, which a card shows as the
+    /// agent's report rather than the person's choice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
-fn text(value: &str, field: &str) -> Result<(), String> {
+/// Nonblank text without hidden characters ([`crate::visible`]); `lines`
+/// allows newlines, and nothing else that is not seen (no tab or CR).
+fn text(value: &str, field: &str, lines: bool) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be blank."));
+    }
+    if crate::visible::has_hidden(value, lines) {
+        return Err(format!("{field} holds a hidden or control character."));
+    }
+    Ok(())
+}
+
+/// A runtime approval's command or reason: not blank, and no control
+/// character but line breaks and tabs.
+fn command_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} must not be blank."));
     }
@@ -190,7 +209,7 @@ fn bounded(value: &impl Serialize, limit: usize, field: &str) -> Result<(), Stri
 
 impl QuestionDefinition {
     pub fn validate(&self) -> Result<(), String> {
-        text(&self.text, "Question")?;
+        text(&self.text, "Question", true)?;
         if let Some(approval) = &self.approval {
             approval.validate()?;
             if !self.choices.is_empty() || self.multiple {
@@ -205,13 +224,25 @@ impl QuestionDefinition {
         if self.multiple && self.choices.is_empty() {
             return Err("Multiple selection requires choices.".into());
         }
-        for label in &self.choices {
-            text(label, "Choice label")?;
+        for (index, label) in self.choices.iter().enumerate() {
+            text(label, "Choice label", false)?;
+            let bare = crate::visible::bare(label);
+            if self.choices[..index]
+                .iter()
+                .any(|other| crate::visible::bare(other) == bare)
+            {
+                return Err("Choice labels must be distinct.".into());
+            }
         }
         bounded(self, MAX_QUESTION_BYTES, "Question")
     }
 
-    /// Old apps display ordinary text and answer through the runtime's text interceptor.
+    /// The readable question, for an app without question controls. Its
+    /// reply goes through the runtime's text interceptor (Hermes: an
+    /// option's number or text, or "skip"; other text on a choice question
+    /// cancels it and reaches the agent as a message). A runtime's channel
+    /// without a bridge for questions sends its runtime's own text instead.
+    /// `tests/fixtures/question/fallback.json` holds the wording.
     /// A runtime approval lists its typed commands only when `typed`: where the
     /// host's person owns the conversation, the only person whose typed
     /// decision the bridge passes on to the runtime.
@@ -279,9 +310,9 @@ impl QuestionDefinition {
         result.push_str(if self.choices.is_empty() {
             "\nReply with your answer, or reply \"skip\" to skip this question."
         } else if self.multiple {
-            "\nChoose one or more options. Reply with their numbers separated by commas, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with the numbers or texts of one or more options, separated by commas, or reply \"skip\" to skip this question. Another message cancels it."
         } else {
-            "\nReply with an option's number, its text, or your own answer. Reply \"skip\" to skip this question."
+            "\nReply with an option's number or text, or reply \"skip\" to skip this question. Another message cancels it."
         });
         result
     }
@@ -315,7 +346,7 @@ impl QuestionAnswer {
                     }
                 }
             }
-            Self::Text { text: value } => text(value, "Answer")?,
+            Self::Text { text: value } => text(value, "Answer", true)?,
             Self::Skip => {}
             Self::Approval { .. } => unreachable!("approval answers were checked above"),
         }
@@ -342,11 +373,16 @@ impl QuestionInfo {
         {
             return Err("This terminal state does not belong to this kind of control.".into());
         }
+        if self.confirmed && self.state == QuestionState::Pending {
+            return Err("A pending question has no confirmed answer.".into());
+        }
+        // An answer the runtime accepted that this contract cannot carry
+        // (text with a hidden character, say) is answered without one.
         match (&self.state, &self.answer) {
             (QuestionState::Answered, Some(answer)) if !matches!(answer, QuestionAnswer::Skip) => {
                 answer.validate(&self.definition)?;
             }
-            (QuestionState::Answered, _) | (_, Some(_)) => {
+            (_, Some(_)) => {
                 return Err("Question state and answer disagree.".into());
             }
             (_, None) => {}
@@ -387,6 +423,89 @@ mod tests {
             state: QuestionState::Pending,
             revision: 0,
             answer: None,
+            confirmed: false,
+        }
+    }
+
+    #[test]
+    fn hidden_characters_and_duplicate_labels_are_refused() {
+        let original = definition(false);
+        // A label that reads as another, or two that read alike: the person
+        // could not tell what they choose.
+        for choices in [
+            vec!["Deny\u{202E}wolla".to_owned(), "Allow".into()],
+            vec!["Allow\u{200B}".to_owned(), "Allow".into()],
+            vec!["Allow".to_owned(), "Allow".into()],
+            vec!["Allow\u{E0041}".to_owned(), "Allow".into()],
+            vec!["\u{2764}".to_owned(), "\u{2764}\u{FE0F}".into()],
+            vec!["Allow\u{2028}".to_owned()],
+            vec!["\u{3164}".to_owned()],
+            vec!["Two\nlines".to_owned()],
+            vec!["Tab\there".to_owned()],
+        ] {
+            let invalid = QuestionDefinition {
+                choices,
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{:?}", invalid.choices);
+        }
+        for text in ["Which\u{2066}?", "Which\r\n?", "Which\t?", "\u{FEFF}Which?"] {
+            let invalid = QuestionDefinition {
+                text: text.into(),
+                ..original.clone()
+            };
+            assert!(invalid.validate().is_err(), "{text:?}");
+        }
+        assert!(
+            QuestionDefinition {
+                text: "Which one?\nPick carefully.".into(),
+                ..original.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        for text in ["ok\u{200D}", "a\tb", "a\r\nb", "\u{00AD}"] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_err(),
+                "{text:?}"
+            );
+        }
+        // Persian spelling, a joined emoji and an emoji's presentation
+        // selector are ordinary text, in a question, a label or an answer.
+        for text in [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert!(
+                QuestionAnswer::Text { text: text.into() }
+                    .validate(&original)
+                    .is_ok(),
+                "{text:?}"
+            );
+            let joined = QuestionDefinition {
+                text: text.into(),
+                choices: vec![text.into(), "Deny".into()],
+                ..original.clone()
+            };
+            assert!(joined.validate().is_ok(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_text_matches_the_shared_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/question/fallback.json")).unwrap();
+        for case in fixture.as_array().unwrap() {
+            let definition: QuestionDefinition =
+                serde_json::from_value(case["definition"].clone()).unwrap();
+            assert!(definition.validate().is_ok());
+            assert_eq!(
+                definition.fallback_text(false),
+                case["text"].as_str().unwrap()
+            );
         }
     }
 
@@ -513,13 +632,42 @@ mod tests {
             .validate()
             .is_err()
         );
+        // Answered, with nothing this contract can carry: the runtime has
+        // the answer, the card says so without its text.
         assert!(
             QuestionInfo {
                 state: QuestionState::Answered,
                 ..pending.clone()
             }
             .validate()
+            .is_ok()
+        );
+        assert!(
+            QuestionInfo {
+                confirmed: true,
+                ..pending.clone()
+            }
+            .validate()
             .is_err()
+        );
+        let confirmed = QuestionInfo {
+            state: QuestionState::Skipped,
+            confirmed: true,
+            ..pending.clone()
+        };
+        assert!(confirmed.validate().is_ok());
+        let encoded = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(encoded["confirmed"], true);
+        assert_eq!(
+            serde_json::from_value::<QuestionInfo>(encoded).unwrap(),
+            confirmed
+        );
+        // Unconfirmed is the default, and not written.
+        assert!(
+            serde_json::to_value(&pending)
+                .unwrap()
+                .get("confirmed")
+                .is_none()
         );
         assert!(
             QuestionInfo {

@@ -77,4 +77,19 @@ mod tests {
             reply
         );
     }
+
+    #[test]
+    fn a_refused_photo_edit_names_why_with_its_own_codes() {
+        use crate::plugin::ErrorCode;
+        for (code, wire) in [
+            (ErrorCode::Conflict, "conflict"),
+            (ErrorCode::Internal, "internal"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ErrorCode>(wire.into()).unwrap(),
+                code
+            );
+        }
+    }
 }

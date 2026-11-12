@@ -150,6 +150,10 @@ _Avoid_: room (Hermes's word), channel (a messaging account), team
 A page an agent makes for a person to open in the app from its conversation.
 _Avoid_: artifact, app (for a generated page)
 
+**Agent photo**:
+The picture that stands for an agent in the app, the same for every person shown the agent. The host's person chooses it; without one, the agent shows its initial.
+_Avoid_: profile picture, icon, avatar (the protocol's word, in `agent.avatar` and its fields, and nowhere else)
+
 **Agent command**:
 A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
 _Avoid_: command alone (enclos's own), shortcut, action
