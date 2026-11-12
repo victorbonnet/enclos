@@ -133,7 +133,7 @@ fn connect_within(
             hello.body
         )));
     };
-    reader.lines.get_ref().set_read_timeout(None)?;
+    read_wait(reader.lines.get_ref(), None)?;
     Ok((
         PluginHello {
             runtime,
@@ -257,6 +257,22 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Sets how long a read on `stream` may wait. macOS refuses to change it
+/// (`EINVAL`) once the connection is shut both ways, which it is as soon
+/// as the plugin has closed its end: a plugin may send its `hello` and
+/// close before the bridge has read it. A read there never waits, it gets
+/// what is left and then the end, so that refusal is no failure.
+fn read_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
+    match stream.set_read_timeout(wait) {
+        // Rust's own refusal (a zero wait) is `InvalidInput` too, but
+        // carries no OS error.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 impl PluginReader {
     /// The plugin's first message, by `deadline` whatever it sends until
     /// then (`wait` is how long it was given), at most [`MAX_HELLO_BYTES`].
@@ -276,7 +292,7 @@ impl PluginReader {
                         wait.as_millis()
                     )));
                 }
-                self.lines.get_ref().set_read_timeout(Some(left))?;
+                read_wait(self.lines.get_ref(), Some(left))?;
                 let read = match self.lines.fill_buf() {
                     Ok(read) => read,
                     Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => continue,
@@ -759,6 +775,46 @@ mod tests {
             Err(PluginError::Protocol(_))
         ));
         plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_plugin_that_says_hello_and_closes_at_once_is_still_read() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut line = Vec::new();
+            BufReader::new(stream).read_until(b'\n', &mut line).unwrap();
+            let hello = FromPlugin::Hello {
+                runtime: "hermes".into(),
+                agent: "main".into(),
+                capabilities: vec![],
+            };
+            let id = MessageId::new(new_id().unwrap()).unwrap();
+            out.write_all(&encode_line(&Envelope::new(id, hello)))
+                .unwrap();
+            out.write_all(&out_line("p-1", "last words")).unwrap();
+            // Closed here, as a rule before the bridge is done with the
+            // hello (on macOS, the timeout it then clears is refused).
+        });
+        let (hello, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
+        assert_eq!(hello.agent, "main");
+        assert_eq!(reader.receive().unwrap().unwrap().id.as_str(), "p-1");
+        assert!(reader.receive().unwrap().is_none());
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_wait_on_a_closed_connection_is_no_failure() {
+        let (stream, other) = UnixStream::pair().unwrap();
+        drop(other);
+        read_wait(&stream, Some(Duration::from_secs(5))).unwrap();
+        read_wait(&stream, None).unwrap();
+        assert_eq!((&stream).read(&mut [0; 8]).unwrap(), 0);
+        // A zero wait is still refused, as Rust refuses it.
+        assert!(read_wait(&stream, Some(Duration::ZERO)).is_err());
     }
 
     #[test]

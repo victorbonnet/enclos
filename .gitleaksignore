@@ -1,0 +1,15 @@
+# Findings gitleaks reports that are not secrets, by fingerprint
+# (commit:file:rule:line). Each names one commit, so it covers nothing else.
+
+# A test's made-up home folder, which the home-folder-path rule takes for a
+# person's; the test uses the rule's placeholder home since, and the commit
+# cannot be rewritten on a shared branch.
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:60
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:62
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:66
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:67
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:69
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:70
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:71
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:83
+2761efbd9b4f8045fa5ae72316e99f89e67574b4:src/engine/tests/approvals.rs:home-folder-path:84
