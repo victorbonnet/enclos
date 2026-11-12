@@ -543,7 +543,7 @@ dependencies = [
  "clap",
  "close_fds",
  "enclos-protocol",
- "getrandom",
+ "getrandom 0.4.3",
  "icu_properties",
  "jiff",
  "landlock",
