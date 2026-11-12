@@ -422,7 +422,8 @@ fn writes_wait(command: &Command) -> Wait {
         | Command::Runtime(_)
         | Command::Inside(_)
         | Command::Dashboard(_)
-        | Command::Logs(_) => Wait::Command,
+        | Command::Logs(_)
+        | Command::App(_) => Wait::Command,
     }
 }
 
