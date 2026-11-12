@@ -100,9 +100,13 @@ fn python_space(c: char) -> bool {
 /// of the session) or `/approvals` (sets the approval mode, `off`
 /// included), in any case, with or without arguments or an `@name` suffix,
 /// after any leading `@image:`, `@file:` or `@url:` lines (Hermes's own
-/// parsing of a command message, `MessageEvent.get_command`). The channel
-/// checks again with Hermes's own parser and aliases (`message.in`'s
-/// `host`); this is the bridge's own line, for a channel that does not.
+/// parsing of a command message, `MessageEvent.get_command`). The bridge
+/// passes none on, whoever types it: a message carries no proof of its
+/// person the plugin could check, and the runtime reads it from whoever the
+/// plugin names, so runtime approvals are decided with the app's buttons,
+/// whose decisions the bridge signs (ADR 0060). The channel answers them
+/// itself too, read with Hermes's own parser and aliases; this is the
+/// bridge's own line, for a channel that does not.
 pub(super) fn typed_approval(text: &str) -> bool {
     let mut rest = text.trim_start_matches(python_space);
     while ["@image:", "@file:", "@url:"].iter().any(|prefix| {
@@ -261,13 +265,6 @@ pub(super) fn acknowledge_ask(
 }
 
 impl Hub {
-    /// Whether `person`'s `text` is a typed runtime approval the bridge must
-    /// not pass on: only the host's person decides runtime approvals, typed
-    /// or through the app's controls, and an unknown host decides none.
-    pub(super) fn refuses_typed_approval(&self, person: &str, text: &str) -> bool {
-        typed_approval(text) && self.known_host().as_deref() != Some(person)
-    }
-
     /// Whether `person`'s devices get `definition`'s structured metadata. A
     /// runtime approval's controls are the host's person's alone; anyone else
     /// reads its history text, which says who can answer it.
@@ -366,14 +363,13 @@ impl Hub {
             ));
         }
         question.validate().map_err(QuestionStoreError::Invalid)?;
-        // Refuse before persistence if a future fallback renderer exceeds the device frame,
-        // with or without the typed commands the host's person sees.
-        let introduction = |typed: bool| {
+        // Refuse before persistence if a future fallback renderer exceeds the device frame.
+        let introduction = || {
             ToDevice::Message(ConversationMessage {
                 conversation: conversation.clone(),
                 agent: origin.agent.into(),
                 from: "agent".into(),
-                text: question.fallback_text(typed),
+                text: question.fallback_text(),
                 kind: if question.approval.is_some() {
                     "runtime_approval"
                 } else {
@@ -386,7 +382,7 @@ impl Hub {
                 question: Some(question.id.clone()),
             })
         };
-        if !(bounded(&introduction(true)) && bounded(&introduction(false))) {
+        if !bounded(&introduction()) {
             return Err(QuestionStoreError::Invalid(
                 "The readable question history exceeds the device frame limit.".into(),
             ));
@@ -631,6 +627,13 @@ impl Hub {
                 "This runtime does not support native app answers.",
             ));
         }
+        if capability == Capability::RuntimeApprovals && self.approval_key.is_none() {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This bridge has no key to sign runtime approvals with. Nothing was sent.",
+            ));
+        }
         let in_flight = requests
             .pending
             .values()
@@ -667,12 +670,37 @@ impl Hub {
             },
         );
         drop(requests);
+        // A runtime approval's decision goes signed (ADR 0060): the plugin
+        // acts on no other, so an agent speaking on its own plugin's socket
+        // cannot approve its own command.
+        let signed = match (&current.info.definition.approval, &request.answer) {
+            (Some(approval), QuestionAnswer::Approval { action }) => {
+                let decision = enclos_protocol::decision::Decision {
+                    agent: &current.info.agent,
+                    conversation: current.info.conversation.as_str(),
+                    question: request.question.as_str(),
+                    request: rpc.as_str(),
+                    action: action.as_str(),
+                    command: &approval.command,
+                    reason: &approval.reason,
+                    patterns: &approval.patterns,
+                };
+                Some(
+                    self.approval_key
+                        .as_ref()
+                        .expect("checked before the answer was registered")
+                        .sign(&decision, now()),
+                )
+            }
+            _ => None,
+        };
         let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::QuestionAnswer {
                 conversation: current.info.conversation,
                 question: request.question.clone(),
                 answer: request.answer,
+                signed,
             },
         );
         if let Err(error) = sent {
