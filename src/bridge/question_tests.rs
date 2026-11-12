@@ -167,6 +167,33 @@ fn ask(native: &mut Native, rx: &Receiver<ToDevice>, definition: &QuestionDefini
 }
 
 #[test]
+fn a_question_brings_its_archived_conversation_back_first() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    assert_eq!(
+        store.set_archived("owned", OWNER, true).unwrap(),
+        Some(true)
+    );
+    let mut native = native(&hub, vec![Capability::Questions]);
+    let definition = definition("q-archived");
+    native.send(
+        "ask",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition.clone(),
+        },
+    );
+    native.ack("ask");
+    // The conversation's metadata, unarchived, comes before the question.
+    assert!(
+        matches!(next(&rx), ToDevice::Conversation(info) if info.conversation.as_str() == "owned" && !info.archived)
+    );
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.definition == definition)
+    );
+    assert!(!store.conversation_info("owned").unwrap().unwrap().archived);
+}
+
+#[test]
 fn native_socket_answer_requires_exact_receipt_and_keeps_history_in_order() {
     let (_dir, hub, store, device, rx) = fixture();
     let mut native = native(&hub, vec![Capability::Questions]);
