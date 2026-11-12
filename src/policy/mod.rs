@@ -23,6 +23,7 @@ pub const DEFAULTS: &str = include_str!("templates/defaults.toml");
 const TEMPLATES: &[(&str, &str)] = &[
     ("minimal", include_str!("templates/minimal.toml")),
     ("assistant", include_str!("templates/assistant.toml")),
+    ("autonomous", include_str!("templates/autonomous.toml")),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -222,9 +223,16 @@ fn normalize(policy: &mut Policy) {
         *entry = canonical_private(entry)
             .unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_ascii_lowercase());
     }
+    // Ports matter only in public mode: `allowlist` keeps the web ports, so
+    // a template's `any` narrowed by `mode = "allowlist"` is not stored to
+    // come back unseen.
+    if policy.net.mode != crate::model::policy::NetMode::Public {
+        policy.net.public_ports = crate::model::policy::PublicPorts::Web;
+    }
     for list in [
         &mut policy.fs.write,
         &mut policy.fs.read_deny,
+        &mut policy.fs.read_only,
         &mut policy.net.allow,
         &mut policy.net.private,
     ] {
@@ -300,7 +308,77 @@ mod tests {
         assert_eq!(snap.policy.fs.write, ["{home}"]);
         // The defaults' deny list holds under every template.
         assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
-        assert_eq!(template_names(), ["minimal", "assistant"]);
+        assert_eq!(template_names(), ["minimal", "assistant", "autonomous"]);
+    }
+
+    /// `autonomous` writes the whole filesystem, keeps the shell's startup
+    /// files read-only and the built-in deny list, and opens every port in
+    /// public mode (ADR 0058); a sandbox's `policy.toml` narrows each.
+    #[test]
+    fn autonomous_writes_everywhere_keeps_the_deny_list_and_opens_every_port() {
+        use crate::model::policy::{NetMode, PublicPorts};
+        let template: TemplateName = "autonomous".parse().unwrap();
+        let text = initial_overrides("home", &template);
+        let policy = resolve(&text, None).unwrap().policy;
+        assert_eq!(policy.fs.write, ["/"]);
+        assert!(policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
+        assert!(policy.fs.read_only.contains(&"~/.zshrc".to_owned()));
+        assert!(policy.fs.read_only.contains(&"~/.config/fish".to_owned()));
+        assert_eq!(policy.net.mode, NetMode::Public);
+        assert_eq!(policy.net.public_ports, PublicPorts::Any);
+
+        let narrowed = text
+            .replace(
+                "write_add = []",
+                "write = [\"{home}\", \"~/Movies\"]\nread_only_add = [\"~/.gitconfig\"]",
+            )
+            .replace("allow_add = []", "allow_add = []\npublic_ports = \"web\"");
+        let policy = resolve(&narrowed, None).unwrap().policy;
+        assert_eq!(policy.fs.write, ["{home}", "~/Movies"]);
+        assert!(policy.fs.read_only.contains(&"~/.gitconfig".to_owned()));
+        assert!(policy.fs.read_only.contains(&"~/.zshrc".to_owned()));
+        assert_eq!(policy.net.public_ports, PublicPorts::Web);
+    }
+
+    /// Ports matter only in public mode: `autonomous` narrowed to the
+    /// allowlist stores the web ports, so `any` does not come back unseen.
+    #[test]
+    fn the_ports_outside_public_mode_are_the_web_ports() {
+        use crate::model::policy::{NetMode, PublicPorts};
+        let template: TemplateName = "autonomous".parse().unwrap();
+        let text = initial_overrides("home", &template)
+            .replace("allow_add = []", "allow_add = []\nmode = \"allowlist\"");
+        let policy = resolve(&text, None).unwrap().policy;
+        assert_eq!(policy.net.mode, NetMode::Allowlist);
+        assert_eq!(policy.net.public_ports, PublicPorts::Web);
+        assert_eq!(policy.net.public_reach(), None);
+    }
+
+    /// A snapshot stored before these fields reads as the web ports and no
+    /// read-only path.
+    #[test]
+    fn a_snapshot_stored_before_read_only_and_public_ports_reads_as_before() {
+        use crate::model::policy::PublicPorts;
+        let stored = r#"{"fs":{"write":["{home}"],"read_deny":["~/.ssh"]},"net":{"mode":"public","allow":[],"private":[],"log":"metadata","listen":false}}"#;
+        let policy: crate::model::policy::Policy = serde_json::from_str(stored).unwrap();
+        assert!(policy.fs.read_only.is_empty());
+        assert_eq!(policy.net.public_ports, PublicPorts::Web);
+        assert_eq!(serde_json::to_string(&policy).unwrap(), stored);
+    }
+
+    /// The new fields stay out of a snapshot at their defaults, so the
+    /// other templates resolve to the same snapshot as before them.
+    #[test]
+    fn read_only_and_public_ports_are_left_out_of_a_snapshot_at_their_defaults() {
+        let snap = resolve(&overrides(""), None).unwrap();
+        let json = serde_json::to_string(&snap.policy).unwrap();
+        assert!(!json.contains("read_only"), "{json}");
+        assert!(!json.contains("public_ports"), "{json}");
+        let template: TemplateName = "autonomous".parse().unwrap();
+        let snap = resolve(&initial_overrides("home", &template), None).unwrap();
+        let json = serde_json::to_string(&snap.policy).unwrap();
+        assert!(json.contains("\"read_only\""), "{json}");
+        assert!(json.contains("\"public_ports\":\"any\""), "{json}");
     }
 
     /// `minimal` is `assistant` with the public web closed: the same writes,
@@ -558,6 +636,11 @@ mod tests {
                 "network.log",
             ),
             ("[network]\nmode = \"public\"\n", "network.mode"),
+            (
+                "[network]\npublic_ports = \"any\"\n",
+                "network.public_ports",
+            ),
+            ("[filesystem]\nread_only_add = [\"~/x\"]\n", "filesystem"),
             ("[filesystem]\nwrite_add = [\"~/x\"]\n", "filesystem"),
         ] {
             let err = resolve(&overrides(""), Some(&layer(text))).unwrap_err();
