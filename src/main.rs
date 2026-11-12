@@ -14,6 +14,7 @@ use enclos::error::{Result, exit};
 use enclos::layout::Layout;
 use enclos::model::audit::{Actor, AuditEntry, AuditResult, Since, VerifyReport};
 use enclos::model::plan::{Confirm, Plan, Planned};
+use enclos::state::Wait;
 
 /// Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log.
 #[derive(Parser)]
@@ -281,7 +282,8 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::accepted_unenforced(args),
         _ => Vec::new(),
     };
-    let engine = Engine::open(Layout::from_env()?).accepting_unenforced(accepted);
+    let engine =
+        Engine::open(Layout::from_env()?, writes_wait(&command)).accepting_unenforced(accepted);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
     match command {
         Command::Init => {
@@ -389,6 +391,34 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Launch(_)
         | Command::Dashboard(_)
         | Command::Logs(_) => false,
+    }
+}
+
+/// How long `command`'s writes to the state database wait for another's
+/// (design §11): those of the programs the service manager runs, which no
+/// person waits on, wait longer than a command's, which the user can run
+/// again. No arm takes the rest, so a new command is placed here to build.
+fn writes_wait(command: &Command) -> Wait {
+    match command {
+        Command::Launch(_) | Command::Proxy(_) | Command::Holder(_) | Command::Relay(_) => {
+            Wait::Background
+        }
+        Command::Init
+        | Command::Doctor
+        | Command::Audit(_)
+        | Command::Sandbox(_)
+        | Command::Policy(_)
+        | Command::Secret(_)
+        | Command::State(_)
+        | Command::Net(_)
+        | Command::Status(_)
+        | Command::Agent(_)
+        | Command::Connect(_)
+        | Command::Exec(_)
+        | Command::Runtime(_)
+        | Command::Inside(_)
+        | Command::Dashboard(_)
+        | Command::Logs(_) => Wait::Command,
     }
 }
 

@@ -100,3 +100,44 @@ fn on_a_runner_status_tells_a_bubblewrap_sandboxs_listeners() {
     );
     assert!(control, "the host's listener did not answer at {address}");
 }
+
+/// `policy show` says where a bubblewrap sandbox listens: in its own
+/// network namespace, which the host's network does not reach, with
+/// `enclos dashboard` the way in (ADR 0040), not that what listens there
+/// can serve the network, which is Seatbelt's case.
+#[test]
+fn on_a_runner_policy_show_says_a_bubblewrap_sandboxs_listeners_are_out_of_the_hosts_network() {
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let file = lab.root.path().join("sandboxes/lab/policy.toml");
+    let current = std::fs::read_to_string(&file).unwrap();
+    assert!(current.contains("[network]\n"), "{current}");
+    let wanted = lab.root.path().join("wanted.toml");
+    std::fs::write(
+        &wanted,
+        current.replacen("[network]\n", "[network]\nlisten = true\n", 1),
+    )
+    .unwrap();
+    let out = lab
+        .command(&["policy", "edit", "lab"])
+        .env_remove("VISUAL")
+        .env("EDITOR", format!("cp '{}'", wanted.display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let shown = text(&lab.ok(&["policy", "show", "lab"]).stdout);
+    let listening = shown
+        .lines()
+        .find(|l| l.trim_start().starts_with("listening:"))
+        .unwrap_or_else(|| panic!("no listening line: {shown}"));
+    assert!(listening.contains("own network namespace"), "{listening}");
+    assert!(
+        listening.contains("the host's network does not reach"),
+        "{listening}"
+    );
+    assert!(listening.contains("`enclos dashboard`"), "{listening}");
+    assert!(!listening.contains("serve the network"), "{listening}");
+}

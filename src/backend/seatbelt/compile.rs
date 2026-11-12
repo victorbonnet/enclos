@@ -1,13 +1,16 @@
 //! Compiling a policy for Seatbelt (design §5): `(deny default)` and what
 //! a sandbox may do on that baseline (ADR 0006), then writes only where
-//! granted, no terminal device but the session's own
-//! and those the sandbox opens, reads of the sandbox home, the sensitive
-//! deny list for reads and writes (after those allows, so no grant covers
-//! it), the writable folders that cannot move (so no rename or clone carries
-//! a denied path elsewhere), network only over TCP to the sandbox's proxy
+//! granted (the whole filesystem without `/dev`, ADR 0058), no terminal
+//! device but the session's own and those the sandbox opens, reads of the
+//! sandbox home, the sensitive deny list for reads and writes and the
+//! read-only paths for writes (after those allows, so no grant covers
+//! them), the writable folders that cannot move or be made as a symlink
+//! (so no rename, clone or link carries a kept path elsewhere), the links
+//! on the way to a kept path, network only over TCP to the sandbox's proxy
 //! port on loopback and to Unix sockets in its home, the host-service
-//! denials, and last, so no rule above can override them, enclos's protected
-//! paths and the home and workspaces themselves, which stay where they are.
+//! denials, and last, so no rule above can override them, enclos's
+//! protected paths and program and the home and workspaces themselves,
+//! which stay where they are.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
@@ -18,7 +21,7 @@ use std::path::Path;
 use super::super::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, PORT_FIRST, PORT_LAST};
-use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
+use crate::policy::paths::{FsPaths, Kept, PathContext, is_whole_filesystem, is_within, real_path};
 
 const HOST_SERVICES: &str = include_str!("host-services.sb");
 
@@ -161,11 +164,31 @@ pub fn compile(
         user_home: ctx.user_home.clone(),
         sandbox_home: ctx.home.clone(),
     };
-    let fs = FsPaths::of(&policy.fs, &paths).map_err(unsupported)?;
+    // enclos's program is named only where a grant holds it (ADR 0058), so
+    // a compiled policy does not change with where enclos is installed;
+    // not knowing where it is, a grant beyond the home could hold it.
+    let program = match &ctx.program {
+        Some(program) => program.as_slice(),
+        None if policy.fs.write.iter().any(|w| w != "{home}") => {
+            return Err(unsupported(
+                "enclos cannot tell where its own program is, and a write grant could hold it: the services run it outside every sandbox, so it must be kept unchanged; run enclos from where it is installed".into(),
+            ));
+        }
+        None => &[],
+    };
+    let kept = Kept {
+        protected: &ctx.protected,
+        program,
+    };
+    let fs = FsPaths::of(&policy.fs, &paths, kept).map_err(unsupported)?;
     let FsPaths {
         home,
         writes,
         read_deny,
+        read_only,
+        protected: _,
+        program,
+        links,
     } = &fs;
 
     let mut sb = String::new();
@@ -184,7 +207,17 @@ pub fn compile(
     line(format!("(deny file-write* (with message \"{tag}\"))"));
     let mut allowed = vec![subpath(home)?];
     for path in writes {
-        allowed.push(subpath(path)?);
+        // The whole filesystem but `/dev`, whose devices keep the rules
+        // below (ADR 0058).
+        allowed.push(if is_whole_filesystem(path) {
+            format!(
+                "(require-all {} (require-not {}))",
+                subpath(path)?,
+                subpath(Path::new("/dev"))?
+            )
+        } else {
+            subpath(path)?
+        });
     }
     allowed.extend(DEVICES.iter().map(|d| d.to_string()));
     line(format!("(allow file-write*\n  {})", allowed.join("\n  ")));
@@ -237,11 +270,53 @@ pub fn compile(
         ));
     }
 
+    if !read_only.is_empty() {
+        line(
+            "\n;; ---- Read-only paths: read, never changed, whatever a grant covers (ADR 0058)"
+                .into(),
+        );
+        let kept = read_only
+            .iter()
+            .map(|p| {
+                // As for the deny list: one holding the home leaves the home
+                // out, since the sandbox must keep writing there.
+                if is_within(home, p) {
+                    Ok(format!(
+                        "(require-all {} (require-not {}))",
+                        subpath(p)?,
+                        subpath(home)?
+                    ))
+                } else {
+                    subpath(p)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        line(format!(
+            "(deny file-write* (with message \"{tag}\")\n  {})",
+            kept.join("\n  ")
+        ));
+    }
+
     line(
         "\n;; ---- Writable folders that cannot move, so no rename or clone carries a denied path elsewhere"
             .into(),
     );
     line(unmovable_rule(&fs, &tag)?);
+    line(unlinkable_rule(&fs, &tag)?);
+    if !links.is_empty() {
+        line(
+            "\n;; ---- Links on the way to a kept path: never removed or replaced (ADR 0058)"
+                .into(),
+        );
+        let literals = links
+            .iter()
+            .map(|p| literal(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        line(format!(
+            "(deny file-write* (with message \"{tag}\")\n  {})",
+            literals.join("\n  ")
+        ));
+    }
 
     // A sandbox that listens binds no port of the proxy range (below): one
     // whose proxy port is elsewhere could have it taken by another sandbox.
@@ -319,6 +394,16 @@ pub fn compile(
             subpath(home)?
         ));
     }
+    if !program.is_empty() {
+        let literals = program
+            .iter()
+            .map(|p| literal(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        line(format!(
+            "(deny file-write* (with message \"{tag}\")\n  {})",
+            literals.join("\n  ")
+        ));
+    }
     let mut hidden = Vec::new();
     for file in &ctx.hidden_files {
         hidden.push(prefix_regex(&real_path(file))?);
@@ -348,7 +433,7 @@ pub fn compile(
             .into(),
     );
     let mut roots = vec![literal(home)?];
-    for path in writes {
+    for path in writes.iter().filter(|w| !is_whole_filesystem(w)) {
         let root = literal(path)?;
         if !roots.contains(&root) {
             roots.push(root);
@@ -373,6 +458,22 @@ pub fn compile(
 /// are still made, renamed and removed. `file-clone` is denied on them too:
 /// cloning a folder copies everything under it in one call, so it would
 /// copy denied paths with it.
+///
+/// A folder of them not made yet cannot be made as a symlink either (nor
+/// moved there as one): the paths inside it would then lead wherever the
+/// link points, past every rule naming them.
+fn unlinkable_rule(fs: &FsPaths, tag: &str) -> Result<String, CompileError> {
+    let folders = fs
+        .unmovable()
+        .iter()
+        .map(|f| literal(f))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "(deny file-write-create (with message \"{tag}\")\n  (require-all (vnode-type SYMLINK)\n    (require-any\n      {})))",
+        folders.join("\n      ")
+    ))
+}
+
 fn unmovable_rule(fs: &FsPaths, tag: &str) -> Result<String, CompileError> {
     let folders = fs
         .unmovable()
@@ -558,6 +659,90 @@ mod tests {
         assert!(text.contains(
             "(require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home\"))"
         ));
+    }
+
+    /// A grant of the whole filesystem (ADR 0058) leaves `/dev` to the
+    /// device rules, and read-only paths and enclos's program are denied
+    /// after every allow; `/` itself gets no literal rule against moving.
+    #[test]
+    fn the_whole_filesystem_leaves_dev_out_and_keeps_read_only_paths() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.fs.write = vec!["/".into()];
+        p.fs.read_only = vec!["~/.zshrc".into()];
+        let mut c = ctx(base);
+        c.program = Some(vec![base.join("bin/enclos")]);
+        let text = compile(&p, &c, Baseline::DenyDefault).unwrap().text;
+        assert!(
+            text.contains("(require-all (subpath \"/\") (require-not (subpath \"/dev\")))"),
+            "{text}"
+        );
+        let last_write_allow = text.rfind("(allow file-write*").unwrap();
+        let last_allow = text.rfind("(allow ").unwrap();
+        let read_only = text
+            .find("(deny file-write* (with message \"enclos:home\")\n  (subpath \"/nonexistent-enclos-test/alice/.zshrc\")")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(last_write_allow < read_only, "{text}");
+        assert!(text.contains(
+            "(deny file-write* (with message \"enclos:home\")\n  (literal \"/nonexistent-enclos-test/bin/enclos\")"
+        ));
+        assert!(
+            last_allow
+                < text
+                    .find("(literal \"/nonexistent-enclos-test/bin/enclos\")")
+                    .unwrap()
+        );
+        // The folders holding the program and enclos's files cannot move;
+        // `/` is never named as one.
+        let unmovable = &text[text
+            .find(";; ---- Writable folders that cannot move")
+            .unwrap()..];
+        assert!(unmovable.contains("(literal \"/nonexistent-enclos-test/bin\")"));
+        assert!(unmovable.contains("(literal \"/nonexistent-enclos-test/alice\")"));
+        assert!(!text.contains("(literal \"/\")"), "{text}");
+        // No folder of them is made as a symlink, nor moved there as one.
+        assert!(text.contains(
+            "(deny file-write-create (with message \"enclos:home\")\n  (require-all (vnode-type SYMLINK)"
+        ));
+
+        // Without a grant covering it, the program is not named, so a
+        // compiled policy does not change with where enclos is installed.
+        let text = compile(&policy(), &c, Baseline::DenyDefault).unwrap().text;
+        assert!(!text.contains("bin/enclos"), "{text}");
+        assert!(!text.contains(";; ---- Read-only paths"), "{text}");
+    }
+
+    /// Not knowing where enclos's program is, a grant beyond the home could
+    /// hold it: refused rather than compiled without it (ADR 0009, 0058).
+    #[test]
+    fn a_grant_beyond_the_home_is_refused_when_enclos_program_is_unknown() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut c = ctx(base);
+        c.program = None;
+        let err = compile(&policy(), &c, Baseline::DenyDefault)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot tell where its own program is"),
+            "{err}"
+        );
+        let mut home_only = policy();
+        home_only.fs.write = vec!["{home}".into()];
+        assert!(compile(&home_only, &c, Baseline::DenyDefault).is_ok());
+    }
+
+    /// A read-only path holding the home leaves the home out, as the deny
+    /// list does: the sandbox keeps writing there.
+    #[test]
+    fn a_read_only_path_holding_the_home_leaves_the_home_out() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.fs.read_only = vec!["~".into()];
+        p.fs.write = vec!["{home}".into()];
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
+        assert!(text.contains(
+            "(require-all (subpath \"/nonexistent-enclos-test/alice\") (require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))"
+        ), "{text}");
     }
 
     #[test]
