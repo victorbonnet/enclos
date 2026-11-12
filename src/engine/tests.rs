@@ -24,7 +24,11 @@ fn alice() -> Actor {
 fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path().join("enclos"));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
         .with_downloader(Box::new(LocalFiles));
@@ -132,6 +136,46 @@ fn init_records_the_first_available_backend() {
         config.contains("default_backend = \"seatbelt\""),
         "{config}"
     );
+}
+
+/// The backend `sandbox create` takes when it names none: the one
+/// `config.toml` names, whether this host runs it or not; where it names
+/// none or is not there, the first available here; with none available,
+/// this system's own, whose probe then refuses the create.
+#[test]
+fn the_default_backend_is_config_tomls_else_the_first_available_else_the_systems() {
+    let (_dir, mut engine) = engine_with(vec![
+        Box::new(FakeBackend::unavailable(BackendKind::Seatbelt, "not here")),
+        Box::new(FakeBackend::available(BackendKind::Bubblewrap)),
+    ]);
+    // Not initialized: no config.toml.
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+
+    let named = crate::config::initial(Some(BackendKind::Seatbelt));
+    std::fs::write(engine.layout.config_file(), named).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Seatbelt);
+
+    std::fs::write(engine.layout.config_file(), crate::config::initial(None)).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    engine.backends = vec![Box::new(FakeBackend::unavailable(
+        BackendKind::Bubblewrap,
+        "not here",
+    ))];
+    let system = match cfg!(target_os = "macos") {
+        true => BackendKind::Seatbelt,
+        false => BackendKind::Bubblewrap,
+    };
+    assert_eq!(engine.default_backend().unwrap(), system);
+
+    std::fs::write(engine.layout.config_file(), "not = [toml").unwrap();
+    let err = engine.default_backend().unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::DefaultBackend { .. }),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), crate::error::exit::ERROR);
 }
 
 /// A `config.toml` written while no backend was available gets the one

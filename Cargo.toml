@@ -1,6 +1,6 @@
 [package]
 name = "enclos"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log"
