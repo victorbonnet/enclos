@@ -22,8 +22,8 @@ use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
 use enclos_protocol::device::ConversationMessage;
 use enclos_protocol::pairing::PairLink;
-use enclos_protocol::plugin::{FromPlugin, OutKind};
-use enclos_protocol::{ConversationId, Person};
+use enclos_protocol::plugin::{FromBridge, FromPlugin, OutKind};
+use enclos_protocol::{ConversationId, MessageId, Person};
 use qrcode::QrCode;
 use qrcode::render::unicode::Dense1x2;
 
@@ -480,9 +480,11 @@ fn chat(
         if text.is_empty() {
             continue;
         }
-        let id = writer
-            .message(&conversation, &person, text)
-            .map_err(plugin_error)?;
+        // Stored first, so what the agent has is in the history.
+        let id = new_id()
+            .ok()
+            .and_then(|id| MessageId::new(id).ok())
+            .ok_or_else(|| failed("cannot make a message id".to_owned()))?;
         let whole = ConversationMessage {
             conversation: conversation.clone(),
             agent: format!("{sandbox}/{agent}"),
@@ -501,6 +503,16 @@ fn chat(
                 "message",
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
+        writer
+            .send_with_id(
+                id,
+                FromBridge::MessageIn {
+                    conversation: conversation.clone(),
+                    person: person.clone(),
+                    text: text.to_owned(),
+                },
+            )
+            .map_err(plugin_error)?;
     }
     // End of input: close the connection itself, so the reading thread
     // sees its end and the plugin is free for the bridge.
