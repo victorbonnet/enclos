@@ -549,6 +549,7 @@ pub trait RuntimeAdapter {
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool;
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;   // read on the host; Err: cannot tell, and why
     fn builtin_agent(&self) -> Option<BuiltinAgent>;                            // permanent identity, if any; not the runtime's selected default
+    fn default_agent(&self, home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable>; // selected native target, read from installed state
     fn delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand>;
     fn finish_delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // finishes a delete that failed after the agent and its folder went: Hermes 0.23.0's `profile purge-identity`
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand>;
@@ -563,6 +564,7 @@ pub trait RuntimeAdapter {
     fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> { Vec::new() }             // Runtime | Cache
     fn runtime_facts(&self) -> RuntimeFacts { RuntimeFacts::default() }          // version, login file, install path
     fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts { AgentFacts::default() }   // folder, model, activity files
+    fn fact_value(&self, at: &ValueAt, text: &str) -> Result<Option<String>, String>; // interpret bounded contents and opaque native selectors
 }
 ```
 

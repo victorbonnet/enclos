@@ -136,12 +136,13 @@ pub enum DiskPart {
     Cache,
 }
 
-/// A value in a YAML file of the sandbox home: the file, and the dotted
-/// keys to try in order (`model.default`).
+/// A fact in a file of the sandbox home. The adapter interprets `keys` as
+/// native selectors in [`RuntimeAdapter::fact_value`]; the engine only reads
+/// the bounded text and makes the result safe to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueAt {
     pub file: HomePath,
-    pub keys: &'static [&'static str],
+    pub keys: Vec<String>,
 }
 
 /// Where a runtime keeps the facts `enclos status` shows about it. Paths
@@ -296,6 +297,14 @@ pub trait RuntimeAdapter {
     /// read a bounded number of entries, and answer [`Unreadable`], with
     /// the reason, rather than guess (ADR 0023).
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    /// The native target used when a person omits an agent. Unlike
+    /// [`Self::builtin_agent`], this may be an ordinary removable agent
+    /// selected by the installed runtime's settings. Read only this home,
+    /// with bounded, link-safe reads (ADR 0023); never run native commands.
+    /// `None` means no target is selected, not a guessed `default` or `main`.
+    fn default_agent(&self, _home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable> {
+        Ok(self.builtin_agent().map(BuiltinAgent::runtime_name))
+    }
     /// The name of the agent the runtime always has once installed, such as
     /// Hermes's `default`: it exists as long as the runtime, so enclos lists
     /// it without a record and neither adds nor removes it. `None`: every
@@ -403,6 +412,13 @@ pub trait RuntimeAdapter {
     /// Parts of the home counted on their own.
     fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> {
         Vec::new()
+    }
+    /// Interpret a fact's bounded file contents using this runtime's native
+    /// selectors. `Ok(None)` means absent; `Err` means the representation
+    /// cannot be interpreted. Error reasons must omit file contents and
+    /// secret values. The engine handles path safety and terminal escaping.
+    fn fact_value(&self, _at: &ValueAt, _text: &str) -> Result<Option<String>, String> {
+        Err("this runtime does not interpret this fact".into())
     }
     fn runtime_facts(&self) -> RuntimeFacts {
         RuntimeFacts::default()

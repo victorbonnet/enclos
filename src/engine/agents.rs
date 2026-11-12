@@ -199,6 +199,17 @@ impl Engine {
             .and_then(|kind| adapter(kind).builtin_agent()))
     }
 
+    /// The installed runtime's native target when an agent is omitted.
+    /// A selected target is not necessarily an immutable built-in agent.
+    pub fn default_agent(&self, name: &SandboxName) -> Result<Option<RuntimeAgentName>> {
+        let runtime = adapter(self.runtime_of(name)?);
+        runtime
+            .default_agent(&self.sandbox_home(name))
+            .map_err(|why| Error::Session {
+                what: format!("cannot read the default agent of sandbox {name}: {why}"),
+            })
+    }
+
     /// Compares the agents the runtime has in the sandbox with the ones
     /// enclos tracks (ADR 0023), or says why it could not read them.
     pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck> {
@@ -451,7 +462,7 @@ impl Engine {
         agent: &AgentName,
     ) -> Option<String> {
         let facts = runtime.agent_facts(&RuntimeAgentName::from(agent));
-        super::status::read_provider(&self.sandbox_home(name), facts.provider.as_ref()).1
+        super::status::read_provider(&self.sandbox_home(name), facts.provider.as_ref(), runtime).1
     }
 
     pub fn agents(&self, name: &SandboxName) -> Result<Vec<AgentRecord>> {

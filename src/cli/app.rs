@@ -513,8 +513,17 @@ fn chat(
     conversation: Option<String>,
 ) -> Result<u8> {
     let ChannelTarget { sandbox, agent } = target;
-    // Hermes's built-in agent; a runtime with another would name it here.
-    let agent = agent.map_or_else(|| "default".to_owned(), |a| a.to_string());
+    let agent = match agent {
+        Some(agent) => agent.to_string(),
+        None => engine
+            .default_agent(&sandbox)?
+            .ok_or_else(|| {
+                failed(format!(
+                    "sandbox {sandbox}'s runtime has no default agent: name one with `enclos app chat {sandbox}/<agent>`"
+                ))
+            })?
+            .to_string(),
+    };
     let endpoint = engine.app_endpoint(&sandbox, &agent)?;
     let store = Store::open(&engine.app_store_path())
         .map_err(|e| failed(format!("cannot open the bridge's database: {e}")))?;

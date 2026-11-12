@@ -23,6 +23,8 @@ Keep the interface small by concentrating native knowledge in the adapter and pl
 
 A permanent built-in agent and the runtime's selected default target are different facts. Hermes always has `default`; OpenClaw's `main` is removable and another configured agent can be selected. An omitted target must resolve through the installed runtime's state, never a shared literal `default` or `main`.
 
+M5-03 implements `default_agent(home)` and adapter-owned `fact_value(at, text)` interpretation. The engine keeps bounded, link-safe reads and terminal escaping. `ValueAt.keys` are dynamic opaque selectors interpreted by the adapter, so a per-agent selector in shared configuration does not expose that configuration's schema to the engine. Hermes's YAML decoder remains with its adapter.
+
 The engine supplies bounded, link-safe reads from the sandbox home and the adapter interprets the bytes into agent discovery, status and settings findings. Shared JSON/JSON5 configuration must not put OpenClaw's schema in the engine. A configured path outside the readable home, a link or an unsupported include is a finding, not permission to follow it. Directory or database presence does not establish usable authentication. Creation/removal failures may follow partial native work, so reconcile the native roster before retrying or recording success.
 
 ### Configuration and secrets
