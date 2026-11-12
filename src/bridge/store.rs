@@ -469,11 +469,22 @@ impl Store {
             })
             .collect()
     }
-    /// Every policy request, decided ones too, beyond the inbox's window.
-    pub fn all_approvals(&self) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
-        let mut q = self.db.prepare("SELECT body, state FROM approvals")?;
+    /// `sandbox`'s policy requests made at `from` (seconds) or later,
+    /// decided ones too, beyond the inbox's window: what tells a proxy
+    /// refusal last seen at `from` or later whether it was asked already.
+    pub fn approvals_since(
+        &self,
+        sandbox: &str,
+        from: i64,
+    ) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        let mut q = self.db.prepare(
+            "SELECT body, state FROM approvals \
+             WHERE json_extract(body, '$.sandbox') = ?1 AND json_extract(body, '$.time') >= ?2",
+        )?;
         let rows = q
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(rusqlite::params![sandbox, from], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter()
             .map(|(s, state)| {
