@@ -31,8 +31,14 @@ pub struct Approval {
     pub action: String,
     pub time: i64,
     pub state: String,
-    /// The exact policy scope, generated on the host.
+    /// What approval changes, described on the host.
     pub change: String,
+    /// The entry approval writes to the policy, generated on the host: the
+    /// normalized destination, or the writable path with its symlinks
+    /// resolved, which may differ from `access.target`. Empty while the
+    /// request cannot be approved.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
     pub restart: bool,
     pub revision: String,
     pub available: bool,

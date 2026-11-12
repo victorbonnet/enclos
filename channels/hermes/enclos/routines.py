@@ -10,13 +10,26 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# The most live routines the app may have made for one agent: each runs
+# unattended, so a lost phone cannot schedule work without bound.
+MAX_APP_ROUTINES = 50
+
+# How long the routine form's catalogues of skills, toolsets and models are
+# kept before they are read again.
+OPTIONS_SECONDS = 30
+
 
 class RoutineError(Exception):
     def __init__(self, code, message):
@@ -45,6 +58,41 @@ def _conversation(value):
     return value
 
 
+# One item of a cron field: `*`, a number or a three-letter name, then an
+# optional range end and step, as in `*/15`, `1-5` or `MON-FRI`.
+_CRON_ITEM = r"(?:\*|\d{1,2}|[A-Za-z]{3})(?:-(?:\d{1,2}|[A-Za-z]{3}))?(?:/\d{1,2})?"
+_CRON_FIELD = re.compile(rf"{_CRON_ITEM}(?:,{_CRON_ITEM})*")
+
+
+def _is_cron(expression):
+    """Five fields of cron's characters, names only for the month and the
+    day of the week: "every monday at 9 am" is five words, not a cron
+    expression, and Hermes would save it as another kind of schedule."""
+    fields = expression.split()
+    return len(fields) == 5 and all(
+        _CRON_FIELD.fullmatch(field) and (index >= 3 or not re.search(r"[A-Za-z]", field))
+        for index, field in enumerate(fields))
+
+
+def _listable_id(value):
+    """A native job id the app's list can carry: the bridge refuses a longer
+    one, or one that does not show as itself."""
+    return isinstance(value, (str, int)) and not isinstance(value, bool) and 0 < len(
+        str(value).encode("utf-8")) <= 128 and str(value).isprintable() and bool(str(value).strip())
+
+
+def _decodable(schedule):
+    """Whether the bridge can read `schedule`, an app-format schedule."""
+    kind = schedule.get("kind")
+    if kind == "cron":
+        return isinstance(schedule.get("expression"), str)
+    if kind == "interval":
+        return type(schedule.get("minutes")) is int and schedule["minutes"] >= 0
+    if kind == "once":
+        return isinstance(schedule.get("at"), str)
+    return False
+
+
 def validate_definition(value):
     if not isinstance(value, dict):
         raise RoutineError("bad_message", "A routine definition is required.")
@@ -69,7 +117,7 @@ def validate_definition(value):
     kind = schedule.get("kind")
     if kind == "cron":
         expression = _text(schedule.get("expression"), "cron expression", 128)
-        if len(expression.split()) != 5:
+        if not _is_cron(expression):
             raise RoutineError("bad_message", "Use a five-field cron expression.")
         definition["schedule"] = {"kind": kind, "expression": expression}
     elif kind == "interval":
@@ -103,6 +151,9 @@ def validate_request(message):
         raise RoutineError("bad_message", "Trusted delivery scope is required.")
     for conversation in allowed:
         _conversation(conversation)
+    # Who asked, as the bridge authenticated them: kept on what they create.
+    if not _text(message.get("person"), "person", 256) or not _text(message.get("device"), "device", 128):
+        raise RoutineError("bad_message", "The requesting person and device are required.")
     action = message.get("action")
     if action not in {"list", "get", "create", "update", "delete", "set_enabled", "run"}:
         raise RoutineError("bad_message", "Unknown routine action.")
@@ -159,32 +210,43 @@ class Manager:
         self._allowed = ContextVar("routine_allowed_deliveries", default=frozenset())
         self._replay_lock = threading.RLock()
         self._replies = OrderedDict()
+        # The skill, toolset and model catalogues, and when they were read.
+        self._options_read = None
+        # Why routines are off, said once in the gateway's log: a Hermes
+        # release that renames what this uses turns the capability off.
+        self.unavailable = None
         try:
             from cron import jobs
             import hermes_constants
             from cron.scheduler_provider import CronScheduler, resolve_cron_scheduler
             required = ("create_job", "get_job", "list_jobs", "update_job", "pause_job", "resume_job",
                         "remove_job", "use_cron_store", "_jobs_lock")
-            if not all(callable(getattr(jobs, key, None)) for key in required):
-                return
+            missing = [key for key in required if not callable(getattr(jobs, key, None))]
+            if missing:
+                return self._off(f"cron.jobs has no {', '.join(missing)}")
             # Hermes falls back to a process-only lock without this backend;
             # stale form revisions need the normal cross-process path.
             if not callable(getattr(getattr(jobs, "fcntl", None), "flock", None)):
-                return
+                return self._off("cron.jobs has no fcntl file lock")
             if not all(callable(getattr(hermes_constants, key, None)) for key in
                        ("set_hermes_home_override", "reset_hermes_home_override")):
-                return
+                return self._off("hermes_constants has no home override")
+            parameters = inspect.signature(jobs.create_job).parameters
+            if not {"prompt", "schedule", "name", "deliver", "origin"}.issubset(parameters):
+                return self._off("cron.jobs.create_job takes other parameters")
             self.jobs = jobs
             self.constants = hermes_constants
             self.provider = resolve_cron_scheduler
             self.home = Path(home or hermes_constants.get_hermes_home()).resolve()
-            self.parameters = inspect.signature(jobs.create_job).parameters
-            if not {"prompt", "schedule", "name", "deliver", "origin"}.issubset(self.parameters):
-                self.jobs = None
-                return
+            self.parameters = parameters
             self.run_supported = all(callable(getattr(CronScheduler, key, None)) for key in ("claim_fire", "fire_claimed"))
-        except Exception:
+        except Exception as error:
             self.jobs = None
+            self._off(f"{type(error).__name__}: {error}")
+
+    def _off(self, reason):
+        self.unavailable = reason
+        logger.warning("App routines are off for this Hermes: %s", reason)
 
     @property
     def available(self):
@@ -220,7 +282,9 @@ class Manager:
         return None, str(target)[:160], False
 
     def _definition(self, job):
-        schedule = job.get("schedule") or {}
+        schedule = job.get("schedule")
+        if not isinstance(schedule, dict):
+            schedule = {}
         kind = schedule.get("kind")
         if kind == "cron":
             schedule = {"kind": kind, "expression": schedule.get("expr")}
@@ -277,7 +341,17 @@ class Manager:
             result["definition"] = definition
         return result
 
-    def _native_fields(self, definition):
+    def _listed(self, job):
+        """The job's summary for a list page, or None for a job the app's
+        format cannot carry (no schedule, another kind, a null field, a long
+        id), which a hand-edited jobs.json or a later Hermes can hold: one
+        such job must not stop the others from being listed."""
+        if not (_listable_id(job.get("id")) and _decodable(self._definition(job)["schedule"])):
+            logger.warning("Routine %.80r is left out of the app's list: the app cannot show it.", job.get("id"))
+            return None
+        return self._view(job)
+
+    def _native_fields(self, definition, saved_script=None):
         if definition.get("delivery") and definition["delivery"] not in self._allowed.get():
             raise RoutineError("unsupported", "This conversation is outside the routine's allowed delivery scope.")
         schedule = definition["schedule"]
@@ -295,7 +369,9 @@ class Manager:
                     raise RoutineError("unsupported", f"This Hermes version does not support {key}.")
                 continue
             fields[key] = value
-        if fields.get("script"):
+        # A script the routine already had stays as Hermes saved it, even
+        # one an older Hermes stored as an absolute path.
+        if fields.get("script") and fields["script"] != saved_script:
             raw = Path(fields["script"])
             root = (self.home / "scripts").resolve()
             if raw.is_absolute() or fields["script"].startswith("~"):
@@ -362,9 +438,17 @@ class Manager:
                 if job and job["origin"].get("_enclos_definition") != fingerprint:
                     raise RoutineError("conflict", "This create request was already used with another definition.")
                 if job is None:
+                    made = sum(1 for item in self.jobs.list_jobs(include_disabled=True)
+                               if isinstance(item.get("origin"), dict) and item["origin"].get("_enclos_request"))
+                    if made >= MAX_APP_ROUTINES:
+                        raise RoutineError("not_allowed", f"This agent already has {MAX_APP_ROUTINES} routines made "
+                                                          "from the app. Delete one before creating another.")
                     fields = self._native_fields(definition)
+                    # Who made it, from where: the routine runs long after,
+                    # and outlives the device that made it.
                     fields["origin"] = {"platform": "enclos", "chat_id": self.home_channel or "",
-                                        "_enclos_request": message["id"], "_enclos_definition": fingerprint}
+                                        "_enclos_request": message["id"], "_enclos_definition": fingerprint,
+                                        "_enclos_person": message["person"], "_enclos_device": message["device"]}
                     job = self.jobs.create_job(**fields)
                 self._save_receipt(message["id"], fingerprint, job)
         # Registration may call back into storage or a remote provider. Never hold the store lock.
@@ -383,6 +467,17 @@ class Manager:
             pass
 
     def _options(self):
+        """The routine form's choices, read again at most every
+        `OPTIONS_SECONDS`: building the catalogues for every list page
+        reads the skills, toolsets and model inventory each time."""
+        now = time.monotonic()
+        if self._options_read and now - self._options_read[0] < OPTIONS_SECONDS:
+            return copy.deepcopy(self._options_read[1])
+        options = self._read_options()
+        self._options_read = (now, options)
+        return copy.deepcopy(options)
+
+    def _read_options(self):
         timezone = "Server local time"
         try:
             from hermes_time import get_timezone_name, now
@@ -542,11 +637,18 @@ class Manager:
                 action = message["action"]
                 if action == "list":
                     cursor = message.get("cursor") or ""
-                    jobs = sorted(self.jobs.list_jobs(include_disabled=True), key=lambda job: str(job["id"]))
-                    jobs = [job for job in jobs if str(job["id"]) > cursor]
-                    result = {"result": "list", "routines": [self._view(job) for job in jobs[:25]], "options": self._options()}
-                    if len(jobs) > 25:
-                        result["next_cursor"] = str(jobs[24]["id"])
+                    jobs = [job for job in self.jobs.list_jobs(include_disabled=True)
+                            if isinstance(job, dict) and job.get("id") is not None]
+                    jobs = sorted((job for job in jobs if str(job["id"]) > cursor), key=lambda job: str(job["id"]))
+                    result = {"result": "list", "routines": [], "options": self._options()}
+                    for job in jobs:
+                        view = self._listed(job)
+                        if view is None:
+                            continue
+                        if len(result["routines"]) == 25:
+                            result["next_cursor"] = result["routines"][-1]["id"]
+                            break
+                        result["routines"].append(view)
                     return result
                 if action == "create":
                     return self._create(message)
@@ -564,7 +666,7 @@ class Manager:
                         raise RoutineError("conflict", "The routine changed. Refresh before trying again.")
                     if action == "update":
                         definition = validate_definition(message["definition"])
-                        fields = self._native_fields(definition)
+                        fields = self._native_fields(definition, saved_script=job.get("script"))
                         # Sending an unchanged schedule re-anchors Hermes intervals and can
                         # reject an old one-shot while merely changing its prompt.
                         if _same_schedule(definition["schedule"], self._definition(job)["schedule"]):
