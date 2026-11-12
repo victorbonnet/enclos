@@ -381,6 +381,7 @@ mod tests {
                 skills: vec![],
                 models: vec![],
                 toolsets: vec![],
+                operations: None,
             },
             deliveries: vec![],
             deliveries_limited: false,
