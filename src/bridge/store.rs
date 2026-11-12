@@ -698,23 +698,32 @@ impl Store {
     }
 
     /// Makes the Home conversation of `agent` (`<sandbox>/<agent>`), owned
-    /// by `owner` and named Home by them, so the runtime's names do not
-    /// replace it; one already there keeps its owner, unless it had none
-    /// (made before anyone was known), which `owner` then takes. Whether it
-    /// was made.
-    pub fn ensure_home(&self, agent: &str, owner: &str) -> rusqlite::Result<bool> {
+    /// by `owner` (`""`: nobody yet) and named Home, so the runtime's names
+    /// do not replace it. With `host` true, `owner` is the host's person as
+    /// the transport names them, and takes Home from anyone else (a person
+    /// it went to while the host was not known). Otherwise `owner` takes it
+    /// only when it has no owner. Whether it was made or changed owner.
+    pub fn ensure_home(&self, agent: &str, owner: &str, host: bool) -> rusqlite::Result<bool> {
         let Some((sandbox, name)) = agent.split_once('/') else {
             return Ok(false);
         };
         let id = home_id(agent);
         if self.conversation_of(&id)?.is_some() {
-            if !owner.is_empty() {
+            if owner.is_empty() {
+                return Ok(false);
+            }
+            let changed = if host {
+                self.db.execute(
+                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner != ?2",
+                    params![id, owner],
+                )?
+            } else {
                 self.db.execute(
                     "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner = ''",
                     params![id, owner],
-                )?;
-            }
-            return Ok(false);
+                )?
+            };
+            return Ok(changed == 1);
         }
         self.conversation(&id, sandbox, name, owner)?;
         self.name(&id, "Home", BY_PERSON)?;
@@ -1701,9 +1710,22 @@ mod tests {
         let store = Store::open(&folder.path().join("app.db")).unwrap();
         assert_eq!(home_id("lab/main"), "home.lab.main");
         assert!(is_home("home.lab.main") && !is_home("a47e17c0-eaad-4d1d-8853-56aa0b69e1e2"));
-        assert!(store.ensure_home("lab/main", "victor@example.com").unwrap());
-        // Once: a second person does not take it.
-        assert!(!store.ensure_home("lab/main", "alice@example.com").unwrap());
+        assert!(
+            store
+                .ensure_home("lab/main", "victor@example.com", true)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ensure_home("lab/main", "victor@example.com", true)
+                .unwrap()
+        );
+        // Once: a second person, who is not the host, does not take it.
+        assert!(
+            !store
+                .ensure_home("lab/main", "alice@example.com", false)
+                .unwrap()
+        );
         assert_eq!(
             store.owner("home.lab.main").unwrap().as_deref(),
             Some("victor@example.com")
@@ -1723,17 +1745,38 @@ mod tests {
                 .name("home.lab.main", "Gateway notices", BY_AGENT)
                 .unwrap()
         );
-        assert!(!store.ensure_home("no-slash", "victor@example.com").unwrap());
+        assert!(
+            !store
+                .ensure_home("no-slash", "victor@example.com", true)
+                .unwrap()
+        );
         // Made before anyone was known: the first person takes it, once.
-        assert!(store.ensure_home("lab/scout", "").unwrap());
+        assert!(store.ensure_home("lab/scout", "", false).unwrap());
         assert_eq!(store.owner("home.lab.scout").unwrap().as_deref(), Some(""));
-        store.ensure_home("lab/scout", "alice@example.com").unwrap();
-        store
-            .ensure_home("lab/scout", "victor@example.com")
-            .unwrap();
+        assert!(
+            store
+                .ensure_home("lab/scout", "alice@example.com", false)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ensure_home("lab/scout", "victor@example.com", false)
+                .unwrap()
+        );
         assert_eq!(
             store.owner("home.lab.scout").unwrap().as_deref(),
             Some("alice@example.com")
         );
+        // Once the transport names the host's person, Home is theirs.
+        assert!(
+            store
+                .ensure_home("lab/scout", "victor@example.com", true)
+                .unwrap()
+        );
+        assert_eq!(
+            store.owner("home.lab.scout").unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        assert!(!store.ensure_home("lab/scout", "", false).unwrap());
     }
 }
