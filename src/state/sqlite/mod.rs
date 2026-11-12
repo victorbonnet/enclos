@@ -23,7 +23,9 @@ use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
 pub use log_writer::NetLogWriter;
 
-use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore, UnreadableRecord};
+use super::{
+    Migration, NetLogStore, Result, StateError, StateLock, StateStore, UnreadableRecord, Wait,
+};
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
@@ -39,19 +41,30 @@ use crate::model::unenforced::Acceptance;
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
+#[derive(Clone)]
 pub struct SqliteStateStore {
     db: PathBuf,
     lock_file: PathBuf,
+    /// How long a write waits for another's to finish: [`Wait::limit`], or
+    /// a shorter one in tests.
+    write_wait: Duration,
     /// Set once `open` has compared the schema with the migrations: one
     /// command opens the database several times.
     schema_checked: OnceLock<()>,
 }
 
+/// A connection to `state.db` held open, unused: [`SqliteStateStore::keep_open`].
+pub struct KeptOpen {
+    _conn: Connection,
+}
+
 impl SqliteStateStore {
-    pub fn new(db: impl Into<PathBuf>, lock_file: impl Into<PathBuf>) -> Self {
+    /// The store whose writes wait for another's as `wait` says.
+    pub fn new(db: impl Into<PathBuf>, lock_file: impl Into<PathBuf>, wait: Wait) -> Self {
         SqliteStateStore {
             db: db.into(),
             lock_file: lock_file.into(),
+            write_wait: wait.limit(),
             schema_checked: OnceLock::new(),
         }
     }
@@ -65,7 +78,10 @@ impl SqliteStateStore {
 
     fn connect(&self, flags: OpenFlags) -> Result<Connection> {
         let mut conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
-        conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
+        // How long a write waits for another's; in WAL mode a read never
+        // waits for a write.
+        conn.busy_timeout(self.write_wait)
+            .map_err(self.sqlite_err())?;
         // A transaction takes the write lock as it begins: one that read
         // first would fail at once, without waiting, when it came to write
         // while another connection writes.
@@ -81,7 +97,7 @@ impl SqliteStateStore {
         // then copy the log into `state.db` and delete it, holding the whole
         // database through two flushes; the next write would flush a new
         // log's header, holding the write lock. A flush can take seconds on a
-        // loaded SD card, past `LOCK_WAIT` for the calls waiting. The commit
+        // loaded SD card, longer than a command's write waits. The commit
         // that grows the log past 1000 pages copies it instead, while other
         // connections read and write.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
@@ -118,6 +134,26 @@ impl SqliteStateStore {
             let _ = self.schema_checked.set(());
         }
         Ok(conn)
+    }
+
+    /// A connection kept open, and never used, while the result lives: so
+    /// that no read of this process waits on SQLite rebuilding the log's
+    /// index, which `state.db-shm` holds.
+    ///
+    /// A connection that opens while no other connection has the database
+    /// open, in any process, starts the index over and rebuilds it from the
+    /// whole log, holding the write lock and the lock that keeps every
+    /// other connection off the index until it is done: every read waits for
+    /// it, as every write does. enclos opens a connection for each call and
+    /// leaves the log in place, so the next call often finds none open and
+    /// rebuilds, reading up to 1000 pages or more from a disk that may be
+    /// slow. While this process keeps a connection open, the index stays
+    /// valid and no connection, of any process, rebuilds it.
+    pub fn keep_open(&self) -> Result<KeptOpen> {
+        // `open` reads, which maps the index.
+        Ok(KeptOpen {
+            _conn: self.open()?,
+        })
     }
 
     /// Refuses a database whose tables and columns differ from what this
@@ -255,6 +291,13 @@ fn io_err(path: &Path) -> impl Fn(std::io::Error) -> StateError + '_ {
 }
 
 impl StateStore for SqliteStateStore {
+    fn waiting(&self, wait: Wait) -> Box<dyn StateStore> {
+        Box::new(SqliteStateStore {
+            write_wait: wait.limit(),
+            ..self.clone()
+        })
+    }
+
     fn lock(&self) -> Result<StateLock> {
         let started = Instant::now();
         loop {
