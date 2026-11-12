@@ -66,7 +66,7 @@ impl Hub {
         store: &Store,
         name: &SandboxName,
     ) -> Result<PolicyState, String> {
-        let mut state = Engine::open(self.layout.clone())
+        let mut state = Engine::open(self.layout.clone(), crate::state::Wait::Background)
             .mobile_policy(name)
             .map_err(|e| e.to_string())?;
         let accepted = store.accepted_access().map_err(|e| e.to_string())?;
@@ -97,13 +97,8 @@ impl Hub {
             user: format!("{person} (device {})", device.id),
             host: self.layout.data().display().to_string(),
         };
-        let result = Engine::open(self.layout.clone()).mobile_policy_apply(
-            &actor,
-            name,
-            &edit.base,
-            &edit.revision,
-            &edit.change,
-        );
+        let result = Engine::open(self.layout.clone(), crate::state::Wait::Background)
+            .mobile_policy_apply(&actor, name, &edit.base, &edit.revision, &edit.change);
         self.refresh_access_context(name.as_str());
         if let Ok(state) = self.managed_policy(store, name) {
             self.deliver(person, ToDevice::SandboxPolicy(state));
