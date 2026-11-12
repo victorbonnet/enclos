@@ -77,7 +77,11 @@ impl HolderArgs {
 pub fn run(args: HolderArgs) -> Result<u8> {
     match args.verb {
         HolderVerb::Run { sandbox } => {
-            let engine = enclos::engine::Engine::open(enclos::layout::Layout::from_env()?);
+            // Run by the service manager: no person waits on its writes.
+            let engine = enclos::engine::Engine::open(
+                enclos::layout::Layout::from_env()?,
+                enclos::state::Wait::Background,
+            );
             Ok(ended_as(engine.run_holder(&sandbox, &stderr()?)?))
         }
         HolderVerb::Serve { port, proxy } => Err(serve(port, &proxy)),

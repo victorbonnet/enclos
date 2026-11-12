@@ -53,6 +53,18 @@
           <tr><td>enclos’s own files</td><td>Denies other sandboxes’ folders and enclos’s records</td><td>No</td></tr>
         </tbody>
       </table></div>
+      <p>On Linux, the bubblewrap backend writes <code>compiled/&lt;hash&gt;.json</code>: bubblewrap’s arguments, Landlock rules and a seccomp filter. At each launch enclos reads it, masks what your home holds at that moment, and runs the program under bubblewrap. Inside, enclos runs first, applies Landlock where the kernel has it and the seccomp filter, then runs the program:</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Part of the file</th><th>What it does</th><th>From your policy?</th></tr></thead>
+        <tbody>
+          <tr><td>Mounts</td><td>Mounts your files read-only, then the sandbox’s home and the folders you granted writable. The sandbox has its own <code>/tmp</code>, <code>/run</code>, <code>/dev</code> and <code>/proc</code></td><td>Yes</td></tr>
+          <tr><td>Sensitive paths</td><td>Masked: each is empty, or not there, inside the sandbox</td><td>Yes</td></tr>
+          <tr><td>Landlock</td><td>A second check on writes, and rules that let programs run only from the system’s folders and the sandbox’s home. Where the kernel has no Landlock, as on Raspberry Pi OS, the mounts alone hold writes, and any program the sandbox can read can run</td><td>Yes</td></tr>
+          <tr><td>seccomp</td><td>Refuses calls such as <code>keyctl</code>, <code>bpf</code>, mounting, making namespaces and typing into the terminal (TIOCSTI)</td><td>No</td></tr>
+          <tr><td>Network</td><td>The sandbox has a network namespace of its own, which its sessions share. Its one way out is the proxy, through a Unix socket</td><td>No</td></tr>
+          <tr><td>enclos’s own files</td><td>Hides other sandboxes’ folders and enclos’s records</td><td>No</td></tr>
+        </tbody>
+      </table></div>
 
       <h2>4. The network stays with the proxy</h2>
       <p>Your allowed hosts are not in the compiled policy. It only sends every connection to the sandbox’s proxy, which reads the active policy for each new connection. So a change to the network applies at once, without a restart.</p>
@@ -66,8 +78,10 @@
       </table></div>
 
       <h2>What a backend cannot enforce is refused</h2>
-      <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. Seatbelt holds a process to its open files only, so limits on CPU time, memory, file size and CPU share are refused. No backend enforces rules on programs yet, so an <code>[exec]</code> section is an error.</p>
-      <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
+      <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. Seatbelt holds a process to its open files only, so limits on CPU time, memory, file size and CPU share are refused. bubblewrap also holds memory and a CPU share, on the sandbox as a whole, and refuses CPU time and file size. No backend enforces rules on programs yet, so an <code>[exec]</code> section is an error.</p>
+      <p>A Linux host can lack a control bubblewrap relies on: Landlock, or the memory controller, which Raspberry Pi OS turns off. The sandbox still runs without it, and <code>enclos doctor</code> says what is not enforced, the risk and the fix. A <code>memory</code> limit the host cannot hold runs not applied, and only once you accept it with <code>--accept-unenforced memory</code>, which the audit log records.</p>
+      <p>One exception: on bubblewrap, <code>listen = false</code> is declared, not held. A listener in one session is reached by the sandbox’s other sessions, never by your network, and each session’s start says so.</p>
+      <p>The same <code>policy.toml</code> is meant for every backend, each with a compiler of its own. Moving a Mac’s policy to Linux is not yet shown.</p>
 
       <h2 id="templates">The templates</h2>
       <p>A sandbox starts from a template, named when it is created and kept in <code>extends</code>. Change <code>extends</code> with <code>enclos policy edit lab</code> to move it to another. The two differ only in what the sandbox reaches on the network:</p>
@@ -84,14 +98,14 @@
           <tr><td>Reach other ports</td><td>If listed</td><td>If listed</td></tr>
           <tr><td>Reach a host on your local network</td><td>If you opt in</td><td>If you opt in</td></tr>
           <tr><td>Reach your computer’s own services or cloud metadata</td><td>No</td><td>No</td></tr>
-          <tr><td>Open apps, send Apple Events or signal other processes</td><td>No</td><td>No</td></tr>
+          <tr><td>Use your computer’s services, such as Apple Events or the session bus, or signal other processes</td><td>No</td><td>No</td></tr>
         </tbody>
       </table></div>
       <ul>
         <li><strong><code>minimal</code></strong> reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes, that is its install sources and the ChatGPT subscription’s hosts; another model provider’s hosts need <code>enclos policy allow</code>. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server’s host, then tell the runtime of it with its own commands.</li>
         <li><strong><code>assistant</code></strong> adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.</li>
       </ul>
-      <p>Under every template, each connection goes through the sandbox’s proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
+      <p>Under every template, each connection goes through the sandbox’s proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does. On macOS, anything in the sandbox can then serve your network; on Linux, only the sandbox’s own sessions reach it, and you, through <code>enclos dashboard</code>. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
 
       <h2 id="settings">Every setting</h2>
       <p>A <code>policy.toml</code> holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox’s file with <code>enclos policy edit lab</code>.</p>
@@ -148,20 +162,20 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
           <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
           <tr><td><code>private_add</code></td><td>hosts</td><td>Adds to that list.</td></tr>
           <tr><td><code>log</code></td><td><code>metadata</code></td><td>The only value: host, port, address, verdict, bytes and duration, never contents.</td></tr>
-          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on. Leave it unset: its gateway exits if it cannot listen.</td></tr>
+          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on. Leave it unset: its gateway exits if it cannot listen. On bubblewrap, <code>false</code> is declared, not held.</td></tr>
         </tbody>
       </table></div>
 
       <h3>[resources]</h3>
       <p>A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until <code>enclos policy apply</code> restarts the sandbox into it.</p>
       <div class="table-scroll"><table>
-        <thead><tr><th>Setting</th><th>Accepts</th><th>On Seatbelt</th></tr></thead>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>On Seatbelt</th><th>On bubblewrap</th></tr></thead>
         <tbody>
-          <tr><td><code>open_files</code></td><td>16 to 1048576</td><td>Enforced. Above macOS’s own ceiling, it is refused.</td></tr>
-          <tr><td><code>file_size</code></td><td>bytes, or <code>512K</code>, <code>100M</code>, <code>1G</code></td><td>Refused.</td></tr>
-          <tr><td><code>cpu_seconds</code></td><td>seconds</td><td>Refused.</td></tr>
-          <tr><td><code>memory</code></td><td>any value</td><td>Refused.</td></tr>
-          <tr><td><code>cpu</code></td><td>any value</td><td>Refused.</td></tr>
+          <tr><td><code>open_files</code></td><td>16 to 1048576</td><td>Enforced, on each process. Above macOS’s own ceiling, it is refused.</td><td>Enforced, on each process.</td></tr>
+          <tr><td><code>file_size</code></td><td>bytes, or <code>512K</code>, <code>100M</code>, <code>1G</code></td><td>Refused.</td><td>Refused.</td></tr>
+          <tr><td><code>cpu_seconds</code></td><td>seconds</td><td>Refused.</td><td>Refused.</td></tr>
+          <tr><td><code>memory</code></td><td>a size from <code>64M</code></td><td>Refused.</td><td>Enforced, on the sandbox as a whole. Without the host’s memory controller, it runs not applied, once you accept that.</td></tr>
+          <tr><td><code>cpu</code></td><td>cores, 0.01 to 1024, such as <code>0.5</code></td><td>Refused.</td><td>Enforced, on the sandbox as a whole.</td></tr>
         </tbody>
       </table></div>
 
@@ -181,8 +195,8 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       <div class="terminal"><pre><code><span class="comment"># the active policy: version, writes, deny list, network</span>
 <span class="command">enclos policy show lab</span>
 
-<span class="comment"># the compiled policies themselves</span>
-<span class="command">ls ~/.enclos/sandboxes/lab/compiled/</span>
+<span class="comment"># what the active policy compiles to, for the sandbox’s backend</span>
+<span class="command">enclos policy show lab --compiled</span>
 
 <span class="comment"># compile it, then try known ways out from inside</span>
 <span class="command">enclos policy test lab</span></code></pre></div>
