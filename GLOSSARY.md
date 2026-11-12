@@ -127,6 +127,10 @@ _Avoid_: client, session (a sandbox's word)
 Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
 _Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
 
+**Host's person**:
+The person each agent's Home conversation belongs to: the person of the first device paired at the host's terminal, until it is changed there.
+_Avoid_: owner (a conversation's word), admin
+
 **Share**:
 What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
 _Avoid_: grant (a secret's or policy's word), permission
