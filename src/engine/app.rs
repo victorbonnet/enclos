@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::Engine;
 use crate::error::{Error, Result};
+use crate::model::audit::Actor;
 use crate::model::channel::Channel;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::SecretValue;
@@ -86,5 +87,20 @@ impl Engine {
     /// The bridge's own database: conversations and their messages.
     pub fn app_store_path(&self) -> PathBuf {
         self.layout.data().join("app.db")
+    }
+
+    /// Runs `work`, a change to which devices reach the bridge (`app pair`,
+    /// `app unpair`), as an audited command: its intent is in the audit log
+    /// before the work starts, and when the log cannot be written the work
+    /// does not run (ADR 0010).
+    pub fn app_access<T>(
+        &self,
+        by: &Actor,
+        command: &str,
+        target: String,
+        summary: impl FnOnce(&T) -> String,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.write(by, command, Some(target), summary, |_| work())
     }
 }

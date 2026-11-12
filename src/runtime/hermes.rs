@@ -42,12 +42,21 @@ const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/pro
 const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/approvals.py");
 const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
 const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
+const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.py");
 const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
 const APP_PLUGIN_RUNTIME_APPROVALS: &str =
     include_str!("../../channels/hermes/enclos/runtime_approvals.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+/// How long Hermes's `clarify` waits for the person's answer before the
+/// agent goes on without one. Hermes's own default (90 s on main of
+/// 2026-11-10, `tools/clarify_gateway.py`, `resolve_clarify_timeout`) frees
+/// a turn quickly at a desk; a question on a phone is often seen later, so
+/// the app's agents wait an hour, Hermes's earlier default. A reply typed
+/// instead still cancels the question at once. The bridge's own backstop
+/// for a channel that stays away is twice this (`bridge/questions.rs`).
+pub const CLARIFY_TIMEOUT_SECONDS: u32 = 3600;
 
 /// Hermes's built-in profile, the root of its home.
 const DEFAULT_PROFILE: BuiltinAgent = BuiltinAgent::new("default");
@@ -311,6 +320,7 @@ impl RuntimeAdapter for Hermes {
                 file("outbox.py", APP_PLUGIN_OUTBOX)?,
                 file("approvals.py", APP_PLUGIN_APPROVALS)?,
                 file("routines.py", APP_PLUGIN_ROUTINES)?,
+                file("lines.py", APP_PLUGIN_LINES)?,
                 file("questions.py", APP_PLUGIN_QUESTIONS)?,
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
@@ -333,6 +343,11 @@ impl RuntimeAdapter for Hermes {
                 // the start, so Hermes never asks for one. Overwrites what
                 // a `/sethome` left.
                 ("MOBILE_APP_HOME_CHANNEL".to_owned(), home.to_owned()),
+                // A question asked in the app waits for a phone, not a desk.
+                (
+                    "agent.clarify_timeout".to_owned(),
+                    CLARIFY_TIMEOUT_SECONDS.to_string(),
+                ),
             ],
         })
     }
@@ -1104,6 +1119,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
                 ".hermes/profiles/main/plugins/enclos/approvals.py",
                 ".hermes/profiles/main/plugins/enclos/routines.py",
+                ".hermes/profiles/main/plugins/enclos/lines.py",
                 ".hermes/profiles/main/plugins/enclos/questions.py",
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
@@ -1129,6 +1145,7 @@ mod tests {
                     "MOBILE_APP_HOME_CHANNEL".to_owned(),
                     "home.lab.main".to_owned()
                 ),
+                ("agent.clarify_timeout".to_owned(), "3600".to_owned()),
             ]
         );
         let default = RuntimeAgentName::new("default").unwrap();

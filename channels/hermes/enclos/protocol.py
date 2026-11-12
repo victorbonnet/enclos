@@ -9,7 +9,7 @@ import hmac
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -29,19 +29,20 @@ MAX_TITLE_CHARS = 100
 # docs/protocol.md). Short, as it is in every prompt; it changes when the
 # app's list does.
 PLATFORM_HINT = (
-    "You are talking through the enclos mobile app. "
+    "You talk with the user through the enclos mobile app on their phone. "
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
     "fenced code blocks, tables and links. Keep tables narrow. A newline is a line break. "
-    "Send MEDIA:/absolute/path/to/file on its own line: images show in the conversation; "
-    "attachments open on tap (PDF/text in the app) and can be shared. "
-    "Use clarify with questions:[{question,choices,multi_select?}] for decisions: short labels in choices; "
-    "Other text and Skip are offered. Wait for results. Native approval buttons, when supported, "
-    "answer Hermes's own gate; questions are no substitute and never change sandbox policy. "
-    "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
+    "Send MEDIA:/absolute/path/to/file on its own line: images show inline, "
+    "other files as attachments; both can be shared. "
+    "For decisions use clarify with questions:[{question,choices,multi_select?}]; "
+    "the app adds Other and Skip. Wait for it. Approval buttons answer "
+    "Hermes's own gate; questions never replace them or change sandbox policy. "
+    "For a static HTML artefact send a self-contained UTF-8 .html file the same way: "
     "it opens in the app. Use inline CSS and data images/fonts; JavaScript, external "
-    "resources, forms and automatic navigation are blocked. Tapped HTTP(S) links open the browser. "
-    "A remote image in markdown is not loaded, "
-    "and message HTML shows as literal text."
+    "resources, forms and automatic navigation are blocked. A tapped HTTP(S) link opens the browser "
+    "once the person confirms its address. "
+    "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
+    "message HTML shows as literal text."
 )
 
 
@@ -141,6 +142,14 @@ def _check_text(value: Any, field: str) -> str:
     return value
 
 
+def _check_line(value: Any, field: str) -> str:
+    """Text for people that the host may print: no control character."""
+    _check_text(value, field)
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in value):
+        raise ValueError(f"{field} holds a control character")
+    return value
+
+
 def decode_from_bridge(line: bytes) -> dict[str, Any]:
     """One message the bridge sent, checked; raises DecodeError."""
     if len(line) > MAX_MESSAGE_BYTES:
@@ -149,6 +158,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         message = json.loads(line)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise DecodeError("bad_message", f"not JSON: {e}") from None
+    except RecursionError:
+        raise DecodeError("bad_message", "nested too deep") from None
     if not isinstance(message, dict):
         raise DecodeError("bad_message", "not a JSON object")
     raw_id = message.get("id") if isinstance(message.get("id"), str) else None
@@ -176,6 +187,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
             _check_text(message.get("text"), "text")
+            if not isinstance(message.get("host", False), bool):
+                raise ValueError("host must be a boolean")
         elif kind == "conversation.rename":
             _check_id(message.get("conversation"), "conversation")
             _check_text(message.get("title"), "title")
@@ -200,10 +213,31 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("of"), "of")
         elif kind == "error":
             _check_text(message.get("code"), "code")
-            _check_text(message.get("message"), "message")
+            _check_line(message.get("message"), "message")
+            if message.get("of") is not None:
+                _check_id(message.get("of"), "of")
     except ValueError as e:
         raise DecodeError("bad_message", str(e), raw_id) from None
     return message
+
+
+def unsendable(message: dict[str, Any]) -> str | None:
+    """Why the bridge would refuse this message of the plugin's, or None.
+
+    The bridge's decoder refuses a conversation or id that breaks the id
+    rule and a line over 1 MiB; such a message, kept in the outbox, would
+    be sent again after every hello and refused every time.
+    """
+    try:
+        _check_id(message.get("id"), "id")
+        for field in ("conversation", "reply_to"):
+            if message.get(field) is not None:
+                _check_id(message.get(field), field)
+    except ValueError as e:
+        return str(e)
+    if len(encode_line(message)) > MAX_MESSAGE_BYTES + 1:
+        return "larger than 1 MiB"
+    return None
 
 
 def token_matches(presented: Any, expected: str) -> bool:
@@ -220,6 +254,16 @@ def encode_line(message: dict[str, Any]) -> bytes:
 
 def _message(message_type: str, /, **fields: Any) -> dict[str, Any]:
     return {"v": VERSION, "id": new_id(), "type": message_type, **fields}
+
+
+def message(message_type: str, /, **fields: Any) -> dict[str, Any]:
+    """A new message of `message_type` with `fields`, for the plugin's other modules."""
+    return _message(message_type, **fields)
+
+
+def check_id(value: Any, field: str) -> str:
+    """`value` if it is an id the protocol accepts; raises ValueError otherwise."""
+    return _check_id(value, field)
 
 
 def hello(runtime: str, agent: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -270,11 +314,29 @@ def attachment(file: str, mime: str, name: str, size: int) -> dict[str, Any]:
 LOCAL_IMAGE = re.compile(r"!\[([^\]]*)\]\((?!https?://)([^)\s]+)\)")
 
 
-def local_images(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """The text without its local markdown images, and each one's (alt, path)."""
-    found = [(m.group(1), m.group(2)) for m in LOCAL_IMAGE.finditer(text)]
-    rest = LOCAL_IMAGE.sub("", text)
+def local_images(text: str, sendable: Callable[[str], bool] = lambda path: True) -> tuple[str, list[tuple[str, str]]]:
+    """The text without the local markdown images whose path `sendable` takes,
+    and each taken one's (alt, path). An image it does not take stays in the
+    text, so that nothing the agent wrote goes missing without a sign."""
+    found: list[tuple[str, str]] = []
+
+    def take(m: re.Match) -> str:
+        if not sendable(m.group(2)):
+            return m.group(0)
+        found.append((m.group(1), m.group(2)))
+        return ""
+
+    rest = LOCAL_IMAGE.sub(take, text)
     return re.sub(r"\n{3,}", "\n\n", rest).strip(), found
+
+
+def with_files_not_sent(text: str, names: list[str]) -> str:
+    """The text, with a line for each file the agent sent that could not be
+    passed on, so the person knows one is missing."""
+    if not names:
+        return text
+    note = "\n".join(f"(A file could not be sent: {name})" for name in names)
+    return f"{text}\n\n{note}" if text else note
 
 
 def typing(conversation: str, on: bool) -> dict[str, Any]:
