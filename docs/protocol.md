@@ -58,6 +58,8 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | `ack` | either | `of` (the acknowledged `id`) | Received and stored |
 | `error` | either | `of`?, `code`, `message` | See [Errors](#errors) |
 
+**What the agent says is markdown.** The `text` of a `message.out` is CommonMark with GitHub's tables, strikethrough and bare links; a device draws it, and fetches and runs nothing in it: an image shows as its alt text, a link to it, and is never loaded; HTML shows as its text; and only `http`, `https` and `mailto` links open (the app's [ADR 0002](https://github.com/victorbonnet/enclos-app/blob/main/docs/adr/0002-messages-are-markdown-drawn-by-the-app.md), proposed). A plugin tells its runtime so (Hermes: the platform's `platform_hint`), so that the agent formats when it helps. What a person sends (`message.in`) is plain text, shown as typed.
+
 **Delivery is at least once.** The plugin keeps each `message.out` on disk, in the sandbox home, until the bridge's `ack` for it, and sends what it kept again after each `hello`. The bridge drops an `id` it has already stored. The bridge acknowledges a `message.in` it sent only once it has stored it; the plugin acknowledges it once the runtime has it.
 
 ## The device leg
@@ -106,7 +108,7 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `agents.list` | bridge | `agents`: `[{"agent":"lab/main","runtime":"hermes","capabilities":[…],"abilities":["read","chat"]}]` | The list, filtered to what is shared with the person |
 | `conversation.new` | device | `conversation`, `agent` | Start one; its owner is the device's person |
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
-| `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (RFC 3339), `seq` | A message of a conversation, sent and received alike, in order |
+| `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq` | A message of a conversation, sent and received alike, in order |
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
 | `sync` | device | `since` (a `seq`, or 0) | Every `message` of the person's conversations after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |

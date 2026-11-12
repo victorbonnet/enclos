@@ -17,6 +17,20 @@ MAX_ID_BYTES = 128
 FROM_BRIDGE_TYPES = ("hello", "message.in", "ack", "error")
 CAPABILITIES = ("notify", "typing")
 
+# What the runtime tells the agent about this channel, in its system prompt
+# (Hermes: the platform's `platform_hint`): where the person is, and what the
+# app draws of the markdown it writes ("What the agent says is markdown" in
+# docs/protocol.md). Short, as it is in every prompt; it changes when the
+# app's list does.
+PLATFORM_HINT = (
+    "You are talking with the user through the enclos mobile app, on their phone. "
+    "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
+    "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
+    "on a phone screen, and keep tables narrow. A single newline is a line break. "
+    "Images are not shown (an image shows as its alt text, a link to it) and HTML shows as "
+    "literal text."
+)
+
 
 class DecodeError(Exception):
     """Why a line is not a message to act on. `code` is the protocol's."""
