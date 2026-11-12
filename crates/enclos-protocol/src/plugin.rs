@@ -2,10 +2,27 @@
 //! socket in the sandbox home, one JSON object per line
 //! (`docs/protocol.md`, The plugin leg).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId, Person, QuestionId};
+use crate::ids::{self, ConversationId, MessageId, Person, QuestionId};
+
+/// A name the sandbox sends, which the host may print: the id rule.
+fn name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    ids::check(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+/// Text for people, which the host may print: no control character, so it
+/// cannot move a terminal's cursor or break a log's line.
+fn line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom("holds a control character"));
+    }
+    Ok(value)
+}
 
 /// What the bridge sends to a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +40,11 @@ pub enum FromBridge {
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
         allowed_deliveries: Vec<ConversationId>,
+        /// Who asked, from which of their paired devices (its bridge id), as
+        /// the bridge authenticated them: a routine the request creates
+        /// keeps both, so the runtime says where it came from.
+        person: Person,
+        device: String,
         #[serde(flatten)]
         request: Box<crate::routine::RoutineRequest>,
     },
@@ -47,6 +69,11 @@ pub enum FromBridge {
         conversation: ConversationId,
         person: Person,
         text: String,
+        /// Whether `person` is the host's person, who alone decides runtime
+        /// approvals: the plugin answers a runtime's approval commands from
+        /// anyone else itself. An older bridge says nothing (`None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<bool>,
     },
     /// Requests cancellation of this exact ingress, when the plugin advertises
     /// `abort`. Unknown or settled targets have no effect on later turns. An ack
@@ -106,7 +133,11 @@ pub enum FromPlugin {
     /// The plugin's answer to the bridge's `hello`.
     #[serde(rename = "hello")]
     Hello {
+        /// The runtime's name (`hermes`), by the id rule.
+        #[serde(deserialize_with = "name")]
         runtime: String,
+        /// The agent's name in its runtime (`main`), by the id rule.
+        #[serde(deserialize_with = "name")]
         agent: String,
         capabilities: Vec<Capability>,
     },
@@ -277,6 +308,8 @@ pub struct ErrorBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub of: Option<MessageId>,
     pub code: ErrorCode,
+    /// For people, may be shown: one line, no control character.
+    #[serde(deserialize_with = "line")]
     pub message: String,
 }
 
@@ -291,9 +324,16 @@ pub enum ErrorCode {
     UnknownAgent,
     UnknownConversation,
     AgentUnavailable,
+    /// What the request changes was changed since the revision it names,
+    /// or a request id was reused.
     Conflict,
+    /// The receiver failed on its side; trying again later may work.
+    Internal,
     Unsupported,
     NotFound,
+    /// A request that may have reached the agent, whose outcome was not
+    /// confirmed: unlike `agent_unavailable`, retrying is not known to be safe.
+    Unconfirmed,
     #[serde(other)]
     Unknown,
 }

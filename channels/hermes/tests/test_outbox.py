@@ -31,6 +31,27 @@ class OutboxTest(unittest.TestCase):
         self.assertFalse(outbox.put(protocol.message_out("c-1", "two")))
         self.assertEqual(len(outbox.pending()), 1)
 
+    def test_an_unreadable_message_is_set_aside_and_said(self):
+        outbox = Outbox(self.folder, limit=1)
+        with open(os.path.join(self.folder, "000000000001-" + "0" * 8 + "-0000-0000-0000-" + "0" * 12 + ".json"),
+                  "w") as f:
+            f.write("{half a mess")
+        with self.assertLogs("enclos.outbox", "WARNING") as logs:
+            self.assertEqual(outbox.pending(), [])
+        self.assertIn("set aside", logs.output[0])
+        # Set aside, it no longer counts toward the limit
+        self.assertTrue(outbox.put(protocol.message_out("c-1", "one")))
+        self.assertEqual([m["text"] for m in outbox.pending()], ["one"])
+
+    def test_a_message_set_aside_is_not_sent_again(self):
+        outbox = Outbox(self.folder)
+        first, second = protocol.message_out("c-1", "one"), protocol.message_out("c-1", "two")
+        outbox.put(first)
+        outbox.put(second)
+        self.assertTrue(outbox.set_aside(first["id"]))
+        self.assertFalse(outbox.set_aside(first["id"]))
+        self.assertEqual([m["text"] for m in outbox.pending()], ["two"])
+
     def test_its_folder_is_the_users_alone(self):
         folder = os.path.join(self.folder, "new")
         Outbox(folder)

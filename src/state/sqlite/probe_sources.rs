@@ -49,6 +49,14 @@ impl SqliteStateStore {
             [netlog::fixed(at)],
         )
         .map_err(self.sqlite_err())?;
+        // A removed sandbox takes its log rows with it: their provenance goes too.
+        conn.execute(
+            "DELETE FROM probe_sources.events WHERE NOT EXISTS (SELECT 1 FROM main.net_events n \
+             WHERE n.id = probe_sources.events.event AND n.sandbox = probe_sources.events.sandbox \
+             AND n.at = probe_sources.events.at)",
+            [],
+        )
+        .map_err(self.sqlite_err())?;
         conn.execute(
             "INSERT INTO probe_sources.runs VALUES (?1,?2,?3)",
             params![tag, sandbox.as_str(), netlog::fixed(expires)],
@@ -81,7 +89,18 @@ impl SqliteStateStore {
     pub(super) fn user_denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
         let conn = self.open()?;
         let attached = matches!(self.attach_probe_sources(&conn, false), Ok(true));
-        netlog::denied_from(&conn, sandbox, attached).map_err(|e| self.read_err(e))
+        match netlog::denied_from(&conn, sandbox, attached) {
+            // Attached but not readable: no row counts as diagnostic (ADR 0059).
+            Err(e) if attached => {
+                eprintln!(
+                    "enclos: diagnostic run metadata cannot be read: {}",
+                    self.read_err(e)
+                );
+                netlog::denied_from(&conn, sandbox, false)
+            }
+            read => read,
+        }
+        .map_err(|e| self.read_err(e))
     }
 }
 
