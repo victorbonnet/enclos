@@ -3442,7 +3442,8 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
         [
             "MOBILE_APP_SOCKET",
             "MOBILE_APP_ALLOW_ALL",
-            "MOBILE_APP_HOME_CHANNEL"
+            "MOBILE_APP_HOME_CHANNEL",
+            "agent.clarify_timeout"
         ]
     );
     assert_eq!(
@@ -3451,7 +3452,7 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
     assert!(
         calls().ends_with(&format!(
-            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n",
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n-p default config set agent.clarify_timeout 3600\n",
             socket.display()
         )),
         "{}",
