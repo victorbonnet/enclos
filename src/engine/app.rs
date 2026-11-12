@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::Engine;
 use crate::error::{Error, Result};
+use crate::model::audit::Actor;
 use crate::model::channel::Channel;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::SecretValue;
@@ -51,8 +52,51 @@ impl Engine {
         })
     }
 
+    /// Every agent of every sandbox whose active policy grants it an app
+    /// channel token, as `(sandbox, agent, runtime)`.
+    pub fn app_agents(&self) -> Result<Vec<(SandboxName, String, String)>> {
+        let variable = Channel::App.token_variable();
+        let mut agents = Vec::new();
+        for view in self.list_sandboxes()? {
+            let name = view.record.name.clone();
+            let Ok(policy) = self.policy(&name) else {
+                continue;
+            };
+            let runtime = self
+                .runtime_of(&name)
+                .map(|k| k.to_string())
+                .unwrap_or_default();
+            for (agent, grants) in &policy.snapshot.policy.agent_secrets {
+                if grants.contains_key(variable) {
+                    agents.push((name.clone(), agent.as_str().to_owned(), runtime.clone()));
+                }
+            }
+        }
+        Ok(agents)
+    }
+
+    /// The bridge's static key pair's file.
+    pub fn app_key_path(&self) -> PathBuf {
+        self.layout.app_bridge_key()
+    }
+
     /// The bridge's own database: conversations and their messages.
     pub fn app_store_path(&self) -> PathBuf {
         self.layout.app_store()
+    }
+
+    /// Runs `work`, a change to which devices reach the bridge (`app pair`,
+    /// `app unpair`), as an audited command: its intent is in the audit log
+    /// before the work starts, and when the log cannot be written the work
+    /// does not run (ADR 0010).
+    pub fn app_access<T>(
+        &self,
+        by: &Actor,
+        command: &str,
+        target: String,
+        summary: impl FnOnce(&T) -> String,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.write(by, command, Some(target), summary, |_| work())
     }
 }

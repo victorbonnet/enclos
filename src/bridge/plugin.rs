@@ -19,6 +19,10 @@ use super::ids::new_id;
 
 /// How long the plugin has to answer the bridge's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a write to the plugin may wait for it to read: the socket is
+/// in the sandbox home, and an agent that never reads must not hold the
+/// bridge.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -79,6 +83,7 @@ pub fn connect(
         path: socket.display().to_string(),
         source,
     })?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
         lock: Arc::new(Mutex::new(())),
@@ -134,16 +139,22 @@ impl PluginWriter {
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        self.send_with_id(id.clone(), body)?;
+        self.send_as(id.clone(), body)?;
         Ok(id)
     }
 
-    /// Sends `body` with `id`, one the bridge made, and stored, first.
-    pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+    /// Sends `body` with `id`: the same on every try of one message, so the
+    /// plugin knows a message it has had already.
+    pub fn send_as(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
         let line = encode_line(&Envelope::new(id, body));
         let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.stream.write_all(&line)?;
         Ok(())
+    }
+
+    /// Sends `body` with `id`, one the bridge made, and stored, first.
+    pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+        self.send_as(id, body)
     }
 
     /// Answers the plugin's message `of` (when its id could be read) with

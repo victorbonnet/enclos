@@ -100,15 +100,19 @@ The account on a channel through which the sandbox's runtime answers people, suc
 _Avoid_: agent (an agent is the runtime's identity, not the account)
 
 **Bridge**:
-The service of an install that the mobile app reaches over the user's tailnet, and that talks to each agent's channel plugin inside its sandbox.
+The service of an install that the mobile app reaches through its transport, and that talks to each agent's channel plugin inside its sandbox.
 _Avoid_: daemon, server, gateway (the runtime's word), relay (the proxy's)
+
+**Transport**:
+What puts the bridge, which listens on the host's loopback only, on a network the person's devices are on, and tells the bridge who each caller is. Tailscale is the only one for now.
+_Avoid_: tunnel (the proxy's word), front, VPN (one kind of transport)
 
 **Paired device**:
 A phone or other device that a bridge accepts, because the host's user paired it there and it holds the key it was paired with.
 _Avoid_: client, session (a sandbox's word)
 
 **Person**:
-Someone the bridge knows by their tailnet login, who talks to agents from their paired devices. The host's user is one.
+Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
 _Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
 
 **Share**:

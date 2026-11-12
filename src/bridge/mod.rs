@@ -4,5 +4,9 @@
 //! the device side, over the tailnet, comes after.
 
 pub mod ids;
+pub mod keys;
 pub mod plugin;
+pub mod server;
 pub mod store;
+pub mod text;
+pub mod transport;

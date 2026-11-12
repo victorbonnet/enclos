@@ -2945,6 +2945,33 @@ fn connect_reports_untracked_agents_on_stderr_without_the_untrackable_names() {
 }
 
 #[test]
+fn app_devices_status_and_log_print_a_document_when_piped() {
+    let home = Home::new();
+    home.init(1);
+    for (args, key) in [
+        (&["app", "devices"][..], "devices"),
+        (&["app", "status"][..], "devices"),
+        (&["app", "log"][..], "log"),
+    ] {
+        let (code, json) = home.json(args);
+        assert_eq!(code, 0, "{args:?}");
+        assert_eq!(json[key], serde_json::json!([]), "{args:?}");
+    }
+    let out = home.run(&["app", "devices"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "No paired device: pair one with `enclos app pair`.\n"
+    );
+    let out = home.run(&["app", "unpair", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no paired device nope"),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[test]
 fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() {
     let home = Home::new();
     home.init(1);

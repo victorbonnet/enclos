@@ -62,7 +62,7 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
-    /// The enclos mobile app's side of this host: chat with an agent through its app channel.
+    /// The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, or chat with an agent through its app channel.
     App(cli::app::AppArgs),
     /// Show, widen, edit, apply, discard, refresh, diff, roll back or test a sandbox's policy, or list its history.
     Policy(cli::policy::PolicyArgs),
@@ -407,6 +407,8 @@ fn writes_wait(command: &Command) -> Wait {
         Command::Launch(_) | Command::Proxy(_) | Command::Holder(_) | Command::Relay(_) => {
             Wait::Background
         }
+        // The bridge, which the service manager runs
+        Command::App(args) if args.is_service() => Wait::Background,
         Command::Init
         | Command::Doctor
         | Command::Audit(_)
