@@ -77,14 +77,34 @@ def blocked_file(tool_name, args, result, error_message=""):
     return kind, target
 
 
-def register(ctx, adapters, socket_path):
-    def current():
-        path = socket_path()
-        return next((a for a in list(adapters) if a._path == path), None)
+def routes(adapters, conversation):
+    """The agents' connections a request for `conversation` goes through.
 
+    One gateway serves every agent of the sandbox, and its process
+    environment names only the first agent's socket. So a request goes
+    through the agents the conversation reached (one, or a group's members),
+    or, before any message came, through every connected agent: the bridge
+    keeps it only for an agent of that conversation.
+    """
+    live = list(adapters)
+    return [a for a in live if conversation in getattr(a, "_last_in", {})] or live
+
+
+def session(platform):
+    """The current turn's conversation, if it is an enclos one."""
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM") != platform:
+        return None
+    return get_session_env("HERMES_SESSION_CHAT_ID") or None
+
+
+def register(ctx, adapters, socket_path, platform="enclos"):
     def context(**_):
+        conversation = session(platform)
+        through = routes(adapters, conversation) if conversation else []
+        path = through[0]._path if through else socket_path()
         try:
-            text = Path(socket_path() + ".policy-context").read_text()[:48000]
+            text = Path(path + ".policy-context").read_text()[:48000]
         except OSError:
             text = "Enclos policy context is not available yet. A request never grants access."
         return {"context": text + " If an action is blocked, call enclos_request_access with its exact destination or path, then wait for the person to approve in their inbox. Do not repeatedly retry or bypass the sandbox. The policy, not this description, enforces access."}
@@ -109,16 +129,15 @@ def register(ctx, adapters, socket_path):
     def ask(args, **_):
         kind, target, action, private = args.get("kind"), args.get("target"), args.get("action", ""), args.get("private", False)
         try:
-            from gateway.session_context import get_session_env
-            conversation = get_session_env("HERMES_SESSION_CHAT_ID")
-            adapter = current()
-            if not adapter or not conversation:
+            conversation = session(platform)
+            through = routes(adapters, conversation) if conversation else []
+            if not through:
                 return json.dumps({"error": "No enclos conversation is active."})
             message = request(conversation, kind, target, action, private)
-            # The bridge may refuse it (a scope already decided or closed under
-            # this policy): the agent is told, not left waiting.
-            wait = asyncio.run_coroutine_threadsafe(submit(adapter, message), adapter._loop)
-            return json.dumps(outcome([wait.result(timeout=ANSWER_SECONDS + 5)]))
+            # The bridge may refuse it (a scope already decided or closed
+            # under this policy, too many pending): the agent is told, not left waiting.
+            waits = [asyncio.run_coroutine_threadsafe(submit(adapter, message), adapter._loop) for adapter in through]
+            return json.dumps(outcome([w.result(timeout=ANSWER_SECONDS + 5) for w in waits]))
         except Exception as e:
             return json.dumps({"error": str(e)})
 
@@ -126,12 +145,11 @@ def register(ctx, adapters, socket_path):
         scope = blocked_file(tool_name, args, result, error_message)
         if scope:
             # Observer hooks return promptly; no network or wait on their worker.
-            from gateway.session_context import get_session_env
-            adapter = current()
-            conversation = get_session_env("HERMES_SESSION_CHAT_ID")
-            if adapter and conversation:
+            conversation = session(platform)
+            if conversation:
                 message = request(conversation, *scope)
-                asyncio.run_coroutine_threadsafe(enqueue(adapter, message), adapter._loop)
+                for adapter in routes(adapters, conversation):
+                    asyncio.run_coroutine_threadsafe(enqueue(adapter, message), adapter._loop)
 
     ctx.register_hook("pre_llm_call", context)
     ctx.register_hook("post_tool_call", after)

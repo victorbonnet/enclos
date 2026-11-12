@@ -31,6 +31,29 @@ class Approvals(unittest.TestCase):
         result = json.loads(handler({"kind": "write", "target": "/work/a"}))
         self.assertIn("error", result)  # no active Hermes conversation
 
+    def test_a_request_goes_through_the_agents_the_conversation_reached(self):
+        main, coder = Mock(_last_in={"c-main": ("m1", 0.0)}), Mock(_last_in={"g": ("m2", 0.0)})
+        main._last_in["g"] = ("m3", 0.0)
+        self.assertEqual(approvals.routes({main, coder}, "c-main"), [main])
+        self.assertCountEqual(approvals.routes({main, coder}, "g"), [main, coder])
+        # Before any message came: every connected agent; the bridge keeps it for the right one.
+        self.assertCountEqual(approvals.routes({main, coder}, "new"), [main, coder])
+
+    def test_only_an_enclos_conversation_files_a_request(self):
+        env = {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "12345"}
+        module = types.ModuleType("gateway.session_context")
+        module.get_session_env = lambda name: env.get(name)
+        with patch.dict(sys.modules, {"gateway": types.ModuleType("gateway"), "gateway.session_context": module}):
+            self.assertIsNone(approvals.session("enclos"))
+            adapter = Mock(_last_in={"12345": ("m", 0.0)})
+            ctx = Mock()
+            approvals.register(ctx, {adapter}, lambda: "/absent/main.sock", "enclos")
+            handler = ctx.register_tool.call_args.kwargs["handler"]
+            self.assertIn("error", json.loads(handler({"kind": "write", "target": "/work/a"})))
+            adapter._outbox.put.assert_not_called()
+            env["HERMES_SESSION_PLATFORM"] = "enclos"
+            self.assertEqual(approvals.session("enclos"), "12345")
+
     def test_the_tool_says_what_the_bridge_answered(self):
         import asyncio
         import threading
@@ -40,6 +63,7 @@ class Approvals(unittest.TestCase):
             def __init__(self, loop, reply):
                 self._loop, self._reply, self._answers = loop, reply, {}
                 self._path = "/absent/main.sock"
+                self._last_in = {"c1": ("m", 0.0)}
                 self._outbox = Mock()
                 self._outbox.put.return_value = True
 
@@ -54,12 +78,13 @@ class Approvals(unittest.TestCase):
         loop = asyncio.new_event_loop()
         threading.Thread(target=loop.run_forever, daemon=True).start()
         self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        env = {"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "c1"}
         module = types.ModuleType("gateway.session_context")
-        module.get_session_env = lambda name: "c1" if name == "HERMES_SESSION_CHAT_ID" else None
+        module.get_session_env = lambda name: env.get(name)
 
-        def ask(reply):
+        def ask(*replies):
             ctx = Mock()
-            approvals.register(ctx, {Bridge(loop, reply)}, lambda: "/absent/main.sock")
+            approvals.register(ctx, [Bridge(loop, r) for r in replies], lambda: "/absent/main.sock", "enclos")
             return json.loads(ctx.register_tool.call_args.kwargs["handler"]({"kind": "network", "target": "example.com:443"}))
 
         with patch.dict(sys.modules, {"gateway": types.ModuleType("gateway"), "gateway.session_context": module}):
@@ -67,6 +92,11 @@ class Approvals(unittest.TestCase):
             closed = ask("A request for this scope was already closed.")
             self.assertNotIn("status", closed)
             self.assertIn("already closed", closed["error"])
+            denied = ask("A request for this scope was already denied.")
+            self.assertNotIn("status", denied)
+            self.assertIn("already denied", denied["error"])
+            # One connection kept it: it is in the inbox.
+            self.assertEqual(ask("Not this agent's conversation.", None)["status"], "requested")
             with patch.object(approvals, "ANSWER_SECONDS", 0.05):
                 self.assertEqual(ask("silent")["status"], "queued")
 
