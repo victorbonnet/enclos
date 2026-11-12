@@ -246,7 +246,7 @@ impl Hub {
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e))?;
         let deliveries = self.routine_deliveries(store, person, agent).map_err(|e| {
             eprintln!("enclos app: cannot read the delivery conversations of {agent}: {e}");
-            failure(original.clone(), ErrorCode::Unknown, NOT_READ_BEFORE)
+            failure(original.clone(), ErrorCode::Internal, NOT_READ_BEFORE)
         })?;
         if deliveries.len() > MAX_DELIVERIES {
             return Err(failure(
@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn a_database_failure_is_answered_as_unknown_not_blamed_on_the_runtime() {
+    fn a_database_failure_is_answered_as_internal_or_unknown_not_blamed_on_the_runtime() {
         // Before the request is sent: nothing reaches the runtime.
         let (_dir, hub, store, device, rx) = fixture();
         break_table(&hub, "members");
@@ -1233,7 +1233,7 @@ mod tests {
                 RoutineRequest::List { cursor: None },
             )
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.code, ErrorCode::Internal);
         assert!(!error.message.contains("members"), "{}", error.message);
         // Once the runtime answered, a list or a saved routine.
         for (request, result) in [

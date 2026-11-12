@@ -2260,7 +2260,7 @@ impl ArchiveError {
             ArchiveError::Storage(detail) => {
                 eprintln!("enclos app: an archive change failed: {detail}");
                 (
-                    enclos_protocol::plugin::ErrorCode::Unknown,
+                    enclos_protocol::plugin::ErrorCode::Internal,
                     "The archive state could not be saved. Try again later.".to_owned(),
                 )
             }
