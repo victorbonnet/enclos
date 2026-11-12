@@ -16,6 +16,7 @@ use crate::model::sandbox::SandboxName;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::proxy::decide::{Destination, allowed};
 use crate::runtime::{RuntimeAgentName, SandboxCommand, adapter};
+use std::path::PathBuf;
 
 /// One setting `runtime configure` gives an agent, written `KEY=VALUE`: a
 /// secret appears in the value only as `${VAR}`, which the agent reads from
@@ -69,16 +70,28 @@ pub struct Configured {
     pub channel: Option<ChannelSet>,
 }
 
-/// The bot `runtime configure --channel` set up.
+/// The channel `runtime configure --channel` set up.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelSet {
-    pub channel: Channel,
-    /// The variable the bot's token is read from.
-    pub token: String,
-    /// The people it answers, each once.
-    pub answers: Vec<ChannelUser>,
-    /// Whether the active policy lets the sandbox reach the channel's host.
-    pub reachable: bool,
+pub enum ChannelSet {
+    /// A messaging service's bot.
+    Bot {
+        channel: Channel,
+        /// The variable the bot's token is read from.
+        token: String,
+        /// The people it answers, each once.
+        answers: Vec<ChannelUser>,
+        /// Whether the active policy lets the sandbox reach the channel's
+        /// host.
+        reachable: bool,
+    },
+    /// The mobile app's channel (ADR 0042, proposed), which answers whom
+    /// the bridge lets in.
+    App {
+        /// The variable the agent's token is read from.
+        token: String,
+        /// Its socket, in the sandbox home, which the bridge connects to.
+        socket: PathBuf,
+    },
 }
 
 impl Engine {
@@ -153,6 +166,7 @@ impl Engine {
             })
         };
         let mut keys = Vec::new();
+        let mut staged = Vec::new();
         for setting in settings {
             self.check_setting(name, &agent, setting, policy, pending)?;
             commands.push(set(&setting.key, &setting.value)?);
@@ -160,6 +174,16 @@ impl Engine {
         }
         let channel = match channel {
             None => None,
+            Some(request) if request.channel == Channel::App => {
+                let plan = self.app_channel(name, &agent, &request, policy, pending, confirm)?;
+                commands.extend(plan.commands);
+                for (key, value) in &plan.settings {
+                    commands.push(set(key, value)?);
+                    keys.push(key.clone());
+                }
+                staged = plan.staged;
+                Some(plan.set)
+            }
             Some(request) => {
                 let (bot, settings) =
                     self.channel_settings(name, &agent, request, &view.snapshot.policy, pending)?;
@@ -186,15 +210,27 @@ impl Engine {
                     )
                 })
                 .collect();
-            if let Some(bot) = done.channel.as_ref().filter(|b| !b.reachable) {
-                changes.push(unreachable(name, bot.channel));
+            if let Some(ChannelSet::Bot {
+                channel,
+                reachable: false,
+                ..
+            }) = &done.channel
+            {
+                changes.push(unreachable(name, *channel));
             }
             return Ok(Planned::DryRun(Plan {
                 changes,
                 ..Plan::default()
             }));
         }
-        self.run_all(by, name, commands)?;
+        let ran = self.run_all(by, name, commands);
+        // The staged plugin is the binary's own, and the sandbox may not
+        // write `installers/`: one left there when its removal fails does
+        // no harm, so that failure does not undo what ran.
+        for path in staged {
+            let _ = std::fs::remove_file(path);
+        }
+        ran?;
         Ok(Planned::Done(done))
     }
 
@@ -334,10 +370,11 @@ impl Engine {
                 "the policy of sandbox {name} also gives agent {agent} ${usual}, which {shown} reads for the bot before ${token}, so the bot would be the one ${usual} names: take ${usual} out of its {section}, or set the bot up with it (no --token-env)"
             )));
         }
-        let reachable =
-            Destination::parse(channel.host(), 443).is_ok_and(|dest| allowed(policy, &dest));
+        let reachable = channel.host().is_none_or(|host| {
+            Destination::parse(host, 443).is_ok_and(|dest| allowed(policy, &dest))
+        });
         Ok((
-            ChannelSet {
+            ChannelSet::Bot {
                 channel,
                 token,
                 answers,
@@ -345,6 +382,105 @@ impl Engine {
             },
             settings,
         ))
+    }
+
+    /// What sets up the mobile app's channel for `agent` (ADR 0042,
+    /// proposed): the runtime's plugin copied into the sandbox home from
+    /// `installers/`, the runtime's commands that turn it on, and the
+    /// settings that give it its socket. Refused first: people to answer
+    /// or a token variable of another name, which the bridge decides
+    /// instead, a runtime with no such channel, the agent's token,
+    /// `MOBILE_APP_TOKEN`, not granted to the agent alone, and a socket
+    /// path too long for a Unix socket.
+    fn app_channel(
+        &self,
+        name: &SandboxName,
+        agent: &RuntimeAgentName,
+        request: &ChannelRequest,
+        policy: &Policy,
+        pending: Option<&Policy>,
+        confirm: Confirm,
+    ) -> Result<AppChannelPlan> {
+        let session = |what: String| Error::Session { what };
+        // The plugin answers whoever the bridge lets in, and the bridge
+        // presents the agent's token under one name: an `--allow-user` or
+        // a `--token-env` would be ignored, so both are refused.
+        if !request.answers.is_empty() {
+            return Err(session(
+                "`--allow-user` does not apply to the app channel: enclos's bridge decides who talks to the agent, the people whose devices are paired with it".to_owned(),
+            ));
+        }
+        if request.token.is_some() {
+            return Err(session(format!(
+                "`--token-env` does not apply to the app channel: its token is always ${}, the one the bridge presents to the agent",
+                Channel::App.token_variable()
+            )));
+        }
+        let kind = self.runtime_of(name)?;
+        let runtime = adapter(kind);
+        let shown = kind.display_name();
+        let token = Channel::App.token_variable();
+        let section = format!("[secrets.agents.{agent}]");
+        let granted = |p: &Policy| {
+            p.agent_secrets
+                .get(agent.as_str())
+                .is_some_and(|g| g.contains_key(token))
+        };
+        if policy.secrets.contains_key(token) {
+            return Err(session(format!(
+                "the policy of sandbox {name} gives ${token} to the whole sandbox, under [secrets], which every agent receives: with `enclos policy edit {name}`, move it to {section}, so each agent has a token of its own"
+            )));
+        }
+        if !granted(policy) {
+            let secret = format!("{name}/{agent}-app");
+            return Err(session(match pending.is_some_and(granted) {
+                true => format!(
+                    "the pending policy of sandbox {name} gives agent {agent} ${token}, but it is not in force yet: `enclos policy apply {name}` first"
+                ),
+                false => format!(
+                    "the policy of sandbox {name} gives agent {agent} no ${token}, the token the bridge presents to its app channel: store a new random one with `openssl rand -hex 32 | enclos secret set {secret}`, then with `enclos policy edit {name}` add `{token} = \"secret:{secret}\"` to the `env` of its {section} section"
+                ),
+            }));
+        }
+        let socket = self.layout.agent_app_socket(name.as_str(), agent.as_str());
+        // A Unix socket's path holds at most 104 bytes on macOS (108 on
+        // Linux), its last one a NUL.
+        if socket.as_os_str().len() > 103 {
+            return Err(session(format!(
+                "the app channel's socket, {}, is longer than a Unix socket's path may be (103 bytes): set ENCLOS_HOME to a shorter folder",
+                socket.display()
+            )));
+        }
+        let Some(app) = runtime.app_channel(agent, &socket) else {
+            return Err(session(format!(
+                "{shown} has no app channel enclos can set up"
+            )));
+        };
+        // A dry run writes nothing, staged files included: it names them.
+        let (copy, staged) = match confirm {
+            Confirm::DryRun => {
+                let mut words = vec!["cp".to_owned()];
+                words.extend(
+                    app.files
+                        .iter()
+                        .map(|(place, _)| format!("~/{}", place.as_path().display())),
+                );
+                let words = words.into_iter().map(Into::into).collect();
+                (SandboxCommand::new(words), Vec::new())
+            }
+            _ => self.stage_home_copy(name, &app.files, &format!("app-{agent}"))?,
+        };
+        let mut commands = vec![copy];
+        commands.extend(app.commands);
+        Ok(AppChannelPlan {
+            set: ChannelSet::App {
+                token: token.to_owned(),
+                socket,
+            },
+            commands,
+            settings: app.settings,
+            staged,
+        })
     }
 
     /// Runs `commands` in the sandbox in order; one that fails stops the
@@ -396,11 +532,24 @@ fn referenced(value: &str) -> Vec<&str> {
     found
 }
 
+/// What sets up an app channel.
+struct AppChannelPlan {
+    /// What `runtime configure` reports.
+    set: ChannelSet,
+    /// The commands that put the plugin in place and turn it on.
+    commands: Vec<SandboxCommand>,
+    /// Its settings, set after `commands`.
+    settings: Vec<(String, String)>,
+    /// The plugin's files staged in `installers/`, removed once the
+    /// commands have run.
+    staged: Vec<PathBuf>,
+}
+
 /// What a dry run says of a channel whose host the policy does not reach.
 fn unreachable(name: &SandboxName, channel: Channel) -> String {
     format!(
         "find that the policy does not let the bot reach {host}: allow it with `enclos policy allow {name} {host}`",
-        host = channel.host()
+        host = channel.host().unwrap_or_default()
     )
 }
 

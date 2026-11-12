@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use super::output;
-use enclos::engine::{ChannelRequest, Engine, Setting};
+use enclos::engine::{ChannelRequest, ChannelSet, Engine, Setting};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -45,8 +45,9 @@ enum RuntimeVerb {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<Setting>,
         /// A bot on this messaging channel, its token a secret the policy
-        /// grants the agent.
-        #[arg(long, requires = "allow_user")]
+        /// grants the agent; or `app`, the enclos mobile app's channel,
+        /// which enclos's bridge connects to.
+        #[arg(long)]
         channel: Option<Channel>,
         /// With --channel: the variable the policy grants the bot's token
         /// as; the channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
@@ -189,13 +190,24 @@ fn configure(
             "sandbox": sandbox.to_string(),
             "agent": agent.to_string(),
             "settings": done.settings,
-            "channel": done.channel.as_ref().map(|bot| json!({
-                "channel": bot.channel.to_string(),
-                "token_variable": bot.token,
-                "answers": bot.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "reachable": bot.reachable,
-                "host": bot.channel.host(),
-            })),
+            "channel": done.channel.as_ref().map(|set| match set {
+                ChannelSet::Bot { channel, token, answers, reachable } => json!({
+                    "channel": channel.to_string(),
+                    "token_variable": token,
+                    "answers": answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "reachable": reachable,
+                    "host": channel.host(),
+                    "socket": null,
+                }),
+                ChannelSet::App { token, socket } => json!({
+                    "channel": Channel::App.to_string(),
+                    "token_variable": token,
+                    "answers": [],
+                    "reachable": true,
+                    "host": null,
+                    "socket": socket.display().to_string(),
+                }),
+            }),
         }));
         return Ok(exit::OK);
     }
@@ -205,18 +217,28 @@ fn configure(
     if !done.settings.is_empty() {
         println!("Set: {}.", done.settings.join(", "));
     }
-    if let Some(bot) = &done.channel {
-        println!(
-            "Its {} bot is set up: its token is read from ${}, and it answers {} user(s).",
-            bot.channel.display_name(),
-            bot.token,
-            bot.answers.len()
-        );
-        if !bot.reachable {
+    match &done.channel {
+        None => {}
+        Some(ChannelSet::App { token, socket }) => println!(
+            "Its app channel is set up: it listens at {}, for enclos's bridge, which presents ${token}.",
+            socket.display()
+        ),
+        Some(ChannelSet::Bot {
+            channel,
+            token,
+            answers,
+            reachable,
+        }) => {
             println!(
-                "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
-                host = bot.channel.host(),
+                "Its {} bot is set up: its token is read from ${token}, and it answers {} user(s).",
+                channel.display_name(),
+                answers.len()
             );
+            if let (false, Some(host)) = (*reachable, channel.host()) {
+                println!(
+                    "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`."
+                );
+            }
         }
     }
     println!(
