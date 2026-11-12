@@ -789,6 +789,52 @@ fn approval_requests_refuse_hidden_characters_and_strip_them_from_labels() {
     let saved = store.approvals().unwrap();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].action, "Read txt.emdaer");
+    // The shared rule's wider set: a tag character or a line separator in
+    // a target is refused; a joiner inside an emoji is ordinary text.
+    for target in ["c.example.com\u{E0041}", "d.example.com\u{2028}"] {
+        assert!(
+            hub.request_access(&store, "lab/main", None, network(target), "")
+                .is_err(),
+            "{target:?}"
+        );
+    }
+    hub.request_access(
+        &store,
+        "lab/main",
+        None,
+        network("e.example.com"),
+        "Ask \u{1F468}\u{200D}\u{1F469} a\u{200D}b",
+    )
+    .unwrap();
+    let saved = store.approvals().unwrap();
+    assert!(
+        saved
+            .iter()
+            .any(|a| a.action == "Ask \u{1F468}\u{200D}\u{1F469} ab"),
+        "{saved:?}"
+    );
+}
+
+#[test]
+fn approval_an_agent_asking_again_for_a_decided_scope_is_told_so() {
+    let (_dir, hub, store) = approval_hub();
+    let access = network("a.example.com");
+    hub.request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap();
+    // Still in the inbox: the request stands.
+    hub.request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap();
+    let mut a = store.approvals().unwrap().remove(0);
+    assert!(store.claim_approval(&a.request).unwrap());
+    a.state = "denied".into();
+    store.put_approval(&a).unwrap();
+    let told = hub
+        .request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap_err();
+    assert!(told.contains("already denied"), "{told}");
+    // A proxy refusal of it stays quiet: nobody waits for its answer.
+    hub.request_access(&store, "lab", None, access, "").unwrap();
+    assert_eq!(store.approvals().unwrap().len(), 1);
 }
 
 #[test]
@@ -818,6 +864,33 @@ fn approval_a_refusal_counts_once_and_a_denial_is_not_asked_again() {
         90,
         50
     ));
+}
+
+#[test]
+fn approval_the_collector_reads_only_a_sandboxs_recent_requests() {
+    let (_dir, _hub, store) = approval_hub();
+    for (request, sandbox, time) in [("r1", "lab", 10), ("r2", "lab", 20), ("r3", "other", 30)] {
+        let mut a = approval_sample();
+        a.request = request.into();
+        a.sandbox = sandbox.into();
+        a.time = time;
+        a.state = "denied".into();
+        store.create_approval(&a).unwrap();
+    }
+    let ids = |sandbox, from| {
+        let mut ids: Vec<_> = store
+            .approvals_since(sandbox, from)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.request)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids("lab", 0), ["r1", "r2"]);
+    assert_eq!(ids("lab", 20), ["r2"]);
+    assert!(ids("lab", 21).is_empty());
+    assert_eq!(ids("other", 0), ["r3"]);
 }
 
 #[test]
