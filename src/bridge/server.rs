@@ -400,13 +400,6 @@ impl Hub {
     /// when a request that waits for the person arrives in it (ADR 0049):
     /// the flag is cleared, and the owner's devices get the metadata.
     /// Whether it was archived.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "questions and command approvals, which call it, are not on this branch yet"
-        )
-    )]
     pub(super) fn unarchive_for_request(&self, store: &Store, id: &str) -> rusqlite::Result<bool> {
         if !store.unarchive_for_request(id)? {
             return Ok(false);
