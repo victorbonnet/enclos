@@ -9,7 +9,7 @@ import hmac
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -251,11 +251,29 @@ def attachment(file: str, mime: str, name: str, size: int) -> dict[str, Any]:
 LOCAL_IMAGE = re.compile(r"!\[([^\]]*)\]\((?!https?://)([^)\s]+)\)")
 
 
-def local_images(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """The text without its local markdown images, and each one's (alt, path)."""
-    found = [(m.group(1), m.group(2)) for m in LOCAL_IMAGE.finditer(text)]
-    rest = LOCAL_IMAGE.sub("", text)
+def local_images(text: str, sendable: Callable[[str], bool] = lambda path: True) -> tuple[str, list[tuple[str, str]]]:
+    """The text without the local markdown images whose path `sendable` takes,
+    and each taken one's (alt, path). An image it does not take stays in the
+    text, so that nothing the agent wrote goes missing without a sign."""
+    found: list[tuple[str, str]] = []
+
+    def take(m: re.Match) -> str:
+        if not sendable(m.group(2)):
+            return m.group(0)
+        found.append((m.group(1), m.group(2)))
+        return ""
+
+    rest = LOCAL_IMAGE.sub(take, text)
     return re.sub(r"\n{3,}", "\n\n", rest).strip(), found
+
+
+def with_files_not_sent(text: str, names: list[str]) -> str:
+    """The text, with a line for each file the agent sent that could not be
+    passed on, so the person knows one is missing."""
+    if not names:
+        return text
+    note = "\n".join(f"(A file could not be sent: {name})" for name in names)
+    return f"{text}\n\n{note}" if text else note
 
 
 def typing(conversation: str, on: bool) -> dict[str, Any]:
