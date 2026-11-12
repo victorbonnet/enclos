@@ -1,38 +1,21 @@
 //! Text a caller chose, made safe to store and show at a terminal: a
 //! device's name in `pair.request`, a node's name from the transport.
 
-/// Characters that move the cursor, hide what follows or reorder it:
-/// controls, and the invisible and bidirectional formatting characters.
-fn hidden(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{ad}'
-                | '\u{34f}'
-                | '\u{61c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{fe00}'..='\u{fe0f}'
-                | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
-                | '\u{e0000}'..='\u{e007f}'
-                | '\u{e0100}'..='\u{e01ef}'
-        )
-}
+use enclos_protocol::visible::stripped;
 
-/// `text` without hidden characters, its runs of white space made one
+/// `text` without the characters hidden where they stand (the shared rule
+/// of [`enclos_protocol::visible`]), its runs of white space made one
 /// space, cut to `max` characters; `fallback` when nothing is left.
 pub fn plain(text: &str, max: usize, fallback: &str) -> String {
-    let shown: String = text
+    let spaced: String = text
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !hidden(*c))
         .collect();
+    let shown = stripped(&spaced, false);
     let words: Vec<&str> = shown.split(' ').filter(|w| !w.is_empty()).collect();
-    let joined: String = words.join(" ").chars().take(max).collect();
-    match joined.trim_end() {
+    let cut: String = words.join(" ").chars().take(max).collect();
+    // A joiner the cut left at the end is hidden there
+    match stripped(&cut, false).trim_end() {
         "" => fallback.to_owned(),
         kept => kept.to_owned(),
     }
@@ -58,5 +41,20 @@ mod tests {
         );
         assert_eq!(plain(&"é".repeat(100), 64, "?").chars().count(), 64);
         assert_eq!(plain("\u{202e}\n\t ", 64, "unnamed"), "unnamed");
+    }
+
+    #[test]
+    fn a_joiner_stays_only_inside_non_ascii_text() {
+        // A joined emoji keeps its joiner
+        assert_eq!(
+            plain("Vic \u{1f469}\u{200d}\u{1f4bb}", 64, "?"),
+            "Vic \u{1f469}\u{200d}\u{1f4bb}"
+        );
+        // Next to ASCII it goes
+        assert_eq!(plain("Pi\u{200d}xel", 64, "?"), "Pixel");
+        // Cut just after a joiner: the joiner, now at the end, goes too
+        assert_eq!(plain("\u{e9}\u{200d}\u{e9}", 2, "?"), "\u{e9}");
+        // Tags and fillers the first rule missed
+        assert_eq!(plain("Pixel\u{e0041}\u{3164}", 64, "?"), "Pixel");
     }
 }

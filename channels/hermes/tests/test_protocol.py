@@ -161,6 +161,19 @@ class Files(unittest.TestCase):
         self.assertEqual(rest, "Here's your unicorn on the moon:\n\n"
                                "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
 
+    def test_a_local_image_that_cannot_be_sent_stays_in_the_text(self):
+        text = "Two:\n\n![a](images/a.png)\n\n![b](/etc/b.png)"
+        rest, found = protocol.local_images(text, lambda path: path == "images/a.png")
+        self.assertEqual(found, [("a", "images/a.png")])
+        self.assertEqual(rest, "Two:\n\n![b](/etc/b.png)")
+
+    def test_a_file_that_could_not_be_sent_is_said_in_the_text(self):
+        self.assertEqual(protocol.with_files_not_sent("Here", []), "Here")
+        self.assertEqual(protocol.with_files_not_sent("Here", ["a.pdf"]),
+                         "Here\n\n(A file could not be sent: a.pdf)")
+        self.assertEqual(protocol.with_files_not_sent("", ["a.pdf", "b.png"]),
+                         "(A file could not be sent: a.pdf)\n(A file could not be sent: b.png)")
+
 
 if __name__ == "__main__":
     unittest.main()
