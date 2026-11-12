@@ -1,7 +1,8 @@
-# The enclos package and, as they come, the crates it shares in crates/
-# (the mobile app's protocol, docs/protocol.md, is the first).
+# The enclos package and the crates it shares in crates/: enclos-protocol,
+# the mobile app's protocol (docs/protocol.md), which the app uses too.
 [workspace]
 resolver = "3"
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
