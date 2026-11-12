@@ -284,20 +284,25 @@ impl Hub {
         }
         self.plugin(agent)
             .map_err(|e| failure(original.clone(), ErrorCode::AgentUnavailable, e))?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        let Some(Plugin {
-            writer,
-            capabilities,
-            ..
-        }) = plugins.get_mut(agent)
-        else {
+        // The plugins lock is let go before writing: the write goes through
+        // the plugin's own lock
+        let found = {
+            let plugins = self.plugins.lock().expect("not poisoned");
+            plugins.get(agent).map(|plugin| {
+                (
+                    Arc::clone(&plugin.out),
+                    plugin.capabilities.contains(&Capability::Routines),
+                )
+            })
+        };
+        let Some((out, routines)) = found else {
             return Err(failure(
                 original,
                 ErrorCode::AgentUnavailable,
                 "The agent's channel is disconnected.",
             ));
         };
-        if !capabilities.contains(&Capability::Routines) {
+        if !routines {
             return Err(failure(
                 original,
                 ErrorCode::Unsupported,
@@ -309,7 +314,6 @@ impl Hub {
         match replay(&requests, &rpc, &request, &original)? {
             Replay::Completed(response) => {
                 drop(requests);
-                drop(plugins);
                 return answered(self, *response);
             }
             Replay::Pending => return Ok(()),
@@ -345,7 +349,7 @@ impl Hub {
             .into_iter()
             .map(|d| ConversationId::new(d.id).expect("stored conversation id"))
             .collect();
-        if let Err(e) = writer.send_with_id(
+        let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::RoutineRequest {
                 allowed_deliveries,
@@ -353,7 +357,8 @@ impl Hub {
                 device: device.id.clone(),
                 request: Box::new(request),
             },
-        ) {
+        );
+        if let Err(e) = sent {
             let pending = self
                 .routines
                 .lock()
@@ -642,7 +647,7 @@ mod tests {
             node: None,
         };
         store.add_device(&device).unwrap();
-        store.ensure_home(AGENT, OWNER).unwrap();
+        store.ensure_home(AGENT, OWNER, false).unwrap();
         store.conversation("owned", "lab", "coder", OWNER).unwrap();
         store
             .conversation("foreign", "lab", "coder", "guest@example.com")
