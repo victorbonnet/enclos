@@ -5,6 +5,8 @@ use crate::{ConversationId, MessageId};
 
 pub const PAGE_SIZE: usize = 25;
 pub const MAX_PROMPT_BYTES: usize = 8192;
+/// The most bytes of a routine's id, and of a list cursor.
+pub const MAX_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -176,6 +178,23 @@ fn text(value: &str, maximum: usize, empty: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `value` can be a routine's id: the runtime chooses it, and it
+/// reaches the bridge's log, the host's terminal and a person's screen, so
+/// it is short, not blank, and holds no control or hidden character.
+pub fn valid_id(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_ID_BYTES
+        && !crate::visible::has_hidden(value, false)
+}
+
+fn id(value: &str) -> Result<(), String> {
+    if valid_id(value) {
+        Ok(())
+    } else {
+        Err("A routine id is empty, too long, or holds a control or hidden character.".into())
+    }
+}
+
 impl RoutineDefinition {
     pub fn validate(&self) -> Result<(), String> {
         let has_other_work = self.script_only
@@ -228,17 +247,17 @@ impl RoutineRequest {
         match self {
             Self::List { cursor } => {
                 if let Some(value) = cursor {
-                    text(value, 128, false)?;
+                    id(value)?;
                 }
             }
-            Self::Get { routine } => text(routine, 128, false)?,
+            Self::Get { routine } => id(routine)?,
             Self::Create { definition } => definition.validate()?,
             Self::Update {
                 routine,
                 revision,
                 definition,
             } => {
-                text(routine, 128, false)?;
+                id(routine)?;
                 text(revision, 128, false)?;
                 definition.validate()?;
             }
@@ -247,7 +266,7 @@ impl RoutineRequest {
                 routine, revision, ..
             }
             | Self::Run { routine, revision } => {
-                text(routine, 128, false)?;
+                id(routine)?;
                 text(revision, 128, false)?;
             }
         }
@@ -280,9 +299,123 @@ impl RoutineRequest {
     }
 }
 
+impl RoutineResult {
+    /// Keeps only the ids [`valid_id`] accepts: a list leaves out the
+    /// routines whose id it refuses, so one odd native job does not hide
+    /// the others; any other result, or a list whose cursor is refused, is
+    /// refused whole (`false`).
+    pub fn retain_valid_ids(&mut self) -> bool {
+        match self {
+            Self::List {
+                routines,
+                next_cursor,
+                ..
+            } => {
+                routines.retain(|r| valid_id(&r.id));
+                next_cursor.as_deref().is_none_or(valid_id)
+            }
+            Self::Routine { routine } => valid_id(&routine.summary.id),
+            Self::Deleted { routine } | Self::Run { routine } => valid_id(routine),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routine_id_is_short_and_shows_as_itself() {
+        for good in ["native-1", "0f3a9c", "ma\u{EF}n"] {
+            assert!(valid_id(good), "{good}");
+        }
+        for bad in [
+            "",
+            "  ",
+            "a\nb",
+            "x\u{1b}[2J",
+            "main\u{202E}",
+            "a\u{200B}b",
+            "main\u{FE0F}",
+        ] {
+            assert!(!valid_id(bad), "{bad:?}");
+            let request = RoutineRequest::Delete {
+                routine: bad.into(),
+                revision: "r1".into(),
+            };
+            assert!(request.validate().is_err(), "{bad:?}");
+        }
+        assert!(!valid_id(&"a".repeat(MAX_ID_BYTES + 1)));
+        assert!(valid_id(&"a".repeat(MAX_ID_BYTES)));
+    }
+
+    #[test]
+    fn a_list_leaves_out_routines_whose_id_is_refused_and_other_results_are_refused() {
+        let summary = |id: &str| RoutineSummary {
+            id: id.into(),
+            revision: "r".into(),
+            name: None,
+            schedule: RoutineSchedule::Interval { minutes: 5 },
+            enabled: true,
+            prompt_preview: String::new(),
+            delivery_label: "Nowhere".into(),
+            editable: true,
+            state: None,
+            paused_reason: None,
+            last_error: None,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+        };
+        let mut list = RoutineResult::List {
+            routines: vec![summary("good"), summary("bad\n[forged]")],
+            next_cursor: None,
+            options: RoutineOptions {
+                timezone: "UTC".into(),
+                features: vec![],
+                skills: vec![],
+                models: vec![],
+                toolsets: vec![],
+            },
+            deliveries: vec![],
+            deliveries_limited: false,
+        };
+        assert!(list.retain_valid_ids());
+        let RoutineResult::List { routines, .. } = &list else {
+            unreachable!()
+        };
+        assert_eq!(routines.len(), 1);
+        assert_eq!(routines[0].id, "good");
+        if let RoutineResult::List { next_cursor, .. } = &mut list {
+            *next_cursor = Some("\u{1b}]52".into());
+        }
+        assert!(!list.retain_valid_ids());
+        assert!(
+            !RoutineResult::Run {
+                routine: "a\u{2028}b".into()
+            }
+            .retain_valid_ids()
+        );
+        let mut routine = RoutineResult::Routine {
+            routine: Box::new(Routine {
+                summary: summary("x\u{1b}[31m"),
+                definition: RoutineDefinition {
+                    name: None,
+                    prompt: "hi".into(),
+                    schedule: RoutineSchedule::Interval { minutes: 5 },
+                    delivery: None,
+                    skills: vec![],
+                    model: None,
+                    provider: None,
+                    toolsets: None,
+                    script: None,
+                    script_only: false,
+                    working_directory: None,
+                },
+            }),
+        };
+        assert!(!routine.retain_valid_ids());
+    }
 
     #[test]
     fn typed_requests_preserve_explicit_no_tools_and_script_mode() {
