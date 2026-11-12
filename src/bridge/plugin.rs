@@ -111,6 +111,7 @@ fn connect_within(
             Capability::Questions,
             Capability::RuntimeApprovals,
             Capability::RuntimeApprovalScopes,
+            Capability::Abort,
         ],
         home: ConversationId::new(home).ok(),
     })?;
@@ -150,6 +151,14 @@ fn connect_within(
 }
 
 impl PluginWriter {
+    #[cfg(test)]
+    pub(super) fn for_test(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
     /// Another writer on the same connection, for another thread.
     pub fn try_clone(&self) -> std::io::Result<PluginWriter> {
         Ok(PluginWriter {

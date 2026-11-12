@@ -316,6 +316,7 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             adapter._write = AsyncMock(return_value=True)
             adapter._questions = types.SimpleNamespace(refused=AsyncMock())
             adapter._answers = {}
+            adapter._interrupts = types.SimpleNamespace(admit=lambda event: None, complete=lambda event: None)
             adapter.name = "enclos"
             # Python's split takes U+001F for whitespace, as Hermes does. The bridge's
             # `host` is no proof (any program with the token sends it): the host's

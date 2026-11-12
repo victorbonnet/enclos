@@ -105,3 +105,22 @@ test('a damaged route cannot collapse a conversation into a native default sessi
   } }));
   assert.throws(() => new ChannelTransport(account, { onMessage: async () => {} }), /invalid enclos channel conversation route/);
 });
+
+test('asynchronous controls retain their exact peer and protected token authority', async t => {
+  const account = accountFixture(t); let release, began = false, settled = false, effects = 0;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const channel = new ChannelTransport(account, { onMessage: async () => {}, async onControl(_control, owner, requestPeer) {
+    owner.assertControlPeer(requestPeer); began = true;
+    try { await blocked; owner.assertControlPeer(requestPeer); effects++; }
+    finally { settled = true; }
+  } });
+  await channel.start(); t.after(() => channel.close());
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const oldPeer = channel.peer;
+  assert.throws(() => channel.assertControlPeer({ ...oldPeer }), error => error.code === 'agent_unavailable');
+  owner.send(message('turn.abort', { conversation: 'c', of: 'exact-ingress' })); await waitFor(() => began);
+  writeFileSync(account.tokenFile, JSON.stringify({ MOBILE_APP_TOKEN: 'rotated-test-token' }), { mode: 0o600 });
+  release(); await waitFor(() => settled);
+  assert.equal(effects, 0);
+  assert.throws(() => channel.assertControlPeer(oldPeer), error => error.code === 'agent_unavailable');
+});

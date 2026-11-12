@@ -728,6 +728,86 @@ fn approval_closed_requests_are_not_recreated_by_collection_or_agent_retries() {
 }
 
 #[test]
+fn group_stop_targets_the_original_ingress_only_when_the_plugin_can_abort() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::net::UnixStream;
+
+    for supports_abort in [true, false] {
+        let (_dir, hub, store) = diagnostic_approval_hub();
+        let members = vec!["main".to_owned(), "other".to_owned()];
+        store
+            .group("group", "lab", &members, "owner@example.com")
+            .unwrap();
+        store
+            .turn(
+                "turn",
+                "group",
+                1,
+                0,
+                "main",
+                "working",
+                Some("original-ingress"),
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let mut discussion = Discussion::new(1, "@all hello", &members);
+        discussion.started("main", "turn".into(), "original-ingress".into(), 1, false);
+        hub.groups
+            .lock()
+            .unwrap()
+            .insert("group".into(), discussion);
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        hub.plugins.lock().unwrap().insert(
+            "lab/main".into(),
+            Plugin {
+                capabilities: if supports_abort {
+                    vec![Capability::Abort]
+                } else {
+                    vec![]
+                },
+                generation: 0,
+                out: Arc::new(Mutex::new(PluginOut {
+                    writer: PluginWriter::for_test(writer),
+                    sent: HashSet::new(),
+                })),
+            },
+        );
+
+        hub.group_stop(&store, "group");
+        assert_eq!(hub.groups.lock().unwrap()["group"].state, "stopped");
+        assert_eq!(
+            store
+                .turn_sent("original-ingress", "group", "main")
+                .unwrap()
+                .unwrap()
+                .1,
+            "cancelled"
+        );
+        if supports_abort {
+            let mut line = String::new();
+            BufReader::new(&mut peer).read_line(&mut line).unwrap();
+            let frame = enclos_protocol::plugin::decode_from_bridge(line.as_bytes()).unwrap();
+            assert_eq!(
+                frame.body,
+                FromBridge::TurnAbort {
+                    conversation: ConversationId::new("group").unwrap(),
+                    of: MessageId::new("original-ingress").unwrap(),
+                }
+            );
+        }
+        // A repeated Stop cannot dispatch another request or synthesize a
+        // runtime-specific text command, including on an older plugin.
+        hub.group_stop(&store, "group");
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
 fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";

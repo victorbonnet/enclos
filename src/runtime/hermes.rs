@@ -40,6 +40,7 @@ const APP_PLUGIN_INIT: &str = include_str!("../../channels/hermes/enclos/__init_
 const APP_PLUGIN_ADAPTER: &str = include_str!("../../channels/hermes/enclos/adapter.py");
 const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/protocol.py");
 const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/approvals.py");
+const APP_PLUGIN_INTERRUPTS: &str = include_str!("../../channels/hermes/enclos/interrupts.py");
 const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
 const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
 const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.py");
@@ -324,6 +325,7 @@ impl RuntimeAdapter for Hermes {
                 file("plugin.yaml", APP_PLUGIN_YAML)?,
                 file("__init__.py", APP_PLUGIN_INIT)?,
                 file("adapter.py", APP_PLUGIN_ADAPTER)?,
+                file("interrupts.py", APP_PLUGIN_INTERRUPTS)?,
                 file("protocol.py", APP_PLUGIN_PROTOCOL)?,
                 file("outbox.py", APP_PLUGIN_OUTBOX)?,
                 file("approvals.py", APP_PLUGIN_APPROVALS)?,
@@ -1160,6 +1162,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/plugin.yaml",
                 ".hermes/profiles/main/plugins/enclos/__init__.py",
                 ".hermes/profiles/main/plugins/enclos/adapter.py",
+                ".hermes/profiles/main/plugins/enclos/interrupts.py",
                 ".hermes/profiles/main/plugins/enclos/protocol.py",
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
                 ".hermes/profiles/main/plugins/enclos/approvals.py",

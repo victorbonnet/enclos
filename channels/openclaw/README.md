@@ -11,7 +11,7 @@ The package is tested against **OpenClaw 2026.11.2**. `PluginRuntime.version` is
 checked before activation: an untested version gets an actionable failure. The
 SDK is experimental. This does not change enclos's installer-as-served policy.
 There are no runtime dependencies besides Node's standard library and the host's
-public `openclaw/plugin-sdk/channel-core` entry point.
+public `openclaw/plugin-sdk` entry points.
 
 ## Configuration
 
@@ -104,18 +104,6 @@ never a path or symlink. There are at most ten files and 25 MiB total per messag
 The prompt explains markdown, files and the app's static HTML behavior. The app
 continues to own rendering and blocking scripts/network assets in artefacts.
 
-Routines use the public Gateway service's lifecycle-scoped `getCron()` facade.
-Only explicitly agent-owned jobs enter its bounded inventory; supported full
-definitions are read-only. `options.operations=["get"]` hides creation and
-mutation controls. Native unknown fields and external destinations are never
-rewritten. Unsupported native schedules or incomplete definitions report
-`unsupported`. The public facade does not provide atomic definition
-preconditions for changes/removal/manual runs or complete agent-targeted
-creation, so all writes are refused before scheduler access. See the
-[source evidence](../../docs/research/openclaw-routines.md).
-Read-only inventory/details are M5's agreed scope; mutation parity is tracked
-in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
-
 Native question presentations retain the complete public text fallback, including
 batches and multiple selections. Credential requests retain their native trusted
 Control UI guidance. No structured question capability is advertised; see
@@ -129,18 +117,88 @@ It changes the native display title, whose values may repeat; native addressable
 labels keep their separate meaning and validation. Renaming a conversation before
 it has a native session keeps the name in the bridge without creating a session.
 
-Structured questions, runtime approvals and typed
-interruption remain separate work. Unsupported controls return `unsupported`.
+Routines use the public Gateway service's lifecycle-scoped `getCron()` facade.
+Only explicitly agent-owned jobs enter its bounded inventory; supported full
+definitions are read-only. `options.operations=["get"]` hides creation and
+mutation controls. Native unknown fields and external destinations are never
+rewritten. Unsupported native schedules or incomplete definitions report
+`unsupported`. The public facade does not provide atomic definition
+preconditions for changes/removal/manual runs or complete agent-targeted
+creation, so all writes are refused before scheduler access. See the
+[source evidence](../../docs/research/openclaw-routines.md).
+Read-only inventory/details are M5's agreed scope; mutation parity is tracked
+in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
+
+Typed `turn.abort` targets the original incoming message id. Each ingress owns
+the public native run abort signal; a queued target, a repeated stop, and a stale
+stop never select another run by its session. Account stop also aborts its owned
+signals. The acknowledgement accepts cancellation without claiming cleanup has
+drained. [Native cancellation evidence](NATIVE_CANCELLATION.md) records the exact
+public dispatch test and Hermes compatibility boundary.
+
+Structured questions remain separate work.
+Unsupported controls return `unsupported`.
 Structured native
 control modules can gate live sends and durable replay with `canDeliver`; the
 retained bridge hello excludes its token.
+
+## Native exec approvals
+
+`native-approvals.js` registers the public channel approval capability and the
+account's `approval.native` runtime context. OpenClaw owns pending discovery,
+native replay, expiration and resolution. The module never reads native approval
+storage, opens an administrator client, dispatches general gateway methods or
+executes commands. Channel integration supplies the current account guard and
+the native session key derived from the persisted conversation route.
+
+A structured card requires an exact local `gateway` or `sandbox` exec request:
+agent, account, source channel, conversation, person and native session must
+match. Remote `node` requests, unknown Home owners, thread routes and other
+approval kinds stay on OpenClaw's native approval surface. The native view's
+complete display command, warnings, metadata and offered actions are preserved.
+OpenClaw normally offers Once/Always/Deny; its `ask: always` policy offers
+Once/Deny. Session is never fabricated. Always describes OpenClaw's native
+executable/argument allowlist policy, rather than an exact-command or session
+grant invented by enclos.
+
+The bridge must negotiate both `runtime_approvals` and
+`runtime_approval_scopes`; the host separately checks the app's opt-in. Live
+structured sends and durable replay are gated. Older bridges get bounded literal
+text with the complete command, all actions and native instructions. Oversized
+or unrepresentable views receive the same complete fallback without an app
+answer binding. Native instructions refer to OpenClaw's approval surface; an
+unbound `/approve` message through enclos is not authorized by this module.
+
+An app answer records its control id and content hash before requesting the
+public canonical resolver. Native reviewer authorization is restricted to that
+live exact attempt. Only `applied: true` with the same request id, creation and
+expiration, complete display command, chosen decision and terminal status emits
+`answered` with that control id. Consent does not mean execution succeeded.
+External decisions emit neutral `resolved`, without an action or receipt.
+The exact requesting bridge peer and token are checked again by the native
+commit authorizer and after resolution. Revocation before commit denies the
+decision. If the native decision was already confirmed when receipt authority
+is lost, private evidence is retained and reconciliation shows only its neutral
+terminal state; the successor connection does not receive an answer receipt.
+Timeouts and ambiguous failures expire the app's control lease and retain the
+uncertain receipt; they never retry a native decision. Reconnect reuses current
+bindings. Restart expires old cards; only a fresh native pending callback creates
+a new binding with a new app id, so old buttons cannot acquire new authority.
+
+The private shared channel state retains at most 128 cards and 256 decision
+receipts. It preserves conflict hashes, including pending/uncertain evidence.
+At capacity, new structured work is refused with complete native fallback and
+an explicit reason; generating that fallback grants nothing. There is no
+automatic retention migration or evidence deletion. Use OpenClaw's native
+approval surface until a future safe retirement policy is implemented. Corrupt
+approval state refuses activation rather than discarding receipts.
 
 ## Validation
 
 ```sh
 node channels/openclaw/scripts/build.mjs --check
 node --test channels/openclaw/tests/*.test.js
-ENCLOS_OPENCLAW_PACKAGE=/path/to/installed/openclaw node --test channels/openclaw/tests/native-sdk.test.js
+ENCLOS_OPENCLAW_PACKAGE=/path/to/installed/openclaw node --test channels/openclaw/tests/native-sdk.test.js channels/openclaw/tests/native-approvals.test.js
 ```
 
 The build uses Node's type stripper to emit `index.js` from `index.ts`; the emitted
@@ -148,6 +206,9 @@ JavaScript ships with enclos. No TypeScript compiler or upstream development
 dependencies are installed. The transport tests use disposable Unix sockets and
 fake secrets, and read the Rust/Hermes wire fixtures. Native SDK registration and
 session-key checks are optional when the exact installed package is unavailable.
+The approval source harness uses public SDK lifecycle calls and an in-memory
+canonical resolver transport: it verifies native action sets, exact reviewer
+parameters and receipts without starting a gateway client or executing a command.
 Live gateway/plugin loading, Seatbelt socket reachability and real model/scheduled
 output are recorded separately in `prototype/m5/`; source/fixture tests alone do
 not establish those behaviors.
