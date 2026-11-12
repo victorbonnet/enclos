@@ -777,7 +777,7 @@ impl Store {
             }
             let changed = if host {
                 self.db.execute(
-                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner != ?2",
+                    "UPDATE conversations SET owner = ?2, revision = revision + 1 WHERE id = ?1 AND owner != ?2",
                     params![id, owner],
                 )?
             } else {
@@ -1561,13 +1561,18 @@ mod tests {
     fn home_owner_claim_and_group_creation_publish_new_metadata_revisions() {
         let folder = tempfile::tempdir().unwrap();
         let store = Store::open(&folder.path().join("app.db")).unwrap();
-        store.ensure_home("lab/main", "").unwrap();
+        store.ensure_home("lab/main", "", false).unwrap();
         let home = home_id("lab/main");
         assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 1);
-        store.ensure_home("lab/main", "owner").unwrap();
+        store.ensure_home("lab/main", "owner", false).unwrap();
         assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 2);
-        store.ensure_home("lab/main", "other").unwrap();
+        store.ensure_home("lab/main", "other", false).unwrap();
         assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 2);
+        // The host's person, once the transport names them, takes it back
+        store.ensure_home("lab/main", "host", true).unwrap();
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 3);
+        store.ensure_home("lab/main", "host", true).unwrap();
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 3);
         store
             .group("g-1", "lab", &["main".into(), "coder".into()], "owner")
             .unwrap();
@@ -1645,10 +1650,10 @@ mod tests {
             )
             .unwrap();
         assert!(store.conversation_info("g-1").unwrap().unwrap().archived);
-        store.ensure_home("lab/main", owner).unwrap();
+        store.ensure_home("lab/main", owner, false).unwrap();
         let home = home_id("lab/main");
         assert_eq!(store.set_archived(&home, owner, true).unwrap(), Some(true));
-        store.ensure_home("lab/main", owner).unwrap();
+        store.ensure_home("lab/main", owner, false).unwrap();
         store
             .add(
                 "home-notify",
