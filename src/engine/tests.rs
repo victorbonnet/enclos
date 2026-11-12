@@ -22,8 +22,30 @@ fn alice() -> Actor {
 }
 
 fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
-    let dir = tempfile::tempdir().unwrap();
-    let layout = Layout::at(dir.path().join("enclos"));
+    engine_under(backends, &Root::usual())
+}
+
+/// Where a test's enclos folder goes: `leaf`, in a new folder made in
+/// `parent`; the lengths of the paths in it follow.
+pub(super) struct Root {
+    pub(super) parent: std::path::PathBuf,
+    pub(super) leaf: String,
+}
+
+impl Root {
+    /// `enclos`, in the system's temporary folder.
+    pub(super) fn usual() -> Root {
+        Root {
+            parent: std::env::temp_dir(),
+            leaf: "enclos".to_owned(),
+        }
+    }
+}
+
+/// [`engine_with`], enclos's folder at `root`.
+fn engine_under(backends: Vec<Box<dyn Backend>>, root: &Root) -> (TempDir, Engine) {
+    let dir = tempfile::tempdir_in(&root.parent).unwrap();
+    let layout = Layout::at(dir.path().join(&root.leaf));
     let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
@@ -220,6 +242,73 @@ fn audit_since_keeps_recent_entries() {
     done(engine.init(&alice(), Confirm::Ask).unwrap());
     let recent = engine.audit(Some("1h".parse().unwrap())).unwrap();
     assert_eq!(recent.len(), 1);
+}
+
+#[test]
+fn a_change_to_the_apps_devices_is_audited_or_not_made() {
+    let (_dir, engine) = engine();
+    // No audit log yet: the work does not run
+    let mut ran = false;
+    let refused = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-1".into(),
+        |_| String::new(),
+        || {
+            ran = true;
+            Ok(())
+        },
+    );
+    assert!(refused.is_err());
+    assert!(!ran);
+    done(engine.init(&alice(), Confirm::Ask).unwrap());
+    engine
+        .app_access(
+            &alice(),
+            "app pair",
+            "Pixel".into(),
+            |id: &String| format!("paired as {id}"),
+            || Ok("d-1".to_owned()),
+        )
+        .unwrap();
+    let failed = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-2".into(),
+        |_| String::new(),
+        || {
+            Err::<(), _>(Error::Session {
+                what: "no paired device d-2".into(),
+            })
+        },
+    );
+    assert!(failed.is_err());
+    let entries = engine.audit(None).unwrap();
+    let app: Vec<_> = entries
+        .iter()
+        .filter(|e| e.intent.command.starts_with("app "))
+        .map(|e| {
+            let outcome = &e.finished.as_ref().unwrap().outcome;
+            (
+                e.intent.command.as_str(),
+                e.intent.target.as_deref(),
+                outcome.result,
+                outcome.message.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        app,
+        [
+            ("app pair", Some("Pixel"), AuditResult::Ok, "paired as d-1"),
+            (
+                "app unpair",
+                Some("d-2"),
+                AuditResult::Failed,
+                "no paired device d-2"
+            ),
+        ]
+    );
 }
 
 mod approvals;

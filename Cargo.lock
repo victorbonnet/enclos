@@ -583,11 +583,13 @@ dependencies = [
  "clap",
  "close_fds",
  "enclos-protocol",
+ "getrandom 0.4.3",
  "icu_properties",
  "image",
  "jiff",
  "json5",
  "landlock",
+ "p256",
  "psl",
  "qrcode",
  "rusqlite",
@@ -619,6 +621,7 @@ dependencies = [
  "sha2 0.11.1",
  "snow",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
