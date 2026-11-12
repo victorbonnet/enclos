@@ -53,6 +53,6 @@ impl Engine {
 
     /// The bridge's own database: conversations and their messages.
     pub fn app_store_path(&self) -> PathBuf {
-        self.layout.data().join("app.db")
+        self.layout.app_store()
     }
 }
