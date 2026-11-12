@@ -22,8 +22,30 @@ fn alice() -> Actor {
 }
 
 fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
-    let dir = tempfile::tempdir().unwrap();
-    let layout = Layout::at(dir.path().join("enclos"));
+    engine_under(backends, &Root::usual())
+}
+
+/// Where a test's enclos folder goes: `leaf`, in a new folder made in
+/// `parent`; the lengths of the paths in it follow.
+pub(super) struct Root {
+    pub(super) parent: std::path::PathBuf,
+    pub(super) leaf: String,
+}
+
+impl Root {
+    /// `enclos`, in the system's temporary folder.
+    pub(super) fn usual() -> Root {
+        Root {
+            parent: std::env::temp_dir(),
+            leaf: "enclos".to_owned(),
+        }
+    }
+}
+
+/// [`engine_with`], enclos's folder at `root`.
+fn engine_under(backends: Vec<Box<dyn Backend>>, root: &Root) -> (TempDir, Engine) {
+    let dir = tempfile::tempdir_in(&root.parent).unwrap();
+    let layout = Layout::at(dir.path().join(&root.leaf));
     let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
