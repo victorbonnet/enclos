@@ -72,7 +72,7 @@ pub(super) fn while_waiting<T>(
     let (held, wait) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let other = Engine::open(layout);
+            let other = Engine::open(layout, crate::state::Wait::Command);
             let lock = other.state.lock().unwrap();
             held.send(()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -294,6 +294,7 @@ pub(super) fn with_backends(engine: &Engine, backends: Vec<Box<dyn Backend>>) ->
         Box::new(SqliteStateStore::new(
             layout.state_db(),
             layout.state_lock(),
+            crate::state::Wait::Command,
         )),
         Box::new(JsonlAuditLog::new(layout.audit_log())),
         backends,
@@ -354,7 +355,7 @@ fn stop_records_the_end_of_a_session_gone_after_a_crash_and_marks_the_sandbox_st
     assert_eq!(
         last_audit(&engine),
         format!(
-            "removed 0 services, stopped 0 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            "removed 0 services, stopped 0 sessions; recorded the end of session {gone}, whose processes were gone"
         )
     );
 }
@@ -383,7 +384,7 @@ fn stop_ends_a_session_still_running_and_records_one_gone_beside_it() {
     assert_eq!(
         last_audit(&engine),
         format!(
-            "removed 0 services, stopped 1 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            "removed 0 services, stopped 1 session; recorded the end of session {gone}, whose processes were gone"
         )
     );
 }
