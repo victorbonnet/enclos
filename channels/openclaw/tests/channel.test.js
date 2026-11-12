@@ -244,3 +244,58 @@ test('files enter the native context and an HTML artefact leaves through ordinar
   assert.equal(outgoing.attachments[0].name, 'answer.html');
   assert.equal(readFileSync(path.join(mediaFolder(account), outgoing.attachments[0].file), 'utf8'), '<!doctype html><p>Static answer</p>');
 });
+
+test('native fallback rendering precedes delivery and rechecks the account after awaiting', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const original = { presentation: { blocks: [{ type: 'text', text: 'Both native questions' }] }, channelData: { askUser: { questionId: 'native-question' } } };
+  let release, began = false, wait = false;
+  const blocker = new Promise(resolve => { release = resolve; });
+  const channel = createChannel({ async renderPayload(payload) {
+    assert.equal(payload, original);
+    if (wait) { began = true; await blocker; }
+    return { ...payload, text: 'Both native questions\n\nAll options' };
+  } });
+  const native = nativeHarness(cfg);
+  native.api.channel.inbound.dispatch = async params => params.delivery.deliver(original);
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  const hello = await owner.hello(); assert.equal(hello.capabilities.includes('questions'), false);
+  const first = message('message.in', { conversation: 'questions', person: 'alice', text: 'hello' });
+  owner.send(first); await owner.next('ack', first.id);
+  const reply = await owner.next('message.out');
+  assert.equal(reply.text, 'Both native questions\n\nAll options'); assert.equal(reply.reply_to, first.id);
+  owner.send(message('ack', { of: reply.id }));
+  await waitFor(() => channel.running.get('main').transport.state.outbox.length === 0);
+  wait = true;
+  const input = message('message.in', { conversation: 'questions', person: 'alice', text: 'another' });
+  owner.send(input); await waitFor(() => began);
+  cfg.channels.enclos.accounts.main.enabled = false; release();
+  assert.equal((await owner.next('error', input.id)).code, 'agent_unavailable');
+  assert.deepEqual(channel.running.get('main').transport.state.outbox, []);
+});
+
+test('native titles and human renames cross the authenticated channel using the exact route', async t => {
+  const account = accountFixture(t), cfg = configured(account), native = nativeHarness(cfg), channel = createChannel();
+  let row = { sessionId: 'test-owned', updatedAt: 42, autoLabel: 'Native title' }, selected;
+  native.api.agent = { session: {
+    resolveStorePath: () => '/test-owned/store',
+    async getSessionEntryAsync(target) { selected = target; return row; },
+    async prepareSessionEntryPatch(params) {
+      assert.equal(params.sessionKey, selected.sessionKey); params.authority.assertCurrent();
+      row = { ...row, ...await params.prepare(row, { existingEntry: row }) };
+      params.authority.assertCurrent(); return row;
+    },
+  } };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('titles'));
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.equal((await owner.next('conversation.title')).title, 'Native title');
+  const rename = message('conversation.rename', { conversation: 'c', title: 'Human title' });
+  owner.send(rename); await owner.next('ack', rename.id);
+  const titled = await owner.next('conversation.title'); assert.equal(titled.title, 'Human title'); assert.equal(titled.conversation, 'c');
+  assert.equal(row.updatedAt, 42); assert.equal(row.label, undefined);
+  assert.equal(selected.sessionKey, native.calls.dispatch[0].route.sessionKey);
+  assert.equal(selected.agentId, 'main');
+});

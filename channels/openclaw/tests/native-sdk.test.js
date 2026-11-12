@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -6,9 +6,19 @@ import path from 'node:path';
 import { createChannel, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { commandCatalog } from '../features.js';
 import { stageMedia } from '../media.js';
+import { createNativeTitles } from '../native-titles.js';
 import { accountFixture } from './helpers.js';
 
 const installed = process.env.ENCLOS_OPENCLAW_PACKAGE;
+// Native database helpers also own a shared schema/lease registry. Select a
+// disposable native state root before importing any SDK runtime, not just a
+// temporary session-store filename.
+if (installed) {
+  const state = mkdtempSync('/private/tmp/enclos-native-sdk-');
+  process.env.OPENCLAW_STATE_DIR = state;
+  process.env.OPENCLAW_CONFIG_PATH = path.join(state, 'openclaw.json');
+  after(() => rmSync(state, { recursive: true, force: true }));
+}
 test('the installed public SDK registers the package and builds isolated session keys', { skip: !installed }, async () => {
   assert.equal(JSON.parse(readFileSync(path.join(installed, 'package.json'))).version, TESTED_OPENCLAW);
   const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/channel-core.js')));
@@ -47,4 +57,55 @@ test('the installed scoped media loader preserves HTML and rejects an unrelated 
   const outside = mkdtempSync('/private/tmp/enclos-sdk-outside-'); t.after(() => rmSync(outside, { recursive: true, force: true }));
   const excluded = path.join(outside, 'outside.txt'); writeFileSync(excluded, 'fixture');
   await assert.rejects(loader.loadWebMediaRaw(excluded, { localRoots: [workspace] }));
+});
+
+test('the installed native fallback retains every question and respects existing fallback text', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/interactive-runtime.js')));
+  const id = `ask_${'a'.repeat(32)}`;
+  const payload = { channelData: { askUser: { questionId: id } }, presentation: { title: 'Questions for you', blocks: [
+    { type: 'text', text: 'First question?' },
+    { type: 'buttons', buttons: [
+      { label: 'First option', action: { type: 'question', questionId: id, optionValue: 'first' } },
+      { label: 'Second option', action: { type: 'question', questionId: id, optionValue: 'second' } },
+    ] },
+    { type: 'context', text: 'Keep this complete explanation.' },
+    { type: 'text', text: 'Second question?' },
+    { type: 'select', placeholder: 'Choose several', options: [
+      { label: 'Third option', value: 'third' }, { label: 'Fourth option', value: 'fourth' },
+    ] },
+  ] } };
+  const rendered = await sdk.renderPresentationForDelivery({}, payload);
+  assert.equal(rendered.presentation, undefined);
+  assert.equal(rendered.text, 'Questions for you\n\nFirst question?\n\n- First option\n- Second option\n\nKeep this complete explanation.\n\nSecond question?\n\nChoose several:\n- Third option\n- Fourth option');
+  assert.deepEqual(rendered.channelData, payload.channelData);
+  assert.equal(rendered.text.includes(id), false);
+  const fallback = 'Complete native text, including the native answer instructions.';
+  assert.equal((await sdk.renderPresentationForDelivery({}, { ...payload, text: fallback, presentationTextMode: 'fallback' })).text, fallback);
+  const credential = { text: 'Never send credentials in chat; open the trusted Control UI.', channelData: payload.channelData };
+  assert.equal(await sdk.renderPresentationForDelivery({}, credential), credential);
+});
+
+test('installed native session workers read, rename and clear only the selected title', { skip: !installed }, async t => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/session-store-runtime.js')));
+  const folder = mkdtempSync('/private/tmp/enclos-native-title-'); t.after(() => rmSync(folder, { recursive: true, force: true }));
+  const storePath = path.join(folder, 'sessions.json'), sessionKey = 'agent:main:enclos:main:direct:test-owned';
+  const entry = { sessionId: '32b35e61-28fb-4b21-bdb5-e8fbb521a18c', updatedAt: 42, autoLabel: 'Native generated title' };
+  await sdk.upsertSessionEntry({ agentId: 'main', sessionKey, storePath, entry });
+  const outbox = [], transport = { state: { routes: { c: {} } }, enqueue: frame => outbox.push(frame) };
+  const titles = createNativeTitles({ agent: { session: { ...sdk, resolveStorePath: () => storePath } } }, { agentId: 'main' }, transport,
+    { currentConfig: () => ({}), assertCurrent() {}, sessionKeyFor: c => c === 'c' ? sessionKey : undefined });
+  t.after(() => titles.close());
+  await titles.refresh('c'); assert.equal(outbox.at(-1).title, 'Native generated title');
+  await titles.handleControl({ type: 'conversation.rename', conversation: 'c', title: 'Human title' });
+  const named = await sdk.getSessionEntryAsync({ agentId: 'main', sessionKey, storePath, readConsistency: 'latest' });
+  assert.equal(named.displayName, 'Human title'); assert.equal(named.label, undefined); assert.equal(named.sessionId, entry.sessionId); assert.equal(named.updatedAt, 42);
+  await titles.handleControl({ type: 'conversation.rename', conversation: 'c', title: '' });
+  const cleared = await sdk.getSessionEntryAsync({ agentId: 'main', sessionKey, storePath, readConsistency: 'latest' });
+  assert.equal(cleared.displayName, undefined); assert.equal(cleared.autoLabel, 'Native generated title'); assert.equal(cleared.updatedAt, 42);
+  await sdk.upsertSessionEntry({ agentId: 'main', sessionKey: `${sessionKey}-other`, storePath,
+    entry: { sessionId: 'fe9ede27-c8b0-4c1e-bcfc-a79bb6e8d95f', updatedAt: 50, label: 'Addressable native label', displayName: 'Duplicate display title' } });
+  await titles.handleControl({ type: 'conversation.rename', conversation: 'c', title: 'Duplicate display title' });
+  const duplicate = await sdk.getSessionEntryAsync({ agentId: 'main', sessionKey, storePath, readConsistency: 'latest' });
+  assert.equal(duplicate.displayName, 'Duplicate display title'); assert.equal(duplicate.label, undefined);
+  assert.equal((await sdk.getSessionEntryAsync({ agentId: 'main', sessionKey: `${sessionKey}-other`, storePath, readConsistency: 'latest' })).label, 'Addressable native label');
 });
