@@ -33,7 +33,11 @@ fn runs_a_proxy_when_asked() {
     let port = std::env::var(PROXY_PORT).unwrap().parse().unwrap();
     let records = std::env::var_os(PROXY_RECORDS).is_some();
     let layout = Layout::at(std::path::PathBuf::from(folder));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     let err = engine
@@ -59,6 +63,16 @@ impl ProxyChild {
         let port = engine.state.get(name).unwrap().unwrap().proxy_port;
         // `Layout::at` keeps everything in one folder, the state's.
         let folder = engine.layout.state_db().parent().unwrap().to_owned();
+        ProxyChild::start_at(&folder, name, port, records)
+    }
+
+    /// [`ProxyChild::start`], for the engine whose folder is `folder`.
+    fn start_at(
+        folder: &std::path::Path,
+        name: &SandboxName,
+        port: u16,
+        records: bool,
+    ) -> ProxyChild {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -144,7 +158,11 @@ fn a_running_proxy_decides_and_logs_on_its_socket() {
 fn engine_with_a_long_path() -> (tempfile::TempDir, Engine) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path().join("e".repeat(120)));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     (dir, engine)
@@ -240,7 +258,11 @@ fn run_proxy_of(
     let name = name.clone();
     let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
     std::thread::spawn(move || {
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
         engine.run_proxy(&name, port, Some(&alice()))
@@ -398,4 +420,44 @@ fn a_started_proxy_is_waited_for_where_its_sessions_reach_it() {
         assert!(engine.proxy_runs(&name).unwrap(), "{backend}");
         proxy.end();
     }
+}
+
+/// `sandbox start` holds the state lock while it installs the sandbox's
+/// services, the proxy first, and the service manager runs the proxy at
+/// once, which records itself under that lock. On a Raspberry Pi under load
+/// (2026-11-11), installing the services after it took longer than the 10
+/// seconds a command waits for the lock: the proxy gave up, and `sandbox
+/// start` said it had not started. It waits as long as a write no person
+/// waits on (design §11), then records itself.
+#[test]
+fn a_proxy_service_records_itself_after_a_long_sandbox_start() {
+    use crate::engine::service::{PROXY_WAIT, Unit};
+    use crate::model::runtime::RuntimeKind;
+    use crate::service::ServiceLabel;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, engine, fake, name) =
+        super::services::sandbox_with_services(Some(RuntimeKind::Hermes));
+    let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    let folder = engine.layout.state_db().parent().unwrap().to_owned();
+    let proxy = engine.label(&name, Unit::Proxy).unwrap();
+    let running = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let started = std::rc::Rc::clone(&running);
+    let sandbox = name.clone();
+    *fake.on_start.borrow_mut() = Some(Box::new(move |label: &ServiceLabel| {
+        if *label == proxy {
+            *started.borrow_mut() = Some(ProxyChild::start_at(&folder, &sandbox, port, true));
+        } else {
+            // The gateway's install takes longer than a command waits for
+            // the lock, as systemd's did on the Pi.
+            std::thread::sleep(std::time::Duration::from_secs(11));
+        }
+    }));
+    engine.start_sandbox(&alice(), &name).unwrap();
+    let mut proxy = running.borrow_mut().take().unwrap();
+    // As `sandbox start` waits for it once the services are installed.
+    let recorded = engine.proxy_started(&name, PROXY_WAIT).unwrap();
+    assert!(!proxy.exited(), "the proxy exited");
+    assert!(recorded, "the proxy did not record itself");
+    proxy.end();
 }

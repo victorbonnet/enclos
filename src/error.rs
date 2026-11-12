@@ -100,6 +100,13 @@ pub enum Error {
         backend: String,
         template: String,
     },
+    /// A `config.toml` whose default backend cannot be read, asked for by a
+    /// `sandbox create` that names no `--backend`.
+    #[error(
+        "{} names no default backend enclos can read: {reason}. Fix the file, or name the backend with `--backend`",
+        path.display()
+    )]
+    DefaultBackend { path: PathBuf, reason: String },
     /// A backend this host cannot run; never overridden (ADR 0009).
     #[error("sandbox `{sandbox}` uses the {backend} backend, which this host cannot run: {reason}")]
     BackendUnavailable {
@@ -402,6 +409,7 @@ impl Error {
             | Error::Audit(_)
             | Error::Policy(_)
             | Error::NoSuchSandbox { .. }
+            | Error::DefaultBackend { .. }
             | Error::NoPolicy { .. }
             | Error::ProxyPortTaken { .. }
             | Error::ProxyRuns { .. }

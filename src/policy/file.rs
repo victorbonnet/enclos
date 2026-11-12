@@ -7,7 +7,7 @@
 use serde::Deserialize;
 
 use super::PolicyError;
-use crate::model::policy::{ByteSize, NetLog, NetMode, Policy, TemplateName};
+use crate::model::policy::{ByteSize, NetLog, NetMode, Policy, PublicPorts, TemplateName};
 use crate::model::secret::SecretGrant;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -76,6 +76,8 @@ pub struct FsLayer {
     pub write_add: Vec<String>,
     pub read_deny: Option<Vec<String>>,
     pub read_deny_add: Vec<String>,
+    pub read_only: Option<Vec<String>>,
+    pub read_only_add: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -88,6 +90,7 @@ pub struct NetLayer {
     pub private_add: Vec<String>,
     pub log: Option<NetLog>,
     pub listen: Option<bool>,
+    pub public_ports: Option<PublicPorts>,
 }
 
 impl PolicyFile {
@@ -113,6 +116,9 @@ impl PolicyFile {
         }
         if self.network.log.is_some() {
             found.push("network.log");
+        }
+        if self.network.public_ports.is_some() {
+            found.push("network.public_ports");
         }
         if self.resources != ResourcesLayer::default() {
             found.push("resources");
@@ -145,6 +151,11 @@ impl PolicyFile {
             &self.filesystem.read_deny_add,
         );
         layer(
+            &mut policy.fs.read_only,
+            &self.filesystem.read_only,
+            &self.filesystem.read_only_add,
+        );
+        layer(
             &mut policy.net.allow,
             &self.network.allow,
             &self.network.allow_add,
@@ -162,6 +173,9 @@ impl PolicyFile {
         }
         if let Some(listen) = self.network.listen {
             policy.net.listen = listen;
+        }
+        if let Some(ports) = self.network.public_ports {
+            policy.net.public_ports = ports;
         }
         if let Some(env) = &self.secrets.env {
             policy.secrets.clone_from(env);
