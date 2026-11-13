@@ -23,19 +23,20 @@ use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    ToDevice, decode_from_device, split_text,
+    ToDevice, commands_for_devices, decode_from_device, split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
-    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind, ToolStep,
+    Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
+    ToolStep,
 };
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
@@ -120,6 +121,16 @@ struct Hub {
     agents: Vec<AgentEndpoint>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
+    /// One lock per agent, held while its plugin connection opens, never
+    /// with `plugins`: a plugin slow to answer its `hello` holds up the
+    /// callers that need that agent, not the bridge.
+    opening: HashMap<String, Mutex<()>>,
+    /// Whether a pass of [`Hub::open_plugins`] runs: one at a time.
+    opening_all: AtomicBool,
+    /// The commands each agent's plugin last listed, as devices get them:
+    /// kept while the bridge runs, the plugin connected or not, until it
+    /// connects again without the `commands` capability.
+    commands: Mutex<HashMap<String, Vec<Command>>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -146,6 +157,48 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    // Each is one thing the bridge is given at start; tests pass their own
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        transport: Transport,
+        whois: Whois,
+        store_path: std::path::PathBuf,
+        layout: crate::layout::Layout,
+        bridge_private: Vec<u8>,
+        agents: Vec<AgentEndpoint>,
+        host: Option<String>,
+        silence: Duration,
+    ) -> Hub {
+        // `host`: a person to name the host's person if the database names
+        // none yet, as a first pairing would (tests); `serve` names none.
+        if let Some(host) = &host
+            && let Ok(store) = Store::open(&store_path)
+        {
+            let _ = store.claim_host(host);
+        }
+        let opening = agents
+            .iter()
+            .map(|a| (a.name.clone(), Mutex::new(())))
+            .collect();
+        Hub {
+            transport,
+            whois,
+            store_path,
+            layout,
+            bridge_private,
+            agents,
+            plugins: Mutex::new(HashMap::new()),
+            opening,
+            opening_all: AtomicBool::new(false),
+            commands: Mutex::new(HashMap::new()),
+            generations: AtomicU64::new(0),
+            devices: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            refusals: Mutex::new(HashMap::new()),
+            silence,
+        }
+    }
+
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
@@ -191,6 +244,74 @@ impl Hub {
         }
     }
 
+    /// Sends `message` to every connected device: what any person who may
+    /// reach every agent needs, such as an agent's commands.
+    ///
+    /// Every paired person may reach every agent today. Once who sees
+    /// which agent is limited (ADR 0043), this needs the same filter as
+    /// `agents.list`, or an agent's commands reach people it is not shared
+    /// with.
+    fn deliver_all(&self, message: ToDevice) {
+        let devices = self.devices.lock().expect("not poisoned");
+        for (_, sender, _) in devices.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+
+    /// What a device asking for the agents is sent: the list, then each
+    /// agent's commands as far as the bridge knows them; the others come
+    /// once their plugin connects.
+    fn agents_answer(&self) -> Vec<ToDevice> {
+        let plugins = self.plugins.lock().expect("not poisoned");
+        let agents = self
+            .agents
+            .iter()
+            .map(|a| AgentInfo {
+                agent: a.name.clone(),
+                runtime: a.runtime.clone(),
+                capabilities: plugins
+                    .get(&a.name)
+                    .map(|p| p.capabilities.clone())
+                    .unwrap_or_default(),
+                abilities: vec!["read".to_owned(), "chat".to_owned()],
+            })
+            .collect();
+        drop(plugins);
+        let mut answer = vec![ToDevice::AgentsList { agents }];
+        let commands = self.commands.lock().expect("not poisoned");
+        for (agent, commands) in commands.iter() {
+            answer.push(ToDevice::Commands {
+                agent: agent.clone(),
+                commands: commands.clone(),
+            });
+        }
+        answer
+    }
+
+    /// Opens, in the background, the plugin connections that are not open:
+    /// the bridge learns each agent's capabilities and commands without
+    /// waiting for a first message. One that cannot open is left for later.
+    /// While a pass runs, another is not started: a plugin slow to answer
+    /// does not gather a thread per request.
+    fn open_plugins(self: &Arc<Hub>) {
+        if self.opening_all.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        /// Ends the pass, whatever ends its thread.
+        struct Done(Arc<Hub>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.opening_all.store(false, Ordering::SeqCst);
+            }
+        }
+        let done = Done(Arc::clone(self));
+        std::thread::spawn(move || {
+            for agent in &done.0.agents {
+                let _ = done.0.plugin(&agent.name);
+            }
+        });
+    }
+
     /// Sends conversation `id`, with its name and how far it was read, to
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
@@ -205,12 +326,13 @@ impl Hub {
     /// in a thread of its own, storing what the agent says and passing it
     /// on to the conversation's owner.
     fn plugin(self: &Arc<Hub>, agent: &str) -> Result<(), String> {
-        if self
-            .plugins
-            .lock()
-            .expect("not poisoned")
-            .contains_key(agent)
-        {
+        let open = |hub: &Hub| {
+            hub.plugins
+                .lock()
+                .expect("not poisoned")
+                .contains_key(agent)
+        };
+        if open(self) {
             return Ok(());
         }
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
@@ -219,31 +341,56 @@ impl Hub {
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
-        // Outside the lock: a plugin that is slow to answer its hello holds
-        // only the caller, not every other agent's messages
+        // One opening at a time for this agent, and none with the map of
+        // connections locked: the plugin listens in the sandbox, and may
+        // take its time over the `hello`.
+        let _opening = self
+            .opening
+            .get(agent)
+            .map(|m| m.lock().expect("not poisoned"));
+        if open(self) {
+            return Ok(());
+        }
         let (hello, mut reader, writer) =
             connect(&endpoint.socket, &endpoint.token, &home_id(agent))
                 .map_err(|e| e.to_string())?;
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        if plugins.contains_key(agent) {
-            // Another thread opened one meanwhile: the plugin takes one
-            // bridge connection at a time, and that one is it
-            writer.shutdown();
-            return Ok(());
+        let lists_commands = hello.capabilities.contains(&Capability::Commands);
+        {
+            let mut plugins = self.plugins.lock().expect("not poisoned");
+            if plugins.contains_key(agent) {
+                // Opened meanwhile: the plugin takes one bridge connection
+                // at a time, and that one is it
+                writer.shutdown();
+                return Ok(());
+            }
+            plugins.insert(
+                agent.to_owned(),
+                Plugin {
+                    capabilities: hello.capabilities,
+                    generation,
+                    out: Arc::new(Mutex::new(PluginOut {
+                        writer,
+                        sent: HashSet::new(),
+                    })),
+                },
+            );
         }
-        plugins.insert(
-            agent.to_owned(),
-            Plugin {
-                capabilities: hello.capabilities,
-                generation,
-                out: Arc::new(Mutex::new(PluginOut {
-                    writer,
-                    sent: HashSet::new(),
-                })),
-            },
-        );
-        drop(plugins);
+        // A plugin that no longer lists its commands: the ones it listed
+        // before are offered no more.
+        let dropped = !lists_commands
+            && self
+                .commands
+                .lock()
+                .expect("not poisoned")
+                .remove(agent)
+                .is_some();
+        if dropped {
+            self.deliver_all(ToDevice::Commands {
+                agent: agent.to_owned(),
+                commands: Vec::new(),
+            });
+        }
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
         // The plugin puts the files the agent sends in the sandbox home.
@@ -333,6 +480,19 @@ impl Hub {
                         {
                             hub.deliver_conversation(&store, &owner, id);
                         }
+                    }
+                    // The commands a person may type to the agent: kept,
+                    // and passed on to every device.
+                    FromPlugin::Commands { commands } => {
+                        let commands = commands_for_devices(commands);
+                        hub.commands
+                            .lock()
+                            .expect("not poisoned")
+                            .insert(agent.clone(), commands.clone());
+                        hub.deliver_all(ToDevice::Commands {
+                            agent: agent.clone(),
+                            commands,
+                        });
                     }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
@@ -537,20 +697,16 @@ pub fn serve(
             "enclos app: no device is paired yet: the first one paired with `enclos app pair` names the host's person, whose each agent's Home is"
         );
     }
-    let hub = Arc::new(Hub {
+    let hub = Arc::new(Hub::new(
         transport,
-        whois: Arc::new(move |address: &str| transport.whois(address)),
+        Arc::new(move |address: &str| transport.whois(address)),
         store_path,
         layout,
         bridge_private,
         agents,
-        plugins: Mutex::new(HashMap::new()),
-        generations: AtomicU64::new(0),
-        devices: Mutex::new(HashMap::new()),
-        waiting: AtomicUsize::new(0),
-        refusals: Mutex::new(HashMap::new()),
-        silence: SILENCE,
-    });
+        None,
+        SILENCE,
+    ));
     serve_on(listener, hub, RETRY);
     Ok(())
 }
@@ -1099,22 +1255,10 @@ fn run_session(
         };
         match message.body {
             FromDevice::Agents => {
-                let plugins = hub.plugins.lock().expect("not poisoned");
-                let agents = hub
-                    .agents
-                    .iter()
-                    .map(|a| AgentInfo {
-                        agent: a.name.clone(),
-                        runtime: a.runtime.clone(),
-                        capabilities: plugins
-                            .get(&a.name)
-                            .map(|p| p.capabilities.clone())
-                            .unwrap_or_default(),
-                        abilities: vec!["read".to_owned(), "chat".to_owned()],
-                    })
-                    .collect();
-                drop(plugins);
-                link.send(ToDevice::AgentsList { agents })?;
+                for answer in hub.agents_answer() {
+                    link.send(answer)?;
+                }
+                hub.open_plugins();
             }
             FromDevice::ConversationNew {
                 conversation,
@@ -1745,25 +1889,21 @@ mod connection_end_tests {
         });
         let socket = folder.join("main.sock");
         let store = folder.join("app.db");
-        let hub = Arc::new(Hub {
-            transport: Transport::Tailscale,
+        let hub = Arc::new(Hub::new(
+            Transport::Tailscale,
             whois,
-            store_path: store.clone(),
-            layout: crate::layout::Layout::at(folder.join("enclos")),
-            bridge_private: keys.private.to_vec(),
-            agents: vec![AgentEndpoint {
+            store.clone(),
+            crate::layout::Layout::at(folder.join("enclos")),
+            keys.private.to_vec(),
+            vec![AgentEndpoint {
                 name: "lab/main".to_owned(),
                 runtime: "hermes".to_owned(),
                 socket: socket.clone(),
                 token: TOKEN.to_owned(),
             }],
-            plugins: Mutex::new(HashMap::new()),
-            generations: AtomicU64::new(0),
-            devices: Mutex::new(HashMap::new()),
-            waiting: AtomicUsize::new(0),
-            refusals: Mutex::new(HashMap::new()),
+            None,
             silence,
-        });
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));

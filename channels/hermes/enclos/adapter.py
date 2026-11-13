@@ -151,7 +151,10 @@ class EnclosAdapter(BasePlatformAdapter):
         logger.info("[%s] Bridge connected", self.name)
         self._adopt_home(hello.get("home"))
         try:
-            await self._write(protocol.hello("hermes", self._agent))
+            listed = _hermes_commands()
+            await self._write(protocol.hello("hermes", self._agent, ("commands",) if listed else ()))
+            if listed:
+                await self._write(protocol.commands(listed))
             for message in self._outbox.pending():
                 reason = protocol.unsendable(message)
                 if reason:
@@ -508,6 +511,35 @@ class EnclosAdapter(BasePlatformAdapter):
 # fire for every platform, the CLI and cron alike: only this channel's are
 # kept. `pre_tool_call` is also a policy hook (a slow or failing one blocks the
 # tool), so both only hand the step to the adapter's loop and return None.
+
+def _hermes_commands() -> list[tuple[str, str, str]]:
+    """(name, description, args) of the commands a person may type to this gateway: Hermes's
+    own that are not for its terminal UI only, then those its plugins register, as its
+    gateway's menus (Telegram, Slack) list them. Empty outside a gateway, or on any error."""
+    try:
+        from hermes_cli.commands import COMMAND_REGISTRY
+    except Exception:
+        return []
+    rows: list[tuple[str, str, str]] = []
+    try:
+        for cmd in COMMAND_REGISTRY:
+            if getattr(cmd, "cli_only", False):
+                continue
+            describe = getattr(cmd, "describe", None)
+            description = describe() if callable(describe) else getattr(cmd, "description", "")
+            rows.append((cmd.name, description, getattr(cmd, "args_hint", "")))
+    except Exception:
+        logger.debug("Cannot read Hermes's commands", exc_info=True)
+        return []
+    try:
+        from hermes_cli.plugins import get_plugin_commands
+        for name, meta in (get_plugin_commands() or {}).items():
+            if isinstance(name, str) and isinstance(meta, dict):
+                rows.append((name, str(meta.get("description") or ""), str(meta.get("args_hint") or "")))
+    except Exception:
+        logger.debug("Cannot read the plugins' commands", exc_info=True)
+    return rows
+
 
 def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: Optional[str] = None,
                status: Optional[str] = None, duration_ms: Any = None, **_: Any) -> None:
