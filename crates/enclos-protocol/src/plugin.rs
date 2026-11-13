@@ -33,6 +33,10 @@ pub enum FromBridge {
         conversation: ConversationId,
         question: QuestionId,
         answer: crate::question::QuestionAnswer,
+        /// For a runtime approval, the bridge's signature of the decision
+        /// ([`crate::decision`]), which the plugin acts on alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed: Option<crate::decision::SignedDecision>,
     },
     #[serde(rename = "question.sync")]
     QuestionSync { questions: Vec<QuestionId> },
@@ -69,6 +73,12 @@ pub enum FromBridge {
         conversation: ConversationId,
         person: Person,
         text: String,
+        /// Whether `person` is the host's person. It is not signed, so it
+        /// grants nothing: the plugin answers every typed approval command
+        /// itself, whoever sends it (ADR 0060). An older bridge says nothing
+        /// (`None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<bool>,
     },
     /// The person named the conversation, or, with an empty `title`,
     /// cleared its name.
@@ -279,6 +289,7 @@ pub enum Capability {
     Commands,
     Routines,
     Questions,
+    RuntimeApprovals,
     #[serde(other)]
     Unknown,
 }

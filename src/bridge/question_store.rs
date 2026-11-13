@@ -1,6 +1,8 @@
 //! Atomic question definitions, settlements and their conversation history.
 use super::*;
-use enclos_protocol::question::{QuestionAnswer, QuestionDefinition, QuestionInfo, QuestionState};
+use enclos_protocol::question::{
+    QuestionAnswer, QuestionDefinition, QuestionInfo, QuestionState, RuntimeApprovalAction,
+};
 use enclos_protocol::{ConversationId, QuestionId};
 
 #[derive(Debug, thiserror::Error)]
@@ -13,7 +15,17 @@ pub enum QuestionStoreError {
     Unknown,
     #[error("{0}")]
     Invalid(String),
+    /// Refused for who would answer it, not for what it is.
+    #[error("{0}")]
+    NotAllowed(String),
 }
+
+/// At most this many pending runtime approvals in one conversation, and of
+/// one agent across its conversations: each is sent to the host's person's
+/// devices at every sync. Hermes holds one at a time in a session, a few
+/// with parallel tool calls.
+pub const MAX_PENDING_APPROVALS_PER_CONVERSATION: i64 = 4;
+pub const MAX_PENDING_APPROVALS_PER_AGENT: i64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredQuestion {
@@ -165,10 +177,23 @@ fn state_text(state: &QuestionState) -> String {
         QuestionState::Skipped => "skipped",
         QuestionState::Expired => "expired",
         QuestionState::Cancelled => "cancelled",
+        QuestionState::Resolved => "resolved",
     }
     .into()
 }
 
+fn introduction_kind(definition: &QuestionDefinition) -> &'static str {
+    if definition.approval.is_some() {
+        "runtime_approval"
+    } else {
+        "question"
+    }
+}
+
+/// The history line of a settlement. `confirmed`: the answer is the one a
+/// paired device submitted, matched by its request; any other is what the
+/// agent's channel reports, and an approval says so rather than read as the
+/// person's decision.
 fn settlement_text(info: &QuestionInfo, confirmed: bool) -> String {
     let lead = if confirmed {
         "Answered"
@@ -176,6 +201,24 @@ fn settlement_text(info: &QuestionInfo, confirmed: bool) -> String {
         "Answered, as the agent reports"
     };
     match &info.answer {
+        Some(QuestionAnswer::Approval { action }) if confirmed => match action {
+            RuntimeApprovalAction::Once => "Runtime approval: allowed once.",
+            RuntimeApprovalAction::Session => "Runtime approval: allowed for this runtime session.",
+            RuntimeApprovalAction::Always => "Runtime approval: always allowed by this runtime.",
+            RuntimeApprovalAction::Deny => "Runtime approval: denied.",
+        }
+        .into(),
+        Some(QuestionAnswer::Approval { action }) => match action {
+            RuntimeApprovalAction::Once => "Runtime approval: allowed once, as the agent reports.",
+            RuntimeApprovalAction::Session => {
+                "Runtime approval: allowed for this runtime session, as the agent reports."
+            }
+            RuntimeApprovalAction::Always => {
+                "Runtime approval: always allowed by this runtime, as the agent reports."
+            }
+            RuntimeApprovalAction::Deny => "Runtime approval: denied, as the agent reports.",
+        }
+        .into(),
         Some(QuestionAnswer::Choices { indices }) => format!(
             "{lead}: {}",
             indices
@@ -185,6 +228,13 @@ fn settlement_text(info: &QuestionInfo, confirmed: bool) -> String {
                 .join(", ")
         ),
         Some(QuestionAnswer::Text { text }) => format!("{lead}: {text}"),
+        _ if info.definition.approval.is_some() => match info.state {
+            QuestionState::Expired => "Runtime approval expired.",
+            QuestionState::Cancelled => "Runtime approval cancelled.",
+            QuestionState::Resolved => "Runtime approval resolved in the runtime.",
+            _ => "Runtime approval settled.",
+        }
+        .into(),
         _ => match info.state {
             QuestionState::Skipped => "Question skipped.",
             QuestionState::Expired => "Question expired.",
@@ -248,19 +298,42 @@ impl Store {
             .collect()
     }
 
+    /// The agent's pending runtime approvals, oldest first.
+    pub fn pending_approvals(&self, agent: &str) -> rusqlite::Result<Vec<QuestionId>> {
+        let mut query = self.db.prepare(
+            "SELECT id FROM questions WHERE agent=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL ORDER BY rowid",
+        )?;
+        query
+            .query_map([agent], |row| {
+                QuestionId::new(row.get::<_, String>(0)?).map_err(json_error)
+            })?
+            .collect()
+    }
+
+    /// Creates the question and its readable introduction. A runtime
+    /// approval is refused unless `host`, the host's person, owns the
+    /// conversation: no one else decides runtime approvals.
     pub fn ask_question(
         &self,
         origin: &str,
         conversation: &ConversationId,
         definition: &QuestionDefinition,
         message_id: &str,
+        host: Option<&str>,
     ) -> Result<QuestionChange, QuestionStoreError> {
         definition.validate().map_err(QuestionStoreError::Invalid)?;
+        let kind = introduction_kind(definition);
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let is_member = origin_conversation(&tx, origin, conversation)?;
+        // Who the conversation is: the question's owner, read there.
+        let owner: String = tx.query_row(
+            "SELECT owner FROM conversations WHERE id=?1",
+            [conversation.as_str()],
+            |row| row.get(0),
+        )?;
         QuestionInfo {
             definition: definition.clone(),
             conversation: conversation.clone(),
@@ -279,7 +352,7 @@ impl Store {
             {
                 return Err(QuestionStoreError::Conflict);
             }
-            let message = history_message(&tx, definition.id.as_str(), "question")?;
+            let message = history_message(&tx, definition.id.as_str(), kind)?;
             return Ok(QuestionChange {
                 question: current,
                 message,
@@ -296,34 +369,62 @@ impl Store {
         {
             return Err(QuestionStoreError::Conflict);
         }
-        let pending = |sql: &str, key: &str| -> rusqlite::Result<i64> {
-            tx.query_row(sql, [key], |r| r.get(0))
-        };
-        if pending(
-            "SELECT COUNT(*) FROM questions WHERE conversation=?1 AND state='pending'",
-            conversation.as_str(),
-        )? >= MAX_PENDING_PER_CONVERSATION
-            || pending(
-                "SELECT COUNT(*) FROM questions WHERE agent=?1 AND state='pending'",
-                origin,
-            )? >= MAX_PENDING_PER_AGENT
-        {
-            return Err(QuestionStoreError::Invalid(
-                "Too many questions are waiting for an answer.".into(),
-            ));
+        if definition.approval.is_some() {
+            // Nobody could answer it: the host's person does not have this
+            // conversation, and no one else decides runtime approvals.
+            if host != Some(owner.as_str()) {
+                return Err(QuestionStoreError::NotAllowed(
+                    "Only the host's person decides runtime approvals, and this conversation is not theirs.".into(),
+                ));
+            }
+            let pending = |sql: &str, key: &str| -> rusqlite::Result<i64> {
+                tx.query_row(sql, [key], |r| r.get(0))
+            };
+            if pending(
+                "SELECT COUNT(*) FROM questions WHERE conversation=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL",
+                conversation.as_str(),
+            )? >= MAX_PENDING_APPROVALS_PER_CONVERSATION
+                || pending(
+                    "SELECT COUNT(*) FROM questions WHERE agent=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NOT NULL",
+                    origin,
+                )? >= MAX_PENDING_APPROVALS_PER_AGENT
+            {
+                return Err(QuestionStoreError::Invalid(
+                    "Too many runtime approvals are waiting for an answer.".into(),
+                ));
+            }
+        } else {
+            let pending = |sql: &str, key: &str| -> rusqlite::Result<i64> {
+                tx.query_row(sql, [key], |r| r.get(0))
+            };
+            if pending(
+                "SELECT COUNT(*) FROM questions WHERE conversation=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NULL",
+                conversation.as_str(),
+            )? >= MAX_PENDING_PER_CONVERSATION
+                || pending(
+                    "SELECT COUNT(*) FROM questions WHERE agent=?1 AND state='pending' AND json_extract(definition,'$.approval') IS NULL",
+                    origin,
+                )? >= MAX_PENDING_PER_AGENT
+            {
+                return Err(QuestionStoreError::Invalid(
+                    "Too many questions are waiting for an answer.".into(),
+                ));
+            }
         }
         let encoded = serde_json::to_string(definition)
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO questions(id,conversation,agent,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,'pending',0,NULL,?5)", params![definition.id.as_str(),conversation.as_str(),origin,encoded,message_id])?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
-        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,'question',?4,?5,?6)",params![message_id,conversation.as_str(),definition.fallback_text(),now(),speaker,definition.id.as_str()])?;
+        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",params![message_id,conversation.as_str(),definition.fallback_text(),kind,now(),speaker,definition.id.as_str()])?;
         let question =
             question_in(&tx, definition.id.as_str())?.ok_or(QuestionStoreError::Unknown)?;
-        let message = history_message(&tx, definition.id.as_str(), "question")?;
+        let message = history_message(&tx, definition.id.as_str(), kind)?;
         tx.commit()?;
         Ok(QuestionChange { question, message })
     }
 
+    /// Settles a question as its agent's channel reports, matched to no
+    /// device request.
     pub fn settle_question(
         &self,
         origin: &str,
@@ -426,6 +527,7 @@ mod tests {
             text: "Que choisir ?".into(),
             choices: vec!["Résultats 🤖".into(), "Classement".into()],
             multiple: true,
+            approval: None,
         }
     }
 
@@ -443,7 +545,13 @@ mod tests {
         let (dir, store, conversation) = fixture();
         let definition = definition("q-1");
         let created = store
-            .ask_question("lab/coder", &conversation, &definition, "ask-1")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask-1",
+                Some("owner"),
+            )
             .unwrap();
         assert_eq!(created.question.info.state, QuestionState::Pending);
         assert_eq!(created.question.info.revision, 0);
@@ -453,7 +561,13 @@ mod tests {
         assert_eq!(first.text, definition.fallback_text());
         assert_eq!(
             store
-                .ask_question("lab/coder", &conversation, &definition, "ask-replayed")
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &definition,
+                    "ask-replayed",
+                    Some("owner")
+                )
                 .unwrap()
                 .message
                 .unwrap()
@@ -535,17 +649,35 @@ mod tests {
             .unwrap();
         let definition = definition("q-1");
         assert!(matches!(
-            store.ask_question("lab/helper", &conversation, &definition, "foreign"),
+            store.ask_question(
+                "lab/helper",
+                &conversation,
+                &definition,
+                "foreign",
+                Some("owner")
+            ),
             Err(QuestionStoreError::Unknown)
         ));
         assert!(store.question(&definition.id).unwrap().is_none());
         store
-            .ask_question("lab/coder", &conversation, &definition, "ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
             .unwrap();
         let mut changed = definition.clone();
         changed.choices.reverse();
         assert!(matches!(
-            store.ask_question("lab/coder", &conversation, &changed, "changed"),
+            store.ask_question(
+                "lab/coder",
+                &conversation,
+                &changed,
+                "changed",
+                Some("owner")
+            ),
             Err(QuestionStoreError::Conflict)
         ));
         assert!(matches!(
@@ -560,7 +692,13 @@ mod tests {
         let group = ConversationId::new("group").unwrap();
         let definition = definition_with_id("group-q");
         let created = store
-            .ask_question("lab/helper", &group, &definition, "group-ask")
+            .ask_question(
+                "lab/helper",
+                &group,
+                &definition,
+                "group-ask",
+                Some("owner"),
+            )
             .unwrap();
         assert_eq!(created.message.unwrap().from, From::Member("helper".into()));
         assert!(matches!(
@@ -568,7 +706,8 @@ mod tests {
                 "other/helper",
                 &group,
                 &definition_with_id("outsider"),
-                "outside"
+                "outside",
+                Some("owner")
             ),
             Err(QuestionStoreError::Unknown)
         ));
@@ -577,7 +716,8 @@ mod tests {
                 "lab/missing",
                 &group,
                 &definition_with_id("nonmember"),
-                "nonmember"
+                "nonmember",
+                Some("owner")
             ),
             Err(QuestionStoreError::Unknown)
         ));
@@ -594,7 +734,7 @@ mod tests {
         let home = ConversationId::new(home_id("lab/coder")).unwrap();
         let definition = definition("home-question");
         store
-            .ask_question("lab/coder", &home, &definition, "home-ask")
+            .ask_question("lab/coder", &home, &definition, "home-ask", Some("owner"))
             .unwrap();
         assert!(store.pending_questions_for("owner").unwrap().is_empty());
         store.ensure_home("lab/coder", "owner", false).unwrap();
@@ -619,7 +759,13 @@ mod tests {
         let (_dir, store, conversation) = fixture();
         let definition = definition("q-1");
         store
-            .ask_question("lab/coder", &conversation, &definition, "ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
             .unwrap();
         assert!(
             store
@@ -687,17 +833,30 @@ mod tests {
                     &conversation,
                     &definition(&format!("q-{index}")),
                     &format!("ask-{index}"),
+                    None,
                 )
                 .unwrap();
         }
         assert!(matches!(
-            store.ask_question("lab/coder", &conversation, &definition("q-over"), "over"),
+            store.ask_question(
+                "lab/coder",
+                &conversation,
+                &definition("q-over"),
+                "over",
+                None
+            ),
             Err(QuestionStoreError::Invalid(_))
         ));
         assert!(store.question(&definition("q-over").id).unwrap().is_none());
         // A replayed ask is not a new question; a settled one no longer counts.
         store
-            .ask_question("lab/coder", &conversation, &definition("q-0"), "ask-0")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition("q-0"),
+                "ask-0",
+                None,
+            )
             .unwrap();
         store
             .settle_question(
@@ -708,7 +867,13 @@ mod tests {
             )
             .unwrap();
         store
-            .ask_question("lab/coder", &conversation, &definition("q-next"), "next")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition("q-next"),
+                "next",
+                None,
+            )
             .unwrap();
         // Across conversations, the agent's own cap.
         for asked in MAX_PENDING_PER_CONVERSATION..=MAX_PENDING_PER_AGENT {
@@ -720,6 +885,7 @@ mod tests {
                 &conversation,
                 &definition(&format!("{id}-q")),
                 &format!("{id}-ask"),
+                None,
             );
             if asked == MAX_PENDING_PER_AGENT {
                 assert!(matches!(result, Err(QuestionStoreError::Invalid(_))));
@@ -741,6 +907,7 @@ mod tests {
                 &ConversationId::new("helper-c").unwrap(),
                 &definition("helper-q"),
                 "helper-ask",
+                None,
             )
             .unwrap();
     }
@@ -750,14 +917,20 @@ mod tests {
         let (_dir, store, conversation) = fixture();
         let old = definition("old");
         store
-            .ask_question("lab/coder", &conversation, &old, "old-ask")
+            .ask_question("lab/coder", &conversation, &old, "old-ask", None)
             .unwrap();
         store
             .db
             .execute("UPDATE messages SET at=100 WHERE id='old-ask'", [])
             .unwrap();
         store
-            .ask_question("lab/coder", &conversation, &definition("new"), "new-ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition("new"),
+                "new-ask",
+                None,
+            )
             .unwrap();
         let pending = store.pending_questions_by_age().unwrap();
         assert_eq!(pending.len(), 2);
@@ -788,7 +961,13 @@ mod tests {
             let mut question = definition(id);
             question.multiple = false;
             store
-                .ask_question("lab/coder", &conversation, &question, &format!("{id}-ask"))
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &question,
+                    &format!("{id}-ask"),
+                    None,
+                )
                 .unwrap();
             let change = store
                 .settle_question(
@@ -822,7 +1001,7 @@ mod tests {
         let (_dir, store, conversation) = fixture();
         let question = definition("q-1");
         store
-            .ask_question("lab/coder", &conversation, &question, "ask")
+            .ask_question("lab/coder", &conversation, &question, "ask", None)
             .unwrap();
         let change = store
             .settle_question(
@@ -847,6 +1026,7 @@ mod tests {
                     &conversation,
                     &definition(id),
                     &format!("{id}-ask"),
+                    None,
                 )
                 .unwrap();
         }
@@ -869,7 +1049,13 @@ mod tests {
         assert_eq!(pending[0].info.definition.id.as_str(), "new");
         // Its id is never taken by another ask.
         assert!(matches!(
-            store.ask_question("lab/coder", &conversation, &definition("old"), "again"),
+            store.ask_question(
+                "lab/coder",
+                &conversation,
+                &definition("old"),
+                "again",
+                None
+            ),
             Err(QuestionStoreError::Conflict)
         ));
         // Its agent's terminal update closes it: no channel sync offers it again.
@@ -903,7 +1089,7 @@ mod tests {
         let conversation = ConversationId::new("owned").unwrap();
         let question = definition("q-1");
         store
-            .ask_question("lab/coder", &conversation, &question, "ask")
+            .ask_question("lab/coder", &conversation, &question, "ask", None)
             .unwrap();
         let stored = store.question(&question.id).unwrap().unwrap();
         assert_eq!(stored.owner, "owner");
@@ -911,5 +1097,208 @@ mod tests {
         drop(store);
         // Opening it again changes nothing more.
         Store::open(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runtime_approval_tests {
+    use super::*;
+    use enclos_protocol::question::{RuntimeApprovalAction as Action, RuntimeApprovalDefinition};
+
+    fn definition(id: &str) -> QuestionDefinition {
+        QuestionDefinition {
+            id: QuestionId::new(id).unwrap(),
+            text: "Allow this command?".into(),
+            choices: vec![],
+            multiple: false,
+            approval: Some(RuntimeApprovalDefinition {
+                command: "npm install --ignore-scripts".into(),
+                reason: "Install dependencies.".into(),
+                actions: vec![Action::Once, Action::Session, Action::Always, Action::Deny],
+                smart_denied: false,
+                patterns: vec!["package install scripts".into()],
+            }),
+        }
+    }
+
+    #[test]
+    fn runtime_approval_history_replays_and_persists_each_scope_without_claiming_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .conversation("owned", "lab", "coder", "owner")
+            .unwrap();
+        let conversation = ConversationId::new("owned").unwrap();
+        for (index, (action, expected)) in [
+            (Action::Once, "Runtime approval: allowed once."),
+            (
+                Action::Session,
+                "Runtime approval: allowed for this runtime session.",
+            ),
+            (
+                Action::Always,
+                "Runtime approval: always allowed by this runtime.",
+            ),
+            (Action::Deny, "Runtime approval: denied."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let definition = definition(&format!("approval-{index}"));
+            let created = store
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &definition,
+                    &format!("ask-{index}"),
+                    Some("owner"),
+                )
+                .unwrap();
+            assert_eq!(created.message.as_ref().unwrap().kind, "runtime_approval");
+            assert_eq!(
+                created.message.as_ref().unwrap().text,
+                definition.fallback_text()
+            );
+            assert_eq!(
+                store
+                    .ask_question(
+                        "lab/coder",
+                        &conversation,
+                        &definition,
+                        &format!("replayed-{index}"),
+                        Some("owner")
+                    )
+                    .unwrap()
+                    .message
+                    .unwrap()
+                    .seq,
+                created.message.unwrap().seq
+            );
+            let settled = store
+                .settle_question(
+                    "lab/coder",
+                    &definition.id,
+                    Settlement {
+                        state: QuestionState::Answered,
+                        answer: Some(QuestionAnswer::Approval { action }),
+                        confirmed: true,
+                    },
+                    &format!("settled-{index}"),
+                )
+                .unwrap();
+            assert_eq!(settled.message.unwrap().text, expected);
+            assert_eq!(settled.question.info.revision, 1);
+            assert!(
+                store
+                    .settle_question(
+                        "lab/coder",
+                        &definition.id,
+                        Settlement::reported(QuestionState::Pending, None),
+                        "reopen"
+                    )
+                    .is_err()
+            );
+            let restored = Store::open(&path)
+                .unwrap()
+                .question(&definition.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored.info.answer,
+                Some(QuestionAnswer::Approval { action })
+            );
+            assert_eq!(restored.info.definition, definition);
+        }
+        assert_eq!(store.since("owner", 0).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn runtime_approval_resolved_is_terminal_without_an_invented_scope_or_skipped_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("app.db")).unwrap();
+        store
+            .conversation("owned", "lab", "coder", "owner")
+            .unwrap();
+        let conversation = ConversationId::new("owned").unwrap();
+        let definition = definition("approval");
+        store
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
+            .unwrap();
+        for answer in [
+            QuestionAnswer::Text {
+                text: "/approve".into(),
+            },
+            QuestionAnswer::Skip,
+            QuestionAnswer::Choices { indices: vec![0] },
+        ] {
+            assert!(
+                store
+                    .settle_question(
+                        "lab/coder",
+                        &definition.id,
+                        Settlement::reported(QuestionState::Answered, Some(answer)),
+                        "invalid"
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .settle_question(
+                    "lab/coder",
+                    &definition.id,
+                    Settlement::reported(QuestionState::Skipped, None),
+                    "skip"
+                )
+                .is_err()
+        );
+        let resolved = store
+            .settle_question(
+                "lab/coder",
+                &definition.id,
+                Settlement::reported(QuestionState::Resolved, None),
+                "resolved",
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.message.unwrap().text,
+            "Runtime approval resolved in the runtime."
+        );
+        assert!(resolved.question.info.answer.is_none());
+        assert!(
+            store
+                .settle_question(
+                    "lab/coder",
+                    &definition.id,
+                    Settlement::reported(
+                        QuestionState::Answered,
+                        Some(QuestionAnswer::Approval {
+                            action: Action::Once
+                        })
+                    ),
+                    "guess-scope"
+                )
+                .is_err()
+        );
+        assert_eq!(store.since("owner", 0).unwrap().len(), 2);
+        let old: QuestionDefinition = serde_json::from_str(
+            r#"{"id":"old-question","text":"Continue?","choices":["Yes","No"],"multiple":false}"#,
+        )
+        .unwrap();
+        assert!(old.approval.is_none());
+        assert!(
+            QuestionAnswer::Approval {
+                action: Action::Once
+            }
+            .validate(&old)
+            .is_err()
+        );
     }
 }

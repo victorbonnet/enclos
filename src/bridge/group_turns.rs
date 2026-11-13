@@ -387,6 +387,7 @@ impl Hub {
                 .ok_or_else(|| format!("{agent}'s app channel closed"))?;
             Arc::clone(&plugin.out)
         };
+        let host = self.known_host().as_deref() == Some(person.as_str());
         out.lock()
             .expect("not poisoned")
             .writer
@@ -396,6 +397,7 @@ impl Hub {
                     conversation,
                     person,
                     text: text.to_owned(),
+                    host: Some(host),
                 },
             )
             .map_err(|e| e.to_string())

@@ -180,6 +180,10 @@ struct Hub {
     /// Refusals logged per caller address in the current minute.
     refusals: Mutex<HashMap<String, (i64, u32)>>,
     silence: Duration,
+    /// The key the bridge signs each runtime-approval decision with (ADR
+    /// 0060, proposed), which the plugin checks; without it the bridge
+    /// passes on no runtime-approval decision.
+    approval_key: Option<enclos_protocol::decision::DecisionKey>,
 }
 
 /// Where a connected device's messages go: the person it speaks for, its
@@ -262,6 +266,15 @@ impl Hub {
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
             silence,
+            approval_key: None,
+        }
+    }
+
+    /// The hub, signing runtime-approval decisions with `key`.
+    fn with_approval_key(self, key: enclos_protocol::decision::DecisionKey) -> Hub {
+        Hub {
+            approval_key: Some(key),
+            ..self
         }
     }
 
@@ -456,10 +469,12 @@ impl Hub {
             agent,
             connection: &routine_connection,
         };
-        let capable = hello.capabilities.contains(&Capability::Questions);
         let store = self.store().ok();
-        self.question_connected(store.as_ref(), origin, capable);
-        if capable && let Some(store) = &store {
+        self.question_connected(store.as_ref(), origin, &hello.capabilities);
+        if (hello.capabilities.contains(&Capability::Questions)
+            || hello.capabilities.contains(&Capability::RuntimeApprovals))
+            && let Some(store) = &store
+        {
             self.sync_questions(store, agent, &mut writer)?;
         }
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
@@ -859,6 +874,7 @@ impl Hub {
             };
             (Arc::clone(&plugin.out), plugin.generation)
         };
+        let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
             if plugin.sent.contains(&message.id) {
@@ -867,6 +883,10 @@ impl Hub {
             let body = FromBridge::MessageIn {
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
+                // Whether the person is the host's. Not signed, so it grants
+                // nothing: runtime approvals are decided with the app's
+                // buttons, whose decisions the bridge signs (ADR 0060).
+                host: Some(host.as_deref() == Some(message.person.as_str())),
                 person: Person::new(message.person).map_err(|e| e.to_string())?,
                 text: message.text,
             };
@@ -953,6 +973,7 @@ pub fn serve(
     store_path: std::path::PathBuf,
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
+    approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -963,16 +984,19 @@ pub fn serve(
             "enclos app: no device is paired yet: the first one paired with `enclos app pair` names the host's person, whose each agent's Home is"
         );
     }
-    let hub = Arc::new(Hub::new(
-        transport,
-        Arc::new(move |address: &str| transport.whois(address)),
-        store_path,
-        layout,
-        bridge_private,
-        agents,
-        None,
-        SILENCE,
-    ));
+    let hub = Arc::new(
+        Hub::new(
+            transport,
+            Arc::new(move |address: &str| transport.whois(address)),
+            store_path,
+            layout,
+            bridge_private,
+            agents,
+            None,
+            SILENCE,
+        )
+        .with_approval_key(approval_key),
+    );
     serve_on(listener, hub, RETRY);
     Ok(())
 }
@@ -1803,9 +1827,11 @@ fn run_session(
                     .pending_questions_for(person)
                     .map_err(|e| e.to_string())?
                 {
-                    link.send(ToDevice::Question {
-                        question: question.info,
-                    })?;
+                    if hub.shows_question(person, &question.info.definition) {
+                        link.send(ToDevice::Question {
+                            question: question.info,
+                        })?;
+                    }
                 }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
@@ -1827,6 +1853,7 @@ fn run_session(
                         && let Some(current) =
                             store.question(question).map_err(|e| e.to_string())?
                         && current.owner == person
+                        && hub.shows_question(person, &current.info.definition)
                     {
                         link.send(ToDevice::Question {
                             question: current.info,
@@ -2409,6 +2436,19 @@ fn send(
     };
     if owner != person {
         return Ok(None);
+    }
+    // A runtime reads `/approve`, `/deny`, `/yolo` and `/approvals` as its
+    // own approval commands, from whoever it is told speaks; and a message
+    // carries no proof of who sent it that the plugin could check. So no
+    // one's is passed on: a runtime approval is decided with the app's
+    // buttons, whose decision the bridge signs (ADR 0060).
+    if questions::typed_approval(&text) {
+        return Ok(Some(ToDevice::Error(ErrorBody {
+            of: Some(id),
+            code: ErrorCode::NotAllowed,
+            message: "Runtime approvals are decided with the app's buttons, not typed commands."
+                .into(),
+        })));
     }
     let group = group_of(store, conversation.as_str()).is_some();
     let name = format!("{sandbox}/{agent}");

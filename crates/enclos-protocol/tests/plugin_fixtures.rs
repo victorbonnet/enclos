@@ -134,6 +134,7 @@ fn a_message_reads_as_its_fields_say() {
         conversation,
         person,
         text,
+        host,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
@@ -141,6 +142,10 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(conversation.as_str(), "c-42");
     assert_eq!(person.as_str(), "alice@example.com");
     assert_eq!(text, "What's the weather in Paris?");
+    assert_eq!(
+        host, None,
+        "a message.in without host comes from an older bridge"
+    );
 
     let message = decode_from_plugin(FROM_PLUGIN[2].1.as_bytes()).unwrap();
     let FromPlugin::MessageOut { kind, reply_to, .. } = message.body else {

@@ -29,17 +29,18 @@ MAX_TITLE_CHARS = 100
 # docs/protocol.md). Short, as it is in every prompt; it changes when the
 # app's list does.
 PLATFORM_HINT = (
-    "You are talking with the user through the enclos mobile app, on their phone. "
+    "You talk with the user through the enclos mobile app on their phone. "
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
-    "fenced code blocks, tables and links. Keep tables narrow. A single newline is a line break. "
-    "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
-    "shows in the conversation, another file as an attachment, and the person can share either. "
-    "For a decision, use clarify with questions:[{question,choices,multi_select?}]; "
-    "the app adds Other and Skip. Wait for its result. "
-    "For a static HTML artefact, send a self-contained UTF-8 .html file the same way: "
-    "the person opens it in the app. Use inline CSS and data images/fonts, not JavaScript, "
-    "external resources, forms or automatic navigation (meant to be blocked). A tapped HTTP(S) link opens the browser "
-    "once the person confirms it. "
+    "fenced code blocks, tables and links. Keep tables narrow. A newline is a line break. "
+    "Send MEDIA:/absolute/path/to/file on its own line: images show inline, "
+    "other files as attachments; both can be shared. "
+    "For decisions use clarify with questions:[{question,choices,multi_select?}]; "
+    "the app adds Other and Skip. Wait for it. Approval buttons answer "
+    "Hermes's own gate; questions never replace them or change sandbox policy. "
+    "For a static HTML artefact send a self-contained UTF-8 .html file the same way: "
+    "it opens in the app. Use inline CSS and data images/fonts, not JavaScript, external "
+    "resources, forms or automatic navigation (meant to be blocked). A tapped HTTP(S) link opens "
+    "the browser once the person confirms it. "
     "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
     "message HTML shows as literal text."
 )
@@ -186,6 +187,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
             _check_text(message.get("text"), "text")
+            if not isinstance(message.get("host", False), bool):
+                raise ValueError("host must be a boolean")
         elif kind == "conversation.rename":
             _check_id(message.get("conversation"), "conversation")
             _check_text(message.get("title"), "title")

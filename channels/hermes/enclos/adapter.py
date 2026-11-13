@@ -15,6 +15,7 @@ this channel's own variable, which `enclos runtime configure` turns on.
 
 import asyncio
 import collections
+import contextvars
 import logging
 import mimetypes
 import os
@@ -32,13 +33,16 @@ from gateway.platforms.event import MessageEvent, MessageType
 from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
+from . import decisions
 from . import routines
 from . import questions
+from . import runtime_approvals
 
 logger = logging.getLogger(__name__)
 
 PLATFORM = "enclos"
 HELLO_TIMEOUT_SECONDS = 10
+_APPROVAL_SEND = contextvars.ContextVar("enclos_runtime_approval_send", default=False)
 # The bridge sends a message again, with its id, until it has the ack: the
 # ids of the last ones the runtime had, to drop one that comes again
 SEEN_MESSAGES = 1024
@@ -87,7 +91,13 @@ class EnclosAdapter(BasePlatformAdapter):
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
-        self._questions = questions.Manager(self._outbox, self._write, self.send)
+        # What checks the bridge's signature of each runtime-approval decision
+        # (ADR 0060): its public key comes from `runtime configure`, never this
+        # socket, which the agent can speak on too.
+        self._questions = questions.Manager(
+            self._outbox, self._write, self.send,
+            decisions=decisions.load(_setting(config, "bridge_key", "MOBILE_APP_BRIDGE_KEY"),
+                                     os.environ.get("ENCLOS_SANDBOX", ""), self._agent))
         # By message id: a policy request's tool call waiting for the bridge.
         self._answers: dict[str, asyncio.Future] = {}
 
@@ -161,6 +171,7 @@ class EnclosAdapter(BasePlatformAdapter):
         logger.info("[%s] Bridge connected", self.name)
         self._adopt_home(hello.get("home"))
         self._questions.bridge_supports = "questions" in hello.get("capabilities", [])
+        self._questions.bridge_runtime_supports = "runtime_approvals" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
@@ -168,11 +179,13 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("routines")
             if self._questions.available:
                 capabilities.append("questions")
+            if self._questions.approvals_available:
+                capabilities.append("runtime_approvals")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
             for message in self._questions.prepare_replay():
-                if message["type"].startswith("question.") and not self._questions.available:
+                if not self._questions.can_deliver(message):
                     continue
                 reason = protocol.unsendable(message)
                 if reason:
@@ -285,8 +298,9 @@ class EnclosAdapter(BasePlatformAdapter):
         elif kind == "error":
             approvals.answered(self._answers, message)
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
-            # A question the bridge refused would wait unseen: it goes as text.
-            await self._questions.refused(message.get("of"))
+            # A question or runtime approval the bridge refused would wait unseen: a
+            # question goes as text, an approval is denied or sent as text.
+            await self._questions.refused(message.get("of"), message.get("code"))
             of = message.get("of")
             if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
                 # The bridge cannot read it: sent again, it would be refused again
@@ -322,9 +336,19 @@ class EnclosAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
-        await self.handle_message(MessageEvent(
+        event = MessageEvent(
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
-            raw_message=message, timestamp=datetime.now(tz=UTC)))
+            raw_message=message, timestamp=datetime.now(tz=UTC))
+        # Hermes reads its approval commands from whoever it is told speaks, and a
+        # message carries no proof of its person: `host` is the bridge's word, which
+        # any program with the token can send. So none is passed on, read with
+        # Hermes's own parser: runtime approvals are decided with the app's buttons,
+        # whose decisions the bridge signs (ADR 0060).
+        if runtime_approvals.approval_command(event):
+            await self.send(message["conversation"], runtime_approvals.TYPED_ANSWER, reply_to=message["id"])
+            await self._write(protocol.ack(message["id"]))
+            return
+        await self.handle_message(event)
         # Only once the runtime has it: if handle_message raised, the bridge
         # sends it again and it must not read as a duplicate
         self._seen[message["id"]] = None
@@ -366,6 +390,20 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def retire_clarify_card(self, clarify_id, notice):
         await self._questions.retire(clarify_id)
+
+    async def _send_exec_approval_prompt(self, prompt):
+        saved, question_id = await self._questions.ask_approval(prompt)
+        return SendResult(success=saved, message_id=question_id,
+                          error=None if saved else "The runtime approval could not be saved.")
+
+    async def send_exec_approval(self, *args, **kwargs):
+        # Keep the native visibility/Deny-only flow and old call signatures. Its
+        # ordinary full-command pre-send must stay literal and frame-bounded too.
+        token = _APPROVAL_SEND.set(True)
+        try:
+            return await super().send_exec_approval(*args, **kwargs)
+        finally:
+            _APPROVAL_SEND.reset(token)
 
     # Files the agent sends. Hermes finds them in a reply (MEDIA:/path tags,
     # bare absolute paths) and calls the method for their kind; each is copied
@@ -459,6 +497,11 @@ class EnclosAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
+        literal_approval = _APPROVAL_SEND.get() or bool((metadata or {}).get("is_approval_prompt"))
+        if literal_approval and len(protocol.encode_line(protocol.message_out(chat_id, content, reply_to))) > questions.MAX_APPROVAL_FRAME_BYTES:
+            # Refuse before persistence. Base's visibility gate then keeps Deny
+            # alone; our fallback sends complete, independently fenced parts.
+            return SendResult(success=False, error="The approval text exceeds one safe message frame.")
         # A local markdown image (`![x](cache/generated/images/y.png)`), which
         # Hermes does not take for a file: sent as one, out of the text.
         # An image Hermes may not send stays in the text, as the agent wrote it.
@@ -470,12 +513,12 @@ class EnclosAdapter(BasePlatformAdapter):
                 sendable[path] = found
             return found is not None
 
-        rest, images = protocol.local_images(content, take)
+        rest, images = (content, []) if literal_approval else protocol.local_images(content, take)
         files = [(sendable[p], None) for _, p in images]
         if files:
             return await self._send_files(chat_id, files, rest, reply_to)
         # Hermes about itself (gateway online, shutting down): a quiet line.
-        notice = protocol.is_notice(content)
+        notice = False if literal_approval else protocol.is_notice(content)
         message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
         reason = protocol.unsendable(message)
         if reason:

@@ -107,7 +107,7 @@ fn connect_within(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
-        capabilities: vec![Capability::Questions],
+        capabilities: vec![Capability::Questions, Capability::RuntimeApprovals],
         home: ConversationId::new(home).ok(),
     })?;
     let mut reader = PluginReader {
@@ -201,17 +201,20 @@ impl PluginWriter {
         Ok(())
     }
 
-    /// A person's message to the agent, in `conversation`.
+    /// A person's message to the agent, in `conversation`; `host` when
+    /// the person is the host's person.
     pub fn message(
         &mut self,
         conversation: &ConversationId,
         person: &Person,
         text: &str,
+        host: bool,
     ) -> Result<MessageId, PluginError> {
         self.send(FromBridge::MessageIn {
             conversation: conversation.clone(),
             person: person.clone(),
             text: text.to_owned(),
+            host: Some(host),
         })
     }
 
@@ -462,7 +465,7 @@ mod tests {
         let person = Person::new("owner@example.com").unwrap();
         assert!(
             writer
-                .message(&conversation, &person, &"x".repeat(4 << 20))
+                .message(&conversation, &person, &"x".repeat(4 << 20), false)
                 .is_err()
         );
         theirs
@@ -491,6 +494,7 @@ mod tests {
                 &conversation,
                 &Person::new("victor@example.com").unwrap(),
                 "hi",
+                true,
             )
             .unwrap();
         let ack = reader.receive().unwrap().unwrap();

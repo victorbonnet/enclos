@@ -88,11 +88,46 @@ fn rpc_id(device: &str, person: &str, original: &MessageId) -> MessageId {
     MessageId::new(format!("question-{suffix}")).expect("bounded digest")
 }
 
-fn canonical_answer(mut answer: QuestionAnswer) -> QuestionAnswer {
-    if let QuestionAnswer::Choices { indices } = &mut answer {
-        indices.sort_unstable();
+/// Whether a character is whitespace to Python's `str.split` and `lstrip`,
+/// which Hermes parses commands with: Unicode's whitespace and also the
+/// separators U+001C to U+001F, which Rust's `char::is_whitespace` is not.
+fn python_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1C}'..='\u{1F}').contains(&c)
+}
+
+/// Whether a runtime reads `text` as one of its commands that decide or
+/// skip approvals: `/approve`, `/deny`, `/yolo` (no approval for the rest
+/// of the session) or `/approvals` (sets the approval mode, `off`
+/// included), in any case, with or without arguments or an `@name` suffix,
+/// after any leading `@image:`, `@file:` or `@url:` lines (Hermes's own
+/// parsing of a command message, `MessageEvent.get_command`). The bridge
+/// passes none on, whoever types it: a message carries no proof of its
+/// person the plugin could check, and the runtime reads it from whoever the
+/// plugin names, so runtime approvals are decided with the app's buttons,
+/// whose decisions the bridge signs (ADR 0060). The channel answers them
+/// itself too, read with Hermes's own parser and aliases; this is the
+/// bridge's own line, for a channel that does not.
+pub(super) fn typed_approval(text: &str) -> bool {
+    let mut rest = text.trim_start_matches(python_space);
+    while ["@image:", "@file:", "@url:"].iter().any(|prefix| {
+        rest.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) {
+        rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        rest = rest.trim_start_matches(python_space);
     }
-    answer
+    let Some(name) = rest
+        .split(python_space)
+        .find(|word| !word.is_empty())
+        .and_then(|word| word.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    matches!(
+        name.split('@').next(),
+        Some("approve" | "deny" | "yolo" | "approvals")
+    )
 }
 
 /// Whether a settlement is what `requested` asked for.
@@ -105,6 +140,13 @@ fn settles_as(
         QuestionAnswer::Skip => state == QuestionState::Skipped && answer.is_none(),
         requested => state == QuestionState::Answered && answer == Some(requested),
     }
+}
+
+fn canonical_answer(mut answer: QuestionAnswer) -> QuestionAnswer {
+    if let QuestionAnswer::Choices { indices } = &mut answer {
+        indices.sort_unstable();
+    }
+    answer
 }
 
 fn bounded(body: &ToDevice) -> bool {
@@ -190,6 +232,8 @@ pub(super) fn acknowledge_question(
             let code = match error {
                 QuestionStoreError::Unknown => ErrorCode::NotFound,
                 QuestionStoreError::Conflict => ErrorCode::Conflict,
+                // The channel denies such a runtime approval at once.
+                QuestionStoreError::NotAllowed(_) => ErrorCode::NotAllowed,
                 _ => ErrorCode::BadMessage,
             };
             let _ = writer.send(FromBridge::Error(failure(
@@ -221,18 +265,44 @@ pub(super) fn acknowledge_ask(
 }
 
 impl Hub {
+    /// Whether `person`'s devices get `definition`'s structured metadata. A
+    /// runtime approval's controls are the host's person's alone; anyone else
+    /// reads its history text, which says who can answer it.
+    pub(super) fn shows_question(&self, person: &str, definition: &QuestionDefinition) -> bool {
+        definition.approval.is_none() || self.known_host().as_deref() == Some(person)
+    }
+
     /// A channel connected. One without the `questions` capability cannot
-    /// answer the cards it left (a runtime that lost its native API, or
-    /// one replaced): they expire now rather than wait for an answer that
-    /// cannot be given.
-    pub(super) fn question_connected(&self, store: Option<&Store>, origin: Origin, capable: bool) {
+    /// answer the cards it left, and one without `runtime_approvals` the
+    /// runtime approvals it left (a runtime that lost its native API, or one
+    /// replaced): they expire now rather than wait for an answer that cannot
+    /// be given.
+    pub(super) fn question_connected(
+        &self,
+        store: Option<&Store>,
+        origin: Origin,
+        capabilities: &[Capability],
+    ) {
         self.questions
             .lock()
             .expect("not poisoned")
             .connections
             .insert(origin.agent.into(), origin.connection.into());
-        if !capable && let Some(store) = store {
+        let Some(store) = store else { return };
+        if !capabilities.contains(&Capability::Questions) {
             for id in store.pending_questions(origin.agent).unwrap_or_default() {
+                if store
+                    .question(&id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|q| q.info.definition.approval.is_none())
+                {
+                    self.expire_question(store, origin.agent, &id);
+                }
+            }
+        }
+        if !capabilities.contains(&Capability::RuntimeApprovals) {
+            for id in store.pending_approvals(origin.agent).unwrap_or_default() {
                 self.expire_question(store, origin.agent, &id);
             }
         }
@@ -280,9 +350,52 @@ impl Hub {
         question: &QuestionDefinition,
         id: &MessageId,
     ) -> Result<(), QuestionStoreError> {
+        if question.approval.is_some()
+            && !self
+                .plugins
+                .lock()
+                .expect("not poisoned")
+                .get(origin.agent)
+                .is_some_and(|plugin| plugin.capabilities.contains(&Capability::RuntimeApprovals))
+        {
+            return Err(QuestionStoreError::Invalid(
+                "The runtime does not support native runtime approvals.".into(),
+            ));
+        }
+        question.validate().map_err(QuestionStoreError::Invalid)?;
+        // Refuse before persistence if a future fallback renderer exceeds the device frame.
+        let introduction = || {
+            ToDevice::Message(ConversationMessage {
+                conversation: conversation.clone(),
+                agent: origin.agent.into(),
+                from: "agent".into(),
+                text: question.fallback_text(),
+                kind: if question.approval.is_some() {
+                    "runtime_approval"
+                } else {
+                    "question"
+                }
+                .into(),
+                time: i64::MAX,
+                seq: i64::MAX,
+                attachments: vec![],
+                question: Some(question.id.clone()),
+            })
+        };
+        if !bounded(&introduction()) {
+            return Err(QuestionStoreError::Invalid(
+                "The readable question history exceeds the device frame limit.".into(),
+            ));
+        }
         let requests = self.questions.lock().expect("not poisoned");
         Self::current_connection(&requests, origin)?;
-        let change = store.ask_question(origin.agent, conversation, question, id.as_str())?;
+        let change = store.ask_question(
+            origin.agent,
+            conversation,
+            question,
+            id.as_str(),
+            self.known_host().as_deref(),
+        )?;
         drop(requests);
         // A question waits for the person: an archived conversation comes
         // back to the active Inbox first (ADR 0049), or nobody would see it.
@@ -419,7 +532,11 @@ impl Hub {
         store
             .question(id)
             .map_err(storage)?
-            .filter(|question| question.owner == person)
+            .filter(|question| {
+                question.owner == person
+                    && (question.info.definition.approval.is_none()
+                        || self.known_host().as_deref() == Some(person))
+            })
             .ok_or(ErrorCode::NotFound)
     }
 
@@ -452,12 +569,9 @@ impl Hub {
             })?;
         let found = {
             let plugins = self.plugins.lock().expect("not poisoned");
-            plugins.get(&current.info.agent).map(|plugin| {
-                (
-                    Arc::clone(&plugin.out),
-                    plugin.capabilities.contains(&Capability::Questions),
-                )
-            })
+            plugins
+                .get(&current.info.agent)
+                .map(|plugin| (Arc::clone(&plugin.out), plugin.capabilities.clone()))
         };
         let mut requests = self.questions.lock().expect("not poisoned");
         request
@@ -512,18 +626,30 @@ impl Hub {
         }
         // Until the answer is written to the channel, a refusal is certain:
         // nothing was sent, and answering again is safe (`agent_unavailable`).
-        let Some((out, questions)) = found else {
+        let Some((out, capabilities)) = found else {
             return Err(failure(
                 original,
                 ErrorCode::AgentUnavailable,
                 "The agent is disconnected. Nothing was sent; answer again when it is back.",
             ));
         };
-        if !questions {
+        let capability = if current.info.definition.approval.is_some() {
+            Capability::RuntimeApprovals
+        } else {
+            Capability::Questions
+        };
+        if !capabilities.contains(&capability) {
             return Err(failure(
                 original,
                 ErrorCode::Unsupported,
                 "This runtime does not support native app answers.",
+            ));
+        }
+        if capability == Capability::RuntimeApprovals && self.approval_key.is_none() {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This bridge has no key to sign runtime approvals with. Nothing was sent.",
             ));
         }
         let in_flight = requests
@@ -562,12 +688,37 @@ impl Hub {
             },
         );
         drop(requests);
+        // A runtime approval's decision goes signed (ADR 0060): the plugin
+        // acts on no other, so an agent speaking on its own plugin's socket
+        // cannot approve its own command.
+        let signed = match (&current.info.definition.approval, &request.answer) {
+            (Some(approval), QuestionAnswer::Approval { action }) => {
+                let decision = enclos_protocol::decision::Decision {
+                    agent: &current.info.agent,
+                    conversation: current.info.conversation.as_str(),
+                    question: request.question.as_str(),
+                    request: rpc.as_str(),
+                    action: action.as_str(),
+                    command: &approval.command,
+                    reason: &approval.reason,
+                    patterns: &approval.patterns,
+                };
+                Some(
+                    self.approval_key
+                        .as_ref()
+                        .expect("checked before the answer was registered")
+                        .sign(&decision, now()),
+                )
+            }
+            _ => None,
+        };
         let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::QuestionAnswer {
                 conversation: current.info.conversation,
                 question: request.question.clone(),
                 answer: request.answer,
+                signed,
             },
         );
         if let Err(error) = sent {
@@ -652,6 +803,7 @@ impl Hub {
             })
         });
         let paired = store.devices().unwrap_or_default();
+        let shown = self.shows_question(&current.owner, &current.info.definition);
         let devices = self.devices.lock().expect("not poisoned");
         for (device, (person, sender, _)) in devices.iter() {
             if person == &current.owner
@@ -659,7 +811,9 @@ impl Hub {
                     .iter()
                     .any(|d| d.id == *device && d.person == *person)
             {
-                let _ = sender.send(question.clone());
+                if shown {
+                    let _ = sender.send(question.clone());
+                }
                 if let Some(message) = &message
                     && bounded(message)
                 {

@@ -273,8 +273,8 @@ impl Layout {
         self.data.join("secrets.json")
     }
 
-    /// The bridge's database: its conversations and their messages (ADR
-    /// 0042, proposed). For the host alone.
+    /// The bridge's database: its conversations, their messages, and the
+    /// paired devices (ADR 0042, proposed). For the host alone.
     pub fn app_store(&self) -> PathBuf {
         self.data.join("app.db")
     }
@@ -283,6 +283,12 @@ impl Layout {
     /// the host alone.
     pub fn app_bridge_key(&self) -> PathBuf {
         self.data.join("app-bridge.key")
+    }
+
+    /// The key the bridge signs runtime-approval decisions with (ADR 0060,
+    /// proposed): no sandbox may read it, or an agent could sign its own.
+    pub fn app_approval_key(&self) -> PathBuf {
+        self.data.join("app-approvals.key")
     }
 
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
@@ -356,6 +362,9 @@ impl Layout {
             // The bridge's Noise key: a sandbox that read it could pass
             // for the bridge to every paired device.
             self.app_bridge_key(),
+            // The key the bridge signs runtime-approval decisions with: a
+            // sandbox that read it could sign its own (ADR 0060).
+            self.app_approval_key(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
         // stores: the two change together.
@@ -563,40 +572,28 @@ mod tests {
                 layout.config_file(),
                 layout.app_store(),
                 layout.app_bridge_key(),
+                layout.app_approval_key(),
             ]
         );
         assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
     }
 
-    /// The bridge's database is hidden on every system: it holds every
-    /// agent's conversations.
+    /// The bridge's database and keys are hidden on every system: the
+    /// approval key above all, which would let an agent sign its own
+    /// decisions (ADR 0060).
     #[test]
     fn the_bridges_files_are_on_the_hidden_files() {
         let layout = Layout::at("/data/enclos");
         for os in [Os::Linux, Os::MacOs] {
-            let file = layout.app_store();
-            assert!(file.starts_with(layout.data()));
-            assert!(
-                layout.hidden_files_on(os).contains(&file),
-                "{os:?}: {}",
-                file.display()
-            );
-        }
-    }
-
-    /// The bridge's Noise key is hidden on every system: a sandbox that
-    /// read it could pass for the bridge to every paired device.
-    #[test]
-    fn the_bridges_key_is_on_the_hidden_files() {
-        let layout = Layout::at("/data/enclos");
-        for os in [Os::Linux, Os::MacOs] {
-            let file = layout.app_bridge_key();
-            assert!(file.starts_with(layout.data()));
-            assert!(
-                layout.hidden_files_on(os).contains(&file),
-                "{os:?}: {}",
-                file.display()
-            );
+            let hidden = layout.hidden_files_on(os);
+            for file in [
+                layout.app_store(),
+                layout.app_bridge_key(),
+                layout.app_approval_key(),
+            ] {
+                assert!(file.starts_with(layout.data()));
+                assert!(hidden.contains(&file), "{os:?}: {}", file.display());
+            }
         }
     }
 

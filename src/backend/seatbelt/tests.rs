@@ -93,13 +93,15 @@ fn world() -> World {
     std::fs::write(user.join("work/project/private/key"), "secret").unwrap();
     std::fs::write(home.join("private/key"), "secret").unwrap();
     std::fs::write(data.join("state.db"), "state").unwrap();
-    // The bridge's database (ADR 0042) and its write-ahead log, its
-    // Noise key, and a file the key is written to first.
+    // The bridge's: its database (ADR 0042) and its write-ahead log, its
+    // Noise key and a file the key is written to first, and its key for
+    // signed runtime-approval decisions (ADR 0060).
     for file in [
         "app.db",
         "app.db-wal",
         "app-bridge.key",
         "app-bridge.key.0123.new",
+        "app-approvals.key",
     ] {
         std::fs::write(data.join(file), "the bridge's").unwrap();
     }
@@ -474,6 +476,7 @@ fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
         "app.db-wal",
         "app-bridge.key",
         "app-bridge.key.0123.new",
+        "app-approvals.key",
     ] {
         assert!(
             !w.sh(&format!(
