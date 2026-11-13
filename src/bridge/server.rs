@@ -19,6 +19,8 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "agent_names.rs"]
+mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
 #[path = "avatars.rs"]
@@ -321,9 +323,20 @@ impl Hub {
     /// What a device asking for the agents is sent: the list, then each
     /// agent's commands as far as the bridge knows them; the others come
     /// once their plugin connects.
-    fn agents_answer(&self, store: &Store, person: &str) -> Result<Vec<ToDevice>, String> {
+    /// The agents' list for `person`, its names in follow-up messages when
+    /// they would not fit one, then the commands of each agent shown.
+    /// `Ok(Err(why))` when the list cannot be sent at all; `Err` for the
+    /// bridge's database failing.
+    fn agents_answer(
+        &self,
+        store: &Store,
+        person: &str,
+    ) -> Result<Result<Vec<ToDevice>, String>, String> {
         let agents = self.agent_infos(store, person)?;
-        let mut answer = vec![ToDevice::AgentsList { agents }];
+        let mut answer = match agent_names::agent_inventory_messages(agents) {
+            Ok(answer) => answer,
+            Err(why) => return Ok(Err(why)),
+        };
         let commands = self.commands.lock().expect("not poisoned");
         for (agent, commands) in commands.iter() {
             // Only for agents this person is shown
@@ -334,7 +347,7 @@ impl Hub {
                 });
             }
         }
-        Ok(answer)
+        Ok(Ok(answer))
     }
 
     /// Opens, in the background, the plugin connections that are not open:
@@ -1507,6 +1520,32 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::AgentNameGet { agent } => {
+                match hub.get_agent_name(store, device, person, &agent, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
+                }
+            }
+            FromDevice::AgentNameSet(edit) => {
+                match hub.set_agent_name(store, device, person, &edit, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => {
+                        if error.code == enclos_protocol::plugin::ErrorCode::Conflict
+                            && let Ok(ToDevice::AgentName(mut current)) = hub.get_agent_name(
+                                store,
+                                device,
+                                person,
+                                &edit.agent,
+                                message.id.to_string(),
+                            )
+                        {
+                            current.of.clear();
+                            link.send(ToDevice::AgentName(current))?;
+                        }
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
@@ -1598,7 +1637,18 @@ fn run_session(
                 }
             }
             FromDevice::Agents => {
-                for answer in hub.agents_answer(store, person)? {
+                let answer = match hub.agents_answer(store, person)? {
+                    Ok(answer) => answer,
+                    Err(reason) => {
+                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                            of: Some(message.id),
+                            code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                            message: reason,
+                        }))?;
+                        continue;
+                    }
+                };
+                for answer in answer {
                     link.send(answer)?;
                 }
                 hub.open_plugins();

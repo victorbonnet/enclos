@@ -110,7 +110,7 @@ fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToDevice {
 
 impl Hub {
     /// Whether `person` is shown `agent`: the one rule `agents.list`, a
-    /// photo's reading and its broadcast share. Every paired person sees
+    /// photo's or a name's reading, and their broadcasts share. Every paired person sees
     /// every listed agent until sharing (ADR 0043, proposed) narrows it.
     pub(super) fn sees_agent(&self, _person: &str, agent: &str) -> bool {
         self.agents.iter().any(|a| a.name == agent)
@@ -122,16 +122,25 @@ impl Hub {
         store: &Store,
         person: &str,
     ) -> Result<Vec<AgentInfo>, String> {
-        // A photo that cannot be read is shown as none, not as a refusal
-        // that ends the device's session
+        // A photo or name that cannot be read is shown as none, not as a
+        // refusal that ends the device's session
         let photos = store.avatar_metadata().unwrap_or_default();
+        let names = store.agent_name_metadata().unwrap_or_default();
         let host = store.host_person().ok().flatten();
         let plugins = self.plugins.lock().expect("not poisoned");
         Ok(self
             .agents
             .iter()
             .filter(|a| self.sees_agent(person, &a.name))
-            .map(|a| AgentInfo {
+            .map(|a| {
+                let name =
+                    self.shown_name(&a.name, names.get(&a.name).cloned().unwrap_or_default());
+                (a, name)
+            })
+            .map(|(a, name)| AgentInfo {
+                display_name: name.display_name,
+                name_revision: name.revision,
+                can_edit_name: host.as_deref() == Some(person),
                 avatar: photos.get(&a.name).cloned().unwrap_or_default(),
                 can_edit_avatar: host.as_deref() == Some(person),
                 can_manage_routines: host.as_deref() == Some(person),

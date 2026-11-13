@@ -11,6 +11,7 @@
 //! - [`visible`]: text checked for hidden characters before a person
 //!   reads it.
 
+pub mod agent_name;
 pub mod approval;
 pub mod avatar;
 pub mod device;

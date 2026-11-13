@@ -13,6 +13,10 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "agent.name.get")]
+    AgentNameGet { agent: String },
+    #[serde(rename = "agent.name.set")]
+    AgentNameSet(crate::agent_name::NameSet),
     #[serde(rename = "routine.request")]
     RoutineRequest {
         agent: String,
@@ -126,6 +130,8 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "agent.name.get",
+    "agent.name.set",
     "routine.request",
     "agent.avatar.get",
     "agent.avatar.set",
@@ -155,6 +161,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "agent.name")]
+    AgentName(crate::agent_name::AgentName),
     #[serde(rename = "routine.response")]
     RoutineResponse {
         agent: String,
@@ -229,6 +237,7 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "agent.name",
     "routine.response",
     "agent.avatar",
     "sandbox.policy",
@@ -318,6 +327,14 @@ pub struct PushToken {
 /// An agent a person may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
+    /// Shared presentation only: never the routing address in `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub name_revision: u64,
+    /// Always sent by new hosts; its presence advertises shared-name support.
+    #[serde(default)]
+    pub can_edit_name: bool,
     #[serde(
         default,
         skip_serializing_if = "crate::avatar::AvatarMetadata::is_default"
