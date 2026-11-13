@@ -15,7 +15,7 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "routine.request",
+FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "conversation.delete", "routine.request",
                      "question.answer", "question.sync", "ack", "error")
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
@@ -189,6 +189,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_text(message.get("text"), "text")
             if not isinstance(message.get("host", False), bool):
                 raise ValueError("host must be a boolean")
+        elif kind == "conversation.delete":
+            _check_id(message.get("conversation"), "conversation")
         elif kind == "conversation.rename":
             _check_id(message.get("conversation"), "conversation")
             _check_text(message.get("title"), "title")

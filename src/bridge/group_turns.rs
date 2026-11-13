@@ -13,6 +13,9 @@ impl Hub {
     /// The person said `text` (message `seq`) in group `id`: a discussion
     /// starts, or waits for the running turn.
     pub(super) fn group_said(self: &Arc<Hub>, store: &Store, id: &str, seq: i64, text: &str) {
+        if store.deletion_started(id).unwrap_or(true) {
+            return;
+        }
         let Some((_, handles)) = group_of(store, id) else {
             return;
         };
@@ -32,6 +35,9 @@ impl Hub {
     /// group's messages it has not seen, under the group's id. A member
     /// that cannot be reached fails its turn, and the next goes on.
     pub(super) fn advance(self: &Arc<Hub>, store: &Store, id: &str) {
+        if store.deletion_started(id).unwrap_or(true) {
+            return;
+        }
         let Some((sandbox, handles)) = group_of(store, id) else {
             return;
         };
@@ -388,9 +394,16 @@ impl Hub {
             Arc::clone(&plugin.out)
         };
         let host = self.known_host().as_deref() == Some(person.as_str());
-        out.lock()
-            .expect("not poisoned")
-            .writer
+        let mut out = out.lock().expect("not poisoned");
+        if text != "/stop"
+            && self
+                .store()?
+                .deletion_started(conversation.as_str())
+                .map_err(|e| e.to_string())?
+        {
+            return Err("This conversation is being deleted.".into());
+        }
+        out.writer
             .send_as(
                 sent,
                 FromBridge::MessageIn {

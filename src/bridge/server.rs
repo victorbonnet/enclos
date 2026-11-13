@@ -26,6 +26,8 @@ mod approvals;
 #[path = "avatars.rs"]
 mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
+#[path = "deletions.rs"]
+mod deletions;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -152,6 +154,9 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
+    deletions: Mutex<HashMap<String, deletions::PendingDelete>>,
+    deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    deletion_jobs: Mutex<HashSet<(String, String)>>,
     questions: Mutex<questions::QuestionRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
@@ -257,6 +262,9 @@ impl Hub {
             agents,
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
+            deletions: Mutex::new(HashMap::new()),
+            deletion_locks: Mutex::new(HashMap::new()),
+            deletion_jobs: Mutex::new(HashSet::new()),
             opening,
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
@@ -548,6 +556,14 @@ impl Hub {
                     // plugin) fails now, not after 15 minutes; a routine
                     // control waiting on it gets its answer.
                     FromPlugin::Error(error) => {
+                        if hub.delete_answer(
+                            &agent,
+                            generation,
+                            error.of.as_ref(),
+                            Err(error.clone()),
+                        ) {
+                            continue;
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -596,6 +612,13 @@ impl Hub {
                         // Every runtime may send on its own: past a burst,
                         // at a pace, so that a loop fills neither the
                         // database nor the devices' queues.
+                        if store
+                            .deletion_started(conversation.as_str())
+                            .unwrap_or(true)
+                        {
+                            let _ = acks.ack(&message.id);
+                            continue;
+                        }
                         hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
@@ -689,6 +712,9 @@ impl Hub {
                         }
                     }
                     FromPlugin::Ack { of } => {
+                        if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
+                            continue;
+                        }
                         let _ = store.delivered(of.as_str());
                     }
                     FromPlugin::Typing { conversation, on } => {
@@ -777,6 +803,7 @@ impl Hub {
                     _ => {}
                 }
             }
+            hub.delete_disconnected(&agent, generation);
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
@@ -881,6 +908,12 @@ impl Hub {
         let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
+            if store
+                .deletion_started(&message.conversation)
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             if plugin.sent.contains(&message.id) {
                 continue;
             }
@@ -1800,6 +1833,9 @@ fn run_session(
             FromDevice::ConversationRead { conversation, seq } => {
                 read(hub, store, person, &conversation, seq)?;
             }
+            FromDevice::ConversationDelete { conversation } => {
+                hub.request_deletion(device, message.id, conversation);
+            }
             FromDevice::ConversationArchive {
                 conversation,
                 archived,
@@ -1813,6 +1849,11 @@ fn run_session(
                 Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
             },
             FromDevice::Sync { since } => {
+                for id in store.deletions(person).map_err(|e| e.to_string())? {
+                    if let Ok(conversation) = ConversationId::new(id) {
+                        link.send(ToDevice::ConversationDeleted { conversation })?;
+                    }
+                }
                 if hub.known_host().as_deref() == Some(person) {
                     // A log that cannot be read must not end the device's session.
                     if let Err(e) = hub.dismiss_probe_requests(store) {
@@ -2238,6 +2279,12 @@ fn destination(
     agent: &str,
     conversation: ConversationId,
 ) -> Option<ConversationId> {
+    if store
+        .deletion_started(conversation.as_str())
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let own = matches!(
         store.conversation_of(conversation.as_str()),
         Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
@@ -2435,6 +2482,24 @@ fn send(
     text: String,
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
+    if store
+        .deletion_started(conversation.as_str())
+        .map_err(|e| e.to_string())?
+    {
+        if store
+            .deletion_owner(conversation.as_str())
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            != Some(person)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(ToDevice::Error(ErrorBody {
+            of: Some(id),
+            code: ErrorCode::Conflict,
+            message: "This conversation is being deleted. Retry Delete to finish.".into(),
+        })));
+    }
     let Some((sandbox, agent, owner)) = store
         .conversation_of(conversation.as_str())
         .map_err(|e| e.to_string())?
@@ -3696,5 +3761,96 @@ mod connection_end_tests {
         )));
         assert_ne!(other, GONE);
         assert_ne!(other, CLOSED);
+    }
+    #[test]
+    fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge_with(folder.path(), Duration::from_millis(600));
+        let listener = UnixListener::bind(&bridge.socket).unwrap();
+        let (waiting, wait) = channel();
+        let (release, released) = channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = String::new();
+            lines.read_line(&mut line).unwrap();
+            out.write_all(&encode_line(&Envelope::new(
+                MessageId::new("hello").unwrap(),
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![Capability::ConversationDelete],
+                },
+            )))
+            .unwrap();
+            loop {
+                line.clear();
+                if lines.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let packet = decode_from_bridge(line.as_bytes()).unwrap();
+                if let FromBridge::Delete { .. } = packet.body {
+                    waiting.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    out.write_all(&encode_line(&Envelope::new(
+                        MessageId::new("native-ack").unwrap(),
+                        FromPlugin::Ack { of: packet.id },
+                    )))
+                    .unwrap();
+                }
+            }
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        let store = Store::open(&bridge.store).unwrap();
+        store
+            .conversation("c-live-delete", "lab", "main", PERSON)
+            .unwrap();
+        device.send(
+            "delete-live",
+            FromDevice::ConversationDelete {
+                conversation: ConversationId::new("c-live-delete").unwrap(),
+            },
+        );
+        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Remain pending beyond the silence threshold while this SAME socket
+        // keeps sending pings and receiving ordinary sync responses.
+        for _ in 0..5 {
+            device.socket.send(Message::Ping(vec![1].into())).unwrap();
+            device.send("sync-pending", FromDevice::Sync { since: 0 });
+            loop {
+                match device.receive() {
+                    Some(ToDevice::Synced { .. }) => break,
+                    Some(_) => {}
+                    None => panic!("the pending deletion blocked this socket's sync"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(160));
+        }
+        assert!(store.conversation_info("c-live-delete").unwrap().is_some());
+        release.send(()).unwrap();
+        let mut deleted = 0;
+        loop {
+            match device.receive() {
+                Some(ToDevice::ConversationDeleted { conversation })
+                    if conversation.as_str() == "c-live-delete" =>
+                {
+                    deleted += 1
+                }
+                Some(ToDevice::Ack { of }) if of.as_str() == "delete-live" => break,
+                Some(_) => {}
+                None => panic!("deletion starved the device session"),
+            }
+        }
+        assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+        device.send("sync-after-delete", FromDevice::Sync { since: 0 });
+        loop {
+            match device.receive() {
+                Some(ToDevice::Synced { .. }) => break,
+                Some(_) => {}
+                None => panic!("the deletion completion closed this socket"),
+            }
+        }
     }
 }

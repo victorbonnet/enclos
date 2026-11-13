@@ -30,6 +30,7 @@ from gateway.platforms._shared import get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
+from . import conversations
 from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
@@ -88,6 +89,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
         # Routine controls in progress, kept so that none is collected early.
         self._routine_tasks: set[asyncio.Task] = set()
+        self._conversation_home = conversations.capture_home()
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
@@ -175,6 +177,8 @@ class EnclosAdapter(BasePlatformAdapter):
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
+            if conversations.available(self):
+                capabilities.append("conversation_delete")
             if self._routines.available:
                 capabilities.append("routines")
             if self._questions.available:
@@ -281,6 +285,10 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.ack(message["id"]))
         elif kind == "message.in":
             await self._on_message(message)
+        elif kind == "conversation.delete":
+            task = asyncio.create_task(conversations.handle(self, message))
+            self._routine_tasks.add(task)
+            task.add_done_callback(self._routine_tasks.discard)
         elif kind == "conversation.rename":
             await self._rename(message["conversation"], message["title"])
         elif kind == "question.answer":
