@@ -179,6 +179,7 @@ fn hub_with(
         Transport::Tailscale,
         no_whois(),
         dir.join("app.db"),
+        crate::layout::Layout::at(dir.join("enclos")),
         vec![0; 32],
         Vec::new(),
         None,
@@ -231,6 +232,7 @@ fn hub(dir: &std::path::Path, names: &[&str]) -> Arc<Hub> {
         Transport::Tailscale,
         no_whois(),
         dir.join("bridge.db"),
+        crate::layout::Layout::at(dir.join("enclos")),
         vec![7; 32],
         agents,
         Some("alice@example.com".to_owned()),
@@ -452,7 +454,11 @@ fn a_forgotten_device_is_unpaired_and_logged() {
         node: Some("n-pixel".to_owned()),
     };
     store.add_device(&phone).unwrap();
-    forget(&store, &phone, "alice@example.com").unwrap();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let log = crate::layout::Layout::at(dir.path().join("enclos")).audit_log();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "").unwrap();
+    forget(&hub, &store, &phone, "alice@example.com").unwrap();
     // Its keys find no device: `connection` refuses the next `auth` with
     // them as "an unknown device".
     assert_eq!(store.device_by_noise_key(&phone.noise_key).unwrap(), None);
@@ -521,6 +527,29 @@ fn a_file_that_cannot_be_recorded_leaves_none_behind() {
     );
     assert!(taken.is_empty());
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
+}
+
+#[test]
+fn home_keeps_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _received) = hub_with(dir.path(), &["alice@example.com"]);
+    let hub = Arc::new(hub);
+    let store = hub.store().unwrap();
+    store
+        .ensure_home("lab/main", "alice@example.com", true)
+        .unwrap();
+    let home = ConversationId::new("home.lab.main").unwrap();
+    // Neither renamed nor cleared, which would let the runtime's names in
+    for title in ["Mine", ""] {
+        rename(&hub, &store, "alice@example.com", &home, title).unwrap();
+    }
+    let titled = store
+        .conversations("alice@example.com")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == "home.lab.main")
+        .unwrap();
+    assert_eq!(titled.title.as_deref(), Some("Home"));
 }
 
 #[test]

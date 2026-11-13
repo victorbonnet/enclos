@@ -37,6 +37,7 @@ fn hub(dir: &Path, names: &[&str]) -> Arc<Hub> {
         Transport::Tailscale,
         Arc::new(|_: &str| Err("no transport in this test".to_owned())),
         dir.join("bridge.db"),
+        crate::layout::Layout::at(dir.join("enclos")),
         vec![7; 32],
         agents,
         Some(ALICE.to_owned()),
