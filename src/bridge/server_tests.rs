@@ -2378,7 +2378,11 @@ fn a_forgotten_device_is_unpaired_and_logged() {
         node: Some("n-pixel".to_owned()),
     };
     store.add_device(&phone).unwrap();
-    forget(&store, &phone, "alice@example.com").unwrap();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let log = crate::layout::Layout::at(dir.path().join("enclos")).audit_log();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "").unwrap();
+    forget(&hub, &store, &phone, "alice@example.com").unwrap();
     // Its keys find no device: `connection` refuses the next `auth` with
     // them as "an unknown device".
     assert_eq!(store.device_by_noise_key(&phone.noise_key).unwrap(), None);
@@ -2470,4 +2474,85 @@ fn a_name_whose_devices_cannot_be_read_answers_internal() {
         .get_agent_name(&store, &owner, &owner.person, &agent, "get".into())
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[test]
+fn a_photos_orientation_tag_is_applied_before_it_is_dropped() {
+    use image::ImageEncoder;
+    // Red left, blue right; tagged "rotate 90° clockwise": red on top
+    let wide = image::RgbImage::from_fn(40, 20, |x, _| {
+        if x < 20 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
+    });
+    let exif = [
+        0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x01, 0x12, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95);
+    encoder.set_exif_metadata(exif.to_vec()).unwrap();
+    encoder
+        .write_image(&wide, 40, 20, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let stored = image::load_from_memory(&super::avatars::normalize(&jpeg).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let (top, bottom) = (stored.get_pixel(128, 20), stored.get_pixel(128, 235));
+    assert!(top[0] > 200 && top[2] < 60, "{top:?}");
+    assert!(bottom[2] > 200 && bottom[0] < 60, "{bottom:?}");
+}
+
+#[test]
+fn home_keeps_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _received) = hub_with(dir.path(), &["alice@example.com"]);
+    let hub = Arc::new(hub);
+    let store = hub.store().unwrap();
+    store
+        .ensure_home("lab/main", "alice@example.com", true)
+        .unwrap();
+    let home = ConversationId::new("home.lab.main").unwrap();
+    // Neither renamed nor cleared, which would let the runtime's names in
+    for title in ["Mine", ""] {
+        rename(&hub, &store, "alice@example.com", &home, title).unwrap();
+    }
+    let titled = store
+        .conversations("alice@example.com")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == "home.lab.main")
+        .unwrap();
+    assert_eq!(titled.title.as_deref(), Some("Home"));
+}
+
+#[test]
+fn a_capability_the_bridge_does_not_know_is_not_shown() {
+    let announced: Vec<Capability> =
+        serde_json::from_value(serde_json::json!(["notify", "commands"])).unwrap();
+    assert_eq!(known(announced), vec![Capability::Commands]);
+}
+
+#[test]
+fn an_approval_request_is_one_per_scope_and_a_failed_one_is_asked_again() {
+    let (_dir, hub, store) = approval_hub();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    hub.request_access(&store, "lab/main", None, network("API.example.com"), "")
+        .unwrap();
+    let saved = store.approvals().unwrap();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    // It failed, changing nothing: the agent may ask again
+    let mut failed = saved[0].clone();
+    assert!(store.claim_approval(&failed.request).unwrap());
+    failed.state = "failed".into();
+    store.put_approval(&failed).unwrap();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    assert_eq!(
+        store.approval(&failed.request).unwrap().unwrap().state,
+        "pending"
+    );
 }

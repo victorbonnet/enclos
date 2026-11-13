@@ -45,7 +45,16 @@ impl Hub {
         loop {
             let seen: HashMap<String, i64> =
                 store.members(id).unwrap_or_default().into_iter().collect();
-            let newest = store.newest(id).unwrap_or(0);
+            let position = |m: &str| seen.get(m).copied().unwrap_or(0);
+            // A member has something to be given when another's words came
+            // after the last message it was given: its own reply does not
+            // count, and its position never passes a message it was not
+            // given, such as the person's sent while its turn ran.
+            let fresh: HashSet<&str> = handles
+                .iter()
+                .map(String::as_str)
+                .filter(|m| store.news_for(id, m, position(m)).unwrap_or(false))
+                .collect();
             let sent = match new_id()
                 .map_err(|e| e.to_string())
                 .and_then(|i| MessageId::new(i).map_err(|e| e.to_string()))
@@ -61,7 +70,7 @@ impl Hub {
             {
                 *d = Discussion::new(seq, &text, &handles);
             }
-            let next = d.next_turn(&handles, |m| seen.get(m).copied().unwrap_or(0) < newest);
+            let next = d.next_turn(&handles, |m| fresh.contains(m));
             let Some((member, direct)) = next else {
                 drop(groups);
                 self.deliver_group_state(store, id);
@@ -69,6 +78,14 @@ impl Hub {
             };
             let (source, round) = (d.source, d.round);
             let turn = turn_id(id, source, round, &member);
+            // What the member is given: the messages after its position,
+            // the newest that a prompt holds and one more, which tells it
+            // that earlier ones were left out; its position then moves to
+            // the last of them, and no further.
+            let unseen = store
+                .newest_after(id, position(&member), crate::bridge::groups::MAX_UNSEEN + 1)
+                .unwrap_or_default();
+            let given = unseen.last().map_or(position(&member), |m| m.seq);
             // Running before it is sent, under the lock: a second call (the
             // person's new message as a reply lands) finds the group busy
             // instead of sending a turn of its own, and the member's reply
@@ -77,7 +94,7 @@ impl Hub {
                 &member,
                 turn.clone(),
                 sent.as_str().to_owned(),
-                newest,
+                given,
                 direct,
             );
             let _ = store.turn(
@@ -88,17 +105,15 @@ impl Hub {
                 &member,
                 "running",
                 Some(sent.as_str()),
-                Some(newest),
+                Some(given),
                 None,
             );
             drop(groups);
             self.deliver_group_state(store, id);
-            let unseen = store
-                .messages_after(id, seen.get(&member).copied().unwrap_or(0))
-                .unwrap_or_default();
+            let own = From::Member(member.clone());
             let said: Vec<Said> = unseen
                 .iter()
-                .filter(|m| m.kind != "status")
+                .filter(|m| m.kind != "status" && m.from != own)
                 .map(|m| Said {
                     member: match &m.from {
                         From::Member(a) => Some(a.as_str()),
@@ -118,7 +133,7 @@ impl Hub {
             }
             match self.send_to(&format!("{sandbox}/{member}"), id, &owner, &sent, &text) {
                 Ok(()) => {
-                    let _ = store.saw(id, &member, newest);
+                    let _ = store.saw(id, &member, given);
                     return;
                 }
                 Err(e) => {
@@ -146,10 +161,12 @@ impl Hub {
             .is_some_and(|r| r.turn == turn)
     }
 
-    /// A message of `member`'s to group `id`: `Some(true)` for the reply
-    /// that ends its running turn, to keep, then go on; `Some(false)` for
-    /// one to keep (what it says before its reply, or on its own); `None`
-    /// for one to drop (a pass, or the reply to a turn that was stopped).
+    /// A message of `member`'s to group `id`, with `files` when it carries
+    /// any: `Some(true)` for the reply that ends its running turn, to keep,
+    /// then go on; `Some(false)` for one to keep (what it says before its
+    /// reply, or on its own); `None` for one to drop (a pass, or the reply
+    /// to a turn that was stopped).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn group_reply(
         self: &Arc<Hub>,
         store: &Store,
@@ -157,6 +174,7 @@ impl Hub {
         member: &str,
         reply_to: Option<&str>,
         text: &str,
+        files: bool,
         kind: &str,
     ) -> Option<bool> {
         let (_, handles) = group_of(store, id)?;
@@ -167,7 +185,7 @@ impl Hub {
             && reply_to == Some(run.sent.as_str())
         {
             let turn = run.turn.clone();
-            let ended = d.replied(text, &handles);
+            let ended = d.replied(text, files, &handles);
             drop(groups);
             return match ended {
                 Ended::Replied => {
@@ -431,9 +449,13 @@ pub(super) fn new_group(
             return Ok(Err(format!("conversation {id} exists already")));
         }
     } else {
-        store
+        // Made meanwhile by another `group.new` with this id: theirs
+        let (owner, made) = store
             .group(id, &sandbox, &names, person)
             .map_err(|e| e.to_string())?;
+        if owner != person || made != names {
+            return Ok(Err(format!("conversation {id} exists already")));
+        }
         let name = title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| names.join(", "));

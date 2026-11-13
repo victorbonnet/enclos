@@ -288,7 +288,7 @@ class EnclosAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[%s] A routine control could not answer", self.name, exc_info=True)
             await self._write(protocol.error(
-                "conflict", "The operation's outcome is unknown. Refresh before trying again.", message["id"]))
+                "unknown", "The operation's outcome is unknown. Refresh before trying again.", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
         if message["id"] in self._seen:
