@@ -87,17 +87,39 @@ fn mobile_policy_rejects_stale_previews_and_edited_requests() {
 fn mobile_policy_cannot_drop_protected_defaults_or_edit_secret_grants() {
     let (_dir, e, name) = with_sandbox();
     let state = e.mobile_policy(&name).unwrap();
-    for c in [
-        edit("read_deny", Some("~/.ssh"), None),
-        edit("secrets", None, Some("TOKEN=secret")),
-        edit("allow", None, Some("127.0.0.1")),
-        edit("mode", Some("public"), Some("anything")),
+    for (c, why) in [
+        (
+            edit("read_deny", Some("~/.ssh"), None),
+            "protected built-in",
+        ),
+        (
+            edit("secrets", None, Some("TOKEN=secret")),
+            "cannot be edited from the app",
+        ),
+        (edit("allow", None, Some("127.0.0.1")), ""),
+        (edit("mode", Some("public"), Some("anything")), ""),
     ] {
-        assert!(
-            e.mobile_policy_preview(&name, &state.base, &c).is_err(),
-            "{c:?}"
-        );
+        let refused = e
+            .mobile_policy_preview(&name, &state.base, &c)
+            .err()
+            .unwrap_or_else(|| panic!("{c:?} was not refused"))
+            .to_string();
+        assert!(refused.contains(why), "{c:?}: {refused}");
     }
+}
+
+#[test]
+fn a_refused_phone_value_does_not_reach_the_audit_log() {
+    let (_dir, e, name) = with_sandbox();
+    let state = e.mobile_policy(&name).unwrap();
+    let before = e.audit(None).unwrap().len();
+    let forged = format!("one.example.com\u{1b}[2J{}", "x".repeat(5000));
+    let change = edit("allow", None, Some(&forged));
+    assert!(
+        e.mobile_policy_apply(&alice(), &name, &state.base, "r", &change)
+            .is_err()
+    );
+    assert_eq!(e.audit(None).unwrap().len(), before);
 }
 #[test]
 fn mobile_policy_refuses_values_with_hidden_characters() {
