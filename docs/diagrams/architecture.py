@@ -25,7 +25,7 @@ SUBTITLE = "No daemon: the CLI writes state and audit, and the service manager k
 CLIENTS = [  # x, title, lines, kind
     (40, "enclos (CLI)", ["every operation", "milestone 1"], "accent"),
     (420, "enclos ui", ["local web UI", "same audit log; later"], "later"),
-    (800, "enclos mcp", ["for scripts and operator agents", "later"], "later"),
+    (800, "Host assistants", ["Claude Code, Codex: run the CLI", "with the enclos plugin"], "solid"),
 ]
 CORE = [
     (60, "State + audit", ["SQLite + JSONL"]),
