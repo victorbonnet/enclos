@@ -5,6 +5,7 @@
 //! given that port; in the sandbox's own network namespace (bubblewrap, ADR
 //! 0039) it reaches the port on its own, and its port is read there.
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::fs::{OpenOptions, TryLockError};
 use std::net::SocketAddr;
@@ -28,6 +29,70 @@ use crate::model::session::{ProcessRef, SessionKind};
 use crate::runtime::home::stat;
 use crate::runtime::{RuntimeListener, adapter};
 use crate::state::StateStore;
+
+/// Lazily read once for all dashboards in one status call. Opening a
+/// dashboard uses a fresh snapshot of the same prerequisites.
+#[derive(Default)]
+pub(super) struct HostServices {
+    listeners: OnceCell<std::result::Result<HostListeners, String>>,
+}
+
+struct HostListeners {
+    ephemeral: RangeInclusive<u16>,
+    sockets: Vec<(u32, SocketAddr)>,
+}
+
+impl HostServices {
+    pub(super) fn port(
+        &self,
+        store: &dyn StateStore,
+        record: &SandboxRecord,
+    ) -> std::result::Result<Option<u16>, String> {
+        let Some(listener) = Engine::listener(record) else {
+            return Ok(None);
+        };
+        let service = listener.service.as_str();
+        let root = running_session(store, &record.name, service).map_err(|e| e.to_string())?;
+        let snapshot = self
+            .listeners
+            .get_or_init(|| {
+                Ok(HostListeners {
+                    ephemeral: ephemeral_ports()?,
+                    sockets: crate::lifecycle::listeners::all_tcp_listeners()
+                        .map_err(|e| e.to_string())?,
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let held: Vec<_> = snapshot
+            .sockets
+            .iter()
+            .filter(|(pid, _)| *pid == root.pid)
+            .map(|(_, addr)| *addr)
+            .collect();
+        let port =
+            chosen(service, root.pid, &held, &snapshot.ephemeral).map_err(|e| e.to_string())?;
+        let address = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        alone_at(
+            service,
+            root.pid,
+            port,
+            Ok(snapshot
+                .sockets
+                .iter()
+                .copied()
+                .filter(|(_, addr)| *addr == address)
+                .collect()),
+        )
+        .map_err(|e| e.to_string())?;
+        if !is_same(&root).map_err(|e| e.to_string())? {
+            return Err(format!("the {service} ended"));
+        }
+        outside_proxy_range(port)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// The limits of `connect`'s wait for the service to listen.
 #[derive(Debug, Clone, Copy)]

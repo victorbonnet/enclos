@@ -22,7 +22,6 @@ pub(super) struct Running {
     /// Its session, once recorded.
     pub session: Option<i64>,
     pub since: Timestamp,
-    pub url: String,
 }
 
 /// The lock, held until dropped.
@@ -89,9 +88,8 @@ fn refusal(name: &SandboxName, first: Option<&Running>) -> String {
         None => String::new(),
     };
     format!(
-        "sandbox {name} already has a dashboard: `enclos dashboard {name}` (pid {}{session}) serves {} since {}. Use that one, or end it with Ctrl-C where it runs",
+        "sandbox {name} already has a dashboard: `enclos dashboard {name}` (pid {}{session}) started at {}. Use the address printed by that run, or end it with Ctrl-C where it runs",
         first.pid,
-        first.url,
         first.since.strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 }
@@ -105,7 +103,6 @@ mod tests {
             pid: 4242,
             session,
             since: "2026-11-06T10:20:30Z".parse().unwrap(),
-            url: "http://127.0.0.1:41003/".to_owned(),
         }
     }
 
@@ -122,7 +119,7 @@ mod tests {
         };
         assert_eq!(
             what,
-            "sandbox lab already has a dashboard: `enclos dashboard lab` (pid 4242, session 12) serves http://127.0.0.1:41003/ since 2026-11-06 10:20:30 UTC. Use that one, or end it with Ctrl-C where it runs"
+            "sandbox lab already has a dashboard: `enclos dashboard lab` (pid 4242, session 12) started at 2026-11-06 10:20:30 UTC. Use the address printed by that run, or end it with Ctrl-C where it runs"
         );
         // Released once the first ends, whatever it left written: soon, as a
         // program another test starts meanwhile holds a copy until it runs.
@@ -141,5 +138,15 @@ mod tests {
         assert!(said.contains("already has a dashboard starting"), "{said}");
         let said = refusal(&name, Some(&running(None)));
         assert!(said.contains("(pid 4242)"), "{said}");
+    }
+
+    #[test]
+    fn a_lock_written_by_an_older_version_does_not_disclose_its_url() {
+        let mut old = serde_json::to_value(running(Some(12))).unwrap();
+        old["url"] = "http://127.0.0.1:41003/private-capability/".into();
+        let first: Running = serde_json::from_value(old).unwrap();
+        let name = "lab".parse().unwrap();
+        assert!(!refusal(&name, Some(&first)).contains("private-capability"));
+        assert!(!serde_json::to_string(&first).unwrap().contains("url"));
     }
 }

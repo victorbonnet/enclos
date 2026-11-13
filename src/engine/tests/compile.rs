@@ -258,6 +258,7 @@ fn a_fake_backend_s_probes_run_through_the_shared_set() {
                     env: Vec::new(),
                     in_terminal: false,
                     service_port: None,
+                    dashboard_socket: false,
                     limits: LaunchLimits::default(),
                     reads: Vec::new(),
                 };
@@ -375,6 +376,7 @@ fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
         env: Vec::new(),
         in_terminal: false,
         service_port: None,
+        dashboard_socket: false,
         limits: Default::default(),
         reads: Vec::new(),
     };

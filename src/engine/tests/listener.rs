@@ -238,45 +238,81 @@ fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatu
     view.sandboxes.remove(0)
 }
 
-/// Status shows the dashboard at the port sessions are given, nothing
-/// once the gateway is gone, and why when the port cannot be trusted.
+/// The gateway serves the SPA without its browser token, so its port is
+/// not a usable dashboard. Status directs the user to a dedicated server.
 #[test]
-fn status_shows_the_dashboard_at_the_gateways_port() {
+fn status_shows_a_dedicated_dashboard_command_instead_of_the_gateway_url() {
     use crate::engine::Fact;
+    fn ready(engine: &Engine, name: &SandboxName) {
+        std::fs::create_dir_all(engine.sandbox_home(name).join(".hermes/hermes-agent")).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.record(name)?;
+                    record.state = crate::model::sandbox::SandboxState::Running;
+                    Ok(engine.state.put(lock, &record)?)
+                },
+            )
+            .unwrap();
+    }
     let (_dir, engine, name) = with_sandbox();
-    let (child, port) = gateway(&engine, &name, 1);
+    let (child, _) = gateway(&engine, &name, 1);
+    ready(&engine, &name);
     let up = status_of(&engine, &name);
-    end(child);
-    assert_eq!(
-        up.dashboard,
-        Fact::Known(format!("http://127.0.0.1:{port}/"))
+    let command = Some(format!("enclos dashboard {name}"));
+    assert!(
+        serde_json::to_value(&up)
+            .unwrap()
+            .get("dashboard")
+            .is_none()
     );
+    assert_eq!(up.dashboard_command, command);
+    let mut unsupported = engine.record(&name).unwrap();
+    unsupported.backend = crate::model::sandbox::BackendKind::Bubblewrap;
+    let runtime = crate::runtime::adapter(unsupported.runtime.unwrap());
+    assert!(
+        engine
+            .dashboard_of(
+                &unsupported,
+                runtime.as_ref(),
+                &super::super::listener::HostServices::default()
+            )
+            .is_err()
+    );
+    assert!(
+        engine
+            .sandbox_status(unsupported, Some(runtime.as_ref()), crate::model::now())
+            .unwrap()
+            .dashboard_command
+            .is_none()
+    );
+    end(child);
     // On loopback alone: nothing the host's network reaches.
     assert_eq!(up.network_listeners, Fact::Known(Vec::new()));
-    assert_eq!(status_of(&engine, &name).dashboard, Fact::Absent);
+    let stopped = status_of(&engine, &name);
+    assert_eq!(stopped.dashboard_command, None);
 
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
+    ready(&engine, &name);
     let several = status_of(&engine, &name);
     end(child);
-    let Fact::CannotTell(why) = several.dashboard else {
-        panic!("{:?}", several.dashboard);
-    };
-    assert!(why.contains("listens on 2 ephemeral ports"), "{why}");
+    assert_eq!(several.dashboard_command, None);
 
-    // On every address: no dashboard, and the gateway is named as what
-    // the host's network reaches.
+    // The command does not depend on a gateway port, and listeners beyond
+    // loopback are still named as reachable from the host's network.
     let (_dir, engine, name) = with_sandbox();
     let (child, held) = perl(&listening(1, "0.0.0.0"), 1);
     let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
     record_gateway(&engine, &name, root);
+    ready(&engine, &name);
     let wide = status_of(&engine, &name);
     end(child);
-    assert!(
-        matches!(wide.dashboard, Fact::CannotTell(_)),
-        "{:?}",
-        wide.dashboard
-    );
+    assert_eq!(wide.dashboard_command, None);
     let Fact::Known(reached) = wide.network_listeners else {
         panic!("{:?}", wide.network_listeners);
     };

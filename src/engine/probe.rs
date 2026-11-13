@@ -347,6 +347,7 @@ impl Engine {
                         // more than a service does.
                         in_terminal: false,
                         service_port: None,
+                        dashboard_socket: false,
                         limits: limits.clone(),
                         reads: Vec::new(),
                     };

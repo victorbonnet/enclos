@@ -59,6 +59,26 @@ pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersEr
     listeners_at_under(Path::new(PROC), port, Tables::Own)
 }
 
+pub fn all_tcp_listeners() -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    let proc = Path::new(PROC);
+    let net = proc.join("self/net");
+    let sockets = net::listening_sockets(&net)?
+        .ok_or_else(|| proc_error(format!("{} shows no TCP table", net.display())))?;
+    let processes = descriptors::every_process(proc).map_err(proc_error)?;
+    Ok(processes
+        .into_iter()
+        .flat_map(|(pid, open)| {
+            open.into_iter()
+                .filter_map(|d| {
+                    sockets
+                        .get(&socket_inode(&d.target)?)
+                        .map(|addr| (pid, *addr))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
 /// The TCP addresses each of `pids` listens on in the network namespace of
 /// `namespace`, a process in it, with the pid that holds it: a socket of
 /// theirs outside that namespace is not one.

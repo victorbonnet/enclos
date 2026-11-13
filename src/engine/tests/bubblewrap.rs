@@ -422,6 +422,34 @@ fn status_looks_for_no_listener_of_a_bubblewrap_sandbox() {
     );
 }
 
+#[test]
+fn a_stopped_namespace_sandbox_still_offers_its_dashboard() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let mut record = stood.engine.record(&stood.name).unwrap();
+    record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+    record.state = crate::model::sandbox::SandboxState::Stopped;
+    let runtime = crate::runtime::adapter(record.runtime.unwrap());
+    assert!(
+        stood
+            .engine
+            .dashboard_of(
+                &record,
+                runtime.as_ref(),
+                &super::super::listener::HostServices::default()
+            )
+            .is_ok()
+    );
+    let status = stood
+        .engine
+        .sandbox_status(record, Some(runtime.as_ref()), crate::model::now())
+        .unwrap();
+    assert_eq!(
+        status.dashboard_command,
+        Some(format!("enclos dashboard {}", stood.name))
+    );
+}
+
 /// `listen = false`, which every template leaves, is not held on
 /// bubblewrap (design §15): each start says so, once.
 #[test]

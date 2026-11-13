@@ -265,9 +265,9 @@ pub trait RuntimeAdapter {
         None
     }
     /// The runtime's dashboard, a page for a browser on the host, served by
-    /// a command of its own: what `enclos dashboard` runs where the host
-    /// cannot reach the sandbox's listeners (ADR 0040). `None` (the
-    /// default): the runtime has none.
+    /// a command of its own through `enclos dashboard`: a namespace relay
+    /// on Linux (ADR 0040), or an inherited private socket on macOS
+    /// (ADR 0063, proposed). `None` (the default): the runtime has none.
     fn dashboard(&self) -> Option<RuntimeDashboard> {
         None
     }
@@ -550,11 +550,6 @@ pub struct RuntimeService {
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
-    /// The path of the page the service serves on its listener for a
-    /// browser on the host, such as `/` for Hermes's dashboard. `enclos
-    /// status` shows it at the port sessions are given, while the service
-    /// has one.
-    pub page: Option<&'static str>,
 }
 
 /// A runtime's dashboard, served by a command run in its sandbox as a
@@ -568,6 +563,17 @@ pub struct RuntimeDashboard {
     pub command: SandboxCommand,
     /// The path of its page, such as `/`.
     pub page: &'static str,
+    /// A server on a host-bound inherited Unix listener, for a backend
+    /// that shares the host's network. No TCP fallback is permitted.
+    pub socket: Option<RuntimeSocketDashboard>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSocketDashboard {
+    /// Trusted adapter source staged read-only for this session.
+    pub source: &'static str,
+    /// Launches the staged script with the runtime's own dependencies.
+    pub launcher: SandboxCommand,
 }
 
 /// A runtime's name for one of its services, stable across versions, as it

@@ -658,6 +658,7 @@ ls \"$(dirname \"$1\")\" 2>/dev/null";
             env: Vec::new(),
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads,
         };

@@ -105,18 +105,8 @@ fn fact<T>(f: &Fact<T>, shown: impl Fn(&T) -> String) -> String {
 /// What the sandbox serves on the host: its runtime's dashboard, or the
 /// command that opens it (ADR 0040), and each member the host's network can
 /// reach (ADR 0028).
-fn listener_lines(
-    dashboard: &Fact<String>,
-    command: Option<&str>,
-    listeners: &Fact<Vec<NetworkListener>>,
-) -> Vec<String> {
+fn listener_lines(command: Option<&str>, listeners: &Fact<Vec<NetworkListener>>) -> Vec<String> {
     let mut lines = Vec::new();
-    match dashboard {
-        Fact::Known(page) => lines.push(format!("dashboard {page}")),
-        Fact::CannotTell(why) => lines.push(format!("dashboard: cannot tell ({why})")),
-        // Its service is not running, as the services line shows.
-        Fact::Absent | Fact::NotProvided => {}
-    }
     if let Some(command) = command {
         lines.push(format!(
             "dashboard: `{command}` serves it to you alone, until Ctrl-C; on a remote host, run it over ssh with -L"
@@ -206,11 +196,7 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     if let Some(why) = &s.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
-    for line in listener_lines(
-        &s.dashboard,
-        s.dashboard_command.as_deref(),
-        &s.network_listeners,
-    ) {
+    for line in listener_lines(s.dashboard_command.as_deref(), &s.network_listeners) {
         println!("  {line}");
     }
 
@@ -340,48 +326,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_the_sandbox_serves_on_the_host_is_one_line_each() {
+    fn reachable_listeners_are_named_and_unknown_listeners_say_why() {
         let perl = NetworkListener {
             pid: 42,
             command: "perl".into(),
             address: "*:8000".into(),
         };
         assert_eq!(
-            listener_lines(
-                &Fact::Known("http://127.0.0.1:61374/".into()),
-                None,
-                &Fact::Known(vec![perl])
-            ),
-            [
-                "dashboard http://127.0.0.1:61374/",
-                "your network can reach perl (pid 42), listening on *:8000"
-            ]
+            listener_lines(None, &Fact::Known(vec![perl])),
+            ["your network can reach perl (pid 42), listening on *:8000"]
         );
         assert_eq!(
-            listener_lines(
-                &Fact::CannotTell("two ports".into()),
-                None,
-                &Fact::CannotTell("lsof failed".into())
-            ),
-            [
-                "dashboard: cannot tell (two ports)",
-                "listeners: cannot tell (lsof failed)"
-            ]
+            listener_lines(None, &Fact::CannotTell("lsof failed".into())),
+            ["listeners: cannot tell (lsof failed)"]
         );
-        // Not running, no such page, nothing listening: nothing to say.
-        assert!(listener_lines(&Fact::Absent, None, &Fact::Known(Vec::new())).is_empty());
-        assert!(listener_lines(&Fact::NotProvided, None, &Fact::Known(Vec::new())).is_empty());
+        assert!(listener_lines(None, &Fact::Known(Vec::new())).is_empty());
     }
 
     /// Where the host cannot reach the sandbox's listeners: the command,
     /// with no address.
     #[test]
     fn a_dashboard_the_host_cannot_reach_is_named_by_its_command() {
-        let lines = listener_lines(
-            &Fact::NotProvided,
-            Some("enclos dashboard lab"),
-            &Fact::Known(Vec::new()),
-        );
+        let lines = listener_lines(Some("enclos dashboard lab"), &Fact::Known(Vec::new()));
         assert_eq!(
             lines,
             [

@@ -70,7 +70,7 @@ enum Command {
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
-    /// Open the runtime's dashboard of a sandbox the host cannot reach, as on Linux, to you alone, until Ctrl-C.
+    /// Open the runtime's protected dashboard to you alone, until Ctrl-C.
     Dashboard(cli::dashboard::DashboardArgs),
     /// What is on this host, what it costs on disk, and what you could do.
     ///

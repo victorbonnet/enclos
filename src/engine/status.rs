@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
-use super::listener::{Network, NoPort, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -31,8 +30,7 @@ use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
-use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter};
-use crate::state::StateStore;
+use crate::runtime::{RuntimeAdapter, RuntimeAgentName, adapter};
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
 pub(super) use facts::read_provider;
@@ -59,10 +57,11 @@ impl Engine {
         let now = now();
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
+        let dashboard_services = super::listener::HostServices::default();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
-            match self.sandbox_status(record, runtime.as_deref(), now) {
+            match self.sandbox_status_in(record, runtime.as_deref(), now, &dashboard_services) {
                 Ok(s) => sandboxes.push(s),
                 Err(e) => unlisted.push(Unlisted {
                     name,
@@ -83,11 +82,27 @@ impl Engine {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn sandbox_status(
         &self,
         record: SandboxRecord,
         runtime: Option<&dyn RuntimeAdapter>,
         now: Timestamp,
+    ) -> Result<SandboxStatus> {
+        self.sandbox_status_in(
+            record,
+            runtime,
+            now,
+            &super::listener::HostServices::default(),
+        )
+    }
+
+    fn sandbox_status_in(
+        &self,
+        record: SandboxRecord,
+        runtime: Option<&dyn RuntimeAdapter>,
+        now: Timestamp,
+        dashboard_services: &super::listener::HostServices,
     ) -> Result<SandboxStatus> {
         let name = record.name.clone();
         let dir = self.layout.sandbox_dir(name.as_str());
@@ -148,16 +163,11 @@ impl Engine {
             true => Fact::NotProvided,
             false => network_listeners(&look, &running),
         };
-        let dashboard = match runtime.and_then(|rt| rt.listener()) {
-            Some(_) if own_network => Fact::NotProvided,
-            Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
-            None => Fact::NotProvided,
-        };
-        // There, `enclos dashboard` opens it, with no address to give now.
-        let dashboard_command = runtime
-            .and_then(|rt| rt.dashboard())
-            .filter(|_| own_network)
-            .map(|_| format!("enclos dashboard {name}"));
+        let dashboard_command = runtime.and_then(|rt| {
+            self.dashboard_of(&record, rt, dashboard_services)
+                .ok()
+                .map(|_| format!("enclos dashboard {name}"))
+        });
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -205,7 +215,6 @@ impl Engine {
             policy_unreadable_refused,
             agents,
             disk,
-            dashboard,
             dashboard_command,
             network_listeners,
             name,
@@ -292,31 +301,6 @@ pub(super) fn last_used(
         .flatten()
         .chain(last_network)
         .fold(created, Timestamp::max)
-}
-
-/// The address of the page `listener`'s service serves on the host, at the
-/// port sessions are given (ADR 0028), found the same way.
-fn dashboard(
-    store: &dyn StateStore,
-    name: &SandboxName,
-    listener: &RuntimeListener,
-    running: &[SessionRecord],
-) -> Fact<String> {
-    let Some(page) = listener.page else {
-        return Fact::NotProvided;
-    };
-    let service = listener.service.as_str();
-    let runs = running
-        .iter()
-        .any(|s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service));
-    if !runs {
-        return Fact::Absent;
-    }
-    match service_listener(store, name, service, &Network::Host) {
-        Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
-        Err(NoPort::NotRunning(_)) => Fact::Absent,
-        Err(why) => Fact::CannotTell(why.to_string()),
-    }
 }
 
 /// Members of the `running` sessions that run in the sandbox (the proxy runs

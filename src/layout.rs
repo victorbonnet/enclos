@@ -333,6 +333,12 @@ impl Layout {
         self.sandbox_run_dir(name).join("dashboard.lock")
     }
 
+    /// Host-bound, in the host-only run folder; the dashboard inherits
+    /// its listener without gaining access to this path.
+    pub fn dashboard_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("dashboard.sock")
+    }
+
     /// Creates the sandbox's folder of what runs, this user's alone.
     pub fn create_sandbox_run_dir(&self, name: &str) -> std::io::Result<()> {
         users_alone(&self.sandbox_run_dir(name))

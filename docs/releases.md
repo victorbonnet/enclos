@@ -1,5 +1,7 @@
 # Releases
 
+This build uses CLI JSON schema 2. Status no longer has the `dashboard` URL fact; readers use `dashboard_command`, which is null when the runtime is not ready. Consumers that require schema 1 must explicitly handle version 2 before upgrading. State, audit-file and mobile protocol versions are separate and unchanged by this CLI change.
+
 A release is a GitHub Release with three archives, each with its checksum beside it:
 
 - `enclos-aarch64-apple-darwin.tar.gz`: for Apple silicon Macs running macOS 15 or later.

@@ -13,7 +13,8 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
     ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    RuntimeService, RuntimeSocketDashboard, SandboxCommand, ServiceName, Signal, Unreadable,
+    ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -567,13 +568,7 @@ impl RuntimeAdapter for Hermes {
         // `gateway.sock` in the home, and dials the WebSocket the gateway
         // serves on 127.0.0.1:0 (`gateway/run_api.py`,
         // `hermes_cli/gateway_client.py`).
-        Some(RuntimeListener {
-            service: GATEWAY,
-            // Its web dashboard, on the same listener. Bound to loopback,
-            // Hermes asks no login for it, by its code
-            // (`listener_auth_required` in `gateway/run_api.py`).
-            page: Some("/"),
-        })
+        Some(RuntimeListener { service: GATEWAY })
     }
 
     fn dashboard(&self) -> Option<RuntimeDashboard> {
@@ -593,6 +588,19 @@ impl RuntimeAdapter for Hermes {
                 "0",
             ]),
             page: "/",
+            socket: Some(RuntimeSocketDashboard {
+                source: include_str!("hermes/dashboard.py"),
+                // Hermes's isolated launcher only imports modules from its
+                // own dependency environment. Copy our staged adapter there
+                // from inside the sandbox, as other adapter files are copied;
+                // never load sandbox Python into the host's interpreter.
+                launcher: SandboxCommand::from_words(&[
+                    "/bin/sh",
+                    "-c",
+                    "set -eu\nadapter=\"$HOME/.hermes/hermes-agent/_enclos_dashboard.py\"\ntrap '/bin/rm -f \"$adapter\"' EXIT\ntrap 'exit 1' HUP INT TERM\n/bin/cp \"$1\" \"$adapter\"\nhermes --run-module _enclos_dashboard \"$2\"",
+                    "enclos-dashboard",
+                ]),
+            }),
         })
     }
 
@@ -870,6 +878,62 @@ mod tests {
             "hermes dashboard --no-open --isolated --port 0"
         );
         assert_eq!(dashboard.page, "/");
+    }
+
+    #[test]
+    fn the_dashboard_launcher_cleans_up_after_term_in_sh_and_dash() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        for shell in ["/bin/sh", "/bin/dash"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let checkout = home.path().join(".hermes/hermes-agent");
+            std::fs::create_dir_all(&checkout).unwrap();
+            let bin = home.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::test_scripts::write_script(
+                &bin.join("hermes"),
+                "echo ready\nexec /bin/sleep 60",
+            );
+            let source = home.path().join("adapter.py");
+            std::fs::write(&source, "# staged adapter").unwrap();
+            let launcher = Hermes
+                .dashboard()
+                .unwrap()
+                .socket
+                .unwrap()
+                .launcher
+                .into_words();
+            let mut command = Command::new(shell);
+            command
+                .args(&launcher[1..])
+                .arg(&source)
+                .arg("50000")
+                .env("HOME", home.path())
+                .env("PATH", &bin)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0);
+            let mut child = crate::lifecycle::marker::spawn_unmarked(&mut command).unwrap();
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let adapter = checkout.join("_enclos_dashboard.py");
+            assert!(adapter.exists());
+            rustix::process::kill_process_group(
+                rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+                rustix::process::Signal::TERM,
+            )
+            .unwrap();
+            child.wait_with_output().unwrap();
+            assert!(!adapter.exists(), "{shell} left the adapter after TERM");
+        }
     }
 
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {

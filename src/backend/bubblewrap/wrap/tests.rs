@@ -156,6 +156,7 @@ fn launch(env: Vec<(String, SecretValue)>) -> Launch {
         env,
         in_terminal: false,
         service_port: None,
+        dashboard_socket: false,
         limits: LaunchLimits::default(),
         reads: Vec::new(),
     }
