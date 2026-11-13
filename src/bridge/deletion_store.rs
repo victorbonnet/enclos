@@ -117,7 +117,12 @@ impl Store {
 
     /// All runtime targets have acknowledged; remove the bridge's content atomically.
     /// Files are removed first, while their ids are still available for a retry.
-    pub fn finish_deletion(&self, id: &str, owner: &str) -> rusqlite::Result<Vec<String>> {
+    pub fn finish_deletion(
+        &self,
+        id: &str,
+        owner: &str,
+        device: &str,
+    ) -> rusqlite::Result<Vec<String>> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -138,10 +143,14 @@ impl Store {
             "DELETE FROM conversations WHERE id=?1 AND owner=?2",
             params![id, owner],
         )?;
-        tx.execute(
-            "UPDATE conversation_deletions SET done=1, targets='[]' WHERE id=?1 AND owner=?2",
+        let changed = tx.execute(
+            "UPDATE conversation_deletions SET done=1, targets='[]' WHERE id=?1 AND owner=?2 AND done=0",
             params![id, owner],
         )?;
+        if changed == 1 {
+            tx.execute("INSERT INTO log(at,device,person,event,reason) VALUES (?1,?2,?3,'conversation.delete',?4)", params![now(),device,owner,id])?;
+            tx.execute("DELETE FROM log WHERE rowid NOT IN (SELECT rowid FROM log ORDER BY rowid DESC LIMIT ?1)", [LOG_KEPT])?;
+        }
         tx.commit()?;
         Ok(files)
     }
@@ -199,7 +208,9 @@ mod tests {
             ["lab/main"]
         );
         assert!(
-            store.finish_deletion("c-delete", "alice").is_err(),
+            store
+                .finish_deletion("c-delete", "alice", "test-device")
+                .is_err(),
             "native confirmation required"
         );
         assert!(
@@ -214,7 +225,9 @@ mod tests {
         );
         store.deletion_target_done("c-delete", "lab/main").unwrap();
         assert_eq!(store.deletion_files("c-delete").unwrap(), ["f1"]);
-        store.finish_deletion("c-delete", "alice").unwrap();
+        store
+            .finish_deletion("c-delete", "alice", "test-device")
+            .unwrap();
         assert!(store.conversation_info("c-delete").unwrap().is_none());
         assert!(store.since("alice", 0).unwrap().is_empty());
         assert!(store.attachment("f1").unwrap().is_none());
@@ -235,7 +248,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        again.finish_deletion("c-delete", "alice").unwrap();
+        again
+            .finish_deletion("c-delete", "alice", "test-device")
+            .unwrap();
+        let entries = again.log_lines(100).unwrap();
+        let deletions: Vec<_> = entries
+            .iter()
+            .filter(|line| line.event == "conversation.delete")
+            .collect();
+        assert_eq!(
+            deletions.len(),
+            1,
+            "idempotent retries create no second audit entry"
+        );
+        assert_eq!(deletions[0].device.as_deref(), Some("test-device"));
+        assert_eq!(deletions[0].person.as_deref(), Some("alice"));
+        assert_eq!(deletions[0].reason.as_deref(), Some("c-delete"));
     }
 
     #[test]
@@ -272,7 +300,9 @@ mod tests {
             "history stays until every native session was removed"
         );
         again.deletion_target_done("g-delete", "lab/main").unwrap();
-        again.finish_deletion("g-delete", "alice").unwrap();
+        again
+            .finish_deletion("g-delete", "alice", "test-device")
+            .unwrap();
         assert!(again.members("g-delete").unwrap().is_empty());
         assert!(again.since("alice", 0).unwrap().is_empty());
     }

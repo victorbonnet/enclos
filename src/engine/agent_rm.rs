@@ -55,7 +55,7 @@ pub enum Leftover {
 
 /// What is left of `agent` in `home`: whether the runtime lists it, then
 /// whether its folder is there, looked at without following a link.
-fn leftover(
+pub(super) fn leftover(
     runtime: &dyn RuntimeAdapter,
     home: &Path,
     agent: &AgentName,

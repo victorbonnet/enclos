@@ -47,10 +47,24 @@ def owner_api_present():
         return False
 
 
+def owner_api():
+    # Hermes renamed the same four-field contract; capability probing and
+    # execution must resolve exactly the same types and functions.
+    session_contract = importlib.import_module("gateway.session_contract")
+    actor = getattr(session_contract, "SessionActor", None) or getattr(session_contract, "Principal", None)
+    from gateway.session_mutations import mutate_session
+    from gateway.session_route_recovery import messaging_owner_ref
+    if not all(callable(value) for value in (actor, getattr(session_contract, "SessionRef", None), mutate_session, messaging_owner_ref)):
+        raise ImportError("Hermes has no supported session actor contract")
+    inspect.signature(actor).bind("enclos-app", "profile", frozenset(), "enclos-plugin")
+    inspect.signature(session_contract.SessionRef).bind("profile", "conversation")
+    return actor, session_contract.SessionRef, mutate_session, messaging_owner_ref
+
+
 def available(adapter):
     try:
         if owner_api_present():
-            from gateway.session_mutations import mutate_session  # noqa: F401
+            owner_api()
             return authority(adapter) is not None and getattr(adapter, "_session_store", None) is not None
         # Pre-owner Hermes uses this same guarded SessionDB API in its mobile
         # REST endpoint. Require routing retirement too, so it cannot resurrect.
@@ -61,7 +75,7 @@ def available(adapter):
                 and "exclude_active_write_guards" in inspect.signature(SessionDB.delete_session).parameters
                 and all(callable(getattr(store, name, None)) for name in ("peek_session_id", "remove_by_session_id", "_db_for_key"))
                 and all(callable(getattr(runner, name, None)) for name in ("_is_session_running", "_evict_cached_agent")))
-    except (ImportError, AttributeError, ValueError):
+    except (ImportError, AttributeError, ValueError, TypeError):
         return False
 
 
@@ -113,16 +127,14 @@ async def delete(adapter, chat_id, request_id):
     if not owner_api_present():
         await legacy_delete(adapter, chat_id)
         return
-    from gateway.session_contract import Principal, SessionRef
-    from gateway.session_mutations import mutate_session
-    from gateway.session_route_recovery import messaging_owner_ref
+    Actor, SessionRef, mutate_session, messaging_owner_ref = owner_api()
     owner = authority(adapter)
     if owner is None:
         raise DeleteError("unsupported", "This Hermes gateway has no session owner. Update Hermes and its app channel.")
     sid = session_id(adapter, chat_id)
     if sid is None:
         return  # Empty chat, or the native deletion committed before its Ack was lost.
-    actor = Principal("enclos-app", owner.profile_id,
+    actor = Actor("enclos-app", owner.profile_id,
                       frozenset({"session:read", "session:control"}), "enclos-plugin")
     ref = messaging_owner_ref(owner, SessionRef(owner.profile_id, sid))
     row = await asyncio.to_thread(owner.db.get_session, ref.session_id)

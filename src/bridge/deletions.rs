@@ -30,6 +30,130 @@ fn storage(error: rusqlite::Error) -> ErrorBody {
 }
 
 impl Hub {
+    /// Native round-trips must never hold the device's receive/ping/outbox loop.
+    pub(super) fn request_deletion(
+        self: &Arc<Hub>,
+        device: &Device,
+        request: MessageId,
+        conversation: ConversationId,
+    ) {
+        let route = self
+            .devices
+            .lock()
+            .expect("not poisoned")
+            .get(&device.id)
+            .cloned();
+        let Some((person, sender, generation)) = route.filter(|r| r.0 == device.person) else {
+            return;
+        };
+        let key = (device.id.clone(), request.to_string());
+        {
+            let mut jobs = self.deletion_jobs.lock().expect("not poisoned");
+            if jobs.contains(&key) {
+                return;
+            }
+            if jobs.len() >= MAX_PENDING {
+                let mut error = failure(
+                    ErrorCode::AgentUnavailable,
+                    "Too many deletions pending. Retry shortly.",
+                );
+                error.of = Some(request);
+                let _ = sender.send(ToDevice::Error(error));
+                return;
+            }
+            jobs.insert(key.clone());
+        }
+        let hub = Arc::clone(self);
+        let device = device.clone();
+        let original = request.clone();
+        let job_key = key.clone();
+        let started = std::thread::Builder::new()
+            .name("conversation-delete".into())
+            .spawn(move || {
+                let result =
+                    hub.store()
+                        .map_err(|_| {
+                            failure(
+                                ErrorCode::Internal,
+                                "The deletion store is unavailable. Retry Delete.",
+                            )
+                        })
+                        .and_then(|store| {
+                            if !store.device(&device.id).ok().flatten().is_some_and(|d| {
+                                d.person == person && d.noise_key == device.noise_key
+                            }) {
+                                return Err(failure(
+                                    ErrorCode::NotAllowed,
+                                    "This device is no longer paired.",
+                                ));
+                            }
+                            let result =
+                                hub.delete_conversation(&store, &person, &conversation, &device.id);
+                            // A revoked device gets no result, and a replacement connection
+                            // recovers canonical state through sync instead of stale receipts.
+                            if store.device(&device.id).ok().flatten().is_some_and(|d| {
+                                d.person == person && d.noise_key == device.noise_key
+                            }) {
+                                let response = match result {
+                                    Ok(()) => ToDevice::Ack {
+                                        of: request.clone(),
+                                    },
+                                    Err(mut error) => {
+                                        error.of = Some(request.clone());
+                                        ToDevice::Error(error)
+                                    }
+                                };
+                                let routes = hub.devices.lock().expect("not poisoned");
+                                if let Some((owner, out, current)) = routes.get(&device.id)
+                                    && owner == &person
+                                    && *current == generation
+                                {
+                                    let _ = out.send(response);
+                                }
+                            }
+                            Ok(())
+                        });
+                if let Err(mut error) = result {
+                    error.of = Some(request);
+                    let _ = sender.send(ToDevice::Error(error));
+                }
+                hub.deletion_jobs
+                    .lock()
+                    .expect("not poisoned")
+                    .remove(&job_key);
+            });
+        if started.is_err() {
+            self.deletion_jobs
+                .lock()
+                .expect("not poisoned")
+                .remove(&key);
+            // The original session's sender is obtained again only if its generation survived.
+            let routes = self.devices.lock().expect("not poisoned");
+            if let Some((_, out, current)) = routes.get(&key.0)
+                && *current == generation
+            {
+                let mut error = failure(
+                    ErrorCode::Internal,
+                    "Could not start deletion. Retry Delete.",
+                );
+                error.of = Some(original);
+                let _ = out.send(ToDevice::Error(error));
+            }
+        }
+    }
+
+    fn deletion_target_absent(&self, agent: &str) -> bool {
+        let Some((sandbox, agent)) = agent.split_once('/') else {
+            return false;
+        };
+        let (Ok(sandbox), Ok(agent)) = (sandbox.parse(), agent.parse()) else {
+            return false;
+        };
+        crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
+            .app_agent_data_absent(&sandbox, &agent)
+            .unwrap_or(false)
+    }
+
     pub(super) fn delete_answer(
         &self,
         agent: &str,
@@ -92,6 +216,7 @@ impl Hub {
         store: &Store,
         person: &str,
         conversation: &ConversationId,
+        device: &str,
     ) -> Result<(), ErrorBody> {
         let id = conversation.as_str();
         // Owner and Home checks precede all plugin access, including retries.
@@ -104,13 +229,16 @@ impl Hub {
             return Err(failure(ErrorCode::NotAllowed, "No such conversation."));
         }
         // One device's first refusal cannot release a reservation another is using.
-        let serial = self
-            .deletion_locks
-            .lock()
-            .expect("not poisoned")
-            .entry(id.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        let serial = {
+            let mut locks = self.deletion_locks.lock().expect("not poisoned");
+            locks.retain(|_, weak| weak.strong_count() > 0);
+            let serial = locks
+                .get(id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            locks.insert(id.to_owned(), Arc::downgrade(&serial));
+            serial
+        };
         let _serial = serial.lock().expect("not poisoned");
         let fresh = !store.deletion_started(id).map_err(storage)?;
         let targets = store
@@ -121,6 +249,10 @@ impl Hub {
         // releases its reservation, so normal conversation use can continue.
         let mut ready = Vec::new();
         for agent in targets {
+            if self.deletion_target_absent(&agent) {
+                store.deletion_target_done(id, &agent).map_err(storage)?;
+                continue;
+            }
             match self.deletion_plugin(&agent) {
                 Ok((out, generation)) => ready.push((agent, out, generation)),
                 Err(error) => {
@@ -203,7 +335,7 @@ impl Hub {
                 }
             }
         }
-        store.finish_deletion(id, person).map_err(storage)?;
+        store.finish_deletion(id, person, device).map_err(storage)?;
         self.groups.lock().expect("not poisoned").remove(id);
         self.deliver(
             person,

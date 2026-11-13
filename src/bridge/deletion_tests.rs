@@ -90,7 +90,9 @@ fn fixture(names: &[&str]) -> (tempfile::TempDir, Arc<Hub>, Store) {
 fn deleting(hub: &Arc<Hub>, id: &str) -> std::thread::JoinHandle<Result<(), ErrorBody>> {
     let hub = Arc::clone(hub);
     let id = ConversationId::new(id).unwrap();
-    std::thread::spawn(move || hub.delete_conversation(&hub.store().unwrap(), "alice", &id))
+    std::thread::spawn(move || {
+        hub.delete_conversation(&hub.store().unwrap(), "alice", &id, "test-device")
+    })
 }
 
 #[test]
@@ -126,10 +128,20 @@ fn native_confirmation_precedes_removal_and_only_the_owners_devices_learn_it() {
         ("other".into(), ("bob".into(), other, 3)),
     ]);
     let missing = hub
-        .delete_conversation(&store, "alice", &ConversationId::new("missing").unwrap())
+        .delete_conversation(
+            &store,
+            "alice",
+            &ConversationId::new("missing").unwrap(),
+            "test-device",
+        )
         .unwrap_err();
     let refused = hub
-        .delete_conversation(&store, "bob", &ConversationId::new("c-delete").unwrap())
+        .delete_conversation(
+            &store,
+            "bob",
+            &ConversationId::new("c-delete").unwrap(),
+            "test-device",
+        )
         .unwrap_err();
     assert_eq!(missing, refused);
     let work = deleting(&hub, "c-delete");
@@ -161,8 +173,13 @@ fn native_confirmation_precedes_removal_and_only_the_owners_devices_learn_it() {
         .is_none(),
         "late native output is not redirected to Home"
     );
-    hub.delete_conversation(&store, "alice", &ConversationId::new("c-delete").unwrap())
-        .unwrap();
+    hub.delete_conversation(
+        &store,
+        "alice",
+        &ConversationId::new("c-delete").unwrap(),
+        "test-device",
+    )
+    .unwrap();
     assert!(
         requests.try_recv().is_err(),
         "retry needs no already-deleted runtime"
@@ -222,7 +239,12 @@ fn older_plugins_and_home_are_refused_without_locking_or_erasing_the_chat() {
         .conversation("c-delete", "lab", "main", "alice")
         .unwrap();
     let error = hub
-        .delete_conversation(&store, "alice", &ConversationId::new("c-delete").unwrap())
+        .delete_conversation(
+            &store,
+            "alice",
+            &ConversationId::new("c-delete").unwrap(),
+            "test-device",
+        )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Unsupported);
     assert!(!store.deletion_started("c-delete").unwrap());
@@ -238,11 +260,91 @@ fn older_plugins_and_home_are_refused_without_locking_or_erasing_the_chat() {
         hub.delete_conversation(
             &store,
             "alice",
-            &ConversationId::new("home.lab.main").unwrap()
+            &ConversationId::new("home.lab.main").unwrap(),
+            "test-device"
         )
         .unwrap_err()
         .code,
         ErrorCode::NotAllowed
     );
     assert!(store.conversation_info("home.lab.main").unwrap().is_some());
+}
+
+#[test]
+fn removed_agent_finishes_deletion_but_kept_native_data_requires_its_channel() {
+    use crate::model::sandbox::{BackendKind, SandboxRecord, SandboxState};
+    use crate::state::StateStore;
+    use crate::state::sqlite::SqliteStateStore;
+    let (_dir, hub, store) = fixture(&[]);
+    std::fs::create_dir_all(hub.layout.data()).unwrap();
+    let state = SqliteStateStore::new(
+        hub.layout.state_db(),
+        hub.layout.state_lock(),
+        crate::state::Wait::Command,
+    );
+    {
+        let lock = state.lock().unwrap();
+        state.migrate(&lock).unwrap();
+        state
+            .put(
+                &lock,
+                &SandboxRecord {
+                    name: "lab".parse().unwrap(),
+                    backend: BackendKind::Seatbelt,
+                    created_from: "minimal".parse().unwrap(),
+                    state: SandboxState::Stopped,
+                    proxy_port: 41000,
+                    runtime: Some(crate::model::runtime::RuntimeKind::Hermes),
+                    created_at: jiff::Timestamp::now(),
+                },
+            )
+            .unwrap();
+    }
+    let profiles = hub.layout.sandbox_home("lab").join(".hermes/profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    store
+        .conversation("c-removed", "lab", "gone", "alice")
+        .unwrap();
+    hub.delete_conversation(
+        &store,
+        "alice",
+        &ConversationId::new("c-removed").unwrap(),
+        "phone",
+    )
+    .unwrap();
+    assert!(store.conversation_info("c-removed").unwrap().is_none());
+    let folder = profiles.join("kept");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("config.yaml"), "model: auto\n").unwrap();
+    store
+        .conversation("c-kept", "lab", "kept", "alice")
+        .unwrap();
+    assert_eq!(
+        hub.delete_conversation(
+            &store,
+            "alice",
+            &ConversationId::new("c-kept").unwrap(),
+            "phone"
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::AgentUnavailable
+    );
+    assert!(!store.deletion_started("c-kept").unwrap());
+    assert!(store.conversation_info("c-kept").unwrap().is_some());
+    // A profile no longer listed by Hermes can still have data on disk.
+    std::fs::remove_file(folder.join("config.yaml")).unwrap();
+    assert!(!hub.deletion_target_absent("lab/kept"));
+    std::fs::remove_dir(&folder).unwrap();
+    // A reservation from an earlier failed attempt also completes when its
+    // native target is now demonstrably gone.
+    store.begin_deletion("c-kept", "alice").unwrap();
+    hub.delete_conversation(
+        &store,
+        "alice",
+        &ConversationId::new("c-kept").unwrap(),
+        "phone",
+    )
+    .unwrap();
+    assert!(store.conversation_info("c-kept").unwrap().is_none());
 }

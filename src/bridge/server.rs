@@ -155,7 +155,8 @@ struct Hub {
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
     deletions: Mutex<HashMap<String, deletions::PendingDelete>>,
-    deletion_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    deletion_jobs: Mutex<HashSet<(String, String)>>,
     questions: Mutex<questions::QuestionRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
@@ -263,6 +264,7 @@ impl Hub {
             routines: Mutex::new(Default::default()),
             deletions: Mutex::new(HashMap::new()),
             deletion_locks: Mutex::new(HashMap::new()),
+            deletion_jobs: Mutex::new(HashSet::new()),
             opening,
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
@@ -1832,16 +1834,7 @@ fn run_session(
                 read(hub, store, person, &conversation, seq)?;
             }
             FromDevice::ConversationDelete { conversation } => {
-                match hub.delete_conversation(store, person, &conversation) {
-                    Ok(()) => {
-                        link.send(ToDevice::ConversationDeleted { conversation })?;
-                        link.send(ToDevice::Ack { of: message.id })?;
-                    }
-                    Err(mut error) => {
-                        error.of = Some(message.id);
-                        link.send(ToDevice::Error(error))?;
-                    }
-                }
+                hub.request_deletion(device, message.id, conversation);
             }
             FromDevice::ConversationArchive {
                 conversation,
@@ -3768,5 +3761,96 @@ mod connection_end_tests {
         )));
         assert_ne!(other, GONE);
         assert_ne!(other, CLOSED);
+    }
+    #[test]
+    fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge_with(folder.path(), Duration::from_millis(600));
+        let listener = UnixListener::bind(&bridge.socket).unwrap();
+        let (waiting, wait) = channel();
+        let (release, released) = channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = String::new();
+            lines.read_line(&mut line).unwrap();
+            out.write_all(&encode_line(&Envelope::new(
+                MessageId::new("hello").unwrap(),
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![Capability::ConversationDelete],
+                },
+            )))
+            .unwrap();
+            loop {
+                line.clear();
+                if lines.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let packet = decode_from_bridge(line.as_bytes()).unwrap();
+                if let FromBridge::Delete { .. } = packet.body {
+                    waiting.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    out.write_all(&encode_line(&Envelope::new(
+                        MessageId::new("native-ack").unwrap(),
+                        FromPlugin::Ack { of: packet.id },
+                    )))
+                    .unwrap();
+                }
+            }
+        });
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        let store = Store::open(&bridge.store).unwrap();
+        store
+            .conversation("c-live-delete", "lab", "main", PERSON)
+            .unwrap();
+        device.send(
+            "delete-live",
+            FromDevice::ConversationDelete {
+                conversation: ConversationId::new("c-live-delete").unwrap(),
+            },
+        );
+        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Remain pending beyond the silence threshold while this SAME socket
+        // keeps sending pings and receiving ordinary sync responses.
+        for _ in 0..5 {
+            device.socket.send(Message::Ping(vec![1].into())).unwrap();
+            device.send("sync-pending", FromDevice::Sync { since: 0 });
+            loop {
+                match device.receive() {
+                    Some(ToDevice::Synced { .. }) => break,
+                    Some(_) => {}
+                    None => panic!("the pending deletion blocked this socket's sync"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(160));
+        }
+        assert!(store.conversation_info("c-live-delete").unwrap().is_some());
+        release.send(()).unwrap();
+        let mut deleted = 0;
+        loop {
+            match device.receive() {
+                Some(ToDevice::ConversationDeleted { conversation })
+                    if conversation.as_str() == "c-live-delete" =>
+                {
+                    deleted += 1
+                }
+                Some(ToDevice::Ack { of }) if of.as_str() == "delete-live" => break,
+                Some(_) => {}
+                None => panic!("deletion starved the device session"),
+            }
+        }
+        assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+        device.send("sync-after-delete", FromDevice::Sync { since: 0 });
+        loop {
+            match device.receive() {
+                Some(ToDevice::Synced { .. }) => break,
+                Some(_) => {}
+                None => panic!("the deletion completion closed this socket"),
+            }
+        }
     }
 }

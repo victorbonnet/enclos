@@ -104,3 +104,56 @@ class NativeDeletion(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(conversations.DeleteError):
                 await conversations.legacy_delete(adapter, 'chat')
         self.assertEqual(actions, [], 'a routed profile must never delete from the launch profile')
+
+    async def test_both_real_actor_shapes_and_the_capability_probe_share_one_contract(self):
+        from dataclasses import make_dataclass
+        for name in ("SessionActor", "Principal"):
+            with self.subTest(actor=name):
+                adapter, owner, mutate, cleaned, modules = self.fixture()
+                actor_type = make_dataclass(name, ["subject", "profile_id", "capabilities", "transport_id"])
+                contract = modules["gateway.session_contract"]
+                del contract.Principal
+                setattr(contract, name, actor_type)
+                adapter._session_store = object()
+                with patch.dict(sys.modules, modules), patch.object(conversations, "authority", return_value=owner), \
+                     patch.object(conversations, "session_id", return_value="session"):
+                    self.assertTrue(conversations.available(adapter))
+                    await conversations.handle(adapter, {"id": "native-actor", "conversation": "chat"})
+                self.assertEqual(adapter._write.await_args.args[0]["type"], "ack")
+                actor = mutate.await_args.args[1]
+                self.assertIsInstance(actor, actor_type)
+                self.assertEqual((actor.subject, actor.profile_id, actor.transport_id), ("enclos-app", owner.profile_id, "enclos-plugin"))
+
+    async def test_missing_actor_or_ref_does_not_advertise_or_dispatch_deletion(self):
+        for missing in ("Principal", "SessionRef"):
+            with self.subTest(missing=missing):
+                adapter, owner, mutate, cleaned, modules = self.fixture()
+                adapter._session_store = object()
+                delattr(modules["gateway.session_contract"], missing)
+                with patch.dict(sys.modules, modules), patch.object(conversations, "authority", return_value=owner):
+                    self.assertFalse(conversations.available(adapter))
+                    await conversations.handle(adapter, {"id": "no-contract", "conversation": "chat"})
+                self.assertEqual(adapter._write.await_args.args[0]["code"], "unsupported")
+                mutate.assert_not_awaited()
+
+    @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "real Hermes checkout not supplied")
+    async def test_real_checkout_actor_contract_supports_the_deletion_path(self):
+        # Exercise the real source contract in hermes-latest CI and local probes;
+        # only the live owner/database are stand-ins, never its public actor type.
+        import importlib.util
+        path = Path(os.environ["ENCLOS_HERMES_SOURCE"]) / "gateway/session_contract.py"
+        spec = importlib.util.spec_from_file_location("_enclos_native_session_contract", path)
+        contract = importlib.util.module_from_spec(spec)
+        adapter, owner, mutate, cleaned, modules = self.fixture()
+        modules["gateway.session_contract"] = contract
+        modules[contract.__name__] = contract
+        adapter._session_store = object()
+        with patch.dict(sys.modules, modules), patch.object(conversations, "authority", return_value=owner), \
+             patch.object(conversations, "session_id", return_value="session"):
+            spec.loader.exec_module(contract)
+            self.assertTrue(conversations.available(adapter))
+            await conversations.handle(adapter, {"id": "real-contract", "conversation": "chat"})
+        self.assertEqual(adapter._write.await_args.args[0]["type"], "ack")
+        actor = mutate.await_args.args[1]
+        expected = getattr(contract, "SessionActor", None) or contract.Principal
+        self.assertIsInstance(actor, expected)

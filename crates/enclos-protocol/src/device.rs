@@ -206,11 +206,11 @@ pub enum ToDevice {
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
-    /// One of the person's conversations: each at `sync`, before the
-    /// messages, and again whenever its name, read position or archive state changes.
     /// A permanent deletion, repeated at sync even when there are no new messages.
     #[serde(rename = "conversation.deleted")]
     ConversationDeleted { conversation: ConversationId },
+    /// One of the person's conversations: each at `sync`, before the
+    /// messages, and again whenever its name, read position or archive state changes.
     #[serde(rename = "conversation")]
     Conversation(ConversationInfo),
     #[serde(rename = "message")]
