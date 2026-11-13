@@ -21,6 +21,8 @@ mod tests;
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "avatars.rs"]
+mod avatars;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -315,31 +317,20 @@ impl Hub {
     /// What a device asking for the agents is sent: the list, then each
     /// agent's commands as far as the bridge knows them; the others come
     /// once their plugin connects.
-    fn agents_answer(&self) -> Vec<ToDevice> {
-        let plugins = self.plugins.lock().expect("not poisoned");
-        let agents = self
-            .agents
-            .iter()
-            .map(|a| AgentInfo {
-                agent: a.name.clone(),
-                runtime: a.runtime.clone(),
-                capabilities: plugins
-                    .get(&a.name)
-                    .map(|p| p.capabilities.clone())
-                    .unwrap_or_default(),
-                abilities: vec!["read".to_owned(), "chat".to_owned()],
-            })
-            .collect();
-        drop(plugins);
+    fn agents_answer(&self, store: &Store, person: &str) -> Result<Vec<ToDevice>, String> {
+        let agents = self.agent_infos(store, person)?;
         let mut answer = vec![ToDevice::AgentsList { agents }];
         let commands = self.commands.lock().expect("not poisoned");
         for (agent, commands) in commands.iter() {
-            answer.push(ToDevice::Commands {
-                agent: agent.clone(),
-                commands: commands.clone(),
-            });
+            // Only for agents this person is shown
+            if self.sees_agent(person, agent) {
+                answer.push(ToDevice::Commands {
+                    agent: agent.clone(),
+                    commands: commands.clone(),
+                });
+            }
         }
-        answer
+        Ok(answer)
     }
 
     /// Opens, in the background, the plugin connections that are not open:
@@ -1471,6 +1462,14 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::AgentAvatarGet { agent } => {
+                link.send(hub.avatar_get_reply(store, device, person, &agent, message.id))?;
+            }
+            FromDevice::AgentAvatarSet(edit) => {
+                for reply in hub.avatar_set_replies(store, device, person, &edit, message.id) {
+                    link.send(reply)?;
+                }
+            }
             FromDevice::SandboxPolicyGet { sandbox } => {
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
@@ -1547,7 +1546,7 @@ fn run_session(
                 }
             }
             FromDevice::Agents => {
-                for answer in hub.agents_answer() {
+                for answer in hub.agents_answer(store, person)? {
                     link.send(answer)?;
                 }
                 hub.open_plugins();
@@ -1678,8 +1677,7 @@ fn run_session(
                 if let Err(why) = forget(hub, store, device, person) {
                     link.send(ToDevice::Error(ErrorBody {
                         of: Some(message.id),
-                        // `internal` once the protocol has it
-                        code: ErrorCode::Unknown,
+                        code: ErrorCode::Internal,
                         message: format!("this host was not forgotten: {why}"),
                     }))?;
                     continue;
@@ -3243,7 +3241,7 @@ mod connection_end_tests {
         let Some(ToDevice::Error(error)) = device.receive() else {
             panic!("not refused");
         };
-        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.code, ErrorCode::Internal);
         assert_eq!(error.of.unwrap().as_str(), "forget-1");
         let store = Store::open(&bridge.store).unwrap();
         assert!(store.device(&phone.id).unwrap().is_some());

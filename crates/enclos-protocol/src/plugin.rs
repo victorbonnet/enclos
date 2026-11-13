@@ -259,6 +259,10 @@ pub enum ErrorCode {
     UnknownAgent,
     UnknownConversation,
     AgentUnavailable,
+    /// What the request changes was changed since the revision it names.
+    Conflict,
+    /// The receiver failed on its side; trying again later may work.
+    Internal,
     #[serde(other)]
     Unknown,
 }

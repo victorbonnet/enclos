@@ -31,6 +31,7 @@ close_fds = "0.3.2"
 enclos-protocol = { version = "0.1.0", path = "crates/enclos-protocol" }
 getrandom = "0.4.3"
 icu_properties = "2.3.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 jiff = { version = "0.2.38", features = ["serde"] }
 psl = "2.1.242"
 qrcode = { version = "0.14.1", default-features = false }

@@ -12,6 +12,7 @@
 //!   reads it.
 
 pub mod approval;
+pub mod avatar;
 pub mod device;
 mod envelope;
 mod ids;

@@ -83,6 +83,13 @@ pub struct StoredAttachment {
     pub size: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredAvatar {
+    pub revision: i64,
+    pub version: Option<String>,
+    pub image: Option<Vec<u8>>,
+}
+
 /// A conversation named by its runtime.
 pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
@@ -152,6 +159,7 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS agent_avatars (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>=0), version TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS approval_marks (name TEXT PRIMARY KEY, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS conversations (
@@ -338,6 +346,79 @@ pub struct PairingRequest {
 }
 
 impl Store {
+    /// The shared photo, or revision zero before the first edit.
+    pub fn avatar(&self, agent: &str) -> rusqlite::Result<StoredAvatar> {
+        self.db
+            .query_row(
+                "SELECT revision,version,image FROM agent_avatars WHERE agent=?1",
+                [agent],
+                |r| {
+                    Ok(StoredAvatar {
+                        revision: r.get(0)?,
+                        version: r.get(1)?,
+                        image: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map(|a| a.unwrap_or_default())
+    }
+    pub fn avatar_metadata(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, enclos_protocol::avatar::AvatarMetadata>>
+    {
+        let mut q = self
+            .db
+            .prepare("SELECT agent,revision,version FROM agent_avatars")?;
+        q.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                enclos_protocol::avatar::AvatarMetadata {
+                    revision: r.get(1)?,
+                    version: r.get(2)?,
+                },
+            ))
+        })?
+        .collect()
+    }
+    /// The revision guard and device log commit with the image; removal retains a tombstone.
+    pub fn set_avatar(
+        &self,
+        agent: &str,
+        expected: i64,
+        image: Option<&[u8]>,
+        by: (&str, &str),
+    ) -> rusqlite::Result<Option<StoredAvatar>> {
+        // Immediate: the write lock is taken (waiting out the busy timeout)
+        // before the revision is read, so a plugin thread writing meanwhile
+        // cannot make the later write fail at once with SQLITE_BUSY.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM agent_avatars WHERE agent=?1",
+                [agent],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if revision != expected {
+            return Ok(None);
+        }
+        let next = StoredAvatar {
+            revision: revision
+                .checked_add(1)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            version: image.map(crate::policy::sha256_hex),
+            image: image.map(<[u8]>::to_vec),
+        };
+        tx.execute("INSERT INTO agent_avatars VALUES (?1,?2,?3,?4) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,version=excluded.version,image=excluded.image",params![agent,next.revision,next.version,next.image])?;
+        tx.execute("INSERT INTO log(at,device,person,event,reason) VALUES (?1,?2,?3,'agent.avatar.set',?4)",params![now(),by.0,by.1,format!("{agent} revision {}",next.revision)])?;
+        tx.commit()?;
+        Ok(Some(next))
+    }
     /// All accepted records, without the inbox history window, for active-grant provenance.
     pub fn accepted_access(&self) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
         let mut q = self
