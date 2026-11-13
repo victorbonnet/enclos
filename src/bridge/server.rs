@@ -2219,6 +2219,12 @@ fn archive_conversation(
     archived: bool,
 ) -> Result<ConversationInfo, ArchiveError> {
     let refused = || ArchiveError::Refused("no such conversation".to_owned());
+    if archived
+        && is_home(id)
+        && store.owner(id).map_err(ArchiveError::storage)?.as_deref() == Some(person)
+    {
+        return Err(ArchiveError::Refused("Home cannot be archived".into()));
+    }
     let changed = store
         .set_archived(id, person, archived)
         .map_err(ArchiveError::storage)?

@@ -464,6 +464,52 @@ fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
 }
 
 #[test]
+fn home_archive_is_rejected_without_a_broadcast_and_unarchive_still_recovers_it() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let home = home_id("lab/main");
+    store.ensure_home("lab/main", owner, false).unwrap();
+    let (tx, rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("phone".into(), (owner.into(), tx, 0));
+    let before = store.conversation_info(&home).unwrap().unwrap();
+    assert_eq!(
+        archive_conversation(&hub, &store, owner, &home, true).unwrap_err(),
+        ArchiveError::Refused("Home cannot be archived".into())
+    );
+    assert_eq!(store.conversation_info(&home).unwrap().unwrap(), before);
+    assert!(rx.try_recv().is_err());
+    let missing = archive_conversation(&hub, &store, owner, "home.missing.main", true).unwrap_err();
+    assert_eq!(
+        archive_conversation(&hub, &store, "guest@example.com", &home, true).unwrap_err(),
+        missing
+    );
+    let current = archive_conversation(&hub, &store, owner, &home, false).unwrap();
+    assert!(current.home);
+    assert!(!current.archived);
+    assert_eq!(current.revision, before.revision);
+    assert!(rx.try_recv().is_err());
+
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute(
+            "UPDATE conversations SET archived = 1 WHERE id = ?1",
+            [&home],
+        )
+        .unwrap();
+    let restored = archive_conversation(&hub, &store, owner, &home, false).unwrap();
+    assert!(restored.home);
+    assert!(!restored.archived);
+    assert_eq!(restored.revision, before.revision + 1);
+    let ToDevice::Conversation(broadcast) = rx.try_recv().unwrap() else {
+        panic!("expected restored Home metadata");
+    };
+    assert_eq!(broadcast, restored);
+}
+
+#[test]
 fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";

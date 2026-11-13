@@ -140,8 +140,11 @@ One exchange with an agent through the mobile app, started by one person, who ow
 _Avoid_: session (a sandbox's word), chat, thread
 
 **Archived conversation**:
-A conversation its owner has set aside from the active list, with its identity and history kept until restored.
+A conversation other than Home that its owner has set aside from the active list, with its identity and history kept until restored.
 _Avoid_: deleted conversation, closed conversation
+
+**Home conversation**:
+An agent's permanent conversation for messages that have no other destination, including scheduled output and the runtime's notices.
 
 **Group**:
 A conversation between one person and several agents of one sandbox, which the bridge keeps and whose turns it runs. Each agent answers in turn, when addressed by its handle (`@main`), by `@all`, or by another member.
