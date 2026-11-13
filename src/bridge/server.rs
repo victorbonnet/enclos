@@ -29,6 +29,8 @@ mod avatars;
 mod group_turns;
 #[path = "policy.rs"]
 mod policy;
+#[path = "questions.rs"]
+mod questions;
 #[path = "routines.rs"]
 mod routines;
 
@@ -149,6 +151,7 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
+    questions: Mutex<questions::QuestionRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
     /// callers that need that agent, not the bridge.
@@ -249,6 +252,7 @@ impl Hub {
             routines: Mutex::new(Default::default()),
             opening,
             opening_all: AtomicBool::new(false),
+            questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
@@ -395,13 +399,6 @@ impl Hub {
     /// when a request that waits for the person arrives in it (ADR 0049):
     /// the flag is cleared, and the owner's devices get the metadata.
     /// Whether it was archived.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "questions and command approvals, which call it, are not on this branch yet"
-        )
-    )]
     pub(super) fn unarchive_for_request(&self, store: &Store, id: &str) -> rusqlite::Result<bool> {
         if !store.unarchive_for_request(id)? {
             return Ok(false);
@@ -455,6 +452,16 @@ impl Hub {
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
+        let origin = questions::Origin {
+            agent,
+            connection: &routine_connection,
+        };
+        let capable = hello.capabilities.contains(&Capability::Questions);
+        let store = self.store().ok();
+        self.question_connected(store.as_ref(), origin, capable);
+        if capable && let Some(store) = &store {
+            self.sync_questions(store, agent, &mut writer)?;
+        }
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
         {
             let mut plugins = self.plugins.lock().expect("not poisoned");
@@ -500,6 +507,10 @@ impl Hub {
                 Ok(store) => store,
                 Err(e) => return eprintln!("enclos app: {e}"),
             };
+            let origin = || questions::Origin {
+                agent: &agent,
+                connection: &routine_connection,
+            };
             loop {
                 let message = match reader.receive() {
                     Ok(Some(message)) => message,
@@ -518,6 +529,7 @@ impl Hub {
                     // plugin) fails now, not after 15 minutes; a routine
                     // control waiting on it gets its answer.
                     FromPlugin::Error(error) => {
+                        hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
                                 "the member's app channel refused the turn: {}",
@@ -526,6 +538,34 @@ impl Hub {
                             hub.fail_turns(&store, &agent, Some(of.as_str()), &why);
                         }
                         hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
+                    FromPlugin::QuestionAsk {
+                        conversation,
+                        question,
+                    } => {
+                        let result = hub.question_ask(
+                            &store,
+                            origin(),
+                            &conversation,
+                            &question,
+                            &message.id,
+                        );
+                        questions::acknowledge_ask(&mut acks, &message.id, result);
+                    }
+                    FromPlugin::QuestionUpdate {
+                        question,
+                        state,
+                        answer,
+                        of,
+                    } => {
+                        let update = questions::Update {
+                            question,
+                            state,
+                            answer,
+                            of,
+                        };
+                        let result = hub.question_update(&store, origin(), update, &message.id);
+                        questions::acknowledge_question(&mut acks, &message.id, result);
                     }
                     FromPlugin::MessageOut {
                         conversation,
@@ -593,6 +633,7 @@ impl Hub {
                             From::Agent
                         };
                         let whole = ConversationMessage {
+                            question: None,
                             conversation: conversation.clone(),
                             agent: agent.clone(),
                             from: "agent".to_owned(),
@@ -717,6 +758,7 @@ impl Hub {
                     _ => {}
                 }
             }
+            hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
             // turn it was running gets no reply on this connection.
@@ -1546,6 +1588,21 @@ fn run_session(
                     }
                 }
             }
+            FromDevice::QuestionAnswer {
+                question,
+                revision,
+                answer,
+            } => {
+                let request = questions::AnswerRequest {
+                    question,
+                    revision,
+                    answer,
+                };
+                if let Err(error) = hub.question_answer(store, device, person, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
@@ -1741,6 +1798,15 @@ fn run_session(
                         link.send(ToDevice::Conversation(info))?;
                     }
                 }
+                // Pending cards must refresh even when their introduction predates `since`.
+                for question in store
+                    .pending_questions_for(person)
+                    .map_err(|e| e.to_string())?
+                {
+                    link.send(ToDevice::Question {
+                        question: question.info,
+                    })?;
+                }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
@@ -1757,7 +1823,17 @@ fn run_session(
                         .into_iter()
                         .map(attachment_info)
                         .collect();
+                    if let Some(question) = &m.question
+                        && let Some(current) =
+                            store.question(question).map_err(|e| e.to_string())?
+                        && current.owner == person
+                    {
+                        link.send(ToDevice::Question {
+                            question: current.info,
+                        })?;
+                    }
                     link.send(ToDevice::Message(ConversationMessage {
+                        question: m.question,
                         conversation: ConversationId::new(m.conversation)
                             .map_err(|e| e.to_string())?,
                         agent,
@@ -2337,6 +2413,7 @@ fn send(
     let group = group_of(store, conversation.as_str()).is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
+        question: None,
         conversation: conversation.clone(),
         // A group is its sandbox's
         agent: if group { sandbox } else { name.clone() },

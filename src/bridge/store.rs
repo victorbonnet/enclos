@@ -8,6 +8,13 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[path = "question_store.rs"]
+mod question_store;
+pub use question_store::{
+    MAX_PENDING_PER_AGENT, MAX_PENDING_PER_CONVERSATION, QuestionChange, QuestionStoreError,
+    Settlement, StoredQuestion,
+};
+
 /// Who wrote a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum From {
@@ -20,6 +27,7 @@ pub enum From {
 /// One stored message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    pub question: Option<enclos_protocol::QuestionId>,
     pub seq: i64,
     pub id: String,
     pub conversation: String,
@@ -35,6 +43,18 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let person: Option<String> = row.get(3)?;
     let speaker: Option<String> = row.get(7)?;
     Ok(Message {
+        question: row
+            .get::<_, Option<String>>(8)?
+            .map(|id| {
+                enclos_protocol::QuestionId::new(id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
         seq: row.get(0)?,
         id: row.get(1)?,
         conversation: row.get(2)?,
@@ -169,6 +189,22 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     }
     // A group's agent messages say which member spoke (ADR 0045, proposed).
     add_column(db, "messages", "speaker", "TEXT")?;
+    add_column(db, "messages", "question", "TEXT")?;
+    // A question's owner is its conversation's, read from there: the copy
+    // an earlier build kept went stale when a Home was claimed.
+    let mut query = db.prepare("SELECT name FROM pragma_table_info('questions')")?;
+    let columns = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|c| c == "owner") {
+        // Dropped meanwhile by another process opening it, as in add_column
+        match db.execute_batch("ALTER TABLE questions DROP COLUMN owner") {
+            Err(rusqlite::Error::SqliteFailure(_, Some(why)))
+                if why.starts_with("no such column") => {}
+            other => other?,
+        }
+    }
+    add_column(db, "questions", "confirmed", "INTEGER NOT NULL DEFAULT 0")?;
     // Home is never archived (ADR 0049): a Home archived by a development
     // build from before that rule is restored, with a new revision so a
     // device that saw it archived takes the change.
@@ -181,6 +217,17 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS questions (
+    id TEXT PRIMARY KEY,
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    agent TEXT NOT NULL,
+    definition TEXT NOT NULL,
+    state TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0),
+    answer TEXT,
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    ask_message TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0), display_name TEXT);
 CREATE TABLE IF NOT EXISTS agent_avatars (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>=0), version TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
@@ -204,7 +251,8 @@ CREATE TABLE IF NOT EXISTS messages (
     person TEXT,
     text TEXT NOT NULL,
     kind TEXT NOT NULL,
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    question TEXT
 );
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
@@ -1096,7 +1144,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -1107,7 +1155,7 @@ impl Store {
     /// The messages of conversation `id` after `since`, in order.
     pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = query.query_map(params![id, since], message_row)?;
@@ -1124,7 +1172,7 @@ impl Store {
         at_most: usize,
     ) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
         )?;
         let rows = query.query_map(params![id, since, at_most as i64], message_row)?;

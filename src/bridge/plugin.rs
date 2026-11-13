@@ -107,6 +107,7 @@ fn connect_within(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
+        capabilities: vec![Capability::Questions],
         home: ConversationId::new(home).ok(),
     })?;
     let mut reader = PluginReader {

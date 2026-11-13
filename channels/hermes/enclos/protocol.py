@@ -15,7 +15,8 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "routine.request", "ack", "error")
+FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "routine.request",
+                     "question.answer", "question.sync", "ack", "error")
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
@@ -33,10 +34,12 @@ PLATFORM_HINT = (
     "fenced code blocks, tables and links. Keep tables narrow. A single newline is a line break. "
     "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
     "shows in the conversation, another file as an attachment, and the person can share either. "
-    "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
-    "the person opens it in the app. Use inline CSS and data images/fonts; don't use JavaScript, "
-    "external resources, forms or automatic navigation, which the viewer is meant to block. A tapped HTTP(S) link opens the browser "
-    "once the person confirms its address. "
+    "For a decision, use clarify with questions:[{question,choices,multi_select?}]; "
+    "the app adds Other and Skip. Wait for its result. "
+    "For a static HTML artefact, send a self-contained UTF-8 .html file the same way: "
+    "the person opens it in the app. Use inline CSS and data images/fonts, not JavaScript, "
+    "external resources, forms or automatic navigation (meant to be blocked). A tapped HTTP(S) link opens the browser "
+    "once the person confirms it. "
     "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
     "message HTML shows as literal text."
 )
@@ -172,6 +175,9 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         _check_id(message.get("id"), "id")
         if kind == "hello":
             _check_text(message.get("token"), "token")
+            capabilities = message.get("capabilities", [])
+            if not isinstance(capabilities, list) or not all(isinstance(c, str) for c in capabilities):
+                raise ValueError("capabilities must be a list of strings")
             if message.get("home") is not None:
                 _check_id(message.get("home"), "home")
         elif kind == "policy.context":
@@ -189,6 +195,17 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
                 validate_request(message)
             except RoutineError as error:
                 raise ValueError(str(error)) from None
+        elif kind == "question.answer":
+            from .questions import validate_answer
+            _check_id(message.get("conversation"), "conversation")
+            _check_id(message.get("question"), "question")
+            validate_answer(message.get("answer"))
+        elif kind == "question.sync":
+            ids = message.get("questions")
+            if not isinstance(ids, list) or len(ids) > 128:
+                raise ValueError("questions must contain at most 128 ids")
+            for question_id in ids:
+                _check_id(question_id, "question")
         elif kind == "ack":
             _check_id(message.get("of"), "of")
         elif kind == "error":
@@ -234,6 +251,16 @@ def encode_line(message: dict[str, Any]) -> bytes:
 
 def _message(message_type: str, /, **fields: Any) -> dict[str, Any]:
     return {"v": VERSION, "id": new_id(), "type": message_type, **fields}
+
+
+def message(message_type: str, /, **fields: Any) -> dict[str, Any]:
+    """A new message of `message_type` with `fields`, for the plugin's other modules."""
+    return _message(message_type, **fields)
+
+
+def check_id(value: Any, field: str) -> str:
+    """`value` if it is an id the protocol accepts; raises ValueError otherwise."""
+    return _check_id(value, field)
 
 
 def hello(runtime: str, agent: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:

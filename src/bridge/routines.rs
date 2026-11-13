@@ -580,9 +580,12 @@ impl Hub {
                 Ok(store) => loop {
                     std::thread::sleep(Duration::from_secs(1));
                     self.expire_routines(&store);
+                    self.expire_questions(&store);
                 },
                 Err(e) => {
-                    eprintln!("enclos app: routine timeouts wait for the database: {e}");
+                    eprintln!(
+                        "enclos app: routine and question timeouts wait for the database: {e}"
+                    );
                     std::thread::sleep(Duration::from_secs(5));
                 }
             }

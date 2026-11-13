@@ -5,7 +5,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{self, ConversationId, MessageId, Person};
+use crate::ids::{self, ConversationId, MessageId, Person, QuestionId};
 
 /// A name the sandbox sends, which the host may print: the id rule.
 fn name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -28,6 +28,14 @@ fn line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromBridge {
+    #[serde(rename = "question.answer")]
+    QuestionAnswer {
+        conversation: ConversationId,
+        question: QuestionId,
+        answer: crate::question::QuestionAnswer,
+    },
+    #[serde(rename = "question.sync")]
+    QuestionSync { questions: Vec<QuestionId> },
     #[serde(rename = "routine.request")]
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
@@ -49,6 +57,8 @@ pub enum FromBridge {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home: Option<ConversationId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
     },
     /// Current active grants, refreshed at connect and after a policy decision.
     #[serde(rename = "policy.context")]
@@ -75,6 +85,8 @@ pub enum FromBridge {
 
 /// The `type`s of [`FromBridge`].
 pub const FROM_BRIDGE_TYPES: &[&str] = &[
+    "question.answer",
+    "question.sync",
     "routine.request",
     "policy.context",
     "hello",
@@ -88,6 +100,20 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromPlugin {
+    #[serde(rename = "question.ask")]
+    QuestionAsk {
+        conversation: ConversationId,
+        question: crate::question::QuestionDefinition,
+    },
+    #[serde(rename = "question.update")]
+    QuestionUpdate {
+        question: QuestionId,
+        state: crate::question::QuestionState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<crate::question::QuestionAnswer>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<MessageId>,
+    },
     #[serde(rename = "routine.response")]
     RoutineResponse(crate::routine::RoutineReply),
     /// The plugin's answer to the bridge's `hello`.
@@ -150,6 +176,8 @@ pub enum FromPlugin {
 
 /// The `type`s of [`FromPlugin`].
 pub const FROM_PLUGIN_TYPES: &[&str] = &[
+    "question.ask",
+    "question.update",
     "routine.response",
     "hello",
     "approval.request",
@@ -250,6 +278,7 @@ pub enum Capability {
     /// It lists the commands a person may type to it (`commands`).
     Commands,
     Routines,
+    Questions,
     #[serde(other)]
     Unknown,
 }
@@ -283,6 +312,9 @@ pub enum ErrorCode {
     Internal,
     Unsupported,
     NotFound,
+    /// A request that may have reached the agent, whose outcome was not
+    /// confirmed: unlike `agent_unavailable`, retrying is not known to be safe.
+    Unconfirmed,
     #[serde(other)]
     Unknown,
 }

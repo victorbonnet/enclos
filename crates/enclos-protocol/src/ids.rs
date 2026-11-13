@@ -83,6 +83,10 @@ id!(
     /// A person, by their tailnet login (`alice@example.com`).
     Person
 );
+id!(
+    /// One immutable question, distinct from a message or runtime's transient waiter id.
+    QuestionId
+);
 
 #[cfg(test)]
 mod tests {

@@ -584,6 +584,7 @@ fn chat(
             .and_then(|id| MessageId::new(id).ok())
             .ok_or_else(|| failed("cannot make a message id".to_owned()))?;
         let whole = ConversationMessage {
+            question: None,
             conversation: conversation.clone(),
             agent: format!("{sandbox}/{agent}"),
             from: person.to_string(),
@@ -697,6 +698,7 @@ fn read_agent(
                 &server::pieces(
                     &message.id,
                     &ConversationMessage {
+                        question: None,
                         conversation: conversation.clone(),
                         agent: format!("{sandbox}/{agent}"),
                         from: "agent".to_owned(),

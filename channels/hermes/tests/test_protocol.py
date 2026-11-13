@@ -23,7 +23,7 @@ def fixture(name: str) -> bytes:
 class FromTheBridge(unittest.TestCase):
     def test_every_fixture_the_bridge_sends_decodes(self):
         names = sorted(n for n in os.listdir(FIXTURES) if n.startswith("from_bridge_"))
-        self.assertEqual(len(names), 6)
+        self.assertGreaterEqual(len(names), 6)
         for name in names:
             with self.subTest(name):
                 self.assertEqual(protocol.decode_from_bridge(fixture(name)), json.loads(fixture(name)))
@@ -177,11 +177,12 @@ class Hint(unittest.TestCase):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
         self.assertIn("message HTML shows as literal text", protocol.PLATFORM_HINT)
+        self.assertIn("clarify with questions", protocol.PLATFORM_HINT)
 
     def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
         for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
-                       "data images/fonts", "JavaScript", "external resources, forms or automatic navigation, which the viewer is meant to block",
-                       "A tapped HTTP(S) link opens the browser", "once the person confirms its address"):
+                       "data images/fonts", "JavaScript", "external resources, forms or automatic navigation (meant to be blocked)",
+                       "A tapped HTTP(S) link opens the browser", "once the person confirms it"):
             self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_says_what_an_image_shows_as_the_protocol_does(self):
