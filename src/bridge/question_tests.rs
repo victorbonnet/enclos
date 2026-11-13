@@ -1354,7 +1354,8 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
     );
     // Another host's person (none recorded, while devices are paired, is
     // not a state the store keeps: it names the first device's person)
-    for host in [Some("another-person@example.com".to_owned())] {
+    {
+        let host = Some("another-person@example.com".to_owned());
         let (_dir, hub, store, device, _rx) = fixture();
         set_host(&hub, host.as_deref());
         let definition = approval_definition("unknown-host", false);
