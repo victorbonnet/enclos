@@ -179,6 +179,7 @@ fn hub_with(
         transport: Transport::Tailscale,
         whois: Arc::new(|_: &str| Err("no transport in this test".to_owned())),
         store_path: dir.join("app.db"),
+        layout: crate::layout::Layout::at(dir.join("enclos")),
         bridge_private: vec![0; 32],
         agents: Vec::new(),
         plugins: Mutex::new(HashMap::new()),
@@ -235,7 +236,11 @@ fn a_forgotten_device_is_unpaired_and_logged() {
         node: Some("n-pixel".to_owned()),
     };
     store.add_device(&phone).unwrap();
-    forget(&store, &phone, "alice@example.com").unwrap();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let log = crate::layout::Layout::at(dir.path().join("enclos")).audit_log();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "").unwrap();
+    forget(&hub, &store, &phone, "alice@example.com").unwrap();
     // Its keys find no device: `connection` refuses the next `auth` with
     // them as "an unknown device".
     assert_eq!(store.device_by_noise_key(&phone.noise_key).unwrap(), None);
