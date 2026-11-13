@@ -1,0 +1,8 @@
+# Codex: run this skill only when the user asks for it, as Claude Code's
+# `disable-model-invocation: true` does.
+interface:
+  display_name: "Set up enclos"
+  short_description: "From nothing to an agent running in an enclos sandbox"
+  default_prompt: "Use $setup to set up enclos on this host."
+policy:
+  allow_implicit_invocation: false

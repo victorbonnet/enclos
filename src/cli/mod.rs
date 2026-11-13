@@ -13,6 +13,8 @@ pub mod net;
 pub mod output;
 pub mod policy;
 pub mod proxy;
+#[cfg(test)]
+mod reference;
 pub mod relay;
 pub mod runtime;
 pub mod sandbox;

@@ -104,6 +104,9 @@ impl Hub {
             self.deliver(person, ToDevice::SandboxPolicy(state));
         }
         result.map_err(|e| format!("{e}. Refresh the policy before retrying."))?;
-        self.managed_policy(store, name)
+        // Saved and audited: a failure to read it back is not a refusal
+        self.managed_policy(store, name).map_err(|e| {
+            format!("The edit was saved, but the policy could not be read back ({e}). Refresh the policy to see it.")
+        })
     }
 }

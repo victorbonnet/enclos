@@ -194,11 +194,25 @@ fn access_approval_adds_only_the_reviewed_scope_and_updates_knowledge() {
             .unwrap()
             .contains("api.example.com:8443")
     );
-    assert_eq!(
-        e.audit(None).unwrap().last().unwrap().intent.command,
-        "app approval"
+    let last = e.audit(None).unwrap().last().unwrap().clone();
+    assert_eq!(last.intent.command, "app approval");
+    // The scope written, not only the agent's spelling of it
+    assert!(
+        last.finished
+            .unwrap()
+            .outcome
+            .message
+            .contains("api.example.com:8443")
     );
     assert!(e.verify_audit().unwrap().intact());
+}
+
+#[test]
+fn two_spellings_of_one_destination_are_one_scope() {
+    assert_eq!(
+        crate::engine::normalized(&network("API.Example.com:8443")),
+        crate::engine::normalized(&network("api.example.com:8443"))
+    );
 }
 #[test]
 fn access_approval_stale_policy_does_not_apply_the_old_decision() {

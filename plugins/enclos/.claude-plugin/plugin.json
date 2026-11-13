@@ -1,0 +1,13 @@
+{
+  "name": "enclos",
+  "version": "0.4.0",
+  "description": "Teaches a host assistant what enclos is and every command it has, so that it can set up and run sandboxed agents on this host through the enclos CLI",
+  "author": {
+    "name": "Victor Bonnet",
+    "url": "https://github.com/victorbonnet"
+  },
+  "homepage": "https://enclos.dev",
+  "repository": "https://github.com/victorbonnet/enclos",
+  "license": "MIT",
+  "keywords": ["sandbox", "agents", "hermes", "seatbelt", "bubblewrap"]
+}

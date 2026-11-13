@@ -223,8 +223,23 @@ fn answered<T>(mut ask: impl FnMut() -> Option<T>) -> Option<T> {
     }
 }
 
-/// A sandbox whose proxy is a listener this test stands in (`nc`), so
-/// that sessions can run through the fake backend; stopped when dropped,
+/// The proxy a [`Lab`] runs: it listens on the port it is given and closes
+/// every connection, until its parent, the test process, is gone. A test
+/// stopped from outside never drops its lab, and a proxy left listening in
+/// the proxy range would take the port of the next sandbox of every later
+/// run. Unlike `nc -lk`, it holds its port without a gap, where the
+/// engine's check for a free port would take the port for free.
+const FAKE_PROXY: &str = "use Socket; my $parent = getppid(); \
+    socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"socket: $!\\n\"; \
+    setsockopt($s, SOL_SOCKET, SO_REUSEADDR, 1) or die \"setsockopt: $!\\n\"; \
+    bind($s, sockaddr_in($ARGV[0], INADDR_LOOPBACK)) or die \"bind: $!\\n\"; \
+    listen($s, 16) or die \"listen: $!\\n\"; \
+    my $wait = \"\"; vec($wait, fileno($s), 1) = 1; \
+    while (getppid() == $parent) { \
+    if (select(my $ready = $wait, undef, undef, 1) > 0) { accept(my $c, $s) and close $c; } }";
+
+/// A sandbox whose proxy is a listener this test stands in ([`FAKE_PROXY`]),
+/// so that sessions can run through the fake backend; stopped when dropped,
 /// so the listener never outlives the test.
 struct Lab {
     _dir: TempDir,
@@ -282,7 +297,9 @@ impl Lab {
         let proxy = dir.path().join("proxy.sh");
         crate::test_scripts::write_script(
             &proxy,
-            "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"",
+            &format!(
+                "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/perl -e '{FAKE_PROXY}' \"$5\""
+            ),
         );
         let home = engine.layout.sandbox_home("home");
         Lab {

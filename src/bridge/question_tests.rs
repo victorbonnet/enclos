@@ -1352,7 +1352,10 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
     assert!(
         matches!(native.receive().body, FromBridge::QuestionAnswer { question, answer: QuestionAnswer::Skip, .. } if question == ordinary.id)
     );
-    for host in [None, Some("another-person@example.com".to_owned())] {
+    // Another host's person (none recorded, while devices are paired, is
+    // not a state the store keeps: it names the first device's person)
+    {
+        let host = Some("another-person@example.com".to_owned());
         let (_dir, hub, store, device, _rx) = fixture();
         set_host(&hub, host.as_deref());
         let definition = approval_definition("unknown-host", false);
@@ -2078,4 +2081,27 @@ fn set_host(hub: &Hub, host: Option<&str>) {
                 .unwrap();
         }
     }
+}
+
+#[test]
+fn an_answer_the_bridge_cannot_check_answers_internal_not_not_found() {
+    let (_dir, hub, store, device, _rx) = fixture();
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute_batch("DROP TABLE devices; CREATE TABLE devices (broken INTEGER);")
+        .unwrap();
+    let error = hub
+        .question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("answer").unwrap(),
+            AnswerRequest {
+                question: QuestionId::new("q-1").unwrap(),
+                revision: 0,
+                answer: QuestionAnswer::Skip,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
 }
