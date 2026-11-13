@@ -833,3 +833,10 @@ fn a_file_that_cannot_be_recorded_leaves_none_behind() {
     assert!(taken.is_empty());
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
 }
+
+#[test]
+fn a_capability_the_bridge_does_not_know_is_not_shown() {
+    let announced: Vec<Capability> =
+        serde_json::from_value(serde_json::json!(["notify", "commands"])).unwrap();
+    assert_eq!(known(announced), vec![Capability::Commands]);
+}
