@@ -184,17 +184,23 @@ impl Hub {
         device: &Device,
         person: &str,
         agent: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), (ErrorCode, String)> {
         if self.known_host().as_deref() != Some(person) {
-            return Err("Only the host's person can manage routines.".into());
+            return Err((
+                ErrorCode::NotAllowed,
+                "Only the host's person can manage routines.".into(),
+            ));
         }
+        // Each refusal with its own code: a database the bridge cannot
+        // read is its fault, not the person's
         self.avatar_authority(store, device, person, agent, false)
             .map_err(|e| match e {
-                PhotoError::NotAllowed(why)
-                | PhotoError::UnknownAgent(why)
-                | PhotoError::Invalid(why)
-                | PhotoError::Conflict(why)
-                | PhotoError::Internal(why) => why,
+                PhotoError::NotAllowed(why) => (ErrorCode::NotAllowed, why),
+                PhotoError::UnknownAgent(why) => (ErrorCode::UnknownAgent, why),
+                PhotoError::Invalid(why) | PhotoError::Conflict(why) => {
+                    (ErrorCode::NotAllowed, why)
+                }
+                PhotoError::Internal(_) => (ErrorCode::Internal, NOT_READ_BEFORE.to_owned()),
             })
     }
 
@@ -240,7 +246,7 @@ impl Hub {
         request: RoutineRequest,
     ) -> Result<(), ErrorBody> {
         self.routine_authority(store, device, person, agent)
-            .map_err(|e| failure(original.clone(), ErrorCode::NotAllowed, e))?;
+            .map_err(|(code, why)| failure(original.clone(), code, why))?;
         request
             .validate()
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e))?;
@@ -370,7 +376,7 @@ impl Hub {
             }
             return Err(failure(
                 original,
-                ErrorCode::AgentUnavailable,
+                ErrorCode::Unknown,
                 format!("{e}. The outcome may be unknown; refresh routines before retrying."),
             ));
         }
@@ -487,8 +493,8 @@ impl Hub {
                     (false, _) => (
                         ToDevice::Error(failure(
                             pending.original.clone(),
-                            ErrorCode::BadMessage,
-                            "The runtime returned an invalid or oversized routine response.",
+                            ErrorCode::Unknown,
+                            "The runtime returned an invalid or oversized routine response: the outcome is unknown; refresh routines before retrying.",
                         )),
                         "unknown: invalid response".to_owned(),
                     ),
@@ -558,7 +564,7 @@ impl Hub {
         drop(requests);
         for p in pending {
             audit(store, &p, "unknown: disconnected");
-            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::AgentUnavailable, "The agent disconnected. The outcome may be unknown; refresh routines before retrying.")));
+            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The agent disconnected. The outcome may be unknown; refresh routines before retrying.")));
         }
     }
 
@@ -595,7 +601,7 @@ impl Hub {
         drop(requests);
         for p in pending {
             audit(store, &p, "unknown: timed out");
-            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::AgentUnavailable, "The routine request timed out. The outcome may be unknown; refresh routines before retrying.")));
+            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The routine request timed out. The outcome may be unknown; refresh routines before retrying.")));
         }
     }
 }
@@ -812,7 +818,7 @@ mod tests {
             .started = Instant::now() - TIMEOUT;
         hub.expire_routines(&store);
         assert!(
-            matches!(rx.recv().unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::AgentUnavailable, .. }) if id.as_str() == "app-request")
+            matches!(rx.recv().unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::Unknown, .. }) if id.as_str() == "app-request")
         );
         hub.routine_response(
             &store,
@@ -994,7 +1000,7 @@ mod tests {
                 RoutineReply { of: rpc, result },
             );
             assert!(
-                matches!(rx.recv().unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::BadMessage, .. }) if id.as_str() == "app-request")
+                matches!(rx.recv().unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::Unknown, .. }) if id.as_str() == "app-request")
             );
         }
     }
@@ -1128,7 +1134,7 @@ mod tests {
                 matches!(
                     rx.recv().unwrap(),
                     ToDevice::Error(ErrorBody {
-                        code: ErrorCode::BadMessage,
+                        code: ErrorCode::Unknown,
                         ..
                     })
                 ),
@@ -1212,6 +1218,23 @@ mod tests {
                 "PRAGMA foreign_keys = OFF; DROP TABLE {table}; CREATE TABLE {table} (broken INTEGER);"
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn devices_that_cannot_be_read_to_check_who_asks_answer_internal() {
+        let (_dir, hub, store, device, _rx) = fixture();
+        break_table(&hub, "devices");
+        let error = hub
+            .routine_request(
+                &store,
+                &device,
+                OWNER,
+                AGENT,
+                MessageId::new("authority").unwrap(),
+                RoutineRequest::List { cursor: None },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
     }
 
     #[test]

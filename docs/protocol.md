@@ -226,9 +226,11 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 | `version` | `v` is one the receiver does not speak; it answers this, then closes the connection |
 | `not_allowed` | The person may not do this (no share, or not that ability) |
 | `unknown_agent`, `unknown_conversation` | No such agent or conversation for this person |
-| `agent_unavailable` | The plugin is not reachable, disconnected or timed out; conversation messages are kept and sent when it is, but live routine controls are not queued |
+| `agent_unavailable` | The plugin is not reachable; conversation messages are kept and sent when it is, but live routine controls are not queued, and none was sent. A routine control that was sent and then met a disconnection or timeout answers `unknown` |
 | `conflict` | What the request changes changed since the revision it names, or a request id was reused; nothing was changed. Refresh before deciding whether to retry |
 | `internal` | The receiver failed on its side; nothing was changed, and trying again later may work |
+| `unsupported` | The runtime does not offer this routine control or delivery; nothing was changed |
+| `not_found` | No such routine for this agent (one removed included); nothing was changed |
 | `unknown` | A runtime could not confirm a routine control it received, or the bridge could not check the runtime's answer to one, and the outcome is not known; a later sync shows it, and an idempotent request may be retried. Also what a receiver reads for a code it does not know |
 
 ## Versions
