@@ -161,7 +161,7 @@ fn serve(engine: &Engine, by: &Actor, port: u16, transport: Transport) -> Result
         key.private.to_vec(),
         approvals,
         agents,
-        Host::new(engine.app_layout(), by.clone(), executable, None),
+        Host::new(engine.app_layout(), by.clone(), executable),
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
     Ok(exit::OK)

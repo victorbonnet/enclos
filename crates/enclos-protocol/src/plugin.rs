@@ -326,7 +326,9 @@ pub enum ErrorCode {
     /// A request that may have reached the agent, whose outcome was not
     /// confirmed: unlike `agent_unavailable`, retrying is not known to be safe.
     Unconfirmed,
+    /// Another provisioning operation is running in this sandbox; nothing changed.
     Busy,
+    /// The engine or installer refused or failed; check the sandbox on the host.
     OperationFailed,
     #[serde(other)]
     Unknown,

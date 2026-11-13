@@ -1,4 +1,4 @@
-//! The host owner's small provisioning surface for the mobile app. Every
+//! Provisioning for the host's person for the mobile app. Every
 //! change goes through the same engine and audit log as its CLI command.
 
 use std::io::Read;
@@ -86,42 +86,21 @@ pub struct Host {
     layout: Layout,
     actor: Actor,
     executable: PathBuf,
-    owner: Option<String>,
 }
 
 impl Host {
-    pub fn new(layout: Layout, actor: Actor, executable: PathBuf, owner: Option<String>) -> Self {
+    pub fn new(layout: Layout, actor: Actor, executable: PathBuf) -> Self {
         Self {
             layout,
             actor,
             executable,
-            owner: owner.filter(|p| !p.trim().is_empty()),
         }
-    }
-
-    /// Unknown ownership fails closed. A paired device alone does not make
-    /// its person the host's user (sharing may pair other people).
-    pub fn owner(&self) -> Option<&str> {
-        self.owner.as_deref()
-    }
-
-    pub fn is_owner(&self, person: &str) -> bool {
-        self.owner.as_deref().map_or_else(
-            || {
-                super::store::Store::open(&self.layout.data().join("app.db"))
-                    .ok()
-                    .and_then(|store| store.host_person().ok().flatten())
-                    .as_deref()
-                    == Some(person)
-            },
-            |owner| owner == person,
-        )
     }
 
     pub fn sandboxes(&self) -> Result<Vec<SandboxInfo>, String> {
         sandbox_list(&Engine::open(
             self.layout.clone(),
-            crate::state::Wait::Background,
+            crate::state::Wait::Command,
         ))
     }
 
@@ -136,9 +115,6 @@ impl Host {
     }
 
     pub fn execute(&self, operation: &Operation, person: &str) -> Result<Completed, String> {
-        if !self.is_owner(person) {
-            return Err("only the host's user can create sandboxes or install runtimes".to_owned());
-        }
         // The authenticated transport login identifies who requested the
         // change; the host is the one executing it.
         let actor = Actor {
@@ -147,7 +123,7 @@ impl Host {
         };
         match operation {
             Operation::Create { name, template } => {
-                let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
+                let engine = Engine::open(self.layout.clone(), crate::state::Wait::Command);
                 create(
                     &engine,
                     &actor,
@@ -186,7 +162,9 @@ impl Host {
             .spawn()
             .map_err(|e| format!("cannot start the runtime installer: {e}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
-        // Drain stdout concurrently, retaining only a bounded JSON document.
+        // CLI document output reserves its original stdout with a close-on-exec
+        // descriptor and redirects installer output to stderr (cli::output).
+        // Drain that document concurrently, retaining only bounded output.
         // Installer output may contain secrets, so it is never sent to a
         // phone or added to the bridge's log.
         let output = std::thread::spawn(move || read_bounded(stdout, 65_536));
@@ -302,12 +280,7 @@ mod tests {
         let executable = dir.path().join("enclos");
         std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let host = Host::new(
-            Layout::at(dir.path().join("data")),
-            actor(),
-            executable,
-            Some("owner@example.org".into()),
-        );
+        let host = Host::new(Layout::at(dir.path().join("data")), actor(), executable);
         (dir, host)
     }
 
@@ -439,32 +412,6 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         )
         .unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
-    }
-
-    #[test]
-    fn ownership_is_explicit_and_exact() {
-        let host = |owner| {
-            Host::new(
-                Layout::at("/unused"),
-                Actor {
-                    user: "local".into(),
-                    host: "mac".into(),
-                },
-                PathBuf::from("/unused/enclos"),
-                owner,
-            )
-        };
-        assert!(!host(None).is_owner("owner@example.org"));
-        assert!(!host(Some("".into())).is_owner(""));
-        let host = host(Some("owner@example.org".into()));
-        assert!(host.is_owner("owner@example.org"));
-        assert!(!host.is_owner("shared@example.org"));
-        let operation = Operation::install("home", "hermes").unwrap();
-        assert!(
-            host.execute(&operation, "shared@example.org")
-                .unwrap_err()
-                .contains("only the host's user")
-        );
     }
 
     #[test]

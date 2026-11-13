@@ -214,15 +214,11 @@ impl Hub {
         device: &Device,
         person: &str,
     ) -> Result<(), ErrorBody> {
-        if !self
-            .provisioning
-            .as_ref()
-            .is_some_and(|h| h.is_owner(person))
-        {
+        if self.provisioning.is_none() || self.known_host().as_deref() != Some(person) {
             return Err(ErrorBody {
                 of: Some(of),
                 code: ErrorCode::NotAllowed,
-                message: "only the host's user can manage sandboxes".to_owned(),
+                message: "only the host's person can manage sandboxes".to_owned(),
             });
         }
         let sandbox = operation.sandbox().to_owned();
@@ -1514,10 +1510,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
-        capabilities: if hub
-            .provisioning
-            .as_ref()
-            .is_some_and(|h| h.is_owner(&person))
+        capabilities: if hub.provisioning.is_some() && hub.known_host().as_deref() == Some(&person)
         {
             vec!["sandboxes".into()]
         } else {
@@ -1858,10 +1851,8 @@ fn run_session(
             | FromDevice::Runtimes
             | FromDevice::SandboxCreate { .. }
             | FromDevice::RuntimeInstall { .. } => {
-                if !hub
-                    .provisioning
-                    .as_ref()
-                    .is_some_and(|h| h.is_owner(person))
+                if hub.provisioning.is_none()
+                    || hub.known_host().as_deref() != Some(person)
                     || !store
                         .device(&device.id)
                         .map_err(|e| e.to_string())?
@@ -1874,7 +1865,7 @@ fn run_session(
                     link.send(ToDevice::Error(ErrorBody {
                         of: Some(message.id),
                         code: ErrorCode::NotAllowed,
-                        message: "only the host's user can manage sandboxes".to_owned(),
+                        message: "only the host's person can manage sandboxes".to_owned(),
                     }))?;
                     continue;
                 }
@@ -2769,6 +2760,21 @@ mod connection_end_tests {
     }
 
     fn bridge_with(folder: &Path, silence: Duration) -> Bridge {
+        bridge_serving(
+            folder,
+            silence,
+            Host::new(
+                crate::layout::Layout::at(folder.join("enclos")),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+            ),
+        )
+    }
+
+    fn bridge_serving(folder: &Path, silence: Duration, provisioning: Host) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
         let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
@@ -2799,15 +2805,7 @@ mod connection_end_tests {
                 None,
                 silence,
             )
-            .with_provisioning(Host::new(
-                crate::layout::Layout::at(folder),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
-                "/unused/enclos".into(),
-                None,
-            )),
+            .with_provisioning(provisioning),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3038,6 +3036,168 @@ mod connection_end_tests {
         let (_, first) = connect(&bridge, &phone);
         assert!(
             matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+        );
+    }
+
+    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+        use crate::{
+            audit::jsonl::JsonlAuditLog,
+            backend::fake::FakeBackend,
+            engine::{Engine, SandboxSpec},
+            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+            state::sqlite::SqliteStateStore,
+        };
+        let layout = crate::layout::Layout::at(folder.join("enclos"));
+        let engine = Engine::new(
+            layout.clone(),
+            Box::new(SqliteStateStore::new(
+                layout.state_db(),
+                layout.state_lock(),
+                crate::state::Wait::Command,
+            )),
+            Box::new(JsonlAuditLog::new(layout.audit_log())),
+            vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+        );
+        let actor = Actor {
+            user: PERSON.into(),
+            host: "test".into(),
+        };
+        engine.init(&actor, Confirm::Yes).unwrap();
+        engine
+            .create_sandbox(
+                &actor,
+                SandboxSpec {
+                    name: "lab".parse().unwrap(),
+                    backend: BackendKind::Seatbelt,
+                    template: "minimal".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap();
+        layout
+    }
+
+    #[test]
+    fn provisioning_install_busy_and_failures_keep_request_ids_over_the_device_connection() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        let executable = folder.path().join("fake-enclos");
+        std::fs::write(&executable, r#"#!/bin/sh
+while [ ! -f "$ENCLOS_HOME/release" ]; do sleep 0.01; done
+if [ -f "$ENCLOS_HOME/fail" ]; then
+  printf '%s\n' '{"error":{"message":"installer refused the operation"}}'
+  exit 1
+fi
+printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enclos connect lab -- hermes setup"}'
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = bridge_serving(
+            folder.path(),
+            SILENCE,
+            Host::new(
+                layout.clone(),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                executable,
+            ),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        let install = || FromDevice::RuntimeInstall {
+            sandbox: "lab".into(),
+            runtime: "hermes".into(),
+        };
+        device.send("install-one", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, operation, sandbox, .. }) if of.as_str() == "install-one" && operation == "runtime.install" && sandbox == "lab")
+        );
+        device.send("install-two", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::Busy, .. })) if of.as_str() == "install-two")
+        );
+        std::fs::write(layout.data().join("release"), "").unwrap();
+        assert!(
+            matches!(device.receive(), Some(ToDevice::RuntimeInstalled { of, sandbox, runtime, login }) if of.as_str() == "install-one" && sandbox == "lab" && runtime == "hermes" && login.contains("hermes setup"))
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "lab"))
+        );
+        std::fs::write(layout.data().join("fail"), "").unwrap();
+        device.send("install-failure", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, .. }) if of.as_str() == "install-failure")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::OperationFailed, message })) if of.as_str() == "install-failure" && message == "installer refused the operation")
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { .. })
+        ));
+        device.send(
+            "duplicate-create",
+            FromDevice::SandboxCreate {
+                sandbox: "lab".into(),
+                template: "minimal".into(),
+            },
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, operation, .. }) if of.as_str() == "duplicate-create" && operation == "sandbox.create")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::OperationFailed, .. })) if of.as_str() == "duplicate-create")
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_creation_reports_completion_then_fresh_inventory_over_the_device_connection() {
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        let bridge = bridge_serving(
+            folder.path(),
+            SILENCE,
+            Host::new(
+                layout.clone(),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+            ),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        device.send(
+            "create-one",
+            FromDevice::SandboxCreate {
+                sandbox: "new-home".into(),
+                template: "minimal".into(),
+            },
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, .. }) if of.as_str() == "create-one")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxCreated { of, sandbox }) if of.as_str() == "create-one" && sandbox == "new-home")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
         );
     }
 

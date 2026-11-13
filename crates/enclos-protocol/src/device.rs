@@ -80,11 +80,7 @@ pub enum FromDevice {
     #[serde(rename = "runtimes")]
     Runtimes,
     #[serde(rename = "sandbox.create")]
-    SandboxCreate {
-        sandbox: String,
-        #[serde(default = "minimal_template")]
-        template: String,
-    },
+    SandboxCreate { sandbox: String, template: String },
     #[serde(rename = "runtime.install")]
     RuntimeInstall { sandbox: String, runtime: String },
     #[serde(rename = "conversation.new")]
@@ -477,10 +473,6 @@ pub struct MemberTurn {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
-}
-
-fn minimal_template() -> String {
-    "minimal".to_owned()
 }
 
 /// A sandbox on the owner's host, including one with no runtime or app channel.
@@ -956,14 +948,10 @@ mod tests {
                 capabilities: vec![]
             }
         );
-        assert_eq!(
+        assert!(
             decode_from_device(br#"{"v":1,"id":"m","type":"sandbox.create","sandbox":"lab"}"#)
-                .unwrap()
-                .body,
-            FromDevice::SandboxCreate {
-                sandbox: "lab".into(),
-                template: "minimal".into()
-            }
+                .is_err(),
+            "creation must explicitly select a policy template"
         );
     }
 }
