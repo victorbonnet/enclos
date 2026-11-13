@@ -2448,3 +2448,26 @@ fn a_file_that_cannot_be_recorded_leaves_none_behind() {
     assert!(taken.is_empty());
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
 }
+
+#[test]
+fn a_name_whose_devices_cannot_be_read_answers_internal() {
+    use enclos_protocol::plugin::ErrorCode;
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/main".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("not-connected.sock"),
+        token: "fixture".into(),
+    });
+    let owner = avatar_device("phone", "owner@example.com");
+    store.add_device(&owner).unwrap();
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute_batch("DROP TABLE devices; CREATE TABLE devices (broken INTEGER);")
+        .unwrap();
+    let agent = hub.agents[0].name.clone();
+    let error = hub
+        .get_agent_name(&store, &owner, &owner.person, &agent, "get".into())
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+}
