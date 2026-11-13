@@ -4252,17 +4252,25 @@ fn a_change_while_a_session_runs_waits_and_apply_restarts_into_it() {
     home.run(&["sandbox", "create", "home", "--template", "assistant"])
         .ok();
     let _stop = StopOnDrop(&home, "home");
+    // What the session and its proxy say, for a failure to say why.
+    let said = home._dir.path().join("exec.err");
     let mut session = home
         .command(&["exec", "home", "--", "/bin/sleep", "30"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(File::create(&said).unwrap())
         .spawn()
         .unwrap();
-    assert!(eventually(|| {
-        home.run(&["sandbox", "show", "home"])
-            .stdout()
-            .contains("/bin/sleep")
-    }));
+    assert!(
+        eventually(|| {
+            home.run(&["sandbox", "show", "home"])
+                .stdout()
+                .contains("/bin/sleep")
+        }),
+        "the session never ran: {}\nthe proxy's log: {}",
+        std::fs::read_to_string(&said).unwrap_or_default(),
+        std::fs::read_to_string(home.root.join("sandboxes/home/logs/proxy.log"))
+            .unwrap_or_default()
+    );
     let file = home.root.join("sandboxes/home/policy.toml");
     let text = std::fs::read_to_string(&file).unwrap();
     let work = home._dir.path().join("work");
