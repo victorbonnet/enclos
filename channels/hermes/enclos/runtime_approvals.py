@@ -123,7 +123,7 @@ _WIDEST_HEADING = "Command, part 9999 of 9999:\n"
 def fallback_chunks(prompt, fits, denied=False):
     # Every command part is a complete literal Markdown block, including when a
     # long backtick/tilde run or JSON escapes changes the available byte budget.
-    # Hidden characters are written out, so what is shown is what runs. No typed
+    # Hidden characters are written out, so nothing in the command is hidden. No typed
     # command decides it (ADR 0060): the last part says it was `denied`, or will be.
     text = revealed(prompt.text)
     if fits(text):

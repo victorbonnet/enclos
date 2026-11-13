@@ -283,6 +283,13 @@ class Manager:
             logger.warning("Runtime approval %s has %d native matches; sending it as text",
                            prompt.request_id, len(matching))
             return await self._unshown(prompt), None
+        if matching[0].get("command") != prompt.command:
+            # Hermes's display command is redacted: a card shows only one
+            # that is the very command its request runs. Otherwise the person
+            # would approve what they did not read.
+            logger.warning("Runtime approval %s shows a command other than the one it runs; it is denied",
+                           prompt.request_id)
+            return await self._unshown(prompt), None
         definition = runtime_approvals.definition(prompt, protocol.new_id(), matching[0])
         try:
             validate_definition(definition)
@@ -511,8 +518,10 @@ class Manager:
         if observed is not None:
             await self._settle(card, *observed, of=request_id)
             return
-        await self.write(protocol.error("agent_unavailable",
-            "The runtime approval was already resolved or is no longer available.", request_id))
+        # It reached the plugin, so not `agent_unavailable` (nothing sent);
+        # this answer changed nothing, which `conflict` says
+        await self.write(protocol.error("conflict",
+            "The runtime approval was already resolved or is no longer available. Refresh to see it.", request_id))
 
     async def refused(self, of, code=None):
         """The bridge refused the message `of`. A refused ask (a conversation it does not

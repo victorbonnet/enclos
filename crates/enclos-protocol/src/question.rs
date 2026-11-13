@@ -250,7 +250,8 @@ impl QuestionDefinition {
     /// typed approval command.
     pub fn fallback_text(&self) -> String {
         if let Some(approval) = &self.approval {
-            // What runs, with its hidden characters written out.
+            // The command, which the channel cards only when it is the one
+            // that runs, with its hidden characters written out.
             let shown = revealed(&approval.command);
             // A command may contain markdown fences. Pick the shorter safe fence;
             // its two copies add at most roughly one command's length to the frame.
