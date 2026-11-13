@@ -45,7 +45,7 @@ mod unenforced;
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use app::AppEndpoint;
-pub use approvals::AccessPlan;
+pub use approvals::{AccessPlan, normalized};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{

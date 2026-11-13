@@ -22,12 +22,18 @@ pub(super) fn normalize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     limits.max_image_height = Some(512);
     limits.max_alloc = Some(8 * 1024 * 1024);
     reader.limits(limits);
-    let photo = reader
-        .decode()
-        .map_err(|e| match e {
-            image::ImageError::Limits(_) => "This image is too large.".to_owned(),
-            _ => "This image cannot be read.".to_owned(),
-        })?
+    let unreadable = |e: image::ImageError| match e {
+        image::ImageError::Limits(_) => "This image is too large.".to_owned(),
+        _ => "This image cannot be read.".to_owned(),
+    };
+    let mut decoder = reader.into_decoder().map_err(unreadable)?;
+    // Applied before the metadata is dropped: a phone's portrait photo is
+    // stored as it is taken, sideways, with an orientation tag
+    let orientation = image::ImageDecoder::orientation(&mut decoder)
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut photo = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
+    photo.apply_orientation(orientation);
+    let photo = photo
         .resize_to_fill(256, 256, image::imageops::FilterType::Triangle)
         .to_rgb8();
     for quality in [85, 75, 60, 40] {
@@ -116,7 +122,10 @@ impl Hub {
         store: &Store,
         person: &str,
     ) -> Result<Vec<AgentInfo>, String> {
-        let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
+        // A photo that cannot be read is shown as none, not as a refusal
+        // that ends the device's session
+        let photos = store.avatar_metadata().unwrap_or_default();
+        let host = store.host_person().ok().flatten();
         let plugins = self.plugins.lock().expect("not poisoned");
         Ok(self
             .agents
@@ -124,7 +133,7 @@ impl Hub {
             .filter(|a| self.sees_agent(person, &a.name))
             .map(|a| AgentInfo {
                 avatar: photos.get(&a.name).cloned().unwrap_or_default(),
-                can_edit_avatar: self.known_host().as_deref() == Some(person),
+                can_edit_avatar: host.as_deref() == Some(person),
                 agent: a.name.clone(),
                 runtime: a.runtime.clone(),
                 capabilities: plugins
@@ -219,7 +228,9 @@ impl Hub {
         // Every other paired device shown the agent; the device that asked
         // gets the reply instead. Per-agent revisions let devices ignore a
         // delayed broadcast from a concurrent update.
-        let paired = store.devices().map_err(internal)?;
+        // Saved already: a failure to read the devices only skips the
+        // broadcast, and the device that asked still hears it was saved
+        let paired = store.devices().unwrap_or_default();
         let message = photo_message(agent, saved.clone(), String::new());
         let devices = self.devices.lock().expect("not poisoned");
         for (id, (person, sender, _)) in devices.iter() {
