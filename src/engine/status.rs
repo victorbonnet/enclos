@@ -153,11 +153,15 @@ impl Engine {
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
-        // There, `enclos dashboard` opens it, with no address to give now.
-        let dashboard_command = runtime
-            .and_then(|rt| rt.dashboard())
-            .filter(|_| own_network)
-            .map(|_| format!("enclos dashboard {name}"));
+        // A dedicated dashboard is also needed when the service's page
+        // cannot authenticate a browser, as with Hermes's gateway.
+        let dashboard_command = runtime.and_then(|rt| rt.dashboard()).map(|dashboard| {
+            if own_network {
+                format!("enclos dashboard {name}")
+            } else {
+                format!("enclos exec {name} -- {}", dashboard.command.shown())
+            }
+        });
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {

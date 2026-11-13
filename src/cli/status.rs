@@ -119,7 +119,7 @@ fn listener_lines(
     }
     if let Some(command) = command {
         lines.push(format!(
-            "dashboard: `{command}` serves it to you alone, until Ctrl-C; on a remote host, run it over ssh with -L"
+            "dashboard: `{command}`; open the URL it prints and keep it running until Ctrl-C; over ssh, forward that port with -L"
         ));
     }
     match listeners {
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "dashboard: `enclos dashboard lab` serves it to you alone, until Ctrl-C; on a remote host, run it over ssh with -L"
+                "dashboard: `enclos dashboard lab`; open the URL it prints and keep it running until Ctrl-C; over ssh, forward that port with -L"
             ]
         );
         assert!(!lines[0].contains("http"));

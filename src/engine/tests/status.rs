@@ -748,10 +748,13 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(default["model"], "absent");
     assert!(s["disk"]["total"].is_u64());
     assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
-    // The gateway is not running, and nothing in the sandbox listens.
-    assert_eq!(s["dashboard"], "absent");
-    // The host reaches a Seatbelt sandbox's listeners: no command to name.
-    assert_eq!(s["dashboard_command"], serde_json::Value::Null);
+    // Hermes's gateway cannot authenticate a browser; a dedicated
+    // dashboard command is offered even before the gateway starts.
+    assert_eq!(s["dashboard"], "not_provided");
+    assert_eq!(
+        s["dashboard_command"],
+        "enclos exec home -- hermes dashboard --no-open --isolated --port 0"
+    );
     assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
     assert_eq!(json["complete"], true);
     assert_eq!(json["idle_days"], 30);

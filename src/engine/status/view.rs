@@ -120,15 +120,15 @@ pub struct SandboxStatus {
     pub agents: Option<AgentList>,
     pub disk: Disk,
     /// The address of the page the runtime's service serves on the host,
-    /// such as Hermes's dashboard (ADR 0028), at the port sessions are
+    /// when it is usable by a browser (ADR 0028), at the port sessions are
     /// given: absent while no session of the service runs, "cannot tell"
     /// while it holds no such port or one that cannot be trusted, not
     /// provided for a runtime with no such page.
     pub dashboard: Fact<String>,
-    /// The command that opens the runtime's dashboard to the user who runs
-    /// it, for a sandbox whose listeners the host cannot reach, where
-    /// `dashboard` gives no address (ADR 0040); none elsewhere, and for a
-    /// runtime with no dashboard.
+    /// The command that starts the runtime's dedicated dashboard. On a
+    /// sandbox whose listeners the host cannot reach, `enclos dashboard`
+    /// also opens the way to it (ADR 0040); elsewhere `enclos exec` runs
+    /// its server directly. None for a runtime with no dashboard.
     pub dashboard_command: Option<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback

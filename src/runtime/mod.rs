@@ -550,10 +550,10 @@ pub struct RuntimeService {
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
-    /// The path of the page the service serves on its listener for a
-    /// browser on the host, such as `/` for Hermes's dashboard. `enclos
-    /// status` shows it at the port sessions are given, while the service
-    /// has one.
+    /// The path of a browser-ready page the service serves on its
+    /// listener. `enclos status` shows it at the port sessions are given,
+    /// while the service has one. None when a dedicated dashboard is
+    /// needed, as for Hermes's gateway, which withholds its browser token.
     pub page: Option<&'static str>,
 }
 

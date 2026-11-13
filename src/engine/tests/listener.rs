@@ -238,45 +238,43 @@ fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatu
     view.sandboxes.remove(0)
 }
 
-/// Status shows the dashboard at the port sessions are given, nothing
-/// once the gateway is gone, and why when the port cannot be trusted.
+/// The gateway serves the SPA without its browser token, so its port is
+/// not a usable dashboard. Status directs the user to a dedicated server.
 #[test]
-fn status_shows_the_dashboard_at_the_gateways_port() {
+fn status_shows_a_dedicated_dashboard_command_instead_of_the_gateway_url() {
     use crate::engine::Fact;
     let (_dir, engine, name) = with_sandbox();
-    let (child, port) = gateway(&engine, &name, 1);
+    let (child, _) = gateway(&engine, &name, 1);
     let up = status_of(&engine, &name);
     end(child);
-    assert_eq!(
-        up.dashboard,
-        Fact::Known(format!("http://127.0.0.1:{port}/"))
-    );
+    let command = Some(format!(
+        "enclos exec {name} -- hermes dashboard --no-open --isolated --port 0"
+    ));
+    assert_eq!(up.dashboard, Fact::NotProvided);
+    assert_eq!(up.dashboard_command, command);
     // On loopback alone: nothing the host's network reaches.
     assert_eq!(up.network_listeners, Fact::Known(Vec::new()));
-    assert_eq!(status_of(&engine, &name).dashboard, Fact::Absent);
+    let stopped = status_of(&engine, &name);
+    assert_eq!(stopped.dashboard, Fact::NotProvided);
+    assert_eq!(stopped.dashboard_command, command);
 
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
     let several = status_of(&engine, &name);
     end(child);
-    let Fact::CannotTell(why) = several.dashboard else {
-        panic!("{:?}", several.dashboard);
-    };
-    assert!(why.contains("listens on 2 ephemeral ports"), "{why}");
+    assert_eq!(several.dashboard, Fact::NotProvided);
+    assert_eq!(several.dashboard_command, command);
 
-    // On every address: no dashboard, and the gateway is named as what
-    // the host's network reaches.
+    // The command does not depend on a gateway port, and listeners beyond
+    // loopback are still named as reachable from the host's network.
     let (_dir, engine, name) = with_sandbox();
     let (child, held) = perl(&listening(1, "0.0.0.0"), 1);
     let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
     record_gateway(&engine, &name, root);
     let wide = status_of(&engine, &name);
     end(child);
-    assert!(
-        matches!(wide.dashboard, Fact::CannotTell(_)),
-        "{:?}",
-        wide.dashboard
-    );
+    assert_eq!(wide.dashboard, Fact::NotProvided);
+    assert_eq!(wide.dashboard_command, command);
     let Fact::Known(reached) = wide.network_listeners else {
         panic!("{:?}", wide.network_listeners);
     };

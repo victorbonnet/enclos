@@ -569,10 +569,11 @@ impl RuntimeAdapter for Hermes {
         // `hermes_cli/gateway_client.py`).
         Some(RuntimeListener {
             service: GATEWAY,
-            // Its web dashboard, on the same listener. Bound to loopback,
-            // Hermes asks no login for it, by its code
-            // (`listener_auth_required` in `gateway/run_api.py`).
-            page: Some("/"),
+            // The gateway serves the SPA but deliberately withholds its
+            // browser token (`GatewayDashboardMount._bind_state` in
+            // gateway/run_api.py). Its API returns 401 and the SPA reloads
+            // repeatedly. The dedicated dashboard below supplies the token.
+            page: None,
         })
     }
 
