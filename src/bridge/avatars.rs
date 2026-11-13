@@ -178,10 +178,15 @@ impl Hub {
                 "This agent is no longer listed by its host.".into(),
             ));
         }
-        if write && self.known_host().as_deref() != Some(person) {
-            return Err(PhotoError::NotAllowed(
-                "Only the host's person can change a shared agent photo.".into(),
-            ));
+        if write {
+            self.host_authority(store, device, person)
+                .map_err(|(code, message)| {
+                    if code == ErrorCode::Internal {
+                        PhotoError::Internal(message)
+                    } else {
+                        PhotoError::NotAllowed(message)
+                    }
+                })?;
         }
         Ok(())
     }

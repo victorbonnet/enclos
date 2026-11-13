@@ -109,7 +109,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `type` | From | Fields |
 | --- | --- | --- |
 | `auth` | device | `device`, `sig` (base64url DER signature of `enclos auth v1` ‖ the handshake hash) |
-| `authenticated` | bridge | `person`, optional `capabilities` (`sandboxes` enables creation and runtime installation) |
+| `authenticated` | bridge | `person`, optional `capabilities` (`sandboxes` for provisioning and `audit` for audit pages, offered to the host's person) |
 | `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of `enclos pair proof v1` ‖ the handshake hash, keyed with `code`), `sig` (base64url DER signature, by `device_key`, of `enclos pair v1` ‖ the handshake hash), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `bad_signature`, `declined` |
@@ -265,6 +265,17 @@ Only the host's person, authenticated on a still-paired device, may use these me
 The bridge sends completion or an `error` with the request's `of`, then a fresh `sandboxes.list` to the host's person's connected devices. Only one provisioning operation per sandbox runs at once (`busy` otherwise). Operations continue if the phone disconnects; they are not replayed on reconnect. A new `sandboxes` request reads the resulting host state. Requests with invalid names, runtimes or templates get `bad_message`; engine and installer failures get `operation_failed`, in their own words. No installed runtime is recorded until its installer succeeds. Existing engine checks still refuse pending policies, another installed runtime, and unrelated policy edits that require host review. Runtime login, app channel setup and service startup remain host operations, and the app says so. Existing mobile policy review and editing are unchanged.
 
 Each request and its completion is logged with its device and person in `enclos app log`. The engine audit records creation by the authenticated person and runtime installation by the local host user running the CLI child. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. After completing a new agent's app channel setup on the host, restart the bridge to list it.
+
+### Host audit
+
+The bridge advertises `audit` only to the host's person, as recorded by pairing or `enclos app host`. Each request rereads that identity and the device's paired identity and keys; another person, unknown ownership or a revoked device receives `not_allowed`. A read failure returns a correlated `internal` error with fixed guidance; database details and host paths are logged only on the host.
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `audit` | device | `before`? (entry sequence) | Newest audit entries first; only entries with a smaller sequence when `before` is given |
+| `audit.list` | bridge | `of`, `entries`, `next_before` (sequence or `null`) | Up to 25 entries, bounded to fit one Noise message; use `next_before` to request older entries |
+
+Each entry has `seq`, `time` (Unix seconds), `user`, `host`, `command`, `target` (or `null`), `result` (`ok`, `failed`, `unfinished`), `message` (or `null`) and `finished` (Unix seconds or `null`). Unfinished means no outcome was recorded, including a command still running. Text fields over 1 KiB are shortened with an ellipsis for display; full entries remain on the host. `of` correlates the page with its request. Reading entries does not verify the hash chain; `enclos audit verify` remains the integrity check. Older bridges advertise no `audit` capability and are not sent these requests.
 
 ### Notifications
 

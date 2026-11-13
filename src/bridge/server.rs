@@ -23,6 +23,10 @@ mod tests;
 mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "audit.rs"]
+mod audit;
+#[path = "authority.rs"]
+mod authority;
 #[path = "avatars.rs"]
 mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
@@ -214,18 +218,25 @@ impl Drop for Waiting {
 impl Hub {
     fn begin(
         self: &Arc<Self>,
+        store: &Store,
         operation: Operation,
         of: MessageId,
         device: &Device,
         person: &str,
     ) -> Result<(), ErrorBody> {
-        if self.provisioning.is_none() || self.known_host().as_deref() != Some(person) {
+        if self.provisioning.is_none() {
             return Err(ErrorBody {
                 of: Some(of),
                 code: ErrorCode::NotAllowed,
                 message: "only the host's person can manage sandboxes".to_owned(),
             });
         }
+        self.host_authority(store, device, person)
+            .map_err(|(code, message)| ErrorBody {
+                of: Some(of.clone()),
+                code,
+                message,
+            })?;
         let sandbox = operation.sandbox().to_owned();
         let verb = operation.verb().to_owned();
         let mut busy = self.provisioning_busy.lock().expect("not poisoned");
@@ -1543,12 +1554,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
-        capabilities: if hub.provisioning.is_some() && hub.known_host().as_deref() == Some(&person)
-        {
-            vec!["sandboxes".into()]
-        } else {
-            vec![]
-        },
+        capabilities: hub.capabilities(&person),
     })?;
     // Authenticated: no longer among the callers that are few at once
     drop(waiting);
@@ -1749,6 +1755,12 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::Audit { before } => {
+                let response = hub
+                    .host_audit(store, device, person, message.id, before)
+                    .unwrap_or_else(ToDevice::Error);
+                link.send(response)?;
+            }
             FromDevice::AgentNameGet { agent } => {
                 match hub.get_agent_name(store, device, person, &agent, message.id.to_string()) {
                     Ok(name) => link.send(name)?,
@@ -1884,21 +1896,19 @@ fn run_session(
             | FromDevice::Runtimes
             | FromDevice::SandboxCreate { .. }
             | FromDevice::RuntimeInstall { .. } => {
-                if hub.provisioning.is_none()
-                    || hub.known_host().as_deref() != Some(person)
-                    || !store
-                        .device(&device.id)
-                        .map_err(|e| e.to_string())?
-                        .is_some_and(|known| {
-                            known.noise_key == device.noise_key
-                                && known.person == person
-                                && known.node == device.node
-                        })
-                {
+                if hub.provisioning.is_none() {
                     link.send(ToDevice::Error(ErrorBody {
                         of: Some(message.id),
                         code: ErrorCode::NotAllowed,
-                        message: "only the host's person can manage sandboxes".to_owned(),
+                        message: "This bridge does not offer provisioning.".into(),
+                    }))?;
+                    continue;
+                }
+                if let Err((code, message_text)) = hub.host_authority(store, device, person) {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code,
+                        message: message_text,
                     }))?;
                     continue;
                 }
@@ -1939,7 +1949,8 @@ fn run_session(
                 };
                 match operation {
                     Ok(operation) => {
-                        if let Err(error) = hub.begin(operation, message.id, device, person) {
+                        if let Err(error) = hub.begin(store, operation, message.id, device, person)
+                        {
                             link.send(ToDevice::Error(error))?;
                         }
                     }
@@ -3087,7 +3098,7 @@ mod connection_end_tests {
         store.set_host(PERSON).unwrap();
         let (mut device, first) = connect(&bridge, &phone);
         assert!(
-            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities == ["sandboxes"])
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.contains(&"sandboxes".into()) && capabilities.contains(&"audit".into()))
         );
         device.send("catalog", FromDevice::Runtimes);
         assert!(
