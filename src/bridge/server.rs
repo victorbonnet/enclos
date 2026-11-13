@@ -114,6 +114,9 @@ struct Hub {
     transport: Transport,
     whois: Whois,
     store_path: std::path::PathBuf,
+    /// Where the audit log is: a device that forgets this host is unpaired
+    /// as `enclos app unpair` does, audited.
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// Open plugin connections, by agent.
@@ -154,10 +157,13 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    // Each is one thing the bridge is given at start; tests pass their own
+    #[allow(clippy::too_many_arguments)]
     fn new(
         transport: Transport,
         whois: Whois,
         store_path: std::path::PathBuf,
+        layout: crate::layout::Layout,
         bridge_private: Vec<u8>,
         agents: Vec<AgentEndpoint>,
         host: Option<String>,
@@ -178,6 +184,7 @@ impl Hub {
             transport,
             whois,
             store_path,
+            layout,
             bridge_private,
             agents,
             plugins: Mutex::new(HashMap::new()),
@@ -678,6 +685,7 @@ pub fn serve(
     transport: Transport,
     port: u16,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
@@ -693,6 +701,7 @@ pub fn serve(
         transport,
         Arc::new(move |address: &str| transport.whois(address)),
         store_path,
+        layout,
         bridge_private,
         agents,
         None,
@@ -1337,7 +1346,17 @@ fn run_session(
             // `enclos app unpair` does, then the connection ends. The
             // conversations stay, the person's.
             FromDevice::DeviceForget => {
-                forget(store, device, person)?;
+                // Not audited, not forgotten: the device stays paired, and
+                // hears why
+                if let Err(why) = forget(hub, store, device, person) {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        // `internal` once the protocol has it
+                        code: ErrorCode::Unknown,
+                        message: format!("this host was not forgotten: {why}"),
+                    }))?;
+                    continue;
+                }
                 // Unpaired whether or not the answer reaches the device: a
                 // failure to send it is not why the connection ended.
                 let _ = link.send(ToDevice::Ack { of: message.id });
@@ -1352,8 +1371,29 @@ fn run_session(
 
 /// The person forgot this host on `device`: its row goes, so its keys
 /// open no connection again ("an unknown device"), and the log says so.
-fn forget(store: &Store, device: &Device, person: &str) -> Result<(), String> {
-    store.remove_device(&device.id).map_err(|e| e.to_string())?;
+/// Audited as `enclos app unpair` is: when the audit log cannot be
+/// written, the device stays paired and the request fails.
+fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(), String> {
+    let engine = crate::engine::Engine::open(hub.layout.clone(), crate::state::Wait::Background);
+    let by = crate::model::audit::Actor {
+        user: person.to_owned(),
+        host: device.name.clone(),
+    };
+    engine
+        .app_access(
+            &by,
+            "app forget",
+            device.id.clone(),
+            |_| "forgotten on the device: it can no longer connect".to_owned(),
+            || {
+                store.remove_device(&device.id).map(|_| ()).map_err(|e| {
+                    crate::error::Error::Session {
+                        what: e.to_string(),
+                    }
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
     let _ = store.log(
         Some(&device.id),
         Some(person),
@@ -1695,7 +1735,9 @@ fn rename(
     else {
         return Ok(());
     };
-    if owner != person {
+    // Home is named Home, so the runtime's names do not replace it (ADR
+    // 0044): clearing its name would let them
+    if owner != person || is_home(conversation.as_str()) {
         return Ok(());
     }
     if !store
@@ -1851,6 +1893,7 @@ mod connection_end_tests {
             Transport::Tailscale,
             whois,
             store.clone(),
+            crate::layout::Layout::at(folder.join("enclos")),
             keys.private.to_vec(),
             vec![AgentEndpoint {
                 name: "lab/main".to_owned(),
@@ -2214,12 +2257,7 @@ mod connection_end_tests {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
         let store = Store::open(&bridge.store).unwrap();
-        // Connecting names nobody: no Home is given yet.
-        let phone = paired(&bridge, "n-pixel");
-        let (_connected, first) = connect(&bridge, &phone);
-        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
         assert_eq!(store.host_person().unwrap(), None);
-        assert_eq!(store.owner("home.lab.main").unwrap(), None);
         // The first paired at the terminal is the host's person, whoever
         // the transport says the host belongs to, and has Home.
         *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
@@ -2800,10 +2838,45 @@ mod connection_end_tests {
         assert_eq!(first, None);
     }
 
+    /// Where the bridge in `folder` writes its audit log, made ready.
+    fn audit_log(folder: &Path) -> PathBuf {
+        let log = crate::layout::Layout::at(folder.join("enclos")).audit_log();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        log
+    }
+
+    #[test]
+    fn a_forgotten_device_is_audited_or_stays_paired() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // No audit log: refused, and the device stays paired
+        device.send("forget-1", FromDevice::DeviceForget);
+        let Some(ToDevice::Error(error)) = device.receive() else {
+            panic!("not refused");
+        };
+        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.of.unwrap().as_str(), "forget-1");
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(store.device(&phone.id).unwrap().is_some());
+        // With one, forgotten, and the audit log says who and which
+        let log = audit_log(folder.path());
+        device.send("forget-2", FromDevice::DeviceForget);
+        assert!(matches!(device.receive(), Some(ToDevice::Ack { .. })));
+        assert!(store.device(&phone.id).unwrap().is_none());
+        let audit = std::fs::read_to_string(log).unwrap();
+        assert!(audit.contains("app forget"), "{audit}");
+        assert!(audit.contains(&phone.id), "{audit}");
+        assert!(audit.contains(PERSON), "{audit}");
+    }
+
     #[test]
     fn a_device_forgotten_on_one_connection_loses_its_others() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
+        audit_log(folder.path());
         let phone = paired(&bridge, "n-pixel");
         // A connection left half open, and the one the device reconnected on
         let (mut old, _) = connect(&bridge, &phone);
