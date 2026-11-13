@@ -165,12 +165,18 @@ fn whois_caller(answer: &[u8]) -> Option<Caller> {
 
 /// `https://<host>.<tailnet>.ts.net`, from `tailscale status --json`.
 fn tailscale_address() -> Option<String> {
+    dns_name_url(&tailscale_status()?)
+}
+
+/// `tailscale status --json`, from the first `tailscale` command that
+/// answers.
+fn tailscale_status() -> Option<Vec<u8>> {
     tailscale_commands().into_iter().find_map(|command| {
         let out = std::process::Command::new(command)
             .args(["status", "--json"])
             .output()
             .ok()?;
-        dns_name_url(&out.stdout)
+        (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
     })
 }
 

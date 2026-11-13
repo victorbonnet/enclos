@@ -2969,6 +2969,23 @@ fn app_devices_status_and_log_print_a_document_when_piped() {
         "{}",
         out.stderr()
     );
+    // No device paired: no host's person, and none can be named.
+    let out = home.run(&["app", "host"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Nobody yet: the first device paired with `enclos app pair` names the host's person.\n"
+    );
+    let out = home.run(&["app", "host", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["host_person"], serde_json::Value::Null);
+    let out = home.run(&["app", "host", "bob@example.com"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr()
+            .contains("bob@example.com has no paired device"),
+        "{}",
+        out.stderr()
+    );
 }
 
 #[test]

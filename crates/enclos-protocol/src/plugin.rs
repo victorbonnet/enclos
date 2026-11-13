@@ -28,9 +28,16 @@ fn line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromBridge {
-    /// First on every connection: the agent's token.
+    /// First on every connection: the agent's token, and its Home
+    /// conversation, where what has no conversation of its own goes (the
+    /// runtime's home channel: Hermes's cron jobs, `send_message` with no
+    /// target).
     #[serde(rename = "hello")]
-    Hello { token: String },
+    Hello {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<ConversationId>,
+    },
     /// A person's message to the agent.
     #[serde(rename = "message.in")]
     MessageIn {
@@ -167,6 +174,9 @@ pub enum OutKind {
     Reply,
     /// Sent with nobody asking now: a cron job, background work.
     Notify,
+    /// Not the agent speaking but its runtime, about itself: Hermes's
+    /// gateway going online or shutting down. Shown as a quiet line.
+    Status,
 }
 
 /// What a runtime can do; an unknown one, from a newer plugin, reads as

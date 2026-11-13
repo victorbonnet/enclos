@@ -80,6 +80,10 @@ enum AppVerb {
     Devices,
     /// Remove a paired device: it can no longer connect.
     Unpair { device: String },
+    /// Show the host's person, whose each agent's Home is: the person of
+    /// the first device paired. With a person, make it them instead; they
+    /// must have a paired device, and get every Home with what it holds.
+    Host { person: Option<String> },
     /// Who can reach the agents, from which devices, and when each was
     /// last seen.
     Status,
@@ -101,6 +105,7 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
         AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
         AppVerb::Unpair { device } => unpair(engine, by, &device),
+        AppVerb::Host { person } => host(engine, by, person),
         AppVerb::Log { lines } => log(engine, lines),
     }
 }
@@ -174,6 +179,7 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
     let store = open_store(engine)?;
+    let host_before = store.host_person().map_err(|e| failed(e.to_string()))?;
     let code = random_bytes(16).map_err(|e| failed(format!("cannot make a code: {e}")))?;
     let expires = now() + 300;
     store
@@ -222,6 +228,12 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
+    if host_before.is_none() {
+        println!(
+            "It is the first device: {} becomes the host's person, whose each agent's Home is.",
+            shown(&request.person)
+        );
+    }
     print!(
         "{} ({transport} login: {}, node: {}) wants to pair. Accept? [y/N] ",
         shown(&request.name),
@@ -295,6 +307,54 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
         },
     )?;
     println!("Paired: device {device}.");
+    // The bridge names the first device's person before it says `paired`.
+    if host_before.is_none()
+        && let Ok(Some(host)) = store.host_person()
+    {
+        println!(
+            "{} is the host's person: each agent's Home is theirs (`enclos app host` changes it).",
+            shown(&host)
+        );
+    }
+    Ok(exit::OK)
+}
+
+fn host(engine: &Engine, by: &Actor, person: Option<String>) -> Result<u8> {
+    let store = open_store(engine)?;
+    let Some(person) = person else {
+        let host = store.host_person().map_err(|e| failed(e.to_string()))?;
+        match (output::json(), host) {
+            (true, host) => output::emit(&json!({"host_person": host})),
+            (false, Some(host)) => {
+                println!("{}: each agent's Home is theirs.", shown(&host));
+            }
+            (false, None) => println!(
+                "Nobody yet: the first device paired with `enclos app pair` names the host's person."
+            ),
+        }
+        return Ok(exit::OK);
+    };
+    let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+    if !devices.iter().any(|d| d.person == person) {
+        return Err(failed(format!(
+            "{} has no paired device: `enclos app devices` lists who has",
+            shown(&person)
+        )));
+    }
+    engine.app_access(
+        by,
+        "app host",
+        person.clone(),
+        |_| "the host's person: each agent's Home is theirs".to_owned(),
+        || store.set_host(&person).map_err(|e| failed(e.to_string())),
+    )?;
+    match output::json() {
+        true => output::emit(&json!({"host_person": person})),
+        false => println!(
+            "{} is the host's person: each agent's Home is theirs, with what it holds.",
+            shown(&person)
+        ),
+    }
     Ok(exit::OK)
 }
 
@@ -370,6 +430,7 @@ fn devices(engine: &Engine) -> Result<u8> {
 
 fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     let store = open_store(engine)?;
+    let person = store.device(device).ok().flatten().map(|d| d.person);
     // A connected device's session ends once its row is gone: the bridge
     // looks for it before each message
     engine.app_access(
@@ -389,6 +450,21 @@ fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     match output::json() {
         true => output::emit(&json!({"device": device, "removed": true})),
         false => println!("Device {device} removed: it can no longer connect."),
+    }
+    // The host's person stays so with no device left (ADR 0044): their
+    // Homes keep what comes, for when they pair again.
+    if let Some(person) = person
+        && store.host_person().ok().flatten().as_deref() == Some(person.as_str())
+        && !store
+            .devices()
+            .unwrap_or_default()
+            .iter()
+            .any(|d| d.person == person)
+    {
+        eprintln!(
+            "{} stays the host's person, with no paired device: each agent's Home keeps what comes until they pair again, or `enclos app host <person>` gives it to another.",
+            shown(&person)
+        );
     }
     Ok(exit::OK)
 }
@@ -458,8 +534,12 @@ fn chat(
     )
     .map_err(failed)?;
     let plugin_error = |e: PluginError| failed(e.to_string());
-    let (hello, mut reader, mut writer) =
-        connect(&endpoint.socket, endpoint.token.expose()).map_err(plugin_error)?;
+    let (hello, mut reader, mut writer) = connect(
+        &endpoint.socket,
+        endpoint.token.expose(),
+        &enclos::bridge::store::home_id(&format!("{sandbox}/{agent}")),
+    )
+    .map_err(plugin_error)?;
     eprintln!(
         "Talking to {sandbox}/{agent} ({}) in conversation {conversation}; Ctrl-D to stop.",
         printable_line(&hello.runtime)
@@ -584,6 +664,7 @@ fn read_agent(
         let kind = match kind {
             OutKind::Reply => "reply",
             OutKind::Notify => "notify",
+            OutKind::Status => "status",
         };
         let ours = store
             .conversation_of(conversation.as_str())
@@ -628,6 +709,12 @@ fn read_agent(
                 "notify" => writeln!(
                     out,
                     "\n[{}, on its own] {}",
+                    printable_line(conversation.as_str()),
+                    shown(text)
+                ),
+                "status" => writeln!(
+                    out,
+                    "\n[{}, runtime] {}",
                     printable_line(conversation.as_str()),
                     shown(text)
                 ),
@@ -739,7 +826,7 @@ mod tests {
                 ("m-3", "c-1", "the weather", OutKind::Notify),
             ],
         );
-        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         let mut acks = writer.try_clone().unwrap();
         let mut printed = Vec::new();
         let done = std::thread::spawn(move || {
