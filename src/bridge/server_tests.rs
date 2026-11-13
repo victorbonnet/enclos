@@ -840,3 +840,25 @@ fn a_capability_the_bridge_does_not_know_is_not_shown() {
         serde_json::from_value(serde_json::json!(["notify", "commands"])).unwrap();
     assert_eq!(known(announced), vec![Capability::Commands]);
 }
+
+#[test]
+fn an_approval_request_is_one_per_scope_and_a_failed_one_is_asked_again() {
+    let (_dir, hub, store) = approval_hub();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    hub.request_access(&store, "lab/main", None, network("API.example.com"), "")
+        .unwrap();
+    let saved = store.approvals().unwrap();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    // It failed, changing nothing: the agent may ask again
+    let mut failed = saved[0].clone();
+    assert!(store.claim_approval(&failed.request).unwrap());
+    failed.state = "failed".into();
+    store.put_approval(&failed).unwrap();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    assert_eq!(
+        store.approval(&failed.request).unwrap().unwrap().state,
+        "pending"
+    );
+}

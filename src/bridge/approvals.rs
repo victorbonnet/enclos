@@ -82,6 +82,8 @@ impl Hub {
         {
             return Err("invalid access target".into());
         }
+        // One request per scope, however the agent spells it
+        let access = crate::engine::normalized(&access);
         let open = store.approvals().map_err(|e| e.to_string())?;
         if open.iter().any(|a| {
             a.sandbox == sandbox
@@ -124,7 +126,11 @@ impl Hub {
         );
         // Decided under this policy: not asked again until it changes. An
         // agent is told so, not left waiting for a request nobody sees.
-        if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
+        // One that failed (the bridge stopped mid-decision, the state lock
+        // was busy) changed nothing: it is asked again
+        let known = store.approval(&key).map_err(|e| e.to_string())?;
+        let reopen = known.as_ref().is_some_and(|k| k.state == "failed");
+        if let Some(known) = known.filter(|_| !reopen) {
             return if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying")
             {
                 Err(format!(
@@ -162,7 +168,12 @@ impl Hub {
             &Engine::open(self.layout.clone(), crate::state::Wait::Background),
             &mut a,
         );
-        if !store.create_approval(&a).map_err(|e| e.to_string())? {
+        let stored = if reopen {
+            store.reopen_approval(&a)
+        } else {
+            store.create_approval(&a)
+        };
+        if !stored.map_err(|e| e.to_string())? {
             return Ok(());
         }
         if let Some(person) = self.known_host() {

@@ -8,6 +8,28 @@ use crate::policy::sha256_hex;
 use enclos_protocol::approval::{Access, AccessKind};
 use toml_edit::{Array, DocumentMut, Item, Table};
 
+/// `access` as the policy would hold it, so two spellings of one scope are
+/// one request: a destination normalized, a path with its symlinks
+/// resolved. One that does not parse stays as it is; planning refuses it.
+pub fn normalized(access: &Access) -> Access {
+    let mut access = access.clone();
+    match access.kind {
+        AccessKind::Network => {
+            if let Ok(entry) = AllowEntry::parse(&access.target) {
+                access.target = entry.to_string();
+            }
+        }
+        AccessKind::Write => {
+            let path = std::path::Path::new(&access.target);
+            if path.is_absolute() {
+                access.target = crate::policy::paths::real_path(path).display().to_string();
+            }
+        }
+        AccessKind::Read => {}
+    }
+    access
+}
+
 pub struct AccessPlan {
     pub revision: String,
     pub change: String,
@@ -289,13 +311,27 @@ impl Engine {
         access: &Access,
         revision: &str,
     ) -> Result<PolicyApplied> {
+        // What the policy received, which the person saw: the agent's own
+        // spelling may differ (a symlink, a host's case or port)
+        let written = std::cell::RefCell::new(String::new());
         let recorded = self.write(
             by,
             "app approval",
             Some(format!("{name} {:?} {}", access.kind, access.target)),
-            |_: &Recorded| "approved the requested policy scope".to_owned(),
+            |_: &Recorded| {
+                format!(
+                    "approved the requested policy scope: {}{}",
+                    written.borrow(),
+                    if access.private {
+                        ", private addresses"
+                    } else {
+                        ""
+                    }
+                )
+            },
             |lock| {
                 let plan = self.access_plan(name, access)?;
+                *written.borrow_mut() = plan.scope.clone();
                 if plan.revision != revision {
                     return Err(refused(
                         "The policy changed. Review the refreshed request before approving.",

@@ -433,6 +433,18 @@ impl Store {
             params![a.request, body, a.state],
         )? == 1)
     }
+    /// A failed request asked again: pending, with `a`'s fresh preview.
+    pub fn reopen_approval(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<bool> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(self.db.execute(
+            "UPDATE approvals SET body=?2,state='pending' WHERE id=?1 AND state='failed'",
+            params![a.request, body],
+        )? == 1)
+    }
     pub fn put_approval(&self, a: &enclos_protocol::approval::Approval) -> rusqlite::Result<()> {
         let body = serde_json::to_string(a)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
