@@ -3,7 +3,6 @@ name: setup
 description: Set enclos up on this host, step by step, from nothing to an agent running in a sandbox; picks up where the host already is. Run only when the user asks for it.
 argument-hint: "[sandbox name]"
 disable-model-invocation: true
-allowed-tools: Bash(enclos *)
 ---
 
 # Set up enclos on this host
@@ -16,7 +15,7 @@ The sandbox's name is `$ARGUMENTS` if the user gave one; otherwise ask, suggesti
 
 ## 1. The host
 
-- `uname -s`, `uname -m`, and on macOS `sw_vers -productVersion`. enclos's releases run on Apple silicon (`arm64`) with macOS 15 or later. On Linux, enclos is in development and not in a release: say so, and continue only if the user has a build (`enclos --version` works) and wants to; read the `enclos` skill's [Linux section](../enclos/reference/workflows.md#on-linux) first.
+- `uname -s`, `uname -m`, and on macOS `sw_vers -productVersion`. enclos's releases run on Apple silicon (`arm64`) with macOS 15 or later, and on Linux on `x86_64` or `aarch64` with systemd 254 or later (`systemctl --version`). On Linux, read the `enclos` skill's [Linux section](../enclos/reference/workflows.md#on-linux) first: bubblewrap must be installed before `enclos init`, and that and any `sudo` step are the user's.
 - Anything else: say enclos does not run here, and stop.
 
 ## 2. enclos itself
@@ -38,7 +37,7 @@ If `<sandbox>` exists, go on to step 5. Otherwise ask the user which template, a
 - `assistant`: its agents reach the public web (ports 80 and 443), logged. The usual choice for an assistant that searches or browses.
 - `minimal`: only Hermes's own hosts (its install sources and the ChatGPT subscription's), and what the user allows later. Their model provider may need `enclos policy allow` if it is not ChatGPT.
 
-Then `enclos sandbox create <sandbox> --template <template>` (on Linux, add `--backend bubblewrap`).
+Then `enclos sandbox create <sandbox> --template <template>`. It uses the default backend `enclos init` chose: Seatbelt on a Mac, bubblewrap on Linux.
 
 ## 5. Hermes
 
