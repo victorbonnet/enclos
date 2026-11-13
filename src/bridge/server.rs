@@ -1188,10 +1188,11 @@ fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(),
             device.id.clone(),
             |_| "forgotten on the device: it can no longer connect".to_owned(),
             || {
-                store
-                    .remove_device(&device.id)
-                    .map(|_| ())
-                    .map_err(|e| crate::error::Error::Session { what: e.to_string() })
+                store.remove_device(&device.id).map(|_| ()).map_err(|e| {
+                    crate::error::Error::Session {
+                        what: e.to_string(),
+                    }
+                })
             },
         )
         .map_err(|e| e.to_string())?;
