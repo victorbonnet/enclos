@@ -235,28 +235,7 @@ impl Engine {
             .iter()
             .find(|f| f.key == edit.field)
             .ok_or_else(|| refused("Unknown policy field"))?;
-        for text in [edit.before.as_deref(), edit.after.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if text.is_empty() || text.len() > 4096 || text.chars().any(char::is_control) {
-                return Err(refused(
-                    "Name one path, destination or setting without control characters.",
-                ));
-            }
-        }
-        // What the phone writes is shown later in the policy page and the
-        // agents' context: nothing in it may change how it reads. An entry
-        // already in the file is named as it is, to be removed.
-        if edit
-            .after
-            .as_deref()
-            .is_some_and(|text| enclos_protocol::visible::has_hidden(text, false))
-        {
-            return Err(refused(
-                "This value contains hidden characters, which would change how it reads.",
-            ));
-        }
+        checked_text(edit)?;
         if edit.before == edit.after {
             return Err(refused("This edit changes nothing."));
         }
@@ -416,6 +395,10 @@ impl Engine {
         revision: &str,
         edit: &PolicyChange,
     ) -> Result<PolicyApplied> {
+        // Before the audit entry, which names the edit: the device's text
+        // is bounded and readable there too
+        checked_text(edit)?;
+        location(&edit.field)?;
         let recorded = self.write(
             by,
             "app policy edit",
@@ -440,6 +423,33 @@ impl Engine {
         )?;
         self.restart_if_asked(by, name, Confirm::Yes, recorded)
     }
+}
+
+/// A phone edit's values: bounded, on one line, and, for what it adds,
+/// with nothing hidden, since the policy page, the audit log and the
+/// agents' context show it later. An entry already in the file is named as
+/// it is, to be removed.
+fn checked_text(edit: &PolicyChange) -> Result<()> {
+    for text in [edit.before.as_deref(), edit.after.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if text.is_empty() || text.len() > 4096 || text.chars().any(char::is_control) {
+            return Err(refused(
+                "Name one path, destination or setting without control characters.",
+            ));
+        }
+    }
+    if edit
+        .after
+        .as_deref()
+        .is_some_and(|text| enclos_protocol::visible::has_hidden(text, false))
+    {
+        return Err(refused(
+            "This value contains hidden characters, which would change how it reads.",
+        ));
+    }
+    Ok(())
 }
 
 /// Edits one list of the sandbox's own layer and leaves what it inherits
