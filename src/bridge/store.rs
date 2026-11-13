@@ -1172,7 +1172,7 @@ impl Store {
         at_most: usize,
     ) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
         )?;
         let rows = query.query_map(params![id, since, at_most as i64], message_row)?;
