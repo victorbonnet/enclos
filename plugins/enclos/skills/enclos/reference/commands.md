@@ -1,6 +1,6 @@
 # enclos commands
 
-Every command of enclos 0.2.0, rendered from its own definitions; `enclos <command> --help` says the same. When `enclos --version` prints another version, read `--help` instead of this file.
+Every command of enclos 0.4.0, rendered from its own definitions; `enclos <command> --help` says the same. When `enclos --version` prints another version, read `--help` instead of this file.
 
 Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log
 
@@ -73,8 +73,8 @@ enclos sandbox create [OPTIONS] --template <TEMPLATE> <NAME>
 ```
 
 - `<NAME>`
-- `--backend <BACKEND>`: The isolation technology. Default: `seatbelt`.
-- `--template <TEMPLATE>`: The policy it starts from, required so the widest is never picked by leaving it out: minimal (only what is listed; from `runtime install` on, the runtime's hosts) or assistant (the public web) (design §7)
+- `--backend <BACKEND>`: The isolation technology: seatbelt (macOS) or bubblewrap (Linux). Without it, the default backend `enclos init` wrote to config.toml for this host.
+- `--template <TEMPLATE>`: The policy it starts from, required so the widest is never picked by leaving it out: minimal (only what is listed; from `runtime install` on, the runtime's hosts), assistant (the public web) or autonomous (Seatbelt only, proposed: writes everywhere but keys, enclos's files and program and the shell's startup files, any port; higher risk) (design §7, ADR 0058)
 
 #### `enclos sandbox list`
 
