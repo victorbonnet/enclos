@@ -26,6 +26,8 @@ mod approvals;
 #[path = "avatars.rs"]
 mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
+#[path = "deletions.rs"]
+mod deletions;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -152,6 +154,8 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
+    deletions: Mutex<HashMap<String, deletions::PendingDelete>>,
+    deletion_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     questions: Mutex<questions::QuestionRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
@@ -257,6 +261,8 @@ impl Hub {
             agents,
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
+            deletions: Mutex::new(HashMap::new()),
+            deletion_locks: Mutex::new(HashMap::new()),
             opening,
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
@@ -548,6 +554,14 @@ impl Hub {
                     // plugin) fails now, not after 15 minutes; a routine
                     // control waiting on it gets its answer.
                     FromPlugin::Error(error) => {
+                        if hub.delete_answer(
+                            &agent,
+                            generation,
+                            error.of.as_ref(),
+                            Err(error.clone()),
+                        ) {
+                            continue;
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -596,6 +610,13 @@ impl Hub {
                         // Every runtime may send on its own: past a burst,
                         // at a pace, so that a loop fills neither the
                         // database nor the devices' queues.
+                        if store
+                            .deletion_started(conversation.as_str())
+                            .unwrap_or(true)
+                        {
+                            let _ = acks.ack(&message.id);
+                            continue;
+                        }
                         hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
@@ -689,6 +710,9 @@ impl Hub {
                         }
                     }
                     FromPlugin::Ack { of } => {
+                        if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
+                            continue;
+                        }
                         let _ = store.delivered(of.as_str());
                     }
                     FromPlugin::Typing { conversation, on } => {
@@ -777,6 +801,7 @@ impl Hub {
                     _ => {}
                 }
             }
+            hub.delete_disconnected(&agent, generation);
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
@@ -881,6 +906,12 @@ impl Hub {
         let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
         for message in pending {
+            if store
+                .deletion_started(&message.conversation)
+                .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
             if plugin.sent.contains(&message.id) {
                 continue;
             }
@@ -1800,6 +1831,18 @@ fn run_session(
             FromDevice::ConversationRead { conversation, seq } => {
                 read(hub, store, person, &conversation, seq)?;
             }
+            FromDevice::ConversationDelete { conversation } => {
+                match hub.delete_conversation(store, person, &conversation) {
+                    Ok(()) => {
+                        link.send(ToDevice::ConversationDeleted { conversation })?;
+                        link.send(ToDevice::Ack { of: message.id })?;
+                    }
+                    Err(mut error) => {
+                        error.of = Some(message.id);
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
             FromDevice::ConversationArchive {
                 conversation,
                 archived,
@@ -1813,6 +1856,11 @@ fn run_session(
                 Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
             },
             FromDevice::Sync { since } => {
+                for id in store.deletions(person).map_err(|e| e.to_string())? {
+                    if let Ok(conversation) = ConversationId::new(id) {
+                        link.send(ToDevice::ConversationDeleted { conversation })?;
+                    }
+                }
                 if hub.known_host().as_deref() == Some(person) {
                     // A log that cannot be read must not end the device's session.
                     if let Err(e) = hub.dismiss_probe_requests(store) {
@@ -2238,6 +2286,12 @@ fn destination(
     agent: &str,
     conversation: ConversationId,
 ) -> Option<ConversationId> {
+    if store
+        .deletion_started(conversation.as_str())
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let own = matches!(
         store.conversation_of(conversation.as_str()),
         Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
@@ -2435,6 +2489,24 @@ fn send(
     text: String,
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
+    if store
+        .deletion_started(conversation.as_str())
+        .map_err(|e| e.to_string())?
+    {
+        if store
+            .deletion_owner(conversation.as_str())
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            != Some(person)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(ToDevice::Error(ErrorBody {
+            of: Some(id),
+            code: ErrorCode::Conflict,
+            message: "This conversation is being deleted. Retry Delete to finish.".into(),
+        })));
+    }
     let Some((sandbox, agent, owner)) = store
         .conversation_of(conversation.as_str())
         .map_err(|e| e.to_string())?

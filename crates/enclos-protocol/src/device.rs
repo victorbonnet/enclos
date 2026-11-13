@@ -117,6 +117,9 @@ pub enum FromDevice {
         conversation: ConversationId,
         archived: bool,
     },
+    /// Permanently deletes an owned conversation and its runtime sessions.
+    #[serde(rename = "conversation.delete")]
+    ConversationDelete { conversation: ConversationId },
     /// The bytes of an attachment of one of the person's messages, from
     /// `offset`: the bridge answers with one `attachment.data`.
     #[serde(rename = "attachment.get")]
@@ -156,6 +159,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "conversation.rename",
     "conversation.read",
     "conversation.archive",
+    "conversation.delete",
     "attachment.get",
     "sync",
     "push.token",
@@ -204,6 +208,9 @@ pub enum ToDevice {
     AgentsList { agents: Vec<AgentInfo> },
     /// One of the person's conversations: each at `sync`, before the
     /// messages, and again whenever its name, read position or archive state changes.
+    /// A permanent deletion, repeated at sync even when there are no new messages.
+    #[serde(rename = "conversation.deleted")]
+    ConversationDeleted { conversation: ConversationId },
     #[serde(rename = "conversation")]
     Conversation(ConversationInfo),
     #[serde(rename = "message")]
@@ -266,6 +273,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "pair.refused",
     "agents.list",
     "conversation",
+    "conversation.deleted",
     "message",
     "typing",
     "tool",
@@ -837,5 +845,17 @@ mod tests {
         ));
         // A Noise transport message is 65,535 bytes, its tag 16 of them.
         assert!(line.len() <= 65_535 - 16, "{} bytes", line.len());
+    }
+    #[test]
+    fn deletion_messages_are_typed_and_require_a_conversation_id() {
+        let request = br#"{"v":1,"id":"d1","type":"conversation.delete","conversation":"c-1"}"#;
+        assert!(
+            matches!(decode_from_device(request).unwrap().body, FromDevice::ConversationDelete { conversation } if conversation.as_str()=="c-1")
+        );
+        assert!(decode_from_device(br#"{"v":1,"id":"d1","type":"conversation.delete"}"#).is_err());
+        let response = br#"{"v":1,"id":"d2","type":"conversation.deleted","conversation":"c-1"}"#;
+        assert!(
+            matches!(decode_to_device(response).unwrap().body, ToDevice::ConversationDeleted { conversation } if conversation.as_str()=="c-1")
+        );
     }
 }
