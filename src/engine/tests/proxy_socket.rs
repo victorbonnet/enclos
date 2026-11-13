@@ -52,10 +52,12 @@ fn runs_a_proxy_when_asked() {
 /// would keep its port, which the next sandbox of another test is given,
 /// for every test after. Killed when dropped; [`ProxyChild::end`]
 /// also checks the port is free again. Take the [`HOST_PORTS`] turn first
-/// and keep it until then.
+/// and keep it until then. What the child writes is kept, for a test to
+/// say why the proxy stopped ([`ProxyChild::said`]).
 struct ProxyChild {
     child: Child,
     port: u16,
+    output: std::path::PathBuf,
 }
 
 impl ProxyChild {
@@ -73,6 +75,8 @@ impl ProxyChild {
         port: u16,
         records: bool,
     ) -> ProxyChild {
+        let output = folder.join(format!("proxy-child-{port}.out"));
+        let file = std::fs::File::create(&output).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -83,15 +87,22 @@ impl ProxyChild {
             .env(PROXY_FOLDER, folder)
             .env(PROXY_SANDBOX, name.as_str())
             .env(PROXY_PORT, port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file));
         if records {
             command.env(PROXY_RECORDS, "1");
         }
         ProxyChild {
             child: spawn_unmarked(&mut command).unwrap(),
             port,
+            output,
         }
+    }
+
+    /// What the child wrote: libtest's report, with the proxy's error once
+    /// it stopped.
+    fn said(&self) -> String {
+        std::fs::read_to_string(&self.output).unwrap_or_else(|e| format!("nothing to read: {e}"))
     }
 
     fn exited(&mut self) -> bool {
@@ -104,7 +115,9 @@ impl ProxyChild {
         loop {
             match UnixStream::connect(path) {
                 Ok(conn) => return conn,
-                Err(e) if started.elapsed().as_secs() > 30 || self.exited() => panic!("{e}"),
+                Err(e) if started.elapsed().as_secs() > 30 || self.exited() => {
+                    panic!("{e}; the proxy wrote:\n{}", self.said())
+                }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
@@ -314,7 +327,7 @@ fn a_proxy_goes_by_its_sandboxs_backend_when_its_socket_cannot_be_opened() {
     let mut running = ProxyChild::start(&engine, &name, true);
     let started = std::time::Instant::now();
     while !engine.proxy_runs(&name).unwrap() {
-        assert!(!running.exited(), "the proxy stopped");
+        assert!(!running.exited(), "the proxy stopped:\n{}", running.said());
         assert!(started.elapsed().as_secs() < 30, "the proxy never recorded");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -372,7 +385,7 @@ fn a_second_proxy_leaves_the_running_one_its_socket_when_neither_holds_a_port() 
         "{err}"
     );
     UnixStream::connect(&path).unwrap();
-    assert!(!running.exited());
+    assert!(!running.exited(), "the proxy stopped:\n{}", running.said());
     running.end();
 }
 
@@ -457,7 +470,7 @@ fn a_proxy_service_records_itself_after_a_long_sandbox_start() {
     let mut proxy = running.borrow_mut().take().unwrap();
     // As `sandbox start` waits for it once the services are installed.
     let recorded = engine.proxy_started(&name, PROXY_WAIT).unwrap();
-    assert!(!proxy.exited(), "the proxy exited");
+    assert!(!proxy.exited(), "the proxy exited:\n{}", proxy.said());
     assert!(recorded, "the proxy did not record itself");
     proxy.end();
 }
