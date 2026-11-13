@@ -27,6 +27,8 @@ mod avatars;
 mod group_turns;
 #[path = "policy.rs"]
 mod policy;
+#[path = "routines.rs"]
+mod routines;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -144,6 +146,7 @@ struct Hub {
     agents: Vec<AgentEndpoint>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
+    routines: Mutex<routines::RoutineRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
     /// callers that need that agent, not the bridge.
@@ -241,6 +244,7 @@ impl Hub {
             bridge_private,
             agents,
             plugins: Mutex::new(HashMap::new()),
+            routines: Mutex::new(Default::default()),
             opening,
             opening_all: AtomicBool::new(false),
             commands: Mutex::new(HashMap::new()),
@@ -437,6 +441,7 @@ impl Hub {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let routine_connection = self.routine_connected(agent);
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
         {
             let mut plugins = self.plugins.lock().expect("not poisoned");
@@ -492,6 +497,23 @@ impl Hub {
                     }
                 };
                 match message.body {
+                    FromPlugin::RoutineResponse(reply) => {
+                        hub.routine_response(&store, &agent, &routine_connection, reply);
+                    }
+                    // An error naming one of the bridge's messages: a group
+                    // turn sent as that message (a line too long for the
+                    // plugin) fails now, not after 15 minutes; a routine
+                    // control waiting on it gets its answer.
+                    FromPlugin::Error(error) => {
+                        if let Some(of) = &error.of {
+                            let why = format!(
+                                "the member's app channel refused the turn: {}",
+                                error.message
+                            );
+                            hub.fail_turns(&store, &agent, Some(of.as_str()), &why);
+                        }
+                        hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
                     FromPlugin::MessageOut {
                         conversation,
                         text,
@@ -679,20 +701,10 @@ impl Hub {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
-                    // The plugin could not take a message of the bridge's
-                    // (a line too long for it): a group turn sent as that
-                    // message fails now, not after 15 minutes.
-                    FromPlugin::Error(ErrorBody {
-                        of: Some(of),
-                        message,
-                        ..
-                    }) => {
-                        let why = format!("the member's app channel refused the turn: {message}");
-                        hub.fail_turns(&store, &agent, Some(of.as_str()), &why);
-                    }
                     _ => {}
                 }
             }
+            hub.routine_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
             // turn it was running gets no reply on this connection.
             let mut plugins = hub.plugins.lock().expect("not poisoned");
@@ -926,6 +938,11 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
             }
         }
     });
+    // Routine requests the runtime leaves unanswered end after a while.
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || hub.expire_routines_forever());
+    }
     // Each agent's Home, the host's person's, before anything is sent to it.
     if let Ok(store) = hub.store() {
         hub.ensure_homes(&store);
@@ -1490,6 +1507,13 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::RoutineRequest { agent, request } => {
+                if let Err(error) =
+                    hub.routine_request(store, device, person, &agent, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::AgentAvatarGet { agent } => {
                 link.send(hub.avatar_get_reply(store, device, person, &agent, message.id))?;
             }

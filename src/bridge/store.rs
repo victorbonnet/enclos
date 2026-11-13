@@ -651,6 +651,25 @@ impl Store {
         rows.collect()
     }
 
+    /// An owner's direct conversations with agent `agent` of `sandbox`,
+    /// groups left out, oldest first: in one query.
+    pub fn direct_conversations(
+        &self,
+        owner: &str,
+        sandbox: &str,
+        agent: &str,
+    ) -> rusqlite::Result<Vec<Conversation>> {
+        let mut query = self.db.prepare(
+            "SELECT c.id, c.sandbox, c.agent, c.title, c.titled_by, c.read, c.archived, c.revision
+             FROM conversations c
+             WHERE c.owner = ?1 AND c.sandbox = ?2 AND c.agent = ?3
+               AND NOT EXISTS (SELECT 1 FROM members m WHERE m.conversation = c.id)
+             ORDER BY c.created, c.id",
+        )?;
+        let rows = query.query_map(params![owner, sandbox, agent], conversation_row)?;
+        rows.collect()
+    }
+
     /// Archives or restores an owner's conversation. `None` means unknown or
     /// owned by someone else; `Some` says whether the flag changed. Content,
     /// routing, read positions and running work are untouched.

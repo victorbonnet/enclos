@@ -13,6 +13,12 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "routine.request")]
+    RoutineRequest {
+        agent: String,
+        #[serde(flatten)]
+        request: crate::routine::RoutineRequest,
+    },
     #[serde(rename = "agent.avatar.get")]
     AgentAvatarGet { agent: String },
     #[serde(rename = "agent.avatar.set")]
@@ -120,6 +126,7 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "routine.request",
     "agent.avatar.get",
     "agent.avatar.set",
     "sandbox.policy.get",
@@ -148,6 +155,12 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "routine.response")]
+    RoutineResponse {
+        agent: String,
+        #[serde(flatten)]
+        reply: crate::routine::RoutineReply,
+    },
     #[serde(rename = "agent.avatar")]
     AgentAvatar(crate::avatar::AgentAvatar),
     #[serde(rename = "sandbox.policy")]
@@ -216,6 +229,7 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "routine.response",
     "agent.avatar",
     "sandbox.policy",
     "sandbox.policy.preview",
@@ -311,6 +325,10 @@ pub struct AgentInfo {
     pub avatar: crate::avatar::AvatarMetadata,
     #[serde(default)]
     pub can_edit_avatar: bool,
+    /// Whether this person may manage the agent's routines: the host's
+    /// person only. Absent (an older host) means no.
+    #[serde(default)]
+    pub can_manage_routines: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,

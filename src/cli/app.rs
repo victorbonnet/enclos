@@ -15,7 +15,7 @@ use enclos::bridge::keys::bridge_keypair;
 use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
-use enclos::bridge::store::{From, Store};
+use enclos::bridge::store::{From, LogLine, Store};
 use enclos::bridge::transport::Transport;
 use enclos::engine::{Engine, printable_line};
 use enclos::error::{Error, Result, exit};
@@ -485,18 +485,27 @@ fn log(engine: &Engine, lines: i64) -> Result<u8> {
         return Ok(exit::OK);
     }
     for line in lines {
-        println!(
-            "{}  {}  {}  {}{}",
-            when(Some(line.at)),
-            line.event,
-            shown(line.device.as_deref().unwrap_or("-")),
-            shown(line.person.as_deref().unwrap_or("-")),
-            line.reason
-                .map(|r| format!("  ({})", shown(&r)))
-                .unwrap_or_default()
-        );
+        println!("{}", log_line(&line));
     }
     Ok(exit::OK)
+}
+
+/// One line of the bridge's log for the terminal. Its fields can come from
+/// a device or an agent's runtime, such as a routine's id, so each is
+/// escaped: none can start another line or send the terminal an escape
+/// sequence.
+fn log_line(line: &LogLine) -> String {
+    format!(
+        "{}  {}  {}  {}{}",
+        when(Some(line.at)),
+        printable_line(&line.event),
+        printable_line(line.device.as_deref().unwrap_or("-")),
+        printable_line(line.person.as_deref().unwrap_or("-")),
+        line.reason
+            .as_deref()
+            .map(|r| format!("  ({})", printable_line(r)))
+            .unwrap_or_default()
+    )
 }
 
 fn chat(
@@ -884,5 +893,23 @@ mod tests {
         assert!(resumable("c-1", stored, ("work", "main", "victor@mac")).is_err());
         let other_person = resumable("c-1", stored, ("lab", "main", "alice@mac")).unwrap_err();
         assert!(other_person.contains("victor@mac's"), "{other_person}");
+    }
+
+    #[test]
+    fn a_log_line_cannot_forge_another_or_reach_the_terminal_raw() {
+        let line = LogLine {
+            at: 0,
+            device: Some("phone\u{1b}[2J".into()),
+            person: None,
+            event: "routine.create".into(),
+            reason: Some(
+                "lab/coder new confirmed as x\n1970-01-01  unpaired  phone  -\u{1b}]52;c;eA==\u{7}"
+                    .into(),
+            ),
+        };
+        let shown = log_line(&line);
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert!(shown.contains("phone\\u{1b}[2J"), "{shown}");
+        assert!(shown.contains("confirmed as x\\n1970-01-01"), "{shown}");
     }
 }
