@@ -252,15 +252,16 @@ impl Engine {
     }
 
     /// The first port no sandbox here uses and nothing on this host listens
-    /// on (other enclos installs or users included).
+    /// on (other enclos installs or users included), seen twice so that a
+    /// listener reopening its socket is not taken for none.
     fn free_port(&self) -> Result<u16> {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
-        let listening = |port: u16| {
+        let free = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            super::loopback::listens(addr, std::time::Duration::from_millis(100))
+            super::loopback::free(addr, std::time::Duration::from_millis(100))
         };
         (PORT_FIRST..=PORT_LAST)
-            .find(|port| !used.contains(port) && !listening(*port))
+            .find(|port| !used.contains(port) && free(*port))
             .ok_or(Error::NoFreePorts)
     }
 
