@@ -1685,3 +1685,32 @@ fn a_file_that_cannot_be_recorded_leaves_none_behind() {
     assert!(taken.is_empty());
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
 }
+
+#[test]
+fn a_photos_orientation_tag_is_applied_before_it_is_dropped() {
+    use image::ImageEncoder;
+    // Red left, blue right; tagged "rotate 90° clockwise": red on top
+    let wide = image::RgbImage::from_fn(40, 20, |x, _| {
+        if x < 20 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
+    });
+    let exif = [
+        0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x01, 0x12, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95);
+    encoder.set_exif_metadata(exif.to_vec()).unwrap();
+    encoder
+        .write_image(&wide, 40, 20, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let stored = image::load_from_memory(&super::avatars::normalize(&jpeg).unwrap())
+        .unwrap()
+        .to_rgb8();
+    let (top, bottom) = (stored.get_pixel(128, 20), stored.get_pixel(128, 235));
+    assert!(top[0] > 200 && top[2] < 60, "{top:?}");
+    assert!(bottom[2] > 200 && bottom[0] < 60, "{bottom:?}");
+}
