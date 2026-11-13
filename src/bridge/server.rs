@@ -23,6 +23,8 @@ mod tests;
 mod approvals;
 #[path = "group_turns.rs"]
 mod group_turns;
+#[path = "policy.rs"]
+mod policy;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -926,6 +928,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     }
     if let Ok(store) = hub.store() {
         let _ = store.recover_approvals();
+        let _ = hub.dismiss_probe_requests(&store);
     }
     {
         let hub = Arc::clone(&hub);
@@ -1468,6 +1471,65 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::SandboxPolicyGet { sandbox } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.managed_policy(store, &name));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyPreview {
+                sandbox,
+                base,
+                change,
+            } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| {
+                        crate::engine::Engine::open(
+                            hub.layout.clone(),
+                            crate::state::Wait::Background,
+                        )
+                        .mobile_policy_preview(&name, &base, &change)
+                        .map_err(|e| e.to_string())
+                    });
+                match result {
+                    Ok(mut preview) => {
+                        preview.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyApply { sandbox, edit } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
             FromDevice::ApprovalDecide {
                 request,
                 revision,
@@ -1551,6 +1613,10 @@ fn run_session(
             }
             FromDevice::Sync { since } => {
                 if hub.known_host().as_deref() == Some(person) {
+                    // A log that cannot be read must not end the device's session.
+                    if let Err(e) = hub.dismiss_probe_requests(store) {
+                        eprintln!("enclos app approvals: {e}");
+                    }
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         link.send(ToDevice::Approval(a))?;
                     }

@@ -26,6 +26,9 @@
 //! ([`OwnProbes::host_services`]) could act on the host if they succeeded,
 //! and run only with `--host-services`.
 
+/// Reserved diagnostic destination; never a user access approval.
+pub const POLICY_PROBE_HOST: &str = "probe.enclos.invalid";
+
 use std::path::{Path, PathBuf};
 
 use crate::layout::Layout;
@@ -657,7 +660,7 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     if !i.every_port {
         list.push(proxy_probe(
             "an unlisted port through the proxy",
-            "https://probe.enclos.invalid:8443/",
+            &format!("https://{POLICY_PROBE_HOST}:8443/"),
         ));
     }
     for (what, address) in [

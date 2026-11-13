@@ -117,18 +117,19 @@ impl Proxy {
             duration_ms: 0,
             name_seen: None,
         };
-        match self.open(&client, &mut event) {
+        let mut probe_tag = None;
+        match self.open(&client, &mut event, &mut probe_tag) {
             Err(reason) => {
                 event.reason = Some(reason);
                 event.duration_ms = started.elapsed().as_millis() as u64;
                 // Logged before the answer, so whoever is refused already finds
                 // the refusal in `enclos net denied`.
-                self.record(&event);
+                self.record(&event, probe_tag.as_deref());
                 let _ = refuse(&mut client, &event, reason);
             }
             Ok((upstream, request, early)) => {
                 // Logged as it opens, so a long tunnel shows while it lasts.
-                let row = self.record(&event);
+                let row = self.record(&event, probe_tag.as_deref());
                 forward(
                     &client,
                     &upstream,
@@ -160,13 +161,13 @@ impl Proxy {
     }
 
     /// Records `event`; returns its row, unless there was nothing to record.
-    fn record(&self, event: &NetEvent) -> Option<i64> {
+    fn record(&self, event: &NetEvent, probe_tag: Option<&str>) -> Option<i64> {
         // A request that never said where it was going is not worth a row.
         if event.host.is_empty() {
             return None;
         }
         self.log
-            .record(event)
+            .record_probe(event, probe_tag)
             .inspect_err(|e| {
                 eprintln!(
                     "enclos proxy: could not log a connection to {}: {e}; {} it without a record",
@@ -187,6 +188,7 @@ impl Proxy {
         &self,
         client: &Stream,
         event: &mut NetEvent,
+        probe_tag: &mut Option<String>,
     ) -> Result<(Stream, Request, Vec<u8>), Reason> {
         let mut slow = Until {
             stream: client,
@@ -194,6 +196,7 @@ impl Proxy {
         };
         let (head, early) = read_head(&mut slow).map_err(|_| Reason::BadRequest)?;
         let request = parse(&head).ok_or(Reason::BadRequest)?;
+        *probe_tag = super::request::probe_tag(&head);
         let (host, port) = match &request {
             Request::Connect { host, port } => (host, *port),
             Request::Http { host, port, .. } => (host, *port),

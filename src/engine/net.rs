@@ -32,6 +32,12 @@ impl Engine {
         Ok(self.state.denied(name)?)
     }
 
+    /// Approval candidates exclude connections attributed to host diagnostic runs.
+    pub fn net_denied_for_approval(&self, name: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        self.require_sandbox(name)?;
+        Ok(self.state.denied_for_approval(name)?)
+    }
+
     /// Runs the sandbox's egress proxy until the process ends: on its Unix
     /// socket, and on `port` on both loopbacks unless its sessions reach it
     /// over the socket alone (ADR 0040). With `record`, it records itself

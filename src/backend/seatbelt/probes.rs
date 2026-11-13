@@ -478,8 +478,8 @@ fn clone_probe(folder: &Path, tag: u32) -> Probe {
 /// the proxy refuses in every mode.
 fn ipv6_loopback_probe(port: u16, every_port: bool) -> Probe {
     let target = match every_port {
-        false => "https://probe.enclos.invalid:8443/",
-        true => "https://127.0.0.1:8443/",
+        false => format!("https://{}:8443/", crate::probes::POLICY_PROBE_HOST),
+        true => "https://127.0.0.1:8443/".to_owned(),
     };
     let url = format!("--proxy 'http://[::1]:{port}' {target}");
     let script = format!("{}; echo \" $?\"", curl_through_proxy(&url));

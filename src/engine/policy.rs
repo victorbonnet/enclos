@@ -491,7 +491,7 @@ impl Engine {
     /// The installed runtime's endpoints, as a policy layer (design §7). A
     /// state that cannot be read is an error: resolving without the layer
     /// would record a policy that lacks them.
-    fn adapter_layer(&self, name: &SandboxName) -> Result<Option<AdapterLayer>> {
+    pub(super) fn adapter_layer(&self, name: &SandboxName) -> Result<Option<AdapterLayer>> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;

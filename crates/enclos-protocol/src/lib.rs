@@ -18,6 +18,7 @@ mod ids;
 pub mod noise;
 pub mod pairing;
 pub mod plugin;
+pub mod policy;
 pub mod preview;
 pub mod visible;
 

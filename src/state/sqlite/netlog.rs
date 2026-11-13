@@ -9,7 +9,7 @@ use crate::model::sandbox::SandboxName;
 
 /// Times in one fixed width, so that comparing them as text, as SQLite does,
 /// orders them in time.
-fn fixed(t: Timestamp) -> String {
+pub(super) fn fixed(t: Timestamp) -> String {
     t.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
@@ -140,11 +140,20 @@ pub fn denied(
     conn: &Connection,
     sandbox: &SandboxName,
 ) -> Result<Vec<DeniedDestination>, ReadError> {
-    let mut stmt = conn.prepare(
-        "SELECT host, port, reason, COUNT(*), MIN(at), MAX(at)
-         FROM net_events WHERE sandbox = ?1 AND verdict = 'denied'
-         GROUP BY host, port, reason ORDER BY MAX(at) DESC",
-    )?;
+    denied_from(conn, sandbox, false)
+}
+
+pub(super) fn denied_from(
+    conn: &Connection,
+    sandbox: &SandboxName,
+    exclude_probes: bool,
+) -> Result<Vec<DeniedDestination>, ReadError> {
+    let filter = if exclude_probes {
+        " AND NOT EXISTS (SELECT 1 FROM probe_sources.events p WHERE p.event=net_events.id AND p.sandbox=net_events.sandbox AND p.at=net_events.at)"
+    } else {
+        ""
+    };
+    let mut stmt=conn.prepare(&format!("SELECT host, port, reason, COUNT(*), MIN(at), MAX(at) FROM net_events WHERE sandbox=?1 AND verdict='denied'{filter} GROUP BY host,port,reason ORDER BY MAX(at) DESC"))?;
     let mut rows = stmt.query(params![sandbox.as_str()])?;
     let mut denied = Vec::new();
     while let Some(row) = rows.next()? {

@@ -228,7 +228,7 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
 #[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Arc::new(Hub::new(
+    let mut hub = Arc::new(Hub::new(
         Transport::Tailscale,
         no_whois(),
         dir.path().join("app.db"),
@@ -261,7 +261,374 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
             .unwrap_err()
             .contains("no longer paired")
     );
+    assert!(
+        hub.policy_authority(&store, &device, "guest@example.com", "lab")
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .unwrap_err()
+            .contains("no longer paired")
+    );
+    store.add_device(&device).unwrap();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/coder".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("unused.sock"),
+        token: "fixture".into(),
+    });
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .is_ok()
+    );
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "other")
+            .is_err()
+    );
+    store.remove_device(&device.id).unwrap();
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .is_err()
+    );
     assert!(store.approvals().unwrap().is_empty());
+}
+
+#[test]
+fn accepted_access_labels_the_entry_the_engine_wrote() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let net = |target: &str, private| Access {
+        kind: AccessKind::Network,
+        target: target.into(),
+        private,
+    };
+    assert!(policy::accepted_entry(
+        "allow",
+        "api.example.com",
+        &net("API.Example.com:443", false)
+    ));
+    assert!(policy::accepted_entry(
+        "allow",
+        "api.example.com:8443",
+        &net("api.example.com:8443", false)
+    ));
+    assert!(!policy::accepted_entry(
+        "allow",
+        "api.example.com",
+        &net("api.example.com:8443", false)
+    ));
+    assert!(policy::accepted_entry(
+        "private",
+        "nas.local",
+        &net("NAS.local:8443", true)
+    ));
+    assert!(!policy::accepted_entry(
+        "private",
+        "nas.local",
+        &net("nas.local:8443", false)
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+    let write = Access {
+        kind: AccessKind::Write,
+        target: dir.path().join("alias").display().to_string(),
+        private: false,
+    };
+    let stored = crate::policy::paths::real_path(&real).display().to_string();
+    assert!(policy::accepted_entry("write", &stored, &write));
+    assert!(!policy::accepted_entry("allow", &stored, &write));
+}
+
+#[test]
+fn accepted_access_is_not_limited_to_the_inbox_history_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    for i in 0..210 {
+        let mut a = approval_sample();
+        a.request = format!("r{i}");
+        store.create_approval(&a).unwrap();
+        store.claim_approval(&a.request).unwrap();
+        a.state = "approved".into();
+        store.put_approval(&a).unwrap();
+    }
+    assert_eq!(store.accepted_access().unwrap().len(), 210);
+}
+
+fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
+    let store = hub.store().unwrap();
+    (dir, hub, store)
+}
+
+#[test]
+fn diagnostic_probe_destination_never_becomes_an_approval_request() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    hub.request_access(
+        &store,
+        "lab",
+        None,
+        Access {
+            kind: AccessKind::Network,
+            target: "probe.enclos.invalid:8443".into(),
+            private: false,
+        },
+        "Connect to the network probe",
+    )
+    .unwrap();
+    assert!(
+        store.approvals().unwrap().is_empty(),
+        "an enclos diagnostic probe must not enter the approval inbox"
+    );
+}
+
+#[test]
+fn diagnostic_probe_matching_is_exact_and_real_destinations_still_request_access() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    for target in ["PROBE.ENCLOS.INVALID.:443", "probe.enclos.invalid:8080"] {
+        hub.request_access(
+            &store,
+            "lab",
+            None,
+            Access {
+                kind: AccessKind::Network,
+                target: target.into(),
+                private: false,
+            },
+            "probe",
+        )
+        .unwrap();
+    }
+    assert!(store.approvals().unwrap().is_empty());
+    for target in [
+        "10.0.0.1:443",
+        "api.example.com:8443",
+        "other.enclos.invalid:8443",
+        "probe.enclos.invalid.example.com:443",
+    ] {
+        hub.request_access(
+            &store,
+            "lab",
+            None,
+            Access {
+                kind: AccessKind::Network,
+                target: target.into(),
+                private: true,
+            },
+            "agent work",
+        )
+        .unwrap();
+    }
+    assert_eq!(store.approvals().unwrap().len(), 4);
+}
+#[test]
+fn diagnostic_probe_requests_are_matched_against_one_read_of_the_log() {
+    use crate::model::net::{DeniedDestination, Reason};
+    let denied = |host: &str, reason| DeniedDestination {
+        host: host.into(),
+        port: 443,
+        reason,
+        count: 1,
+        first: jiff::Timestamp::UNIX_EPOCH,
+        last: jiff::Timestamp::UNIX_EPOCH,
+    };
+    let mut a = approval_sample();
+    a.agent.clear();
+    a.access.target = "10.0.0.1:443".into();
+    let probe_only = (vec![denied("10.0.0.1", Reason::PrivateAddress)], vec![]);
+    assert!(approvals::only_probe_events(&a, &probe_only));
+    // Refused outside a diagnostic run too: a real request.
+    let both = (
+        vec![denied("10.0.0.1", Reason::PrivateAddress)],
+        vec![denied("10.0.0.1", Reason::PrivateAddress)],
+    );
+    assert!(!approvals::only_probe_events(&a, &both));
+    // Another destination, or an agent's explicit request, is not the probe's.
+    assert!(!approvals::only_probe_events(
+        &a,
+        &(vec![denied("10.0.0.2", Reason::PrivateAddress)], vec![])
+    ));
+    a.agent = "lab/main".into();
+    assert!(!approvals::only_probe_events(&a, &probe_only));
+}
+
+#[test]
+fn diagnostic_probe_existing_pending_notification_is_dismissed_and_broadcast() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let (tx, rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("d1".into(), ("owner@example.com".into(), tx, 1));
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    a.agent.clear();
+    store.create_approval(&a).unwrap();
+    hub.dismiss_probe_requests(&store).unwrap();
+    let closed = store.approval(&a.request).unwrap().unwrap();
+    assert_eq!(closed.state, "diagnostic");
+    assert!(!closed.available);
+    assert!(!store.claim_approval(&a.request).unwrap());
+    assert!(matches!(rx.try_recv().unwrap(),ToDevice::Approval(v) if v.state=="diagnostic"));
+    hub.dismiss_probe_requests(&store).unwrap();
+    assert!(rx.try_recv().is_err());
+}
+#[test]
+fn diagnostic_probe_dismissal_preserves_existing_decisions_and_rejects_explicit_agent_requests() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    store.create_approval(&a).unwrap();
+    store.claim_approval(&a.request).unwrap();
+    assert!(store.dismiss_probe(&a).unwrap().is_none());
+    a.state = "approved".into();
+    store.put_approval(&a).unwrap();
+    hub.dismiss_probe_requests(&store).unwrap();
+    assert_eq!(
+        store.approval(&a.request).unwrap().unwrap().state,
+        "approved"
+    );
+    assert!(
+        hub.request_access(
+            &store,
+            "lab/coder",
+            Some("c1"),
+            Access {
+                kind: AccessKind::Network,
+                target: "probe.enclos.invalid:8443".into(),
+                private: false
+            },
+            "probe"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn diagnostic_probe_stale_phone_decision_cannot_approve_the_notification() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let device = Device {
+        id: "d1".into(),
+        name: "phone".into(),
+        person: "owner@example.com".into(),
+        noise_key: vec![],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+        node: None,
+    };
+    store.add_device(&device).unwrap();
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    store.create_approval(&a).unwrap();
+    let error = hub
+        .decide_access(
+            &store,
+            &device,
+            "owner@example.com",
+            &a.request,
+            &a.revision,
+            true,
+        )
+        .unwrap_err();
+    assert!(error.contains("diagnostic"));
+    assert_eq!(
+        store.approval(&a.request).unwrap().unwrap().state,
+        "diagnostic"
+    );
+}
+
+#[test]
+fn diagnostic_provenance_preserves_explicit_agent_identity_and_later_real_requests() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let a = Access {
+        kind: AccessKind::Network,
+        target: "10.0.0.1:443".into(),
+        private: true,
+    };
+    hub.request_access(&store, "lab", None, a.clone(), "proxy refusal")
+        .unwrap();
+    let old = store.approvals().unwrap()[0].clone();
+    hub.request_access(
+        &store,
+        "lab/coder",
+        Some("c1"),
+        a.clone(),
+        "explicit request",
+    )
+    .unwrap();
+    assert_eq!(
+        store.approval(&old.request).unwrap().unwrap().agent,
+        "lab/coder"
+    );
+    assert!(
+        store.dismiss_probe(&old).unwrap().is_none(),
+        "stale cleanup cannot discard the agent identity update"
+    );
+    assert_eq!(
+        store.approval(&old.request).unwrap().unwrap().state,
+        "pending"
+    );
+}
+
+#[test]
+fn diagnostic_provenance_later_real_requests_get_fresh_ids_and_keep_denial_deduplication() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let a = Access {
+        kind: AccessKind::Network,
+        target: "10.0.0.1:443".into(),
+        private: true,
+    };
+    hub.request_access(&store, "lab", None, a.clone(), "proxy refusal")
+        .unwrap();
+    let old = store.approvals().unwrap()[0].clone();
+    assert!(store.dismiss_probe(&old).unwrap().is_some());
+    hub.request_access(
+        &store,
+        "lab/coder",
+        Some("c1"),
+        a.clone(),
+        "genuine later attempt",
+    )
+    .unwrap();
+    let next = store
+        .approvals()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.state == "pending")
+        .unwrap();
+    assert_ne!(next.request, old.request);
+    store.claim_approval(&next.request).unwrap();
+    let mut denied = next.clone();
+    denied.state = "denied".into();
+    store.put_approval(&denied).unwrap();
+    hub.request_access(&store, "lab", None, a, "same refusal")
+        .unwrap();
+    assert!(
+        !store
+            .approvals()
+            .unwrap()
+            .iter()
+            .any(|v| v.state == "pending")
+    );
 }
 
 /// A hub of the host's person, with no enclos set up beside it.
@@ -318,6 +685,49 @@ fn approval_requests_are_capped_per_sandbox_for_agents_and_proxies_alike() {
         approvals::MAX_PENDING
     );
     assert_eq!(pending.len(), approvals::MAX_PENDING + 1);
+}
+
+#[test]
+fn an_agents_request_for_a_scope_already_open_upgrades_it_even_at_the_cap() {
+    let (_dir, hub, store) = approval_hub();
+    // A proxy refusal opened it, then the sandbox filled up
+    hub.request_access(&store, "lab", None, network("api.example.com"), "")
+        .unwrap();
+    for i in 1..approvals::MAX_PENDING {
+        hub.request_access(
+            &store,
+            "lab",
+            None,
+            network(&format!("a{i}.example.com")),
+            "",
+        )
+        .unwrap();
+    }
+    // The agent's explicit request for the same scope adds nothing: it is
+    // not refused by the cap, and the open request becomes the agent's
+    hub.request_access(
+        &store,
+        "lab/main",
+        None,
+        network("api.example.com"),
+        "Fetch the forecast",
+    )
+    .unwrap();
+    let open = store.approvals().unwrap();
+    assert_eq!(open.len(), approvals::MAX_PENDING);
+    let upgraded = open
+        .iter()
+        .find(|a| a.access.target == "api.example.com")
+        .unwrap();
+    assert_eq!(
+        (upgraded.agent.as_str(), upgraded.action.as_str()),
+        ("lab/main", "Fetch the forecast")
+    );
+    // A new scope is still refused
+    assert!(
+        hub.request_access(&store, "lab/main", None, network("new.example.com"), "")
+            .is_err()
+    );
 }
 
 #[test]
