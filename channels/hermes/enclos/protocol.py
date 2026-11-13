@@ -40,6 +40,9 @@ PLATFORM_HINT = (
 
 
 HOME_COMMANDS = ("/sethome", "/set-home")
+# Commands of the runtime the app does not offer: /sethome is answered here,
+# /start and /topic are Telegram's.
+COMMANDS_LEFT_OUT = ("sethome", "set-home", "start", "topic")
 # The answer to /sethome: enclos keeps the agent's home channel (ADR 0044).
 HOME_ANSWER = (
     "In the enclos app, this agent's home channel is its **Home** conversation, which enclos "
@@ -222,8 +225,27 @@ def _message(message_type: str, /, **fields: Any) -> dict[str, Any]:
     return {"v": VERSION, "id": new_id(), "type": message_type, **fields}
 
 
-def hello(runtime: str, agent: str) -> dict[str, Any]:
-    return _message("hello", runtime=runtime, agent=agent, capabilities=list(CAPABILITIES))
+def hello(runtime: str, agent: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The plugin's hello; `extra` adds capabilities it has this time (`commands`, once listed)."""
+    return _message("hello", runtime=runtime, agent=agent, capabilities=[*CAPABILITIES, *extra])
+
+
+def commands(listed: list[tuple[str, str, str]]) -> dict[str, Any]:
+    """The commands a person may type to the runtime, from (name, description, args)
+    rows: each name once, without its `/`, those in COMMANDS_LEFT_OUT left out. The
+    bridge keeps names, lengths and the total within what a device takes."""
+    seen: set[str] = set()
+    rows = []
+    for name, description, args in listed:
+        name = str(name).strip().lstrip("/")
+        if not name or name in seen or name in COMMANDS_LEFT_OUT:
+            continue
+        seen.add(name)
+        row: dict[str, Any] = {"name": name, "description": " ".join(str(description or "").split())}
+        if args and str(args).strip():
+            row["args"] = " ".join(str(args).split())
+        rows.append(row)
+    return _message("commands", commands=rows)
 
 
 def message_out(conversation: str, text: str, reply_to: str | None = None,

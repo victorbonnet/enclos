@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{DecodeError, Envelope, decode, encode_line};
 use crate::ids::{ConversationId, MAX_ID_BYTES, MessageId};
 use crate::noise::MAX_NOISE_MESSAGE;
-use crate::plugin::{Capability, ErrorBody, ToolStep};
+use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
 /// What a device sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,15 @@ pub enum ToDevice {
     /// leg, live, not kept.
     #[serde(rename = "tool")]
     Tool(ToolStep),
+    /// The commands a person may type to an agent's runtime, whole, as its
+    /// plugin listed them ([`commands_for_devices`]): after `agents.list`,
+    /// and again when they change.
+    #[serde(rename = "commands")]
+    Commands {
+        /// `<sandbox>/<agent>`.
+        agent: String,
+        commands: Vec<Command>,
+    },
     /// Bytes of an attachment, from `offset`, at most [`ATTACHMENT_CHUNK`]:
     /// a Noise message holds 64 KiB, base64 included.
     #[serde(rename = "attachment.data")]
@@ -153,11 +162,71 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "message",
     "typing",
     "tool",
+    "commands",
     "attachment.data",
     "synced",
     "ack",
     "error",
 ];
+
+/// The longest command name passed on, as Telegram and Discord allow.
+pub const MAX_COMMAND_NAME: usize = 32;
+/// The longest description passed on, in characters: a line on a phone.
+pub const MAX_COMMAND_DESCRIPTION: usize = 120;
+/// The longest `args` passed on, in characters.
+pub const MAX_COMMAND_ARGS: usize = 60;
+/// The most bytes the commands of one `commands` take: the rest of the
+/// message, and the Noise tag, fit in a Noise message's 65,519.
+pub const COMMANDS_BUDGET: usize = 60_000;
+
+/// A plugin's commands as a device gets them: each name once (lower case
+/// letters, digits, `_` and `-`, at most [`MAX_COMMAND_NAME`]; others are
+/// left out), each text on one line, without hidden characters
+/// ([`crate::visible`]) and cut to its limit, in the plugin's order until
+/// they fill [`COMMANDS_BUDGET`].
+pub fn commands_for_devices(commands: Vec<Command>) -> Vec<Command> {
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    // A bidirectional override or a zero-width character would make the
+    // text beside a command read as something else than what was sent.
+    fn line(text: &str, limit: usize) -> String {
+        let shown = words(&crate::visible::stripped(&words(text), false));
+        let cut: String = shown.chars().take(limit).collect();
+        // A cut may leave a joiner at the end, where it is hidden.
+        crate::visible::stripped(cut.trim_end(), false)
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for c in commands {
+        let name = c.name.trim_start_matches('/');
+        let valid = !name.is_empty()
+            && name.len() <= MAX_COMMAND_NAME
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if !valid || !seen.insert(name.to_owned()) {
+            continue;
+        }
+        let command = Command {
+            name: name.to_owned(),
+            description: line(&c.description, MAX_COMMAND_DESCRIPTION),
+            args: c
+                .args
+                .map(|a| line(&a, MAX_COMMAND_ARGS))
+                .filter(|a| !a.is_empty()),
+        };
+        // Its JSON and the comma before the next.
+        let size = serde_json::to_vec(&command).map_or(usize::MAX, |b| b.len() + 1);
+        if used + size > COMMANDS_BUDGET {
+            break;
+        }
+        used += size;
+        kept.push(command);
+    }
+    kept
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushToken {
@@ -324,6 +393,66 @@ mod tests {
         // Nearly full: no piece but the last is left far below the limit
         let first = sealed_size(&message, &pieces[0]);
         assert!(first > MAX_DEVICE_MESSAGE - ID_AND_SEQ_ROOM - 8, "{first}");
+    }
+
+    fn command(name: &str, description: &str, args: Option<&str>) -> Command {
+        Command {
+            name: name.into(),
+            description: description.into(),
+            args: args.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn commands_keep_valid_names_once_each_on_one_line() {
+        let kept = commands_for_devices(vec![
+            command("new", "Start a new\n  session", Some("[name]")),
+            command("/model", "Switch model", Some("  ")),
+            command("new", "again", None),
+            command("Bad Name", "spaces and capitals", None),
+            command("", "empty", None),
+            command(&"x".repeat(33), "too long", None),
+            command("reload_mcp", &"d".repeat(200), None),
+            command(
+                "usage",
+                "Show\u{202E}tsoc \u{2066}usage\u{2069}\u{200B} \u{1b}[31m",
+                Some("[\u{2028}days\u{0}]"),
+            ),
+            command("tools", "\u{202E}\u{200B}", Some("\u{2067}")),
+        ]);
+        assert_eq!(
+            kept,
+            [
+                command("new", "Start a new session", Some("[name]")),
+                command("model", "Switch model", None),
+                command("reload_mcp", &"d".repeat(MAX_COMMAND_DESCRIPTION), None),
+                command("usage", "Showtsoc usage [31m", Some("[ days]")),
+                command("tools", "", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_stop_where_a_message_would_not_fit_a_noise_message() {
+        let many = (0..2_000)
+            .map(|i| {
+                command(
+                    &format!("c{i}"),
+                    &"é".repeat(MAX_COMMAND_DESCRIPTION),
+                    Some("[x]"),
+                )
+            })
+            .collect();
+        let kept = commands_for_devices(many);
+        assert!(!kept.is_empty() && kept.len() < 2_000);
+        let line = encode_line(&Envelope::new(
+            MessageId::new("m-1").unwrap(),
+            ToDevice::Commands {
+                agent: "lab/main".into(),
+                commands: kept,
+            },
+        ));
+        assert!(line.len() < 65_519 - 16, "{} bytes", line.len());
     }
 
     #[test]
