@@ -448,6 +448,18 @@ impl Store {
             params![a.request, body, a.state],
         )? == 1)
     }
+    /// A failed request asked again: pending, with `a`'s fresh preview.
+    pub fn reopen_approval(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<bool> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(self.db.execute(
+            "UPDATE approvals SET body=?2,state='pending' WHERE id=?1 AND state='failed'",
+            params![a.request, body],
+        )? == 1)
+    }
     /// Reclassify a pending diagnostic notification without granting or denying access.
     pub fn dismiss_probe(
         &self,
@@ -519,7 +531,16 @@ impl Store {
         }
         db.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
-             CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
+             CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;
+             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation, seq);",
+        )?;
+        // A database whose devices were paired before the host's person
+        // was kept: the first of them names it, as it would have, so the
+        // next device paired, a guest's perhaps, does not (ADR 0044)
+        db.execute(
+            "INSERT OR IGNORE INTO settings (name, value)
+             SELECT ?1, person FROM devices ORDER BY paired, rowid LIMIT 1",
+            params![HOST_PERSON],
         )?;
         Ok(Store { db })
     }
@@ -645,7 +666,12 @@ impl Store {
             return Ok(false);
         };
         let id = home_id(agent);
-        if self.conversation_of(&id)?.is_some() {
+        if let Some((s, a, _)) = self.conversation_of(&id)? {
+            // Not this agent's: a device chose the id, before the bridge
+            // kept `home.` for itself. It is not Home, and keeps its owner.
+            if (s.as_str(), a.as_str()) != (sandbox, name) {
+                return Ok(false);
+            }
             if owner.is_empty() {
                 return Ok(false);
             }
@@ -733,6 +759,27 @@ impl Store {
         })
     }
 
+    /// A person's message in a group, from a device, as
+    /// [`Store::add_from_device`] stores one, but given to no plugin: the
+    /// bridge runs the group's turns itself.
+    pub fn add_to_group(
+        &self,
+        origin: &str,
+        id: &str,
+        conversation: &str,
+        person: &str,
+        text: &str,
+    ) -> rusqlite::Result<Added> {
+        let added = self.db.execute(
+            "INSERT OR IGNORE INTO messages (id, origin, pending, conversation, person, text, kind, at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'message', ?6)",
+            params![id, origin, conversation, person, text, now()],
+        )?;
+        Ok(match added {
+            1 => Added::New(self.db.last_insert_rowid()),
+            _ => Added::Again,
+        })
+    }
+
     /// The messages still to give `sandbox`/`agent`'s plugin, oldest first.
     pub fn pending(&self, sandbox: &str, agent: &str) -> rusqlite::Result<Vec<Pending>> {
         let mut query = self.db.prepare(
@@ -789,6 +836,25 @@ impl Store {
         rows.collect()
     }
 
+    /// The newest `at_most` of conversation `id`'s messages after `since`,
+    /// oldest first: a turn's prompt holds only so many, however long a
+    /// member has not been given any.
+    pub fn newest_after(
+        &self,
+        id: &str,
+        since: i64,
+        at_most: usize,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let mut query = self.db.prepare(
+            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+             WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = query.query_map(params![id, since, at_most as i64], message_row)?;
+        let mut newest = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        newest.reverse();
+        Ok(newest)
+    }
+
     /// The `seq` of conversation `id`'s newest message; 0 with none.
     pub fn newest(&self, id: &str) -> rusqlite::Result<i64> {
         self.db.query_row(
@@ -809,18 +875,24 @@ impl Store {
         members: &[String],
         owner: &str,
     ) -> rusqlite::Result<(String, Vec<String>)> {
-        let (_, _, owner) = self.conversation(id, sandbox, "", owner)?;
-        let known = !self.members(id)?.is_empty();
+        // At once, so two `group.new` with one id cannot both find it new
+        // and mix their members
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let (made_in, agent, owner) = self.conversation(id, sandbox, "", owner)?;
+        // Another conversation with this id gets no members
+        let known = made_in != sandbox || !agent.is_empty() || !self.members(id)?.is_empty();
         for (position, agent) in members.iter().enumerate().filter(|_| !known) {
             self.db.execute(
                 "INSERT OR IGNORE INTO members (conversation, agent, position) VALUES (?1, ?2, ?3)",
                 params![id, agent, position as i64],
             )?;
         }
-        Ok((
-            owner,
-            self.members(id)?.into_iter().map(|(a, _)| a).collect(),
-        ))
+        let members = self.members(id)?.into_iter().map(|(a, _)| a).collect();
+        transaction.commit()?;
+        Ok((owner, members))
     }
 
     /// A group's members, in its order, each with the `seq` of the last of
@@ -832,6 +904,17 @@ impl Store {
             .prepare("SELECT agent, seen FROM members WHERE conversation = ?1 ORDER BY position")?;
         let rows = query.query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()
+    }
+
+    /// Whether group `id` holds, after `since`, a message to give member
+    /// `agent`: one that is neither its own nor a runtime's `status` line.
+    pub fn news_for(&self, id: &str, agent: &str, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation = ?1 AND seq > ?2
+             AND kind != 'status' AND (person IS NOT NULL OR speaker IS NULL OR speaker != ?3))",
+            params![id, since, agent],
+            |row| row.get(0),
+        )
     }
 
     /// Member `agent` of group `id` has been given its messages up to `seq`.
@@ -977,7 +1060,8 @@ impl Store {
             params![HOST_PERSON, person],
         )?;
         transaction.execute(
-            "UPDATE conversations SET owner = ?1 WHERE id LIKE 'home.%'",
+            // Not `LIKE`, which ignores case: `Home.x` is a device's
+            "UPDATE conversations SET owner = ?1 WHERE substr(id, 1, 5) = 'home.'",
             params![person],
         )?;
         transaction.commit()
@@ -1252,6 +1336,27 @@ mod tests {
         store.saw("g-1", "main", said).unwrap();
         store.saw("g-1", "main", you).unwrap();
         assert_eq!(store.members("g-1").unwrap()[0], ("main".to_owned(), said));
+    }
+
+    #[test]
+    fn a_members_news_is_what_others_said_after_its_position() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let members = ["main".to_owned(), "coder".to_owned()];
+        store.group("g-1", "lab", &members, "alice").unwrap();
+        let add = |id: &str, from: From, kind: &str| {
+            store.add(id, "g-1", &from, "x", kind).unwrap().unwrap()
+        };
+        let asked = add("p-1", From::Person("alice".into()), "message");
+        assert!(store.news_for("g-1", "main", 0).unwrap());
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        // Its own words and a runtime's status line are no news to it.
+        let own = add("m-1", From::Member("main".into()), "reply");
+        add("m-2", From::Member("main".into()), "status");
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        assert!(store.news_for("g-1", "coder", asked).unwrap());
+        add("c-1", From::Member("coder".into()), "reply");
+        assert!(store.news_for("g-1", "main", own).unwrap());
     }
 
     #[test]
@@ -1793,5 +1898,74 @@ mod tests {
         ] {
             assert_eq!(store.owner(id).unwrap().as_deref(), Some(owner), "{id}");
         }
+    }
+
+    #[test]
+    fn a_device_chosen_id_is_never_a_home() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        // `LIKE` would take this one: it ignores case
+        store
+            .conversation("Home.lab.main", "lab", "main", "bob@example.com")
+            .unwrap();
+        // Made by a device before the bridge kept `home.`, for another agent
+        store
+            .conversation("home.lab.scout", "lab", "main", "bob@example.com")
+            .unwrap();
+        assert!(
+            !store
+                .ensure_home("lab/scout", "victor@example.com", true)
+                .unwrap()
+        );
+        store.set_host("victor@example.com").unwrap();
+        assert_eq!(
+            store.owner("Home.lab.main").unwrap().as_deref(),
+            Some("bob@example.com")
+        );
+        assert_eq!(
+            store
+                .conversation_of("home.lab.scout")
+                .unwrap()
+                .map(|c| c.0),
+            Some("lab".to_owned())
+        );
+    }
+
+    #[test]
+    fn devices_paired_before_the_host_was_kept_name_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        for (id, person, paired) in [
+            ("d-2", "alice@example.com", 20),
+            ("d-1", "victor@example.com", 10),
+        ] {
+            store
+                .add_device(&Device {
+                    id: id.to_owned(),
+                    name: "Pixel".to_owned(),
+                    person: person.to_owned(),
+                    noise_key: vec![paired as u8; 32],
+                    device_key: vec![2; 32],
+                    push_key: vec![3; 32],
+                    push_token: None,
+                    paired,
+                    seen: None,
+                    node: None,
+                })
+                .unwrap();
+        }
+        // As a database from before the setting
+        store
+            .db
+            .execute("DELETE FROM settings WHERE name = ?1", params![HOST_PERSON])
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        // So the next device's person does not become it
+        assert!(!store.claim_host("bob@example.com").unwrap());
     }
 }
