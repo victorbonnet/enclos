@@ -8,6 +8,10 @@ enclos creates sandboxes, installs agent runtimes in them and runs agents there,
 A machine where the enclos CLI runs and keeps its state. Each host is managed locally, by running enclos on it.
 _Avoid_: machine, node, server
 
+**Host assistant**:
+An AI assistant the user runs on the host, outside any sandbox, such as Claude Code or Codex. It operates enclos through the CLI, as the user would.
+_Avoid_: agent (an agent lives in a sandbox), operator agent
+
 **Sandbox**:
 A named, persistent isolated environment created by enclos, with its own backend, policy, home folder and lifecycle state. The sandbox is the permission boundary.
 _Avoid_: container, jail, environment, enclosure
