@@ -539,7 +539,7 @@ enclos logs [OPTIONS] <SANDBOX>
 
 ### `enclos dashboard`
 
-Open the runtime's dashboard of a sandbox the host cannot reach, as on Linux, to you alone, until Ctrl-C
+Open the runtime's protected dashboard to you alone, until Ctrl-C
 
 ```text
 enclos dashboard [OPTIONS] <SANDBOX>

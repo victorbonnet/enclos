@@ -159,7 +159,7 @@ enclos policy allow lab api.example.com:8443
 
 The agent cannot allow anything itself.
 
-On Linux the host cannot reach a sandbox's listeners, so Hermes's dashboard opens with `enclos dashboard lab`: it prints the page's address and serves it to you alone until Ctrl-C. On a host you reach over ssh, such as a Raspberry Pi, forward that port from your own machine with `ssh -L <port>:127.0.0.1:<port> <host>` and open the address there; the host's sshd must allow TCP forwarding (`AllowTcpForwarding`), which some installs turn off.
+Open Hermes's dashboard with `enclos dashboard lab`: enclos prints the protected address and serves it to you alone until Ctrl-C. On macOS the runtime must be installed and its sandbox and gateway running; the private inherited-socket transport is implemented under [ADR 0063 (proposed)](adr/0063-a-dashboard-on-macos-uses-a-private-inherited-socket.md). Keep the full URL private: its random path is a credential. On Linux the namespace relay keeps the runtime's listener off the host's network. On a host you reach over ssh, forward the printed port with `ssh -L <port>:127.0.0.1:<port> <host>` and open the full address locally; the host's sshd must allow TCP forwarding (`AllowTcpForwarding`).
 
 ## Look around
 

@@ -38,6 +38,7 @@ fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
         env: vec![],
         in_terminal: false,
         service_port: None,
+        dashboard_socket: false,
         limits: Default::default(),
         reads: Vec::new(),
     };
@@ -160,6 +161,82 @@ fn world() -> World {
     }
 }
 
+/// The actual kernel boundary: the dashboard can accept on the one
+/// inherited private socket, cannot open that path, and cannot bind TCP.
+#[test]
+fn a_private_dashboard_inherits_its_listener_and_cannot_bind_or_dial_its_path() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let layout = Layout::at(dir.path().join("e"));
+    let name = "home".parse().unwrap();
+    let ctx = SandboxContext::new(&layout, &name, 41000);
+    std::fs::create_dir_all(&ctx.home).unwrap();
+    layout.create_sandbox_run_dir("home").unwrap();
+    let socket = layout.dashboard_socket("home");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut policy = Policy::default();
+    policy.fs.write = vec!["{home}".into()];
+    policy.net.listen = true;
+    let compiled = dir.path().join("policy.sb");
+    let text = Seatbelt::default().compile(&policy, &ctx).unwrap().text;
+    let code = r#"import os, socket
+s = socket.socket(fileno=int(os.environ['ENCLOS_DASHBOARD_FD']))
+assert s.family == socket.AF_UNIX
+for family, address in [(socket.AF_INET, ('127.0.0.1', 0)), (socket.AF_INET6, ('::', 0))]:
+    raw = socket.socket(family, socket.SOCK_STREAM)
+    try: raw.bind(address)
+    except PermissionError: pass
+    else: raise AssertionError('dashboard bound a new listener')
+    raw.close()
+try:
+    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).connect(s.getsockname())
+except PermissionError: pass
+else: raise AssertionError('dashboard dialed its private listener by path')
+client, _ = s.accept()
+client.sendall(b'private token')
+client.close()
+"#;
+    let launch = Launch {
+        program: "/usr/bin/python3".into(),
+        args: vec!["-I".into(), "-c".into(), code.into()],
+        env: vec![],
+        in_terminal: false,
+        service_port: None,
+        dashboard_socket: true,
+        limits: Default::default(),
+        reads: vec![],
+    };
+    for text in [text.clone(), on_allow_default(&text)] {
+        std::fs::write(&compiled, text).unwrap();
+        let mut command = Seatbelt::default().wrap(&compiled, &ctx, &launch).unwrap();
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let marker_dir = layout.sandbox_dir("home").join("members");
+        let (child, _marker) = crate::lifecycle::marker::Marker::new(&marker_dir)
+            .unwrap()
+            .spawn_with(
+                &mut command,
+                Some((listener.as_fd(), "ENCLOS_DASHBOARD_FD")),
+            )
+            .unwrap();
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut answer = String::new();
+        let read = client.read_to_string(&mut answer);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        read.unwrap();
+        assert_eq!(answer, "private token");
+    }
+}
+
 impl World {
     /// Runs a shell command in the sandbox; true when it exits 0.
     fn sh(&self, script: &str) -> bool {
@@ -174,6 +251,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -193,6 +271,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -612,6 +691,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     env: vec![],
                     in_terminal: false,
                     service_port: None,
+                    dashboard_socket: false,
                     limits: Default::default(),
                     reads: Vec::new(),
                 };
@@ -941,6 +1021,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 env: vec![],
                 in_terminal: false,
                 service_port: None,
+                dashboard_socket: false,
                 limits: Default::default(),
                 reads: Vec::new(),
             };
@@ -1368,6 +1449,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -1422,6 +1504,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };

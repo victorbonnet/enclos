@@ -748,13 +748,9 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(default["model"], "absent");
     assert!(s["disk"]["total"].is_u64());
     assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
-    // Hermes's gateway cannot authenticate a browser; a dedicated
-    // dashboard command is offered even before the gateway starts.
-    assert_eq!(s["dashboard"], "not_provided");
-    assert_eq!(
-        s["dashboard_command"],
-        "enclos exec home -- hermes dashboard --no-open --isolated --port 0"
-    );
+    // No gateway URL is published; a created sandbox has no dashboard hint.
+    assert!(s.get("dashboard").is_none());
+    assert_eq!(s["dashboard_command"], serde_json::Value::Null);
     assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
     assert_eq!(json["complete"], true);
     assert_eq!(json["idle_days"], 30);

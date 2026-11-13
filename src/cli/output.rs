@@ -200,7 +200,7 @@ pub fn conclude(result: Value, code: u8, message: impl FnOnce() -> String) -> u8
 /// The shape of what enclos prints as JSON: raised when a field a reader
 /// may rely on changes or goes, so a script can tell one shape from the
 /// next. A field added keeps it.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// `value`, an object as everything enclos prints as JSON is, with its
 /// `schema_version`. Anything else is a bug, which a debug build panics on;

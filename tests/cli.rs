@@ -78,7 +78,7 @@ impl Home {
                 out.stderr()
             )
         });
-        assert_eq!(doc["schema_version"], 1, "{args:?}: {doc}");
+        assert_eq!(doc["schema_version"], 2, "{args:?}: {doc}");
         let code = out.code();
         assert_eq!(
             code == 0,
@@ -4026,7 +4026,7 @@ fn exec_output_stays_its_commands_when_piped() {
     // schema version.
     assert!(
         out.stderr().lines().all(|l| {
-            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|l| l["schema_version"] == 1)
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|l| l["schema_version"] == 2)
         }),
         "{}",
         out.stderr()
@@ -4486,7 +4486,7 @@ fn logs_in_json_are_json_lines() {
             .is_some_and(|n| n.contains("no service logs yet")),
         "{note}"
     );
-    assert_eq!(note["schema_version"], 1, "{note}");
+    assert_eq!(note["schema_version"], 2, "{note}");
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     // A C1 control and a bidirectional one, which JSON leaves alone: the
@@ -4500,7 +4500,7 @@ fn logs_in_json_are_json_lines() {
         .lines()
         .map(|l| {
             let doc: serde_json::Value = serde_json::from_str(l).unwrap();
-            assert_eq!(doc["schema_version"], 1, "{doc}");
+            assert_eq!(doc["schema_version"], 2, "{doc}");
             doc["line"].as_str().unwrap().to_owned()
         })
         .collect();

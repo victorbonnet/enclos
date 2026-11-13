@@ -13,7 +13,8 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
     ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    RuntimeService, RuntimeSocketDashboard, SandboxCommand, ServiceName, Signal, Unreadable,
+    ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -567,14 +568,7 @@ impl RuntimeAdapter for Hermes {
         // `gateway.sock` in the home, and dials the WebSocket the gateway
         // serves on 127.0.0.1:0 (`gateway/run_api.py`,
         // `hermes_cli/gateway_client.py`).
-        Some(RuntimeListener {
-            service: GATEWAY,
-            // The gateway serves the SPA but deliberately withholds its
-            // browser token (`GatewayDashboardMount._bind_state` in
-            // gateway/run_api.py). Its API returns 401 and the SPA reloads
-            // repeatedly. The dedicated dashboard below supplies the token.
-            page: None,
-        })
+        Some(RuntimeListener { service: GATEWAY })
     }
 
     fn dashboard(&self) -> Option<RuntimeDashboard> {
@@ -594,6 +588,19 @@ impl RuntimeAdapter for Hermes {
                 "0",
             ]),
             page: "/",
+            socket: Some(RuntimeSocketDashboard {
+                source: include_str!("hermes/dashboard.py"),
+                // Hermes's isolated launcher only imports modules from its
+                // own dependency environment. Copy our staged adapter there
+                // from inside the sandbox, as other adapter files are copied;
+                // never load sandbox Python into the host's interpreter.
+                launcher: SandboxCommand::from_words(&[
+                    "/bin/sh",
+                    "-c",
+                    "set -eu\n/bin/cp \"$1\" \"$HOME/.hermes/hermes-agent/_enclos_dashboard.py\"\nexec hermes --run-module _enclos_dashboard \"$2\"",
+                    "enclos-dashboard",
+                ]),
+            }),
         })
     }
 

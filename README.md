@@ -110,7 +110,7 @@ The installer always takes the latest release, for your system and architecture:
 
 The [getting started guide](docs/getting-started.md) explains each step and what does not work yet; [releases](docs/releases.md) says how a release is built and checked.
 
-To open Hermes's dashboard on macOS, run `enclos exec lab -- hermes dashboard --no-open --isolated --port 0`, keep the command running, and open the URL it prints. The gateway's own port withholds the browser token, which causes authentication failures and repeated reloads. On Linux, use `enclos dashboard lab`.
+To open Hermes's dashboard, run `enclos dashboard lab` and keep it running until Ctrl-C. Enclos prints a protected address; on macOS its full path is a credential, so keep it private. The gateway's own port withholds the browser token and is not a usable dashboard. On macOS this build uses a private inherited socket ([ADR 0063, proposed](docs/adr/0063-a-dashboard-on-macos-uses-a-private-inherited-socket.md)); Linux uses its namespace relay.
 
 ## From Claude Code or Codex
 

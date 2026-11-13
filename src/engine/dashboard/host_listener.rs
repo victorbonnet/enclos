@@ -5,13 +5,15 @@
 //! owner of each connection's client socket is read from the kernel's
 //! tables, and another user's connection, or one whose owner cannot be
 //! told, is closed before a byte is read or passed on. Each other one goes
-//! to the dashboard's port in the sandbox's network namespace, through the
-//! namespace holder's way in. The address and the check are fixed here,
-//! with no setting.
+//! through the namespace holder on Linux, or to the inherited private
+//! Unix listener on macOS after checking its URL capability. There is no
+//! raw TCP upstream on macOS. The owner check has no setting.
 
 use std::collections::BTreeSet;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -33,7 +35,7 @@ pub(super) type Owner = fn(SocketAddr, SocketAddr) -> Option<u32>;
 /// The owner as this host's tables say, in this process's network
 /// namespace, where the listener is.
 pub(super) fn owner_on_host(client: SocketAddr, server: SocketAddr) -> Option<u32> {
-    crate::lifecycle::proc::tcp_client_owner(client, server)
+    crate::lifecycle::host::tcp_client_owner(client, server)
         .ok()
         .flatten()
 }
@@ -70,10 +72,41 @@ pub(super) fn open(
         Door {
             user,
             owner,
-            way_in,
-            service,
+            upstream: Upstream::Namespace { way_in, service },
         },
     )
+}
+
+/// The local upstream has no TCP listener to bypass this owner check.
+pub(super) fn open_local(
+    listener: TcpListener,
+    user: u32,
+    owner: Owner,
+    socket: PathBuf,
+    prefix: String,
+) -> io::Result<Listening> {
+    serve_on(
+        listener,
+        Door {
+            user,
+            owner,
+            upstream: Upstream::Local { socket, prefix },
+        },
+    )
+}
+
+enum Upstream {
+    Namespace { way_in: WayIn, service: u16 },
+    Local { socket: PathBuf, prefix: String },
+}
+
+impl Upstream {
+    fn connect(&self) -> io::Result<UnixStream> {
+        match self {
+            Self::Namespace { way_in, service } => way_in.connect(*service),
+            Self::Local { socket, .. } => UnixStream::connect(socket),
+        }
+    }
 }
 
 /// Serves `listener` through `door` until the result is dropped.
@@ -95,8 +128,7 @@ fn serve_on(listener: TcpListener, door: Door) -> io::Result<Listening> {
 struct Door {
     user: u32,
     owner: Owner,
-    way_in: WayIn,
-    service: u16,
+    upstream: Upstream,
 }
 
 impl Door {
@@ -140,12 +172,24 @@ impl Door {
 
     /// Carries `client` to the dashboard's port, or closes it when that
     /// cannot be reached.
-    fn pass(&self, client: TcpStream) {
+    fn pass(&self, mut client: TcpStream) {
         // A socket accepted from a polled listener is polled too on macOS.
         if client.set_nonblocking(false).is_err() {
             return;
         }
-        if let Ok(upstream) = self.way_in.connect(self.service) {
+        let first = match &self.upstream {
+            Upstream::Local { prefix, .. } => match super::http::authorize(&mut client, prefix) {
+                Ok(first) => Some(first),
+                Err(_) => return,
+            },
+            Upstream::Namespace { .. } => None,
+        };
+        if let Ok(mut upstream) = self.upstream.connect() {
+            if let Some(first) = first
+                && upstream.write_all(&first).is_err()
+            {
+                return;
+            }
             carry(&client, &upstream, crate::proxy::IDLE_TIMEOUT);
         }
     }
@@ -172,6 +216,146 @@ mod tests {
     use super::*;
 
     const ME: u32 = 1001;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn on_a_runner_a_second_user_is_refused_even_with_the_url_capability() {
+        if std::env::var_os("ENCLOS_HOST_SERVICE_PROBES").is_none() {
+            return;
+        }
+        use std::process::{Command, Stdio};
+        fn as_other(args: &[&str]) -> std::process::Output {
+            let mut command = Command::new("/usr/bin/sudo");
+            command
+                .args(["-n", "-u", "nobody"])
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            crate::lifecycle::marker::spawn_unmarked(&mut command)
+                .unwrap()
+                .wait_with_output()
+                .unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d");
+        let upstream = UnixListener::bind(&socket).unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let port = listener.local_addr().unwrap().port();
+        let user = rustix::process::getuid().as_raw();
+        let _serving = open_local(
+            listener,
+            user,
+            owner_on_host,
+            socket.clone(),
+            "/known-capability/".into(),
+        )
+        .unwrap();
+        let url = format!("http://127.0.0.1:{port}/known-capability/");
+        let refused = as_other(&["/usr/bin/curl", "-fsS", "--max-time", "3", &url]);
+        assert!(!refused.status.success() && refused.stdout.is_empty());
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let denied = as_other(&[
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            "import socket, sys\ns=socket.socket(socket.AF_UNIX)\ntry: s.connect(sys.argv[1])\nexcept PermissionError: sys.exit(0)\nsys.exit(1)",
+            socket.to_str().unwrap(),
+        ]);
+        assert!(
+            denied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        // Control: this user can connect to another loopback server.
+        let control = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let port = control.local_addr().unwrap().port();
+        let served = thread::spawn(move || {
+            let (mut client, _) = control.accept().unwrap();
+            let _ = client.read(&mut [0; 1024]);
+            client
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncontrol",
+                )
+                .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let allowed = as_other(&["/usr/bin/curl", "-fsS", "--max-time", "3", &url]);
+        assert!(
+            allowed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        assert_eq!(allowed.stdout, b"control");
+        served.join().unwrap();
+    }
+
+    #[test]
+    fn the_local_upstream_is_unreachable_without_both_owner_and_url_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d");
+        let upstream = UnixListener::bind(&socket).unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let port = listener.local_addr().unwrap().port();
+        let _serving = open_local(
+            listener,
+            ME,
+            |_, _| Some(ME),
+            socket.clone(),
+            "/capability/".into(),
+        )
+        .unwrap();
+        for path in ["/", "/wrong/api/auth/me"] {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(client, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut bytes = [0; 32];
+            assert!(matches!(client.read(&mut bytes), Ok(0) | Err(_)));
+            assert_eq!(
+                upstream.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        upstream.set_nonblocking(false).unwrap();
+        let serving = thread::spawn(move || {
+            let (mut client, _) = upstream.accept().unwrap();
+            let mut bytes = [0; 1024];
+            let n = client.read(&mut bytes).unwrap();
+            let header = String::from_utf8_lossy(&bytes[..n]);
+            assert!(header.starts_with("GET /api/auth/me HTTP/1.1\r\n"));
+            assert!(header.contains("X-Forwarded-Prefix: /capability\r\n"));
+            client
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ntoken")
+                .unwrap();
+        });
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"GET /capability/api/auth/me HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert!(answer.ends_with("token"));
+        serving.join().unwrap();
+
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let port = listener.local_addr().unwrap().port();
+        let _other = open_local(listener, ME, |_, _| None, socket, "/capability/".into()).unwrap();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = client.write_all(b"GET /capability/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(matches!(client.read(&mut [0; 32]), Ok(0) | Err(_)));
+    }
 
     /// A stand-in for the namespace holder's way in, which answers each
     /// connection with the port it named, then what it was sent.
@@ -205,8 +389,10 @@ mod tests {
         let door = Door {
             user: ME,
             owner,
-            way_in,
-            service: 37000,
+            upstream: Upstream::Namespace {
+                way_in,
+                service: 37000,
+            },
         };
         (serve_on(listener, door).unwrap(), port, folder)
     }

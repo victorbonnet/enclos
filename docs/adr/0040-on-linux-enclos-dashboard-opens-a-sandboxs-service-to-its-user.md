@@ -4,6 +4,8 @@ status: accepted
 
 # On Linux, `enclos dashboard` opens a sandbox's dashboard to the user running it
 
+Proposed amendment: [0063](0063-a-dashboard-on-macos-uses-a-private-inherited-socket.md) supersedes this decision's macOS exception. It implements `enclos dashboard` there through a private inherited socket; this decision's Linux namespace relay remains in force.
+
 Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for the bubblewrap backend.
 
 0028's consequences say that the host can reach a runtime's listener: Hermes's dashboard works in the host's browser, and a listener bound to every address serves the host's network. On Linux a sandbox has its own network namespace ([0004](0004-linux-bubblewrap-and-landlock.md), [0039](0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md)), so the host cannot reach a listener there, on 127.0.0.1 or on every address (ECONNREFUSED; `prototype/m3/README.md`). The gateway's own port does not help: through a path to it the page loads, but Hermes withholds the session token there, so `/api/auth/me` gets 401 and `/api/ws` 403. `hermes dashboard` publishes the token in its page, to anyone who connects, and has no auth on loopback, which every user of the host shares.

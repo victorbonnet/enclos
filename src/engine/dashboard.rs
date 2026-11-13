@@ -1,6 +1,6 @@
 //! `enclos dashboard` (ADR 0040; design §6): a runtime's dashboard, opened
-//! to the user running the command, for a sandbox whose listeners the host
-//! cannot reach, as a bubblewrap sandbox in a network namespace of its own.
+//! to the user running the command. Linux uses its namespace relay;
+//! macOS inherits a host-bound private Unix listener (ADR 0063, proposed).
 //! The runtime's dashboard runs as a recorded session under the sandbox's
 //! policy, its port read from the host as the runtime's service's is
 //! (`listener`), and the host's 127.0.0.1 at the sandbox's reserved port is
@@ -10,6 +10,8 @@
 //! the end. One runs per sandbox at a time (`lock`).
 
 mod host_listener;
+mod http;
+mod local;
 mod lock;
 
 use std::sync::Arc;
@@ -28,6 +30,7 @@ use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::SessionId;
 use crate::runtime::{RuntimeDashboard, adapter};
+use local::Local;
 use lock::{DashboardLock, Running};
 
 /// How long the dashboard has to listen once its session started: a
@@ -39,9 +42,10 @@ const LISTEN_WAIT: Duration = Duration::from_secs(300);
 pub struct DashboardOpen {
     pub sandbox: SandboxName,
     pub session: SessionId,
-    /// The sandbox's reserved port, on the host's 127.0.0.1.
+    /// A host loopback port in enclos's proxy range. On Linux this is the
+    /// sandbox's reserved port; on macOS it is another free port.
     pub port: u16,
-    /// The dashboard's page there.
+    /// The host-verified URL. On macOS its random path is a credential.
     pub url: String,
     /// The uid it serves alone: the user running it.
     pub user: u32,
@@ -83,7 +87,7 @@ impl Engine {
     ) -> Result<DashboardEnd> {
         let record = self.record(name)?;
         let (holder, dashboard) = self.dashboard_of(&record)?;
-        let url = format!("http://127.0.0.1:{}{}", record.proxy_port, dashboard.page);
+        let mut url = format!("http://127.0.0.1:{}{}", record.proxy_port, dashboard.page);
         self.layout
             .create_sandbox_run_dir(name.as_str())
             .map_err(|source| crate::layout::LayoutError::Io {
@@ -98,18 +102,43 @@ impl Engine {
         };
         let mut lock =
             DashboardLock::take(&self.layout.dashboard_lock(name.as_str()), name, &running)?;
+        let mut local = match holder {
+            None => Some(Local::prepare(
+                self,
+                name,
+                dashboard.socket.clone().ok_or_else(|| Error::Dashboard {
+                    what: "this runtime has no dashboard on a private Unix socket".into(),
+                })?,
+            )?),
+            Some(_) => None,
+        };
+        if let Some(local) = &local {
+            url = format!(
+                "http://127.0.0.1:{}{}{}",
+                local.port,
+                local.prefix,
+                dashboard.page.trim_start_matches('/')
+            );
+            running.url = url.clone();
+            let _ = lock.say(&running);
+        }
         self.wait_service_proxy(name)?;
-        self.ensure_holder(&record)?;
-        let ctx = self.sandbox_context(name, record.proxy_port);
-        let way_in = holder.way_in(&ctx);
-        way_in.answers().map_err(|e| Error::Dashboard {
-            what: format!(
-                "the namespace holder of sandbox {name} has no way in from the host ({e}), as one started by an earlier enclos: `enclos sandbox restart {name}` starts it again with the sandbox's sessions and services"
-            ),
-        })?;
-        let held = holder.ask(&ctx).map_err(|why| Error::Dashboard {
-            what: format!("the namespace holder of sandbox {name} does not answer: {why}"),
-        })?;
+        let namespace = if let Some(holder) = holder {
+            self.ensure_holder(&record)?;
+            let ctx = self.sandbox_context(name, record.proxy_port);
+            let way_in = holder.way_in(&ctx);
+            way_in.answers().map_err(|e| Error::Dashboard {
+                what: format!(
+                    "the namespace holder of sandbox {name} has no way in from the host ({e}): `enclos sandbox restart {name}` starts it again"
+                ),
+            })?;
+            let held = holder.ask(&ctx).map_err(|why| Error::Dashboard {
+                what: format!("the namespace holder of sandbox {name} does not answer: {why}"),
+            })?;
+            Some((way_in, held))
+        } else {
+            None
+        };
         // Told to end while the proxy or the namespace holder started.
         if ended.load(Ordering::Relaxed) {
             return Err(Error::Dashboard {
@@ -117,7 +146,11 @@ impl Engine {
             });
         }
         let log = self.dashboard_log(name);
-        let command = dashboard.command.into_words();
+        let command = local
+            .as_ref()
+            .map(|local| local.command.clone())
+            .unwrap_or(dashboard.command);
+        let (command, reads) = command.into_parts();
         let Started {
             session, mut child, ..
         } = self.write(
@@ -126,7 +159,11 @@ impl Engine {
             Some(name.to_string()),
             |started: &Started<()>| format!("session {}", started.session.id),
             |state| {
-                let starting = Starting::Dashboard { log: &log };
+                let starting = Starting::Dashboard {
+                    log: &log,
+                    listener: local.as_ref().map(|local| &local.listener),
+                    reads: &reads,
+                };
                 let started = self.start_session(state, name, &command, starting, || Ok(()));
                 self.failed_on_error(state, name, "dashboard", started)
             },
@@ -146,38 +183,65 @@ impl Engine {
             if listening.is_some() || failed.is_some() {
                 return;
             }
-            let why = match in_namespace("dashboard", &session.root, &held) {
-                Ok(port) => match host_listener::open(
-                    record.proxy_port,
-                    user,
-                    host_listener::owner_on_host,
-                    way_in.clone(),
-                    port,
-                ) {
-                    Ok(serving) => {
-                        listening = Some(serving);
-                        opened(&DashboardOpen {
-                            sandbox: name.clone(),
-                            session: session.id,
-                            port: record.proxy_port,
-                            url: url.clone(),
-                            user,
-                        });
+            let serving = if let Some(local) = &mut local {
+                if !local.ready() {
+                    if begun.elapsed() < LISTEN_WAIT {
                         return;
                     }
-                    Err(e) => format!(
-                        "cannot listen on 127.0.0.1:{}, the sandbox's reserved port: {e}",
-                        record.proxy_port
-                    ),
-                },
-                Err(NoPort::NotYet(_) | NoPort::NotRunning(_)) if begun.elapsed() < LISTEN_WAIT => {
+                    Err(format!(
+                        "the private dashboard did not answer within {} s; `enclos logs {name}` shows its output",
+                        LISTEN_WAIT.as_secs()
+                    ))
+                } else {
+                    host_listener::open_local(
+                        local.front.take().expect("opened once"),
+                        user,
+                        host_listener::owner_on_host,
+                        local.socket.clone(),
+                        local.prefix.clone(),
+                    )
+                    .map_err(|e| format!("cannot serve the private dashboard: {e}"))
+                }
+            } else {
+                let (way_in, held) = namespace.as_ref().expect("a namespace or a private socket");
+                match in_namespace("dashboard", &session.root, held) {
+                    Ok(port) => host_listener::open(
+                        record.proxy_port,
+                        user,
+                        host_listener::owner_on_host,
+                        way_in.clone(),
+                        port,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "cannot listen on 127.0.0.1:{}, the sandbox's reserved port: {e}",
+                            record.proxy_port
+                        )
+                    }),
+                    Err(NoPort::NotYet(_) | NoPort::NotRunning(_))
+                        if begun.elapsed() < LISTEN_WAIT =>
+                    {
+                        return;
+                    }
+                    Err(why) => Err(format!(
+                        "the dashboard did not listen: {why}; `enclos logs {name}` shows its output"
+                    )),
+                }
+            };
+            let why = match serving {
+                Ok(serving) => {
+                    listening = Some(serving);
+                    let port = local.as_ref().map_or(record.proxy_port, |local| local.port);
+                    opened(&DashboardOpen {
+                        sandbox: name.clone(),
+                        session: session.id,
+                        port,
+                        url: url.clone(),
+                        user,
+                    });
                     return;
                 }
-                Err(NoPort::NotYet(why) | NoPort::NotRunning(why)) => format!(
-                    "the dashboard did not listen within {} s ({why}); `enclos logs {name}` shows its output",
-                    LISTEN_WAIT.as_secs()
-                ),
-                Err(NoPort::Refused(why)) => why,
+                Err(why) => why,
             };
             failed = Some(why);
             ended.store(true, Ordering::Relaxed);
@@ -207,21 +271,66 @@ impl Engine {
     fn dashboard_of(
         &self,
         record: &SandboxRecord,
-    ) -> Result<(&dyn NamespaceHolder, RuntimeDashboard)> {
+    ) -> Result<(Option<&dyn NamespaceHolder>, RuntimeDashboard)> {
         let name = &record.name;
         let refused = |what: String| Error::Dashboard { what };
-        let holder = self.holder_of(record.backend).ok_or_else(|| {
-            refused(format!(
-                "sandbox {name} is on {}, whose runtime's listeners the host reaches itself: `enclos status {name}` shows its dashboard's address while its service runs (ADR 0028)",
-                record.backend
-            ))
-        })?;
+        let holder = self.holder_of(record.backend);
         let kind = self.runtime_of(name)?;
-        let dashboard = adapter(kind).dashboard().ok_or_else(|| {
+        let runtime = adapter(kind);
+        if holder.is_none() && record.state != crate::model::sandbox::SandboxState::Running {
+            return Err(refused(format!(
+                "sandbox {name} is not running: run `enclos sandbox start {name}` first"
+            )));
+        }
+        if holder.is_none() {
+            let installed = runtime.runtime_facts().install.ok_or_else(|| {
+                refused(format!(
+                    "cannot verify that {kind} is installed in sandbox {name}"
+                ))
+            })?;
+            match crate::runtime::home::stat(&self.sandbox_home(name), &installed) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(refused(format!(
+                        "{kind}'s files are missing: run `enclos runtime install {kind} --sandbox {name}` first"
+                    )));
+                }
+                Err(why) => {
+                    return Err(refused(format!(
+                        "cannot verify {kind}'s files in sandbox {name}: {why}"
+                    )));
+                }
+            }
+        }
+        let dashboard = runtime.dashboard().ok_or_else(|| {
             refused(format!(
                 "{kind}, the runtime of sandbox {name}, has no dashboard"
             ))
         })?;
+        if holder.is_none()
+            && (record.backend != crate::model::sandbox::BackendKind::Seatbelt
+                || dashboard.socket.is_none())
+        {
+            return Err(refused(format!(
+                "{kind} has no protected dashboard transport on {}",
+                record.backend
+            )));
+        }
+        if holder.is_none() {
+            match self.service_port(record) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(refused(format!(
+                        "the runtime service of sandbox {name} is not listening"
+                    )));
+                }
+                Err(why) => {
+                    return Err(refused(format!(
+                        "the runtime service of sandbox {name} is not ready: {why}"
+                    )));
+                }
+            }
+        }
         Ok((holder, dashboard))
     }
 }

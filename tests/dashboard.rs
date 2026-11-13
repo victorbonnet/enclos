@@ -136,6 +136,12 @@ impl Lab {
         drop(lock);
         let bin = self.root.path().join("sandboxes/lab/home/.local/bin");
         std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(
+            self.root
+                .path()
+                .join("sandboxes/lab/home/.hermes/hermes-agent"),
+        )
+        .unwrap();
         let hermes = bin.join("hermes");
         std::fs::write(
             &hermes,

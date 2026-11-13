@@ -149,6 +149,9 @@ pub struct Launch {
     /// listens; none for the service itself, a probe, a sandbox whose
     /// runtime has no such service, or one whose service does not listen.
     pub service_port: Option<u16>,
+    /// The dashboard inherits a host-bound Unix listener instead of
+    /// binding TCP. Seatbelt permits accepting there and refuses TCP binds.
+    pub dashboard_socket: bool,
     /// The limits each of its processes runs under (design §7).
     pub limits: LaunchLimits,
     /// The files enclos staged in the sandbox's `installers/` folder that

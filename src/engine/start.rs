@@ -17,6 +17,8 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -113,7 +115,11 @@ pub(super) enum Starting<'a> {
     /// The runtime's dashboard, for `enclos dashboard` (ADR 0040): as an
     /// exec session, but in a group of its own and in no terminal, with no
     /// input and its output appended to `log`.
-    Dashboard { log: &'a Path },
+    Dashboard {
+        log: &'a Path,
+        listener: Option<&'a UnixListener>,
+        reads: &'a [PathBuf],
+    },
     /// A service of the sandbox's runtime, for the service manager. Its
     /// proxy already runs, and its secrets are as `service_secrets` says.
     Service { service: &'a str },
@@ -131,7 +137,8 @@ impl Starting<'_> {
     fn reads(self) -> Vec<PathBuf> {
         match self {
             Starting::Command { reads, .. } => reads.to_vec(),
-            Starting::Dashboard { .. } | Starting::Service { .. } => Vec::new(),
+            Starting::Dashboard { reads, .. } => reads.to_vec(),
+            Starting::Service { .. } => Vec::new(),
         }
     }
 
@@ -337,6 +344,13 @@ impl Engine {
             env,
             in_terminal: starting.in_terminal(),
             service_port,
+            dashboard_socket: matches!(
+                starting,
+                Starting::Dashboard {
+                    listener: Some(_),
+                    ..
+                }
+            ),
             limits,
             reads: starting.reads(),
         };
@@ -359,7 +373,7 @@ impl Engine {
             crate::notes::say(&line);
         }
         let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;
-        if let Starting::Dashboard { log } = starting {
+        if let Starting::Dashboard { log, .. } = starting {
             output_to(&mut wrapped, log).map_err(|source| LayoutError::Io {
                 path: log.to_owned(),
                 source,
@@ -370,9 +384,19 @@ impl Engine {
             wrapped.process_group(0);
         }
         let marker = self.new_marker(name)?;
-        let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
-            what: failed_spawn(&named, scope.as_ref().map(Scope::systemd_run), &e),
-        })?;
+        let extra = match starting {
+            Starting::Dashboard {
+                listener: Some(listener),
+                ..
+            } => Some((listener.as_fd(), "ENCLOS_DASHBOARD_FD")),
+            _ => None,
+        };
+        let (child, marked) =
+            marker
+                .spawn_with(&mut wrapped, extra)
+                .map_err(|e| Error::Session {
+                    what: failed_spawn(&named, scope.as_ref().map(Scope::systemd_run), &e),
+                })?;
         let recorded = (|| -> Result<(SessionRecord, T)> {
             let prepared = before_recording()?;
             // Read even if the program already exited: it is still a
@@ -438,6 +462,8 @@ mod tests {
     fn dashboard() -> Starting<'static> {
         Starting::Dashboard {
             log: Path::new("/data/enclos/sandboxes/lab/logs/dashboard.log"),
+            listener: None,
+            reads: &[],
         }
     }
 

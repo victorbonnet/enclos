@@ -353,6 +353,13 @@ pub fn compile(
         "(allow network-outbound (remote unix-socket {}))",
         subpath(home)?
     ));
+    // The host binds this listener in a folder no sandbox can access and
+    // passes its descriptor to this dashboard alone. Never fall back to
+    // TCP, even if the runtime changes how it builds its HTTP server.
+    line(format!(
+        "(if (param \"ENCLOS_DASHBOARD\")\n  (begin\n    (deny network-bind)\n    (allow network-inbound (local unix-socket {}))))",
+        literal(&ctx.inward_socket.with_file_name("dashboard.sock"))?
+    ));
     if policy.net.listen {
         // A runtime's own listener (ADR 0028). Seatbelt refuses `localhost:0`
         // and `localhost` does not hold a bind to loopback (a bind on 0.0.0.0
@@ -364,7 +371,7 @@ pub fn compile(
         // 0.0.0.0, [::1] and [::] (backend tests), and Seatbelt refuses
         // before the port is found in use. It has no port ranges, hence one
         // rule a port.
-        line("(allow network-bind network-inbound (local tcp \"localhost:*\"))".into());
+        line("(if (not (param \"ENCLOS_DASHBOARD\"))\n  (allow network-bind network-inbound (local tcp \"localhost:*\")))".into());
         for port in PORT_FIRST..=PORT_LAST {
             line(format!(
                 "(deny network-bind (local tcp \"*:{port}\") (with message \"{tag}\"))"
@@ -1198,6 +1205,7 @@ mod tests {
         "(allow network-outbound (remote tcp \"localhost:41001\"))",
         "(allow network-bind network-inbound (local unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
         "(allow network-outbound (remote unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
+        "(allow network-inbound (local unix-socket (literal \"/nonexistent-enclos-test/alice/.enclos/run/home/dashboard.sock\")))",
         "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
         "(allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\")))",
         "(allow signal (target same-sandbox))",

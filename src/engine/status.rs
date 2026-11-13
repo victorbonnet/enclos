@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
-use super::listener::{Network, NoPort, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -31,8 +30,7 @@ use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
-use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter};
-use crate::state::StateStore;
+use crate::runtime::{RuntimeAdapter, RuntimeAgentName, adapter};
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
 pub(super) use facts::read_provider;
@@ -148,19 +146,28 @@ impl Engine {
             true => Fact::NotProvided,
             false => network_listeners(&look, &running),
         };
-        let dashboard = match runtime.and_then(|rt| rt.listener()) {
-            Some(_) if own_network => Fact::NotProvided,
-            Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
-            None => Fact::NotProvided,
-        };
-        // A dedicated dashboard is also needed when the service's page
-        // cannot authenticate a browser, as with Hermes's gateway.
-        let dashboard_command = runtime.and_then(|rt| rt.dashboard()).map(|dashboard| {
-            if own_network {
-                format!("enclos dashboard {name}")
-            } else {
-                format!("enclos exec {name} -- {}", dashboard.command.shown())
-            }
+        // Only offer an operational, installed runtime. Opening a dashboard
+        // is an explicit command with a lock and audit, never a plain exec.
+        let dashboard_command = runtime.and_then(|rt| {
+            let dashboard = rt.dashboard()?;
+            let installed = rt
+                .runtime_facts()
+                .install
+                .is_some_and(|file| matches!(exists(&home, &file), Fact::Known(true)));
+            let service_runs = rt.listener().is_some_and(|listener| {
+                running.iter().any(|session| {
+                    session.kind == SessionKind::Service
+                        && session.service.as_deref() == Some(listener.service.as_str())
+                })
+            });
+            let service_ready = own_network
+                || (installed && service_runs && matches!(self.service_port(&record), Ok(Some(_))));
+            (record.state == crate::model::sandbox::SandboxState::Running
+                && installed
+                && (own_network || service_runs)
+                && service_ready
+                && (own_network || dashboard.socket.is_some()))
+            .then(|| format!("enclos dashboard {name}"))
         });
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
@@ -209,7 +216,6 @@ impl Engine {
             policy_unreadable_refused,
             agents,
             disk,
-            dashboard,
             dashboard_command,
             network_listeners,
             name,
@@ -296,31 +302,6 @@ pub(super) fn last_used(
         .flatten()
         .chain(last_network)
         .fold(created, Timestamp::max)
-}
-
-/// The address of the page `listener`'s service serves on the host, at the
-/// port sessions are given (ADR 0028), found the same way.
-fn dashboard(
-    store: &dyn StateStore,
-    name: &SandboxName,
-    listener: &RuntimeListener,
-    running: &[SessionRecord],
-) -> Fact<String> {
-    let Some(page) = listener.page else {
-        return Fact::NotProvided;
-    };
-    let service = listener.service.as_str();
-    let runs = running
-        .iter()
-        .any(|s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service));
-    if !runs {
-        return Fact::Absent;
-    }
-    match service_listener(store, name, service, &Network::Host) {
-        Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
-        Err(NoPort::NotRunning(_)) => Fact::Absent,
-        Err(why) => Fact::CannotTell(why.to_string()),
-    }
 }
 
 /// Members of the `running` sessions that run in the sandbox (the proxy runs
