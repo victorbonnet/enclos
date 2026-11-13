@@ -15,8 +15,8 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("hello", "message.in", "conversation.rename", "ack", "error")
-CAPABILITIES = ("typing", "titles", "tools")
+FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "ack", "error")
+CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
 # The longest conversation title sent (Hermes' own limit is 100 characters).
@@ -171,6 +171,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             _check_text(message.get("token"), "token")
             if message.get("home") is not None:
                 _check_id(message.get("home"), "home")
+        elif kind == "policy.context":
+            _check_text(message.get("text"), "text")
         elif kind == "message.in":
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")

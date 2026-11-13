@@ -162,6 +162,315 @@ fn a_strange_media_type_is_a_plain_file() {
     );
 }
 
+fn approval_sample() -> enclos_protocol::approval::Approval {
+    use enclos_protocol::approval::*;
+    Approval {
+        request: "r1".into(),
+        sandbox: "lab".into(),
+        agent: "lab/main".into(),
+        conversation: Some("c1".into()),
+        access: Access {
+            kind: AccessKind::Network,
+            target: "example.com".into(),
+            private: false,
+        },
+        action: "Connect to example.com".into(),
+        time: 1,
+        state: "pending".into(),
+        change: "Allow example.com".into(),
+        scope: "example.com".into(),
+        restart: false,
+        revision: "rev1".into(),
+        available: true,
+        reason: None,
+    }
+}
+#[test]
+fn approval_two_devices_cannot_decide_or_refresh_the_same_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let a = approval_sample();
+    assert!(first.create_approval(&a).unwrap());
+    assert!(!second.create_approval(&a).unwrap());
+    assert!(first.claim_approval(&a.request).unwrap());
+    assert!(!second.claim_approval(&a.request).unwrap());
+    assert!(!second.refresh_approval(&a).unwrap());
+    assert_eq!(
+        second.approval(&a.request).unwrap().unwrap().state,
+        "applying"
+    );
+    let mut denied = a.clone();
+    denied.state = "denied".into();
+    first.put_approval(&denied).unwrap();
+    assert!(!second.create_approval(&a).unwrap());
+    assert_eq!(
+        second.approval(&a.request).unwrap().unwrap().state,
+        "denied"
+    );
+}
+#[test]
+fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store.create_approval(&approval_sample()).unwrap();
+        store.claim_approval("r1").unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    store.recover_approvals().unwrap();
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+    assert!(!store.claim_approval("r1").unwrap());
+}
+
+#[test]
+fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
+    let store = hub.store().unwrap();
+    let device = Device {
+        id: "d1".into(),
+        name: "phone".into(),
+        person: "owner@example.com".into(),
+        noise_key: vec![],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+        node: None,
+    };
+    assert!(
+        hub.decide_access(&store, &device, "guest@example.com", "r1", "rev1", true)
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.decide_access(&store, &device, "owner@example.com", "r1", "rev1", true)
+            .unwrap_err()
+            .contains("no longer paired")
+    );
+    assert!(store.approvals().unwrap().is_empty());
+}
+
+/// A hub of the host's person, with no enclos set up beside it.
+fn approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
+    let store = hub.store().unwrap();
+    (dir, hub, store)
+}
+
+fn network(target: &str) -> enclos_protocol::approval::Access {
+    enclos_protocol::approval::Access {
+        kind: enclos_protocol::approval::AccessKind::Network,
+        target: target.into(),
+        private: false,
+    }
+}
+
+#[test]
+fn approval_requests_are_capped_per_sandbox_for_agents_and_proxies_alike() {
+    let (_dir, hub, store) = approval_hub();
+    for i in 0..approvals::MAX_PENDING {
+        hub.request_access(
+            &store,
+            "lab/main",
+            None,
+            network(&format!("a{i}.example.com")),
+            "",
+        )
+        .unwrap();
+    }
+    let refused = hub
+        .request_access(&store, "lab/main", None, network("more.example.com"), "")
+        .unwrap_err();
+    assert!(refused.contains("pending policy requests"), "{refused}");
+    // A proxy refusal is left for a later collection, without an error.
+    hub.request_access(&store, "lab", None, network("proxy.example.com"), "")
+        .unwrap();
+    // Another sandbox has its own room.
+    hub.request_access(&store, "other/main", None, network("more.example.com"), "")
+        .unwrap();
+    let pending = store.approvals().unwrap();
+    assert_eq!(
+        pending.iter().filter(|a| a.sandbox == "lab").count(),
+        approvals::MAX_PENDING
+    );
+    assert_eq!(pending.len(), approvals::MAX_PENDING + 1);
+}
+
+#[test]
+fn approval_requests_refuse_hidden_characters_and_strip_them_from_labels() {
+    let (_dir, hub, store) = approval_hub();
+    assert!(
+        hub.request_access(
+            &store,
+            "lab/main",
+            None,
+            network("a.example.com\u{202E}"),
+            ""
+        )
+        .is_err()
+    );
+    hub.request_access(
+        &store,
+        "lab/main",
+        None,
+        network("b.example.com"),
+        "Read \u{202E}txt.emdaer\u{200B}",
+    )
+    .unwrap();
+    let saved = store.approvals().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].action, "Read txt.emdaer");
+    // The shared rule's wider set: a tag character or a line separator in
+    // a target is refused; a joiner inside an emoji is ordinary text.
+    for target in ["c.example.com\u{E0041}", "d.example.com\u{2028}"] {
+        assert!(
+            hub.request_access(&store, "lab/main", None, network(target), "")
+                .is_err(),
+            "{target:?}"
+        );
+    }
+    hub.request_access(
+        &store,
+        "lab/main",
+        None,
+        network("e.example.com"),
+        "Ask \u{1F468}\u{200D}\u{1F469} a\u{200D}b",
+    )
+    .unwrap();
+    let saved = store.approvals().unwrap();
+    assert!(
+        saved
+            .iter()
+            .any(|a| a.action == "Ask \u{1F468}\u{200D}\u{1F469} ab"),
+        "{saved:?}"
+    );
+}
+
+#[test]
+fn approval_an_agent_asking_again_for_a_decided_scope_is_told_so() {
+    let (_dir, hub, store) = approval_hub();
+    let access = network("a.example.com");
+    hub.request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap();
+    // Still in the inbox: the request stands.
+    hub.request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap();
+    let mut a = store.approvals().unwrap().remove(0);
+    assert!(store.claim_approval(&a.request).unwrap());
+    a.state = "denied".into();
+    store.put_approval(&a).unwrap();
+    let told = hub
+        .request_access(&store, "lab/main", None, access.clone(), "")
+        .unwrap_err();
+    assert!(told.contains("already denied"), "{told}");
+    // A proxy refusal of it stays quiet: nobody waits for its answer.
+    hub.request_access(&store, "lab", None, access, "").unwrap();
+    assert_eq!(store.approvals().unwrap().len(), 1);
+}
+
+#[test]
+fn approval_a_refusal_counts_once_and_a_denial_is_not_asked_again() {
+    let mut denied = approval_sample();
+    denied.state = "denied".into();
+    denied.time = 100;
+    let known = [denied.clone()];
+    let access = &denied.access;
+    // Older than the bridge's first collection: never asked.
+    assert!(approvals::refusal_counted(&[], "lab", access, 40, 50));
+    // Seen before the request was made: that request had it, whatever the
+    // policy became since.
+    assert!(approvals::refusal_counted(&known, "lab", access, 90, 50));
+    assert!(approvals::refusal_counted(&known, "lab", access, 100, 50));
+    // Tried again after it: a new refusal.
+    assert!(!approvals::refusal_counted(&known, "lab", access, 101, 50));
+    // Another sandbox, scope or opt-in is another request.
+    assert!(!approvals::refusal_counted(&known, "other", access, 90, 50));
+    let mut private = access.clone();
+    private.private = true;
+    assert!(!approvals::refusal_counted(&known, "lab", &private, 90, 50));
+    assert!(!approvals::refusal_counted(
+        &known,
+        "lab",
+        &network("other.example.com"),
+        90,
+        50
+    ));
+}
+
+#[test]
+fn approval_the_collector_reads_only_a_sandboxs_recent_requests() {
+    let (_dir, _hub, store) = approval_hub();
+    for (request, sandbox, time) in [("r1", "lab", 10), ("r2", "lab", 20), ("r3", "other", 30)] {
+        let mut a = approval_sample();
+        a.request = request.into();
+        a.sandbox = sandbox.into();
+        a.time = time;
+        a.state = "denied".into();
+        store.create_approval(&a).unwrap();
+    }
+    let ids = |sandbox, from| {
+        let mut ids: Vec<_> = store
+            .approvals_since(sandbox, from)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.request)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids("lab", 0), ["r1", "r2"]);
+    assert_eq!(ids("lab", 20), ["r2"]);
+    assert!(ids("lab", 21).is_empty());
+    assert_eq!(ids("other", 0), ["r3"]);
+}
+
+#[test]
+fn approval_refusals_are_collected_from_the_first_collection_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let first = Store::open(&path).unwrap().refusals_since().unwrap();
+    assert!(first > 0);
+    // Kept, not moved forward, by later collections and restarts.
+    assert_eq!(Store::open(&path).unwrap().refusals_since().unwrap(), first);
+}
+
+#[test]
+fn approval_requests_name_only_the_agents_own_conversations_or_groups() {
+    let (_dir, _hub, store) = approval_hub();
+    store
+        .ensure_home("lab/main", "owner@example.com", true)
+        .unwrap();
+    let home = crate::bridge::store::home_id("lab/main");
+    assert!(approvals::speaks_in(&store, "lab/main", &home));
+    assert!(!approvals::speaks_in(&store, "lab/coder", &home));
+    assert!(!approvals::speaks_in(&store, "other/main", &home));
+    assert!(!approvals::speaks_in(&store, "lab/main", "unknown"));
+}
+
 /// A hub with no agent, its database in `dir`, and one connected device
 /// for each of `people`: what each of them receives.
 fn hub_with(
@@ -557,4 +866,26 @@ fn a_capability_the_bridge_does_not_know_is_not_shown() {
     let announced: Vec<Capability> =
         serde_json::from_value(serde_json::json!(["notify", "commands"])).unwrap();
     assert_eq!(known(announced), vec![Capability::Commands]);
+}
+
+#[test]
+fn an_approval_request_is_one_per_scope_and_a_failed_one_is_asked_again() {
+    let (_dir, hub, store) = approval_hub();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    hub.request_access(&store, "lab/main", None, network("API.example.com"), "")
+        .unwrap();
+    let saved = store.approvals().unwrap();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    // It failed, changing nothing: the agent may ask again
+    let mut failed = saved[0].clone();
+    assert!(store.claim_approval(&failed.request).unwrap());
+    failed.state = "failed".into();
+    store.put_approval(&failed).unwrap();
+    hub.request_access(&store, "lab/main", None, network("api.example.com"), "")
+        .unwrap();
+    assert_eq!(
+        store.approval(&failed.request).unwrap().unwrap().state,
+        "pending"
+    );
 }

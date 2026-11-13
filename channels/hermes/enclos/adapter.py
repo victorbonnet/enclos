@@ -31,6 +31,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 from . import lines, protocol
 from .outbox import Outbox
+from . import approvals
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
+        # By message id: a policy request's tool call waiting for the bridge.
+        self._answers: dict[str, asyncio.Future] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -239,11 +242,16 @@ class EnclosAdapter(BasePlatformAdapter):
         kind = message["type"]
         if kind == "ack":
             self._outbox.acknowledge(message["of"])
+            approvals.answered(self._answers, message)
+        elif kind == "policy.context":
+            approvals.save_context(self._path, message["text"])
+            await self._write(protocol.ack(message["id"]))
         elif kind == "message.in":
             await self._on_message(message)
         elif kind == "conversation.rename":
             await self._rename(message["conversation"], message["title"])
         elif kind == "error":
+            approvals.answered(self._answers, message)
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
             of = message.get("of")
             if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
@@ -584,6 +592,7 @@ def _env_enablement() -> dict | None:
 
 
 def register(ctx) -> None:
+    approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"), PLATFORM)
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config,

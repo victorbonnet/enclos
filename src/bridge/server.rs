@@ -19,6 +19,8 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "approvals.rs"]
+mod approvals;
 #[path = "group_turns.rs"]
 mod group_turns;
 
@@ -130,8 +132,9 @@ struct Hub {
     transport: Transport,
     whois: Whois,
     store_path: std::path::PathBuf,
-    /// Where the audit log is: a device that forgets this host is unpaired
-    /// as `enclos app unpair` does, audited.
+    /// Where enclos keeps its state: the engine the bridge opens there
+    /// writes the audit log, when a device that forgets this host is
+    /// unpaired as `enclos app unpair` does, and applies policy decisions.
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
@@ -400,9 +403,18 @@ impl Hub {
         if open(self) {
             return Ok(());
         }
-        let (hello, mut reader, writer) =
+        let (hello, mut reader, mut writer) =
             connect(&endpoint.socket, &endpoint.token, &home_id(agent))
                 .map_err(|e| e.to_string())?;
+        if hello.capabilities.contains(&Capability::Approval)
+            && let Some((sandbox, _)) = agent.split_once('/')
+            && let Ok(name) = sandbox.parse()
+            && let Ok(text) =
+                crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
+                    .access_context(&name)
+        {
+            let _ = writer.send(FromBridge::PolicyContext { text });
+        }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
         {
@@ -606,6 +618,41 @@ impl Hub {
                     }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
+                    FromPlugin::ApprovalRequest {
+                        conversation,
+                        access,
+                        action,
+                    } => {
+                        // The endpoint, not the plugin's text, names its sandbox and agent.
+                        let id = conversation.as_str();
+                        if approvals::speaks_in(&store, &agent, id) {
+                            // Refused or not, the plugin is answered, so its outbox
+                            // does not send the same request again forever.
+                            if let Err(e) =
+                                hub.request_access(&store, &agent, Some(id), access, &action)
+                            {
+                                eprintln!("enclos app: {agent}'s policy request: {e}");
+                                let _ = acks.send(FromBridge::Error(
+                                    enclos_protocol::plugin::ErrorBody {
+                                        of: Some(message.id.clone()),
+                                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                        message: e,
+                                    },
+                                ));
+                            }
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
+                        } else {
+                            let _ =
+                                acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
+                                    of: Some(message.id.clone()),
+                                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                    message:
+                                        "A policy request must name a conversation of this agent."
+                                            .into(),
+                                }));
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
+                        }
+                    }
                     FromPlugin::Tool(step) => {
                         if let Some((owner, step)) = tool_step(&store, &agent, step) {
                             hub.deliver(&owner, ToDevice::Tool(step));
@@ -874,6 +921,27 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 hub.expire_turns(&store);
+            }
+        });
+    }
+    if let Ok(store) = hub.store() {
+        let _ = store.recover_approvals();
+    }
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(store) = hub.store()
+                    && let Err(e) = hub.collect_refusals(&store)
+                {
+                    eprintln!("enclos app approvals: {e}");
+                }
+                // A policy restart closes the plugin sockets. Reopen them so cron
+                // work, too, gets fresh policy knowledge without a phone reconnect.
+                for agent in &hub.agents {
+                    let _ = hub.plugin(&agent.name);
+                }
+                std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
@@ -1400,6 +1468,22 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::ApprovalDecide {
+                request,
+                revision,
+                approve,
+            } => {
+                let answer = hub.decide_access(store, device, person, &request, &revision, approve);
+                if let Err(e) = answer {
+                    link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?;
+                } else {
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
             FromDevice::Agents => {
                 for answer in hub.agents_answer() {
                     link.send(answer)?;
@@ -1466,6 +1550,11 @@ fn run_session(
                 read(hub, store, person, &conversation, seq)?;
             }
             FromDevice::Sync { since } => {
+                if hub.known_host().as_deref() == Some(person) {
+                    for a in store.approvals().map_err(|e| e.to_string())? {
+                        link.send(ToDevice::Approval(a))?;
+                    }
+                }
                 // Every conversation first, named or empty, then the messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {

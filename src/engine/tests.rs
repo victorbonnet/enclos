@@ -355,6 +355,7 @@ fn a_change_to_the_apps_devices_is_audited_or_not_made() {
     );
 }
 
+mod approvals;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 mod compile;

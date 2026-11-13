@@ -28,6 +28,10 @@ _Avoid_: missing feature, fallback mode
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
 _Avoid_: rules, permissions, config
 
+**Policy request**:
+A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+_Avoid_: tool approval (a runtime's own decision), command approval
+
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file

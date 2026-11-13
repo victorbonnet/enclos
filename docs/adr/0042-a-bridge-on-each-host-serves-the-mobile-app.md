@@ -28,5 +28,5 @@ Reason: one listener per host is the least that reaches the phone, and dialing i
 
 - The threat model ([0014](0014-threat-model-accidental-damage.md)) gains actors: someone other than the user trying to reach the agents (another device of the tailnet, a stolen phone, another program of the host), and, with sharing ([0043](0043-sharing-an-agent-is-not-hosting-it.md)), people the user trusts in part.
 - Chat history the bridge keeps sits on the host, outside every sandbox; it needs a retention setting.
-- The phone may read enclos's state (who has access, which devices are connected) but changes nothing in it: changing a sandbox from a phone stays a non-goal (§2).
+- The phone may read enclos's state (who has access, which devices are connected) but otherwise changes nothing in it. [ADR 0046](0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md), proposed, amends this for exact-scope sandbox policy requests approved by the host's person. Other remote control stays a non-goal (§2).
 - That a gateway can bind a socket in the sandbox home and the host can connect to it was shown on a Mac (`prototype/m4/README.md`); on Linux it is to verify (§14).

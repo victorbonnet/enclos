@@ -152,6 +152,8 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS approval_marks (name TEXT PRIMARY KEY, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     sandbox TEXT NOT NULL,
@@ -336,6 +338,141 @@ pub struct PairingRequest {
 }
 
 impl Store {
+    pub fn recover_approvals(&self) -> rusqlite::Result<()> {
+        for mut a in self.approvals()? {
+            if a.state == "applying" {
+                a.state = "failed".into();
+                a.reason = Some("The bridge stopped during this decision. Review the active policy on the host; the action was not replayed.".into());
+                self.put_approval(&a)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn approvals(&self) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        let mut q = self
+            .db
+            .prepare("SELECT body, state FROM approvals WHERE state IN ('pending','applying','failed') OR rowid IN (SELECT rowid FROM approvals ORDER BY rowid DESC LIMIT 200) ORDER BY rowid DESC")?;
+        let rows = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(s, state)| {
+                let mut a: enclos_protocol::approval::Approval = serde_json::from_str(&s)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                a.state = state;
+                Ok(a)
+            })
+            .collect()
+    }
+    /// `sandbox`'s policy requests made at `from` (seconds) or later,
+    /// decided ones too, beyond the inbox's window: what tells a proxy
+    /// refusal last seen at `from` or later whether it was asked already.
+    pub fn approvals_since(
+        &self,
+        sandbox: &str,
+        from: i64,
+    ) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        let mut q = self.db.prepare(
+            "SELECT body, state FROM approvals \
+             WHERE json_extract(body, '$.sandbox') = ?1 AND json_extract(body, '$.time') >= ?2",
+        )?;
+        let rows = q
+            .query_map(rusqlite::params![sandbox, from], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(s, state)| {
+                let mut a: enclos_protocol::approval::Approval = serde_json::from_str(&s)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                a.state = state;
+                Ok(a)
+            })
+            .collect()
+    }
+    /// Since when, in seconds, proxy refusals become policy requests: the
+    /// first time this bridge collected them, so the network log's history
+    /// from before the bridge never floods the inbox.
+    pub fn refusals_since(&self) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO approval_marks VALUES ('refusals', ?1)",
+            [now()],
+        )?;
+        self.db.query_row(
+            "SELECT at FROM approval_marks WHERE name='refusals'",
+            [],
+            |r| r.get(0),
+        )
+    }
+    pub fn approval(
+        &self,
+        id: &str,
+    ) -> rusqlite::Result<Option<enclos_protocol::approval::Approval>> {
+        let row: Option<(String, String)> = self
+            .db
+            .query_row("SELECT body,state FROM approvals WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        row.map(|(body, state)| {
+            let mut a: enclos_protocol::approval::Approval = serde_json::from_str(&body)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            a.state = state;
+            Ok(a)
+        })
+        .transpose()
+    }
+    pub fn create_approval(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<bool> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO approvals VALUES (?1,?2,?3)",
+            params![a.request, body, a.state],
+        )? == 1)
+    }
+    /// A failed request asked again: pending, with `a`'s fresh preview.
+    pub fn reopen_approval(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<bool> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(self.db.execute(
+            "UPDATE approvals SET body=?2,state='pending' WHERE id=?1 AND state='failed'",
+            params![a.request, body],
+        )? == 1)
+    }
+    pub fn put_approval(&self, a: &enclos_protocol::approval::Approval) -> rusqlite::Result<()> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.db.execute(
+            "UPDATE approvals SET body=?2,state=?3 WHERE id=?1 AND state='applying'",
+            params![a.request, body, a.state],
+        )?;
+        Ok(())
+    }
+    pub fn refresh_approval(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<bool> {
+        let body = serde_json::to_string(a)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(self.db.execute(
+            "UPDATE approvals SET body=?2 WHERE id=?1 AND state='pending'",
+            params![a.request, body],
+        )? == 1)
+    }
+    /// Exactly one device claims a pending decision, including after reconnect.
+    pub fn claim_approval(&self, id: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE approvals SET state='applying' WHERE id=?1 AND state='pending'",
+            [id],
+        )? == 1)
+    }
+
     /// Opens the database at `path`, made for the user alone (`0600`): it
     /// holds every conversation, and later each device's keys.
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
@@ -351,6 +488,7 @@ impl Store {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(to_sqlite)?;
         let db = Connection::open(path)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
         upgrade(&db)?;
         for (table, column, declaration) in ADDED_COLUMNS {
