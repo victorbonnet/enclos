@@ -360,11 +360,39 @@ impl Hub {
     /// Sends conversation `id`, with its name and how far it was read, to
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
-        if let Ok(Some(c)) = store.conversation_info(id)
-            && let Some(info) = conversation_info(store, c)
-        {
-            self.deliver(person, ToDevice::Conversation(info));
+        match store.conversation_info(id) {
+            Ok(Some(c)) => {
+                if let Some(info) = conversation_info(store, c) {
+                    self.deliver(person, ToDevice::Conversation(info));
+                }
+            }
+            Ok(None) => {}
+            // The change is stored; the devices learn it at their next sync.
+            Err(e) => eprintln!(
+                "enclos app: conversation {id} changed, but its metadata could not be read to send it: {e}"
+            ),
         }
+    }
+
+    /// Brings an archived conversation back to its owner's active Inbox
+    /// when a request that waits for the person arrives in it (ADR 0049):
+    /// the flag is cleared, and the owner's devices get the metadata.
+    /// Whether it was archived.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "questions and command approvals, which call it, are not on this branch yet"
+        )
+    )]
+    pub(super) fn unarchive_for_request(&self, store: &Store, id: &str) -> rusqlite::Result<bool> {
+        if !store.unarchive_for_request(id)? {
+            return Ok(false);
+        }
+        if let Some(owner) = store.owner(id)? {
+            self.deliver_conversation(store, &owner, id);
+        }
+        Ok(true)
     }
 
     /// The agent's plugin connection, opened if it is not; its reader runs
@@ -1610,6 +1638,18 @@ fn run_session(
             FromDevice::ConversationRead { conversation, seq } => {
                 read(hub, store, person, &conversation, seq)?;
             }
+            FromDevice::ConversationArchive {
+                conversation,
+                archived,
+            } => match archive_conversation(hub, store, person, conversation.as_str(), archived) {
+                Ok(info) => {
+                    // Canonical metadata precedes the Ack, including retries.
+                    // Revisions let devices discard older queued broadcasts.
+                    link.send(ToDevice::Conversation(info))?;
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+                Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
+            },
             FromDevice::Sync { since } => {
                 if hub.known_host().as_deref() == Some(person) {
                     // A log that cannot be read must not end the device's session.
@@ -1620,7 +1660,8 @@ fn run_session(
                         link.send(ToDevice::Approval(a))?;
                     }
                 }
-                // Every conversation first, named or empty, then the messages.
+                // Every conversation first, archived or active, named or empty,
+                // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
                         link.send(ToDevice::Conversation(info))?;
@@ -2051,8 +2092,71 @@ fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo>
         title: c.title,
         titled_by: c.titled_by,
         read: c.read,
+        archived: c.archived,
+        revision: c.revision,
         members,
     })
+}
+
+/// Why an archive change was not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveError {
+    /// Not one of the person's conversations, said the same way for an
+    /// unknown id and another person's, so the answer tells neither apart.
+    Refused(String),
+    /// The bridge's database failed; what it said stays on the host.
+    Storage(String),
+}
+
+impl ArchiveError {
+    fn storage(e: rusqlite::Error) -> ArchiveError {
+        ArchiveError::Storage(e.to_string())
+    }
+
+    /// The device's error: a refusal as it is, a storage failure without
+    /// the database's own words, which the host's log keeps instead.
+    fn body(self, of: MessageId) -> enclos_protocol::plugin::ErrorBody {
+        let (code, message) = match self {
+            ArchiveError::Refused(message) => {
+                (enclos_protocol::plugin::ErrorCode::NotAllowed, message)
+            }
+            ArchiveError::Storage(detail) => {
+                eprintln!("enclos app: an archive change failed: {detail}");
+                (
+                    enclos_protocol::plugin::ErrorCode::Internal,
+                    "The archive state could not be saved. Try again later.".to_owned(),
+                )
+            }
+        };
+        enclos_protocol::plugin::ErrorBody {
+            of: Some(of),
+            code,
+            message,
+        }
+    }
+}
+
+/// Archive is bridge metadata, independent of every runtime's session lifecycle.
+fn archive_conversation(
+    hub: &Hub,
+    store: &Store,
+    person: &str,
+    id: &str,
+    archived: bool,
+) -> Result<ConversationInfo, ArchiveError> {
+    let refused = || ArchiveError::Refused("no such conversation".to_owned());
+    let changed = store
+        .set_archived(id, person, archived)
+        .map_err(ArchiveError::storage)?
+        .ok_or_else(refused)?;
+    if changed {
+        hub.deliver_conversation(store, person, id);
+    }
+    store
+        .conversation_info(id)
+        .map_err(ArchiveError::storage)?
+        .and_then(|c| conversation_info(store, c))
+        .ok_or_else(refused)
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a

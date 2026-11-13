@@ -135,6 +135,10 @@ _Avoid_: grant (a secret's or policy's word), permission
 One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
 _Avoid_: session (a sandbox's word), chat, thread
 
+**Archived conversation**:
+A conversation its owner has set aside from the active list, with its identity and history kept until restored.
+_Avoid_: deleted conversation, closed conversation
+
 **Group**:
 A conversation between one person and several agents of one sandbox, which the bridge keeps and whose turns it runs. Each agent answers in turn, when addressed by its handle (`@main`), by `@all`, or by another member.
 _Avoid_: room (Hermes's word), channel (a messaging account), team

@@ -95,6 +95,12 @@ pub enum FromDevice {
         conversation: ConversationId,
         seq: i64,
     },
+    /// Changes only whether the owner's conversation appears in active lists.
+    #[serde(rename = "conversation.archive")]
+    ConversationArchive {
+        conversation: ConversationId,
+        archived: bool,
+    },
     /// The bytes of an attachment of one of the person's messages, from
     /// `offset`: the bridge answers with one `attachment.data`.
     #[serde(rename = "attachment.get")]
@@ -129,6 +135,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "message.send",
     "conversation.rename",
     "conversation.read",
+    "conversation.archive",
     "attachment.get",
     "sync",
     "push.token",
@@ -159,7 +166,7 @@ pub enum ToDevice {
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
     /// One of the person's conversations: each at `sync`, before the
-    /// messages, and again whenever its name or how far it was read changes.
+    /// messages, and again whenever its name, read position or archive state changes.
     #[serde(rename = "conversation")]
     Conversation(ConversationInfo),
     #[serde(rename = "message")]
@@ -327,14 +334,24 @@ pub struct ConversationInfo {
     /// devices; none before they read any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read: Option<i64>,
+    /// Hidden from active lists until the person explicitly unarchives it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Orders this conversation's metadata independently of message `seq`.
+    #[serde(default, skip_serializing_if = "revision_is_zero")]
+    pub revision: u64,
     /// The agent's Home: where what has no conversation of its own goes
-    /// (cron jobs, the runtime's notices). Shown first, never empty.
+    /// (cron jobs, the runtime's notices). Shown first when active, even empty.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub home: bool,
     /// A group's members, `<sandbox>/<agent>` each, in its order; none for
     /// a conversation with one agent. A group's `agent` is its sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+}
+
+fn revision_is_zero(revision: &u64) -> bool {
+    *revision == 0
 }
 
 /// Where a group's discussion is.
@@ -624,6 +641,8 @@ mod tests {
             title: Some("Weather in Lyon".into()),
             titled_by: Some("agent".into()),
             read: Some(7),
+            archived: false,
+            revision: 0,
             home: false,
             members: Vec::new(),
         });
@@ -637,6 +656,8 @@ mod tests {
             title: Some("Home".into()),
             titled_by: Some("person".into()),
             read: None,
+            archived: false,
+            revision: 0,
             home: true,
             members: Vec::new(),
         });
@@ -649,6 +670,8 @@ mod tests {
             title: Some("Launch".into()),
             titled_by: Some("person".into()),
             read: None,
+            archived: false,
+            revision: 0,
             home: false,
             members: vec!["lab/main".into(), "lab/coder".into()],
         });
@@ -689,6 +712,54 @@ mod tests {
             })
         ));
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn archive_requests_are_explicit_and_conversation_metadata_defaults_to_active() {
+        for archived in [true, false] {
+            let body = FromDevice::ConversationArchive {
+                conversation: ConversationId::new("c-1").unwrap(),
+                archived,
+            };
+            let line = encode_line(&Envelope::new(MessageId::new("a-1").unwrap(), body.clone()));
+            assert_eq!(decode_from_device(&line).unwrap().body, body);
+        }
+        for suffix in ["", ",\"archived\":null", ",\"archived\":\"true\""] {
+            let line = format!(
+                r#"{{"v":1,"id":"a-1","type":"conversation.archive","conversation":"c-1"{suffix}}}"#
+            );
+            assert!(matches!(
+                decode_from_device(line.as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ));
+        }
+        let old =
+            br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main"}"#;
+        let ToDevice::Conversation(mut info) = decode_to_device(old).unwrap().body else {
+            panic!("not conversation metadata");
+        };
+        assert!(!info.archived);
+        assert_eq!(info.revision, 0);
+        for archived in [true, false] {
+            info.archived = archived;
+            let body = ToDevice::Conversation(info.clone());
+            let line = encode_line(&Envelope::new(MessageId::new("m").unwrap(), body.clone()));
+            assert_eq!(decode_to_device(&line).unwrap().body, body);
+            assert_eq!(
+                String::from_utf8_lossy(&line).contains("archived"),
+                archived
+            );
+            assert!(!String::from_utf8_lossy(&line).contains("revision"));
+        }
+        info.revision = 7;
+        let body = ToDevice::Conversation(info);
+        let line = encode_line(&Envelope::new(MessageId::new("m").unwrap(), body.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""revision":7"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, body);
+        assert!(matches!(
+            decode_to_device(br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main","revision":-1}"#),
+            Err(DecodeError::Bad { .. })
+        ));
     }
 
     #[test]
