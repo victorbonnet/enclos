@@ -38,9 +38,9 @@ PLATFORM_HINT = (
     "the app adds Other and Skip. Wait for it. Approval buttons answer "
     "Hermes's own gate; questions never replace them or change sandbox policy. "
     "For a static HTML artefact send a self-contained UTF-8 .html file the same way: "
-    "it opens in the app. Use inline CSS and data images/fonts; JavaScript, external "
-    "resources, forms and automatic navigation are blocked. A tapped HTTP(S) link opens the browser "
-    "once the person confirms its address. "
+    "it opens in the app. Use inline CSS and data images/fonts, not JavaScript, external "
+    "resources, forms or automatic navigation (meant to be blocked). A tapped HTTP(S) link opens "
+    "the browser once the person confirms it. "
     "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
     "message HTML shows as literal text."
 )

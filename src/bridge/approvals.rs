@@ -134,6 +134,8 @@ impl Hub {
         {
             return Err("invalid access target".into());
         }
+        // One request per scope, however the agent spells it
+        let access = crate::engine::normalized(&access);
         let open = store.approvals().map_err(|e| e.to_string())?;
         // A request for a scope already open adds nothing: no cap. A proxy's
         // becomes the agent's explicit one, as #209 does.
@@ -201,6 +203,8 @@ impl Hub {
         );
         // Decided under this policy: not asked again until it changes. An
         // agent is told so, not left waiting for a request nobody sees.
+        // One that failed (the bridge stopped mid-decision, the state lock
+        // was busy) changed nothing: it is asked again
         let told = |known: &Approval| -> Result<(), String> {
             if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying") {
                 Err(format!(
@@ -211,15 +215,15 @@ impl Hub {
                 Ok(())
             }
         };
-        if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
-            if known.state != "diagnostic" {
-                return told(&known);
-            }
+        let mut known = store.approval(&key).map_err(|e| e.to_string())?;
+        if known.as_ref().is_some_and(|k| k.state == "diagnostic") {
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
-            if let Some(known) = store.approval(&key).map_err(|e| e.to_string())? {
-                return told(&known);
-            }
+            known = store.approval(&key).map_err(|e| e.to_string())?;
+        }
+        let reopen = known.as_ref().is_some_and(|k| k.state == "failed");
+        if let Some(known) = known.filter(|_| !reopen) {
+            return told(&known);
         }
         let mut a = Approval {
             request: key,
@@ -248,7 +252,12 @@ impl Hub {
             &Engine::open(self.layout.clone(), crate::state::Wait::Background),
             &mut a,
         );
-        if !store.create_approval(&a).map_err(|e| e.to_string())? {
+        let stored = if reopen {
+            store.reopen_approval(&a)
+        } else {
+            store.create_approval(&a)
+        };
+        if !stored.map_err(|e| e.to_string())? {
             return Ok(());
         }
         if let Some(person) = self.known_host() {

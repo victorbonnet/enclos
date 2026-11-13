@@ -181,8 +181,8 @@ class Hint(unittest.TestCase):
 
     def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
         for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
-                       "data images/fonts", "JavaScript", "external resources, forms and automatic navigation are blocked",
-                       "A tapped HTTP(S) link opens the browser", "once the person confirms its address"):
+                       "data images/fonts", "JavaScript", "external resources, forms or automatic navigation (meant to be blocked)",
+                       "A tapped HTTP(S) link opens the browser", "once the person confirms it"):
             self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_says_what_an_image_shows_as_the_protocol_does(self):
