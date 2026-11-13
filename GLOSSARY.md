@@ -119,6 +119,10 @@ _Avoid_: client, session (a sandbox's word)
 Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
 _Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
 
+**Host's person**:
+The person each agent's Home conversation belongs to: the person of the first device paired at the host's terminal, until it is changed there.
+_Avoid_: owner (a conversation's word), admin
+
 **Share**:
 What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
 _Avoid_: grant (a secret's or policy's word), permission
@@ -126,6 +130,10 @@ _Avoid_: grant (a secret's or policy's word), permission
 **Conversation**:
 One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
 _Avoid_: session (a sandbox's word), chat, thread
+
+**Agent command**:
+A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
+_Avoid_: command alone (enclos's own), shortcut, action
 
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.

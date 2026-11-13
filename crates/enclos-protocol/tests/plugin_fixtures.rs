@@ -22,6 +22,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "conversation_rename",
         include_str!("fixtures/plugin/from_bridge_conversation_rename.json"),
     ),
+    (
+        "hello_home",
+        include_str!("fixtures/plugin/from_bridge_hello_home.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -60,6 +64,14 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "message_out_image",
         include_str!("fixtures/plugin/from_plugin_message_out_image.json"),
+    ),
+    (
+        "message_out_status",
+        include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
+    ),
+    (
+        "commands",
+        include_str!("fixtures/plugin/from_plugin_commands.json"),
     ),
 ];
 
@@ -125,6 +137,52 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(kind, OutKind::Notify);
     assert_eq!(reply_to, None);
 
+    let fixture = |name: &str| FROM_PLUGIN.iter().find(|(n, _)| *n == name).unwrap().1;
+
+    // The commands a person may type, each with what it does and what follows it.
+    let message = decode_from_plugin(fixture("commands").as_bytes()).unwrap();
+    let FromPlugin::Commands { commands } = message.body else {
+        panic!("not commands: {:?}", message.body);
+    };
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.args.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("new", Some("[name]")),
+            ("model", Some("[model] [--provider name] [--global]")),
+            ("stop", None)
+        ]
+    );
+
+    // The runtime about itself: a status, to the agent's Home.
+    let message = decode_from_plugin(fixture("message_out_status").as_bytes()).unwrap();
+    let FromPlugin::MessageOut {
+        kind, conversation, ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!(
+        (kind, conversation.as_str()),
+        (OutKind::Status, "home.lab.main")
+    );
+
+    // The bridge's hello names the agent's Home; an older one, without it, still reads.
+    let message = decode_from_bridge(FROM_BRIDGE.last().unwrap().1.as_bytes()).unwrap();
+    let FromBridge::Hello { home, .. } = message.body else {
+        panic!("not a hello: {:?}", message.body);
+    };
+    assert_eq!(home.as_ref().map(|h| h.as_str()), Some("home.lab.main"));
+    let FromBridge::Hello { home, .. } = decode_from_bridge(FROM_BRIDGE[0].1.as_bytes())
+        .unwrap()
+        .body
+    else {
+        panic!("not a hello");
+    };
+    assert_eq!(home, None);
+
     let message = decode_from_plugin(FROM_PLUGIN[4].1.as_bytes()).unwrap();
     let FromPlugin::Error(error) = message.body else {
         panic!("not an error: {:?}", message.body);
@@ -184,12 +242,16 @@ fn a_message_reads_as_its_fields_say() {
 
 #[test]
 fn unknown_fields_and_capabilities_are_ignored() {
-    let line = br#"{"v":1,"id":"m1","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","teleport"],"later":true}"#;
+    // `notify`, which older plugins announce and every runtime now has, reads as unknown too.
+    let line = br#"{"v":1,"id":"m1","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","typing","teleport"],"later":true}"#;
     let message = decode_from_plugin(line).unwrap();
     let FromPlugin::Hello { capabilities, .. } = message.body else {
         panic!("not a hello: {:?}", message.body);
     };
-    assert_eq!(capabilities, vec![Capability::Notify, Capability::Unknown]);
+    assert_eq!(
+        capabilities,
+        vec![Capability::Unknown, Capability::Typing, Capability::Unknown]
+    );
 }
 
 #[test]

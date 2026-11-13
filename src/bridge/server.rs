@@ -23,19 +23,20 @@ use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    ToDevice, decode_from_device, split_text,
+    ToDevice, commands_for_devices, decode_from_device, split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
 use enclos_protocol::plugin::{
-    Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind, ToolStep,
+    Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
+    ToolStep,
 };
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
@@ -43,10 +44,11 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
+use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::store::{
     Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
-    StoredAttachment, conversation_title, now,
+    StoredAttachment, conversation_title, home_id, is_home, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
@@ -108,15 +110,40 @@ struct PluginOut {
     sent: HashSet<String>,
 }
 
+/// The capabilities the bridge knows of: one it does not (`notify`, from
+/// an older plugin) is not shown to devices as `unknown`.
+fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    capabilities
+        .into_iter()
+        .filter(|c| *c != Capability::Unknown)
+        .collect()
+}
+
 /// What every connection shares.
 struct Hub {
     transport: Transport,
     whois: Whois,
     store_path: std::path::PathBuf,
+    /// Where the audit log is: a device that forgets this host is unpaired
+    /// as `enclos app unpair` does, audited.
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
+    /// One lock per agent, held while its plugin connection opens, never
+    /// with `plugins`: a plugin slow to answer its `hello` holds up the
+    /// callers that need that agent, not the bridge.
+    opening: HashMap<String, Mutex<()>>,
+    /// Whether a pass of [`Hub::open_plugins`] runs: one at a time.
+    opening_all: AtomicBool,
+    /// The commands each agent's plugin last listed, as devices get them:
+    /// kept while the bridge runs, the plugin connected or not, until it
+    /// connects again without the `commands` capability.
+    commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// How fast each agent may have its messages stored, kept across its
+    /// plugin's connections.
+    paces: Mutex<HashMap<String, Pace>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -143,8 +170,97 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    /// Returns once `agent` may have one more message stored ([`Pace`]):
+    /// at once in a burst, else after a wait, in which its plugin's
+    /// connection is not read.
+    fn pace(&self, agent: &str) {
+        loop {
+            let wait = {
+                let mut paces = self.paces.lock().expect("not poisoned");
+                let now = std::time::Instant::now();
+                match paces
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| Pace::new(now))
+                    .take(now)
+                {
+                    Ok(()) => return,
+                    Err(wait) => wait,
+                }
+            };
+            std::thread::sleep(wait);
+        }
+    }
+
+    // Each is one thing the bridge is given at start; tests pass their own
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        transport: Transport,
+        whois: Whois,
+        store_path: std::path::PathBuf,
+        layout: crate::layout::Layout,
+        bridge_private: Vec<u8>,
+        agents: Vec<AgentEndpoint>,
+        host: Option<String>,
+        silence: Duration,
+    ) -> Hub {
+        // `host`: a person to name the host's person if the database names
+        // none yet, as a first pairing would (tests); `serve` names none.
+        if let Some(host) = &host
+            && let Ok(store) = Store::open(&store_path)
+        {
+            let _ = store.claim_host(host);
+        }
+        let opening = agents
+            .iter()
+            .map(|a| (a.name.clone(), Mutex::new(())))
+            .collect();
+        Hub {
+            transport,
+            whois,
+            store_path,
+            layout,
+            bridge_private,
+            agents,
+            plugins: Mutex::new(HashMap::new()),
+            opening,
+            opening_all: AtomicBool::new(false),
+            commands: Mutex::new(HashMap::new()),
+            paces: Mutex::new(HashMap::new()),
+            generations: AtomicU64::new(0),
+            devices: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            refusals: Mutex::new(HashMap::new()),
+            silence,
+        }
+    }
+
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
+    }
+
+    /// The host's person (ADR 0044): named by the first device paired at
+    /// the host's terminal, or by `enclos app host` since, and kept in the
+    /// bridge's database, never taken from the transport. `None` until a
+    /// device is paired.
+    fn known_host(&self) -> Option<String> {
+        self.store().ok()?.host_person().ok().flatten()
+    }
+
+    /// Gives each agent's Home to the host's person, made if need be and
+    /// taken from anyone else. Nothing while no device has named them: a
+    /// Home made meanwhile has no owner, and keeps what comes for it.
+    fn ensure_homes(&self, store: &Store) {
+        let Ok(Some(host)) = store.host_person() else {
+            return;
+        };
+        for agent in &self.agents {
+            if let Ok(true) = store.ensure_home(&agent.name, &host, true) {
+                eprintln!(
+                    "enclos app: {}'s Home is {host}'s, the host's person",
+                    agent.name
+                );
+            }
+        }
     }
 
     /// Where the bridge keeps the files of messages, by attachment id:
@@ -163,6 +279,74 @@ impl Hub {
         }
     }
 
+    /// Sends `message` to every connected device: what any person who may
+    /// reach every agent needs, such as an agent's commands.
+    ///
+    /// Every paired person may reach every agent today. Once who sees
+    /// which agent is limited (ADR 0043), this needs the same filter as
+    /// `agents.list`, or an agent's commands reach people it is not shared
+    /// with.
+    fn deliver_all(&self, message: ToDevice) {
+        let devices = self.devices.lock().expect("not poisoned");
+        for (_, sender, _) in devices.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+
+    /// What a device asking for the agents is sent: the list, then each
+    /// agent's commands as far as the bridge knows them; the others come
+    /// once their plugin connects.
+    fn agents_answer(&self) -> Vec<ToDevice> {
+        let plugins = self.plugins.lock().expect("not poisoned");
+        let agents = self
+            .agents
+            .iter()
+            .map(|a| AgentInfo {
+                agent: a.name.clone(),
+                runtime: a.runtime.clone(),
+                capabilities: plugins
+                    .get(&a.name)
+                    .map(|p| p.capabilities.clone())
+                    .unwrap_or_default(),
+                abilities: vec!["read".to_owned(), "chat".to_owned()],
+            })
+            .collect();
+        drop(plugins);
+        let mut answer = vec![ToDevice::AgentsList { agents }];
+        let commands = self.commands.lock().expect("not poisoned");
+        for (agent, commands) in commands.iter() {
+            answer.push(ToDevice::Commands {
+                agent: agent.clone(),
+                commands: commands.clone(),
+            });
+        }
+        answer
+    }
+
+    /// Opens, in the background, the plugin connections that are not open:
+    /// the bridge learns each agent's capabilities and commands without
+    /// waiting for a first message. One that cannot open is left for later.
+    /// While a pass runs, another is not started: a plugin slow to answer
+    /// does not gather a thread per request.
+    fn open_plugins(self: &Arc<Hub>) {
+        if self.opening_all.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        /// Ends the pass, whatever ends its thread.
+        struct Done(Arc<Hub>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.opening_all.store(false, Ordering::SeqCst);
+            }
+        }
+        let done = Done(Arc::clone(self));
+        std::thread::spawn(move || {
+            for agent in &done.0.agents {
+                let _ = done.0.plugin(&agent.name);
+            }
+        });
+    }
+
     /// Sends conversation `id`, with its name and how far it was read, to
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
@@ -177,12 +361,13 @@ impl Hub {
     /// in a thread of its own, storing what the agent says and passing it
     /// on to the conversation's owner.
     fn plugin(self: &Arc<Hub>, agent: &str) -> Result<(), String> {
-        if self
-            .plugins
-            .lock()
-            .expect("not poisoned")
-            .contains_key(agent)
-        {
+        let open = |hub: &Hub| {
+            hub.plugins
+                .lock()
+                .expect("not poisoned")
+                .contains_key(agent)
+        };
+        if open(self) {
             return Ok(());
         }
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
@@ -191,30 +376,56 @@ impl Hub {
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
-        // Outside the lock: a plugin that is slow to answer its hello holds
-        // only the caller, not every other agent's messages
-        let (hello, mut reader, writer) =
-            connect(&endpoint.socket, &endpoint.token).map_err(|e| e.to_string())?;
-        let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
-        let mut plugins = self.plugins.lock().expect("not poisoned");
-        if plugins.contains_key(agent) {
-            // Another thread opened one meanwhile: the plugin takes one
-            // bridge connection at a time, and that one is it
-            writer.shutdown();
+        // One opening at a time for this agent, and none with the map of
+        // connections locked: the plugin listens in the sandbox, and may
+        // take its time over the `hello`.
+        let _opening = self
+            .opening
+            .get(agent)
+            .map(|m| m.lock().expect("not poisoned"));
+        if open(self) {
             return Ok(());
         }
-        plugins.insert(
-            agent.to_owned(),
-            Plugin {
-                capabilities: hello.capabilities,
-                generation,
-                out: Arc::new(Mutex::new(PluginOut {
-                    writer,
-                    sent: HashSet::new(),
-                })),
-            },
-        );
-        drop(plugins);
+        let (hello, mut reader, writer) =
+            connect(&endpoint.socket, &endpoint.token, &home_id(agent))
+                .map_err(|e| e.to_string())?;
+        let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let lists_commands = hello.capabilities.contains(&Capability::Commands);
+        {
+            let mut plugins = self.plugins.lock().expect("not poisoned");
+            if plugins.contains_key(agent) {
+                // Opened meanwhile: the plugin takes one bridge connection
+                // at a time, and that one is it
+                writer.shutdown();
+                return Ok(());
+            }
+            plugins.insert(
+                agent.to_owned(),
+                Plugin {
+                    capabilities: known(hello.capabilities),
+                    generation,
+                    out: Arc::new(Mutex::new(PluginOut {
+                        writer,
+                        sent: HashSet::new(),
+                    })),
+                },
+            );
+        }
+        // A plugin that no longer lists its commands: the ones it listed
+        // before are offered no more.
+        let dropped = !lists_commands
+            && self
+                .commands
+                .lock()
+                .expect("not poisoned")
+                .remove(agent)
+                .is_some();
+        if dropped {
+            self.deliver_all(ToDevice::Commands {
+                agent: agent.to_owned(),
+                commands: Vec::new(),
+            });
+        }
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
         // The plugin puts the files the agent sends in the sandbox home.
@@ -241,9 +452,23 @@ impl Hub {
                         attachments,
                         ..
                     } => {
+                        // Every runtime may send on its own: past a burst,
+                        // at a pace, so that a loop fills neither the
+                        // database nor the devices' queues.
+                        hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
                             OutKind::Notify => "notify",
+                            OutKind::Status => "status",
+                        };
+                        let host = hub.known_host();
+                        let Some(conversation) =
+                            destination(&store, host.as_deref(), &agent, conversation)
+                        else {
+                            // Not stored, and acknowledged all the same: sent
+                            // again, it would fail again at every connection.
+                            let _ = acks.ack(&message.id);
+                            continue;
                         };
                         let whole = ConversationMessage {
                             conversation,
@@ -294,6 +519,19 @@ impl Hub {
                         {
                             hub.deliver_conversation(&store, &owner, id);
                         }
+                    }
+                    // The commands a person may type to the agent: kept,
+                    // and passed on to every device.
+                    FromPlugin::Commands { commands } => {
+                        let commands = commands_for_devices(commands);
+                        hub.commands
+                            .lock()
+                            .expect("not poisoned")
+                            .insert(agent.clone(), commands.clone());
+                        hub.deliver_all(ToDevice::Commands {
+                            agent: agent.clone(),
+                            commands,
+                        });
                     }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
@@ -486,23 +724,28 @@ pub fn serve(
     transport: Transport,
     port: u16,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let hub = Arc::new(Hub {
+    if let Ok(store) = Store::open(&store_path)
+        && let Ok(None) = store.host_person()
+    {
+        eprintln!(
+            "enclos app: no device is paired yet: the first one paired with `enclos app pair` names the host's person, whose each agent's Home is"
+        );
+    }
+    let hub = Arc::new(Hub::new(
         transport,
-        whois: Arc::new(move |address: &str| transport.whois(address)),
+        Arc::new(move |address: &str| transport.whois(address)),
         store_path,
+        layout,
         bridge_private,
         agents,
-        plugins: Mutex::new(HashMap::new()),
-        generations: AtomicU64::new(0),
-        devices: Mutex::new(HashMap::new()),
-        waiting: AtomicUsize::new(0),
-        refusals: Mutex::new(HashMap::new()),
-        silence: SILENCE,
-    });
+        None,
+        SILENCE,
+    ));
     serve_on(listener, hub, RETRY);
     Ok(())
 }
@@ -523,6 +766,10 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
             }
         }
     });
+    // Each agent's Home, the host's person's, before anything is sent to it.
+    if let Ok(store) = hub.store() {
+        hub.ensure_homes(&store);
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if hub.waiting.fetch_add(1, Ordering::Relaxed) >= MAX_WAITING {
@@ -851,6 +1098,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     drop(waiting);
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
+    hub.ensure_homes(&store);
     let (sender, outbox) = channel();
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     hub.devices
@@ -1007,6 +1255,11 @@ fn pair(
         );
         return Err(e);
     }
+    // The first device paired at the host's terminal names the host's
+    // person (ADR 0044), before the terminal reads it.
+    if let Ok(true) = store.claim_host(person) {
+        eprintln!("enclos app: {person} is the host's person: each agent's Home is theirs");
+    }
     let _ = store.settle_pairing(&code, "paired", Some(&device.id));
     Ok(device)
 }
@@ -1041,22 +1294,10 @@ fn run_session(
         };
         match message.body {
             FromDevice::Agents => {
-                let plugins = hub.plugins.lock().expect("not poisoned");
-                let agents = hub
-                    .agents
-                    .iter()
-                    .map(|a| AgentInfo {
-                        agent: a.name.clone(),
-                        runtime: a.runtime.clone(),
-                        capabilities: plugins
-                            .get(&a.name)
-                            .map(|p| p.capabilities.clone())
-                            .unwrap_or_default(),
-                        abilities: vec!["read".to_owned(), "chat".to_owned()],
-                    })
-                    .collect();
-                drop(plugins);
-                link.send(ToDevice::AgentsList { agents })?;
+                for answer in hub.agents_answer() {
+                    link.send(answer)?;
+                }
+                hub.open_plugins();
             }
             FromDevice::ConversationNew {
                 conversation,
@@ -1065,7 +1306,8 @@ fn run_session(
                 let Some((sandbox, name)) = agent.split_once('/') else {
                     continue;
                 };
-                if !hub.agents.iter().any(|a| a.name == agent) {
+                // A Home is the bridge's to make, for the host's person.
+                if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
                     continue;
                 }
                 store
@@ -1143,7 +1385,17 @@ fn run_session(
             // `enclos app unpair` does, then the connection ends. The
             // conversations stay, the person's.
             FromDevice::DeviceForget => {
-                forget(store, device, person)?;
+                // Not audited, not forgotten: the device stays paired, and
+                // hears why
+                if let Err(why) = forget(hub, store, device, person) {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        // `internal` once the protocol has it
+                        code: ErrorCode::Unknown,
+                        message: format!("this host was not forgotten: {why}"),
+                    }))?;
+                    continue;
+                }
                 // Unpaired whether or not the answer reaches the device: a
                 // failure to send it is not why the connection ended.
                 let _ = link.send(ToDevice::Ack { of: message.id });
@@ -1158,8 +1410,29 @@ fn run_session(
 
 /// The person forgot this host on `device`: its row goes, so its keys
 /// open no connection again ("an unknown device"), and the log says so.
-fn forget(store: &Store, device: &Device, person: &str) -> Result<(), String> {
-    store.remove_device(&device.id).map_err(|e| e.to_string())?;
+/// Audited as `enclos app unpair` is: when the audit log cannot be
+/// written, the device stays paired and the request fails.
+fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(), String> {
+    let engine = crate::engine::Engine::open(hub.layout.clone(), crate::state::Wait::Background);
+    let by = crate::model::audit::Actor {
+        user: person.to_owned(),
+        host: device.name.clone(),
+    };
+    engine
+        .app_access(
+            &by,
+            "app forget",
+            device.id.clone(),
+            |_| "forgotten on the device: it can no longer connect".to_owned(),
+            || {
+                store.remove_device(&device.id).map(|_| ()).map_err(|e| {
+                    crate::error::Error::Session {
+                        what: e.to_string(),
+                    }
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
     let _ = store.log(
         Some(&device.id),
         Some(person),
@@ -1442,9 +1715,39 @@ fn read(
     Ok(())
 }
 
+/// Where `agent`'s message for `conversation` is kept: there, when it is
+/// one of `agent`'s own; else (a conversation the bridge does not know, or
+/// another agent's: the runtime's home channel as it was, or a chat gone)
+/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None`, said on
+/// stderr, when Home's id is not one the protocol takes.
+fn destination(
+    store: &Store,
+    host: Option<&str>,
+    agent: &str,
+    conversation: ConversationId,
+) -> Option<ConversationId> {
+    let own = matches!(
+        store.conversation_of(conversation.as_str()),
+        Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+    );
+    if own {
+        return Some(conversation);
+    }
+    let home = ConversationId::new(home_id(agent))
+        .inspect_err(|e| {
+            eprintln!(
+                "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
+            );
+        })
+        .ok()?;
+    let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
+    Some(home)
+}
+
 /// A conversation for a device: `None` for an id the protocol refuses.
 fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
     Some(ConversationInfo {
+        home: is_home(&c.id),
         conversation: ConversationId::new(c.id).ok()?,
         agent: format!("{}/{}", c.sandbox, c.agent),
         title: c.title,
@@ -1471,7 +1774,9 @@ fn rename(
     else {
         return Ok(());
     };
-    if owner != person {
+    // Home is named Home, so the runtime's names do not replace it (ADR
+    // 0044): clearing its name would let them
+    if owner != person || is_home(conversation.as_str()) {
         return Ok(());
     }
     if !store
@@ -1623,24 +1928,21 @@ mod connection_end_tests {
         });
         let socket = folder.join("main.sock");
         let store = folder.join("app.db");
-        let hub = Arc::new(Hub {
-            transport: Transport::Tailscale,
+        let hub = Arc::new(Hub::new(
+            Transport::Tailscale,
             whois,
-            store_path: store.clone(),
-            bridge_private: keys.private.to_vec(),
-            agents: vec![AgentEndpoint {
+            store.clone(),
+            crate::layout::Layout::at(folder.join("enclos")),
+            keys.private.to_vec(),
+            vec![AgentEndpoint {
                 name: "lab/main".to_owned(),
                 runtime: "hermes".to_owned(),
                 socket: socket.clone(),
                 token: TOKEN.to_owned(),
             }],
-            plugins: Mutex::new(HashMap::new()),
-            generations: AtomicU64::new(0),
-            devices: Mutex::new(HashMap::new()),
-            waiting: AtomicUsize::new(0),
-            refusals: Mutex::new(HashMap::new()),
+            None,
             silence,
-        });
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
@@ -1901,19 +2203,20 @@ mod connection_end_tests {
         code: &[u8],
         name: &str,
     ) -> (Option<PhoneLink>, Option<ToDevice>) {
-        ask_to_pair_signed(bridge, code, name, Signed::Pair)
+        ask_to_pair_signed(bridge, code, name, Signed::Pair, PERSON)
     }
 
-    /// [`ask_to_pair`], its signature made for `purpose`.
+    /// [`ask_to_pair`], its signature made for `purpose`, from `login`.
     fn ask_to_pair_signed(
         bridge: &Bridge,
         code: &[u8],
         name: &str,
         purpose: Signed,
+        login: &str,
     ) -> (Option<PhoneLink>, Option<ToDevice>) {
         let noise = generate_keypair().unwrap();
         let signing = SigningKey::from_slice(&[9u8; 32]).unwrap();
-        let Some(mut device) = handshake(bridge, &noise.private, PERSON) else {
+        let Some(mut device) = handshake(bridge, &noise.private, login) else {
             return (None, None);
         };
         let proof = enclos_protocol::pairing::proof(code, device.session.handshake_hash());
@@ -1942,7 +2245,7 @@ mod connection_end_tests {
         let store = Store::open(&bridge.store).unwrap();
         store.add_pairing(b"code-1", now() + 300).unwrap();
         // An `auth` signature of the same session does not prove a pairing
-        let (_, answer) = ask_to_pair_signed(&bridge, b"code-1", "Pixel", Signed::Auth);
+        let (_, answer) = ask_to_pair_signed(&bridge, b"code-1", "Pixel", Signed::Auth, PERSON);
         assert_eq!(
             answer,
             Some(ToDevice::PairRefused {
@@ -1986,6 +2289,62 @@ mod connection_end_tests {
             .unwrap()
             .as_deref()
             == Some(id.as_str())));
+    }
+
+    #[test]
+    fn the_first_device_paired_names_the_hosts_person_whatever_the_transport_says() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        assert_eq!(store.host_person().unwrap(), None);
+        // The first paired at the terminal is the host's person, whoever
+        // the transport says the host belongs to, and has Home.
+        *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let terminal_1 = terminal(&bridge.store, b"code-1", "accept");
+        let (device, answer) = ask_to_pair_signed(
+            &bridge,
+            b"code-1",
+            "Pixel",
+            Signed::Pair,
+            "alice@example.com",
+        );
+        assert!(
+            matches!(answer, Some(ToDevice::PairAccepted { .. })),
+            "{answer:?}"
+        );
+        terminal_1.join().unwrap();
+        assert!(matches!(
+            device.unwrap().receive(),
+            Some(ToDevice::Authenticated { .. })
+        ));
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        assert!(eventually(|| store
+            .owner("home.lab.main")
+            .unwrap()
+            .as_deref()
+            == Some("alice@example.com")));
+        // A person paired after does not take it.
+        *bridge.whois_login.lock().unwrap() = PERSON.to_owned();
+        store.add_pairing(b"code-2", now() + 300).unwrap();
+        let terminal_2 = terminal(&bridge.store, b"code-2", "accept");
+        let (_, answer) = ask_to_pair(&bridge, b"code-2", "Phone");
+        assert!(
+            matches!(answer, Some(ToDevice::PairAccepted { .. })),
+            "{answer:?}"
+        );
+        terminal_2.join().unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            store.owner("home.lab.main").unwrap().as_deref(),
+            Some("alice@example.com")
+        );
     }
 
     #[test]
@@ -2518,10 +2877,45 @@ mod connection_end_tests {
         assert_eq!(first, None);
     }
 
+    /// Where the bridge in `folder` writes its audit log, made ready.
+    fn audit_log(folder: &Path) -> PathBuf {
+        let log = crate::layout::Layout::at(folder.join("enclos")).audit_log();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        log
+    }
+
+    #[test]
+    fn a_forgotten_device_is_audited_or_stays_paired() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // No audit log: refused, and the device stays paired
+        device.send("forget-1", FromDevice::DeviceForget);
+        let Some(ToDevice::Error(error)) = device.receive() else {
+            panic!("not refused");
+        };
+        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.of.unwrap().as_str(), "forget-1");
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(store.device(&phone.id).unwrap().is_some());
+        // With one, forgotten, and the audit log says who and which
+        let log = audit_log(folder.path());
+        device.send("forget-2", FromDevice::DeviceForget);
+        assert!(matches!(device.receive(), Some(ToDevice::Ack { .. })));
+        assert!(store.device(&phone.id).unwrap().is_none());
+        let audit = std::fs::read_to_string(log).unwrap();
+        assert!(audit.contains("app forget"), "{audit}");
+        assert!(audit.contains(&phone.id), "{audit}");
+        assert!(audit.contains(PERSON), "{audit}");
+    }
+
     #[test]
     fn a_device_forgotten_on_one_connection_loses_its_others() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
+        audit_log(folder.path());
         let phone = paired(&bridge, "n-pixel");
         // A connection left half open, and the one the device reconnected on
         let (mut old, _) = connect(&bridge, &phone);

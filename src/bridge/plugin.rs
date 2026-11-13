@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enclos_protocol::plugin::{
     Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, decode_from_plugin,
@@ -17,11 +17,13 @@ use enclos_protocol::{
 
 use super::ids::new_id;
 
-/// How long the plugin has to answer the bridge's `hello`.
+/// How long the plugin has, in all, to answer the bridge's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a write to the plugin may wait for it to read: the socket is
-/// in the sandbox home, and an agent that never reads must not hold the
-/// bridge.
+/// The longest `hello` the bridge reads: a few names and capabilities.
+const MAX_HELLO_BYTES: usize = 64 * 1024;
+/// How long one write to the plugin may wait for it to read: a plugin that
+/// stops reading must not hold the bridge, which writes to it with its
+/// connections locked.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
@@ -71,11 +73,26 @@ pub struct PluginReader {
 }
 
 /// Connects to the plugin at `socket` and opens the connection with
-/// `token`; the plugin answers with its own `hello`.
+/// `token` and the agent's `home` conversation; the plugin answers with its
+/// own `hello`.
 pub fn connect(
     socket: &Path,
     token: &str,
+    home: &str,
 ) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    connect_within(socket, token, home, HELLO_TIMEOUT)
+}
+
+/// [`connect`], with `wait` for the whole of the plugin's `hello`: a plugin
+/// that sends it a byte at a time, or never ends its line, is given up on
+/// once `wait` is over.
+fn connect_within(
+    socket: &Path,
+    token: &str,
+    home: &str,
+    wait: Duration,
+) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    let deadline = Instant::now() + wait;
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
     refuse_linked_folder(socket)?;
@@ -90,13 +107,13 @@ pub fn connect(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
+        home: ConversationId::new(home).ok(),
     })?;
-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut reader = PluginReader {
         lines: BufReader::new(stream),
         answers: writer.try_clone()?,
     };
-    let hello = match reader.receive() {
+    let hello = match reader.receive_hello(deadline, wait) {
         Ok(Some(message)) => message,
         Ok(None) => return Err(PluginError::Refused),
         Err(PluginError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
@@ -115,7 +132,7 @@ pub fn connect(
             hello.body
         )));
     };
-    reader.lines.get_ref().set_read_timeout(None)?;
+    read_wait(reader.lines.get_ref(), None)?;
     Ok((
         PluginHello {
             runtime,
@@ -226,7 +243,73 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Sets how long a read on `stream` may wait. macOS refuses to change it
+/// (`EINVAL`) once the connection is shut both ways, which it is as soon
+/// as the plugin has closed its end: a plugin may send its `hello` and
+/// close before the bridge has read it. A read there never waits, it gets
+/// what is left and then the end, so that refusal is no failure.
+fn read_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
+    match stream.set_read_timeout(wait) {
+        // Rust's own refusal (a zero wait) is `InvalidInput` too, but
+        // carries no OS error.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 impl PluginReader {
+    /// The plugin's first message, by `deadline` whatever it sends until
+    /// then (`wait` is how long it was given), at most [`MAX_HELLO_BYTES`].
+    fn receive_hello(
+        &mut self,
+        deadline: Instant,
+        wait: Duration,
+    ) -> Result<Option<Envelope<FromPlugin>>, PluginError> {
+        use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+        loop {
+            let mut line = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(PluginError::Protocol(format!(
+                        "it did not answer the hello within {} ms",
+                        wait.as_millis()
+                    )));
+                }
+                read_wait(self.lines.get_ref(), Some(left))?;
+                let read = match self.lines.fill_buf() {
+                    Ok(read) => read,
+                    Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if read.is_empty() {
+                    return Ok(None);
+                }
+                let (taken, ended) = match read.iter().position(|&b| b == b'\n') {
+                    Some(end) => (end + 1, true),
+                    None => (read.len(), false),
+                };
+                line.extend_from_slice(&read[..taken]);
+                self.lines.consume(taken);
+                if line.len() > MAX_HELLO_BYTES {
+                    return Err(PluginError::Protocol(format!(
+                        "its hello is longer than {MAX_HELLO_BYTES} bytes"
+                    )));
+                }
+                if ended {
+                    break;
+                }
+            }
+            match decode_from_plugin(&line) {
+                Ok(message) => return Ok(Some(message)),
+                Err(DecodeError::UnknownType { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// The next message; `None` once the plugin closed the connection.
     ///
     /// As `docs/protocol.md` says: a line is read up to 1 MiB, and one
@@ -302,7 +385,8 @@ mod tests {
             let mut lines = BufReader::new(stream);
             let mut line = Vec::new();
             lines.read_until(b'\n', &mut line).unwrap();
-            let FromBridge::Hello { token: given } = decode_from_bridge(&line).unwrap().body else {
+            let FromBridge::Hello { token: given, .. } = decode_from_bridge(&line).unwrap().body
+            else {
                 panic!("not a hello first");
             };
             if given != token {
@@ -318,7 +402,7 @@ mod tests {
                 FromPlugin::Hello {
                     runtime: "hermes".into(),
                     agent: "main".into(),
-                    capabilities: vec![Capability::Notify],
+                    capabilities: vec![Capability::Typing],
                 },
             );
             loop {
@@ -357,9 +441,9 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
-        let (hello, mut reader, mut writer) = connect(&socket, "t0ken").unwrap();
+        let (hello, mut reader, mut writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert_eq!(hello.agent, "main");
-        assert_eq!(hello.capabilities, [Capability::Notify]);
+        assert_eq!(hello.capabilities, [Capability::Typing]);
         let conversation = ConversationId::new("c-1").unwrap();
         let sent = writer
             .message(
@@ -396,7 +480,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
-        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         // A clone keeps the descriptor open, as the reading thread's
         // acknowledgements do in `enclos app chat`
         let clone = writer.try_clone().unwrap();
@@ -485,7 +569,7 @@ mod tests {
         raw.extend(b"not json\n");
         raw.extend(out_line("p-3", "still here"));
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         let message = reader.receive().unwrap().unwrap();
         assert_eq!(message.id.as_str(), "p-3");
         let (unknown, bad, not_json) = (
@@ -511,7 +595,7 @@ mod tests {
         // No line break: a reader without a bound would keep growing
         let raw = vec![b'x'; MAX_MESSAGE_BYTES + 100];
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert!(matches!(reader.receive(), Err(PluginError::TooLong)));
         let error = answer(&lines_back);
         assert_eq!((error.code, error.of), (ErrorCode::BadMessage, None));
@@ -534,7 +618,7 @@ mod tests {
         let mut raw = br#"{"v":2,"type":"message.out","id":"p-1"}"#.to_vec();
         raw.push(b'\n');
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert!(matches!(reader.receive(), Err(PluginError::Version(2))));
         let error = answer(&lines_back);
         assert_eq!(
@@ -552,7 +636,8 @@ mod tests {
         let plugin = echo_plugin(UnixListener::bind(real.join("main.sock")).unwrap(), "t0ken");
         let linked = folder.path().join(".enclos-app");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        let Err(PluginError::Connect { source, .. }) = connect(&linked.join("main.sock"), "t0ken")
+        let Err(PluginError::Connect { source, .. }) =
+            connect(&linked.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
         };
@@ -569,7 +654,8 @@ mod tests {
         let own = folder.path().join(".enclos-app");
         std::fs::create_dir(&own).unwrap();
         std::os::unix::fs::symlink(&elsewhere, own.join("main.sock")).unwrap();
-        let Err(PluginError::Connect { source, .. }) = connect(&own.join("main.sock"), "t0ken")
+        let Err(PluginError::Connect { source, .. }) =
+            connect(&own.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
         };
@@ -586,17 +672,112 @@ mod tests {
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
         assert!(matches!(
-            connect(&socket, "other"),
+            connect(&socket, "other", "home.lab.main"),
             Err(PluginError::Refused)
         ));
         plugin.join().unwrap();
     }
 
     #[test]
+    fn a_plugin_that_trickles_its_hello_is_given_up_on_in_time() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A byte at a time, never a line: each read gets something
+            // before a per-read timeout would end it.
+            for _ in 0..40 {
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let refused = connect_within(
+            &socket,
+            "t0ken",
+            "home.lab.main",
+            Duration::from_millis(400),
+        );
+        assert!(
+            matches!(refused, Err(PluginError::Protocol(_))),
+            "{:?}",
+            refused.map(|(hello, ..)| hello)
+        );
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_hello_longer_than_its_bound_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The bridge's hello read first, and the connection kept until
+            // the bridge leaves: closing on unread bytes would reset it.
+            let mut lines = BufReader::new(stream.try_clone().unwrap());
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).unwrap();
+            let _ = stream.write_all(&vec![b'x'; MAX_HELLO_BYTES + 2]);
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {}
+        });
+        assert!(matches!(
+            connect(&socket, "t0ken", "home.lab.main"),
+            Err(PluginError::Protocol(_))
+        ));
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_plugin_that_says_hello_and_closes_at_once_is_still_read() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut line = Vec::new();
+            BufReader::new(stream).read_until(b'\n', &mut line).unwrap();
+            let hello = FromPlugin::Hello {
+                runtime: "hermes".into(),
+                agent: "main".into(),
+                capabilities: vec![],
+            };
+            let id = MessageId::new(new_id().unwrap()).unwrap();
+            out.write_all(&encode_line(&Envelope::new(id, hello)))
+                .unwrap();
+            out.write_all(&out_line("p-1", "last words")).unwrap();
+            // Closed here, as a rule before the bridge is done with the
+            // hello (on macOS, the timeout it then clears is refused).
+        });
+        let (hello, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
+        assert_eq!(hello.agent, "main");
+        assert_eq!(reader.receive().unwrap().unwrap().id.as_str(), "p-1");
+        assert!(reader.receive().unwrap().is_none());
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_wait_on_a_closed_connection_is_no_failure() {
+        let (stream, other) = UnixStream::pair().unwrap();
+        drop(other);
+        read_wait(&stream, Some(Duration::from_secs(5))).unwrap();
+        read_wait(&stream, None).unwrap();
+        assert_eq!((&stream).read(&mut [0; 8]).unwrap(), 0);
+        // A zero wait is still refused, as Rust refuses it.
+        assert!(read_wait(&stream, Some(Duration::ZERO)).is_err());
+    }
+
+    #[test]
     fn no_plugin_says_where_it_looked() {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
-        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken") else {
+        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken", "home.lab.main")
+        else {
             panic!("connected to nothing");
         };
         assert!(path.ends_with("main.sock"));

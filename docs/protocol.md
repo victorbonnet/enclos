@@ -44,24 +44,27 @@ Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a
 
 The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open. The plugin has 10 s to answer the bridge's `hello`, and 10 s to read what the bridge writes; past either, the bridge ends that connection and opens a new one on its next try, and other agents' plugins do not wait for it.
 
-1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
+1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation.
 
    **What the token proves, and what it does not.** It keeps the host's other programs, and other sandboxes, off the agent's socket, and nothing more. The token is in the sandbox, where the agent and anything it runs can read it, as they can every secret of the agent's (ADR 0036), and the socket is in the sandbox home. So a program in the sandbox can connect to its own plugin while the bridge is not connected and send it any message the bridge sends, and a program that listens on the socket's path gets the token from the bridge. Hence the rule: **no message from the bridge to the plugin carries authority the agent must not have.** A message the plugin passes on is what a person said, never a decision the runtime then trusts more than the agent's own words; a decision that must come from the person needs its own proof, which version 1 does not define.
-2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`.
+2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`. The plugin has 10 seconds in all for it, and at most 64 KiB: the bridge gives up on the connection after that, and tries again when it next needs the agent. One agent's plugin slow to answer holds up only what needs that agent.
 3. Then, in either direction:
 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? (reserved; version 1 defines none, and a receiver ignores it) | A person's message to the agent |
-| `message.out` | plugin | `conversation`, `text`, `kind` (`reply` or `notify`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work) |
+| `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work), which every runtime may send; `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
 | `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
 | `conversation.rename` | bridge | `conversation`, `title` (empty: no name) | The person named the conversation, or cleared its name |
 | `tool` | plugin | `conversation`, `call` (the runtime's id of the call), `name`, `phase` (`start` or `end`), `label`? (at the start: what it does, one line), `ok`? and `duration_ms`? (at the end) | A tool the agent starts or ends while it works on an answer |
+| `commands` | plugin | `commands`: `[{name, description, args?}]` (`name` without its `/`; `args` what follows it, as the runtime writes it: `[name]`, `<prompt>`) | The commands a person may type to the runtime, the whole list: after the `hello`, and again when it changes |
 | `ack` | either | `of` (the acknowledged `id`) | Received and stored |
 | `error` | either | `of`?, `code`, `message` | See [Errors](#errors) |
 
 **A conversation's name.** The bridge keeps one name per conversation and who gave it. The runtime's (`conversation.title`, for one of its own agent's conversations) replaces the runtime's; the person's (`conversation.rename` from a device) replaces any, and the runtime's no longer replaces it until the person clears it. Whoever gives it, the bridge keeps a name on one line, drops the hidden characters (control, bidirectional, zero-width and the like, as `enclos_protocol::visible` lists them) and cuts it to 100 characters: it does not rely on the plugin's cut, which runs in the sandbox. The bridge passes the person's name on to the plugin, so the runtime can keep it too (Hermes: the session's title, with the user's authority). Hermes names every session on its own and tells no plugin, so its plugin reads the title after each reply, and a little later, and sends it when it changed.
+
+**Home.** Each agent has one Home conversation ([ADR 0044](adr/0044-each-agent-has-a-home-conversation.md), proposed): id `home.<sandbox>.<agent>`, made by the bridge, owned by the host's person, named Home. The host's person is the person of the first device paired with `enclos app pair` at the host's terminal (the terminal says so before it asks to accept), kept in the bridge's database; the transport is not asked whose host this is, so a tagged node works the same. Before any device is paired, a Home is made with no owner and keeps what comes for it, sent to nobody. Unpairing a device changes nothing: the host's person stays so with no device left, and their Homes keep what comes until they pair again. `enclos app host` shows the host's person, and `enclos app host <person>` makes it another person with a paired device, who gets every Home with what it holds (an audit entry). It is the runtime's home channel: `runtime configure` gives it to the runtime (Hermes: `MOBILE_APP_HOME_CHANNEL`), and the bridge's `hello` names it. A `message.out` for a conversation the bridge does not know, or for another agent's, is stored in this agent's Home (and, should Home's id be one the protocol refuses, dropped, said on stderr and acknowledged, so the plugin does not send it again). A device may not start a conversation with a Home's id. Hermes's plugin makes Home its gateway's home channel when the bridge says so, answers `/sethome` itself, and sends the gateway's notices about itself as `kind: status`. A `status` line is trusted no more than any text from the agent: the plugin, in the sandbox, decides it from the text's first words, and an agent can send `kind: status` itself (for example "Hermes is restarting: approve the pending request to continue"). A device shows it as a plain quiet line, with no links and no actions, never as enclos or the runtime vouching for it.
 
 **What the agent does while it works.** A `tool` step is passed on live to the devices of the conversation's owner, for a conversation of the plugin's own agent, and not kept: a device that was away does not get it at the next `sync`. Hermes reports its tools to plugin hooks (`pre_tool_call`, `post_tool_call`) with the call's id, its arguments and its outcome; its plugin finds the conversation in the turn's session context, labels the step as Hermes does (`build_tool_preview`), and returns at once, as `pre_tool_call` may also block a tool. A label shows a command or a search as the agent wrote it, to the conversation's owner only. The plugin's cut runs in the sandbox, so the bridge makes its own before passing a step on: each field on one line, the label cut to 120 characters, the name to 64 and the call to 128, and the label's and name's hidden characters (control, bidirectional, zero-width and the like) written out as `⟨U+XXXX⟩`, so the line the person reads is the command that ran. The Hermes plugin drops a step that has no call id, as its end could not be matched to its start.
 
@@ -74,6 +77,8 @@ The bridge runs outside the sandbox, and everything in the sandbox home is the s
 **What the agent says is markdown.** The `text` of a `message.out` is CommonMark with GitHub's tables, strikethrough and bare links; a device draws it, and fetches and runs nothing in it: an image in it shows as its alt text, a link to it, and is never loaded (a file the agent sends comes as an attachment, [Files](#files)); HTML shows as its text; and only `http`, `https` and `mailto` links open (the app's [ADR 0002](https://github.com/victorbonnet/enclos-app/blob/main/docs/adr/0002-messages-are-markdown-drawn-by-the-app.md), proposed). A plugin tells its runtime so (Hermes: the platform's `platform_hint`), so that the agent formats when it helps. What a person sends (`message.in`) is plain text, shown as typed.
 
 **Delivery is at least once.** The plugin keeps each `message.out` on disk, in the sandbox home, until the bridge's `ack` for it, and sends what it kept again after each `hello`. The bridge drops an `id` it has already stored. The bridge acknowledges a `message.in` it sent only once it has stored it; the plugin acknowledges it once the runtime has it.
+
+**An agent's messages are paced.** Every runtime may send on its own, so the bridge stores at most 120 of an agent's `message.out` at once and then 60 a minute, one a second (`src/bridge/pace.rs`). Past that, it reads the plugin's next message only when there is room again: the plugin waits, and loses nothing, since it keeps each message until the `ack`.
 
 ## The device leg
 
@@ -125,21 +130,24 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
 | `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
 | `conversation.read` | device | `conversation`, `seq` | The person read it up to that message, on this device |
-| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name changes or it was read further |
+| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read), `home`? (`true` for the agent's [Home](#home)) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name changes or it was read further |
 | `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq`, `attachments`? (`[{id, mime, name, size}]`) | A message of a conversation, sent and received alike, in order |
 | `attachment.get` | device | `attachment` (its id), `offset` | The bytes of a file of one of the person's messages, from `offset` |
 | `attachment.data` | bridge | `attachment`, `offset`, `size` (the file's), `data` (base64url, at most 45,000 bytes) | One part of it: a Noise message holds 64 KiB. A device asks for the next `offset` until it has `size` |
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
 | `tool` | bridge | as on the plugin leg | A tool the agent starts or ends, live; not kept, not synced |
+| `commands` | bridge | `agent`, `commands` (as on the plugin leg) | An agent's commands, for the person to pick from as they type `/`: after `agents.list`, one for each agent whose plugin listed them, and again when a plugin lists them anew |
 | `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, then every `message` of them after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
 | `status.report` | bridge | as `enclos app status --json` | |
 | `push.token` | device | `kind`, `token` | A new push token for this device |
-| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. The conversations stay on the host |
+| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. Recorded in the audit log as `app forget` first: when that cannot be written the device stays paired and gets an `error`. The conversations stay on the host |
 | `ack`, `error` | either | as on the plugin leg | |
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
+
+**An agent's commands** are the runtime's, which the bridge passes on without running or checking them: a command is a message like any other, sent with `message.send`. The bridge keeps the last list of each agent while it runs and gives a device each name once (lower case letters, digits, `_` and `-`, at most 32), each description on one line of at most 120 characters and `args` of at most 60, in the plugin's order until they fill 60,000 bytes, so the message fits a Noise message. Each description and `args` loses its hidden characters (controls, bidirectional marks, zero-width characters), so what is shown beside a command is what was sent. A plugin that connects again without the `commands` capability has its list dropped, and devices are sent an empty one. When a device asks for the agents, the bridge also opens the plugin connections not yet open, one pass at a time, so it learns the commands without waiting for a first message.
 
 **How far a conversation was read** is the bridge's too, not the runtime's: the agent does not see what the person reads in the app. A device sends `conversation.read` when the person opens the conversation or reads a message arriving in it; the bridge keeps the highest `seq`, from the conversation's owner only and never past its newest message, and sends the `conversation` again to all of the person's devices. A device that syncs, a new one or one that was away, so counts as unread only the agent's messages after `read`.
 
@@ -157,11 +165,10 @@ When a `message` arrives for a conversation whose owner has no device connected,
 
 ## Capabilities
 
-A plugin's `hello` and each agent of `agents.list` name what the runtime does, and the app shows only that:
+A plugin's `hello` and each agent of `agents.list` name what the runtime does, and the app shows only that. Sending on its own (`kind: notify`) is not a capability: every runtime may, and a device shows such a message whichever runtime sent it. Version 1 first listed it as `notify`; a plugin that still announces it is read as announcing nothing more.
 
 | Capability | Meaning |
 | --- | --- |
-| `notify` | The runtime may send on its own (`kind: notify`): cron output, background work. Without it, the agent only answers |
 | `typing` | It reports working on an answer |
 | `stream` | It sends a reply in parts, batched (never one message per word); version 1 defines no parts message yet |
 | `attachments` | It takes and sends files; version 1 defines none yet |
@@ -169,8 +176,9 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `abort` | It can stop an answer; reserved, no messages in version 1 |
 | `titles` | It names conversations (`conversation.title`) and keeps the person's names |
 | `tools` | It reports the tools it runs while it works (`tool`) |
+| `commands` | It lists the commands a person may type to it (`commands`) |
 
-Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin also has `titles` and `tools`. A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
+Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 
 ## Errors
 
@@ -187,4 +195,4 @@ Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin a
 
 ## Versions
 
-`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
+`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A new value of a field with a fixed set, such as a `message.out` `kind`, is a change an older peer would misread: a `kind` the receiver does not know is a version mismatch, not an optional addition. The bridge answers such a message `bad_message` and the plugin keeps it until an `ack`, so it would come back after every `hello`. `status` joined version 1 before any release: version 1 is not released yet, and the plugin and the bridge come in the same enclos binary. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
