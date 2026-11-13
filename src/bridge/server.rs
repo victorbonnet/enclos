@@ -71,6 +71,7 @@ use super::groups::{
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
+use super::provisioning::{Completed, Host, Operation};
 use super::store::{
     Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
     StoredAttachment, conversation_title, home_id, is_home, now,
@@ -155,6 +156,8 @@ struct Hub {
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
+    provisioning: Option<Host>,
+    provisioning_busy: Mutex<HashSet<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
@@ -213,6 +216,122 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    fn begin(
+        self: &Arc<Self>,
+        store: &Store,
+        operation: Operation,
+        of: MessageId,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), ErrorBody> {
+        if self.provisioning.is_none() {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::NotAllowed,
+                message: "only the host's person can manage sandboxes".to_owned(),
+            });
+        }
+        self.host_authority(store, device, person)
+            .map_err(|(code, message)| ErrorBody {
+                of: Some(of.clone()),
+                code,
+                message,
+            })?;
+        let sandbox = operation.sandbox().to_owned();
+        let verb = operation.verb().to_owned();
+        let mut busy = self.provisioning_busy.lock().expect("not poisoned");
+        if !busy.insert(sandbox.clone()) {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Busy,
+                message: format!("an operation is already running in sandbox {sandbox}"),
+            });
+        }
+        drop(busy);
+        self.deliver(
+            person,
+            ToDevice::OperationProgress {
+                of: of.clone(),
+                operation: verb.clone(),
+                sandbox: sandbox.clone(),
+                message: operation.progress().to_owned(),
+            },
+        );
+        let hub = Arc::clone(self);
+        let person = person.to_owned();
+        let device = device.id.clone();
+        std::thread::spawn(move || {
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!("{verb} started"),
+                    Some(&sandbox),
+                );
+            }
+            let result = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .execute(&operation, &person);
+            let failed = result.as_ref().err().cloned();
+            let response = match result {
+                Ok(Completed::Created) => ToDevice::SandboxCreated {
+                    of,
+                    sandbox: sandbox.clone(),
+                },
+                Ok(Completed::Installed { runtime, login }) => ToDevice::RuntimeInstalled {
+                    of,
+                    sandbox: sandbox.clone(),
+                    runtime,
+                    login,
+                },
+                Err(message) => ToDevice::Error(ErrorBody {
+                    of: Some(of),
+                    code: ErrorCode::OperationFailed,
+                    message,
+                }),
+            };
+            // Release before completing: a next request may follow at once.
+            hub.provisioning_busy
+                .lock()
+                .expect("not poisoned")
+                .remove(&sandbox);
+            hub.deliver(&person, response);
+            if let Ok(sandboxes) = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .sandboxes()
+            {
+                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+            }
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!(
+                        "{verb} {}",
+                        if failed.is_some() {
+                            "failed"
+                        } else {
+                            "completed"
+                        }
+                    ),
+                    Some(&sandbox),
+                );
+            }
+        });
+        Ok(())
+    }
+
+    fn with_provisioning(self, host: Host) -> Hub {
+        Hub {
+            provisioning: Some(host),
+            ..self
+        }
+    }
+
     /// Returns once `agent` may have one more message stored ([`Pace`]):
     /// at once in a burst, else after a wait, in which its plugin's
     /// connection is not read.
@@ -264,6 +383,8 @@ impl Hub {
             layout,
             bridge_private,
             agents,
+            provisioning: None,
+            provisioning_busy: Mutex::new(HashSet::new()),
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
             deletions: Mutex::new(HashMap::new()),
@@ -1008,6 +1129,7 @@ fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, Tool
 }
 
 /// Serves on `127.0.0.1:port` until the process ends.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     transport: Transport,
     port: u16,
@@ -1016,6 +1138,7 @@ pub fn serve(
     bridge_private: Vec<u8>,
     approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
+    provisioning: Host,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     if let Ok(store) = Store::open(&store_path)
@@ -1036,7 +1159,8 @@ pub fn serve(
             None,
             SILENCE,
         )
-        .with_approval_key(approval_key),
+        .with_approval_key(approval_key)
+        .with_provisioning(provisioning),
     );
     serve_on(listener, hub, RETRY);
     Ok(())
@@ -1429,8 +1553,8 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
         }
     };
     link.send(ToDevice::Authenticated {
-        capabilities: hub.capabilities(&person),
         person: person.clone(),
+        capabilities: hub.capabilities(&person),
     })?;
     // Authenticated: no longer among the callers that are few at once
     drop(waiting);
@@ -1766,6 +1890,75 @@ fn run_session(
                     }))?;
                 } else {
                     link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
+            FromDevice::Sandboxes
+            | FromDevice::Runtimes
+            | FromDevice::SandboxCreate { .. }
+            | FromDevice::RuntimeInstall { .. } => {
+                if hub.provisioning.is_none() {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::NotAllowed,
+                        message: "This bridge does not offer provisioning.".into(),
+                    }))?;
+                    continue;
+                }
+                if let Err((code, message_text)) = hub.host_authority(store, device, person) {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code,
+                        message: message_text,
+                    }))?;
+                    continue;
+                }
+                let operation = match message.body {
+                    FromDevice::Sandboxes => {
+                        match hub
+                            .provisioning
+                            .as_ref()
+                            .expect("provisioning request checked")
+                            .sandboxes()
+                        {
+                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
+                            Err(why) => link.send(ToDevice::Error(ErrorBody {
+                                of: Some(message.id),
+                                code: ErrorCode::OperationFailed,
+                                message: why,
+                            }))?,
+                        }
+                        continue;
+                    }
+                    FromDevice::Runtimes => {
+                        link.send(ToDevice::RuntimesList {
+                            runtimes: hub
+                                .provisioning
+                                .as_ref()
+                                .expect("provisioning request checked")
+                                .runtimes(),
+                        })?;
+                        continue;
+                    }
+                    FromDevice::SandboxCreate { sandbox, template } => {
+                        Operation::create(&sandbox, &template)
+                    }
+                    FromDevice::RuntimeInstall { sandbox, runtime } => {
+                        Operation::install(&sandbox, &runtime)
+                    }
+                    _ => unreachable!("matched provisioning requests"),
+                };
+                match operation {
+                    Ok(operation) => {
+                        if let Err(error) = hub.begin(store, operation, message.id, device, person)
+                        {
+                            link.send(ToDevice::Error(error))?;
+                        }
+                    }
+                    Err(why) => link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::BadMessage,
+                        message: why,
+                    }))?,
                 }
             }
             FromDevice::Agents => {
@@ -2643,6 +2836,21 @@ mod connection_end_tests {
     }
 
     fn bridge_with(folder: &Path, silence: Duration) -> Bridge {
+        bridge_serving(
+            folder,
+            silence,
+            Host::new(
+                crate::layout::Layout::at(folder.join("enclos")),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+            ),
+        )
+    }
+
+    fn bridge_serving(folder: &Path, silence: Duration, provisioning: Host) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
         let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
@@ -2657,21 +2865,24 @@ mod connection_end_tests {
         });
         let socket = folder.join("main.sock");
         let store = folder.join("app.db");
-        let hub = Arc::new(Hub::new(
-            Transport::Tailscale,
-            whois,
-            store.clone(),
-            crate::layout::Layout::at(folder.join("enclos")),
-            keys.private.to_vec(),
-            vec![AgentEndpoint {
-                name: "lab/main".to_owned(),
-                runtime: "hermes".to_owned(),
-                socket: socket.clone(),
-                token: TOKEN.to_owned(),
-            }],
-            None,
-            silence,
-        ));
+        let hub = Arc::new(
+            Hub::new(
+                Transport::Tailscale,
+                whois,
+                store.clone(),
+                crate::layout::Layout::at(folder.join("enclos")),
+                keys.private.to_vec(),
+                vec![AgentEndpoint {
+                    name: "lab/main".to_owned(),
+                    runtime: "hermes".to_owned(),
+                    socket: socket.clone(),
+                    token: TOKEN.to_owned(),
+                }],
+                None,
+                silence,
+            )
+            .with_provisioning(provisioning),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
@@ -2871,6 +3082,199 @@ mod connection_end_tests {
             }
         });
         got
+    }
+
+    #[test]
+    fn provisioning_capability_follows_confirmed_host_and_transfer_on_existing_connection() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.set_host("another@example.com").unwrap();
+        let (_, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+        );
+        store.set_host(PERSON).unwrap();
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.contains(&"sandboxes".into()) && capabilities.contains(&"audit".into()))
+        );
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(
+            matches!(device.receive(), Some(ToDevice::RuntimesList { runtimes }) if runtimes.iter().any(|r| r.runtime == "hermes"))
+        );
+        store.set_host("another@example.com").unwrap();
+        device.send("after-transfer", FromDevice::Runtimes);
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { code: ErrorCode::NotAllowed, of: Some(of), .. })) if of.as_str() == "after-transfer")
+        );
+        let (_, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+        );
+    }
+
+    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+        use crate::{
+            audit::jsonl::JsonlAuditLog,
+            backend::fake::FakeBackend,
+            engine::{Engine, SandboxSpec},
+            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+            state::sqlite::SqliteStateStore,
+        };
+        let layout = crate::layout::Layout::at(folder.join("enclos"));
+        let engine = Engine::new(
+            layout.clone(),
+            Box::new(SqliteStateStore::new(
+                layout.state_db(),
+                layout.state_lock(),
+                crate::state::Wait::Command,
+            )),
+            Box::new(JsonlAuditLog::new(layout.audit_log())),
+            vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+        );
+        let actor = Actor {
+            user: PERSON.into(),
+            host: "test".into(),
+        };
+        engine.init(&actor, Confirm::Yes).unwrap();
+        engine
+            .create_sandbox(
+                &actor,
+                SandboxSpec {
+                    name: "lab".parse().unwrap(),
+                    backend: BackendKind::Seatbelt,
+                    template: "minimal".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap();
+        layout
+    }
+
+    #[test]
+    fn provisioning_install_busy_and_failures_keep_request_ids_over_the_device_connection() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        let executable = folder.path().join("fake-enclos");
+        std::fs::write(&executable, r#"#!/bin/sh
+while [ ! -f "$ENCLOS_HOME/release" ]; do sleep 0.01; done
+if [ -f "$ENCLOS_HOME/fail" ]; then
+  printf '%s\n' '{"error":{"message":"installer refused the operation"}}'
+  exit 1
+fi
+printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enclos connect lab -- hermes setup"}'
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = bridge_serving(
+            folder.path(),
+            SILENCE,
+            Host::new(
+                layout.clone(),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                executable,
+            ),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        let install = || FromDevice::RuntimeInstall {
+            sandbox: "lab".into(),
+            runtime: "hermes".into(),
+        };
+        device.send("install-one", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, operation, sandbox, .. }) if of.as_str() == "install-one" && operation == "runtime.install" && sandbox == "lab")
+        );
+        device.send("install-two", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::Busy, .. })) if of.as_str() == "install-two")
+        );
+        std::fs::write(layout.data().join("release"), "").unwrap();
+        assert!(
+            matches!(device.receive(), Some(ToDevice::RuntimeInstalled { of, sandbox, runtime, login }) if of.as_str() == "install-one" && sandbox == "lab" && runtime == "hermes" && login.contains("hermes setup"))
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "lab"))
+        );
+        std::fs::write(layout.data().join("fail"), "").unwrap();
+        device.send("install-failure", install());
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, .. }) if of.as_str() == "install-failure")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::OperationFailed, message })) if of.as_str() == "install-failure" && message == "installer refused the operation")
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { .. })
+        ));
+        device.send(
+            "duplicate-create",
+            FromDevice::SandboxCreate {
+                sandbox: "lab".into(),
+                template: "minimal".into(),
+            },
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, operation, .. }) if of.as_str() == "duplicate-create" && operation == "sandbox.create")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { of: Some(of), code: ErrorCode::OperationFailed, .. })) if of.as_str() == "duplicate-create")
+        );
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_creation_reports_completion_then_fresh_inventory_over_the_device_connection() {
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        let bridge = bridge_serving(
+            folder.path(),
+            SILENCE,
+            Host::new(
+                layout.clone(),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+            ),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        device.send(
+            "create-one",
+            FromDevice::SandboxCreate {
+                sandbox: "new-home".into(),
+                template: "minimal".into(),
+            },
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::OperationProgress { of, .. }) if of.as_str() == "create-one")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxCreated { of, sandbox }) if of.as_str() == "create-one" && sandbox == "new-home")
+        );
+        assert!(
+            matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
+        );
     }
 
     fn start_conversation(device: &mut PhoneLink) {

@@ -4110,6 +4110,30 @@ fn what_a_program_enclos_starts_prints_stays_out_of_the_document() {
     assert!(out.stderr().contains("editor-noise"), "{}", out.stderr());
 }
 
+/// The same document stdout reservation used by runtime install must survive
+/// more child output than the bridge retains for its JSON result.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_json_document_survives_more_than_64_kib_of_child_output() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "minimal"])
+        .ok();
+    let mut command = home.piped(&["--json", "policy", "edit", "home"]);
+    command.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "awk 'BEGIN { for (i = 0; i < 8192; i++) print \"installer-progress\" }'",
+        ),
+    );
+    let out = Run(command.output().unwrap());
+    let document: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert!(document.get("error").is_none());
+    assert!(out.stderr().len() > 65_536);
+    assert!(!out.stdout().contains("installer-progress"));
+}
+
 /// A document nobody reads fails the command, and says what the command
 /// itself did, so that it is not run again blindly.
 #[cfg(target_os = "macos")]

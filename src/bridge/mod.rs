@@ -9,6 +9,7 @@ pub mod keys;
 pub mod pace;
 pub mod page;
 pub mod plugin;
+pub mod provisioning;
 pub mod server;
 pub mod store;
 pub mod text;

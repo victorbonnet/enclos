@@ -109,7 +109,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `type` | From | Fields |
 | --- | --- | --- |
 | `auth` | device | `device`, `sig` (base64url DER signature of `enclos auth v1` ‖ the handshake hash) |
-| `authenticated` | bridge | `person`, `capabilities`? (`["audit"]` for the host's person) |
+| `authenticated` | bridge | `person`, optional `capabilities` (`sandboxes` for provisioning and `audit` for audit pages, offered to the host's person) |
 | `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of `enclos pair proof v1` ‖ the handshake hash, keyed with `code`), `sig` (base64url DER signature, by `device_key`, of `enclos pair v1` ‖ the handshake hash), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `bad_signature`, `declined` |
@@ -246,6 +246,26 @@ Client fallback does not imply binary downgrade compatibility: once a bridge sto
 
 Structured approval controls bypass a running group's queue of ordinary messages and work for a member's exact request; older group clients need a supporting app and bridge.
 
+### Sandbox creation and runtime installation
+
+Only the host's person, authenticated on a still-paired device, may use these messages. Authority uses the stored host identity established by the first pairing accepted at the terminal or changed with `enclos app host`; it is checked on every request. Until the host has a confirmed person, provisioning is unavailable. `authenticated.capabilities` includes `sandboxes` for eligible devices; older bridges omit it.
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `sandboxes` | device | (none) | List the host's sandboxes, including those without a runtime or app channel |
+| `sandboxes.list` | bridge | `sandboxes`: `[{"sandbox":"lab","runtime":null,"state":"created"}]` | Runtime is its identifier or `null`; state is `created`, `running`, `stopped` or `failed` |
+| `runtimes` | device | (none) | List runtimes this host knows how to install |
+| `runtimes.list` | bridge | `runtimes`: `[{"runtime":"hermes","name":"Hermes","description":"…"}]` | The runtime catalog; currently Hermes |
+| `sandbox.create` | device | `sandbox`, `template` (required: `minimal` or `assistant`) | Create using the host's configured default backend and existing engine checks |
+| `runtime.install` | device | `sandbox`, `runtime` | Install using the runtime's own noninteractive installer, inside the sandbox |
+| `operation.progress` | bridge | `of`, `operation` (`sandbox.create` or `runtime.install`), `sandbox`, `message` | The request identified by `of` is running; milestones only, no raw installer output |
+| `sandbox.created` | bridge | `of`, `sandbox` | Creation completed |
+| `runtime.installed` | bridge | `of`, `sandbox`, `runtime`, `login` | Installation completed; `login` is the remaining host setup command, e.g. `enclos connect lab -- hermes setup` |
+
+The bridge sends completion or an `error` with the request's `of`, then a fresh `sandboxes.list` to the host's person's connected devices. Only one provisioning operation per sandbox runs at once (`busy` otherwise). Operations continue if the phone disconnects; they are not replayed on reconnect. A new `sandboxes` request reads the resulting host state. Requests with invalid names, runtimes or templates get `bad_message`; engine and installer failures get `operation_failed`, in their own words. No installed runtime is recorded until its installer succeeds. Existing engine checks still refuse pending policies, another installed runtime, and unrelated policy edits that require host review. Runtime login, app channel setup and service startup remain host operations, and the app says so. Existing mobile policy review and editing are unchanged.
+
+Each request and its completion is logged with its device and person in `enclos app log`. The engine audit records creation by the authenticated person and runtime installation by the local host user running the CLI child. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. After completing a new agent's app channel setup on the host, restart the bridge to list it.
+
 ### Host audit
 
 The bridge advertises `audit` only to the host's person, as recorded by pairing or `enclos app host`. Each request rereads that identity and the device's paired identity and keys; another person, unknown ownership or a revoked device receives `not_allowed`. A read failure returns a correlated `internal` error with fixed guidance; database details and host paths are logged only on the host.
@@ -303,6 +323,8 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 | `agent_unavailable` | The plugin is not reachable; conversation messages are kept and sent when it is, but live routine controls are not queued, and none was sent. A routine control that was sent and then met a disconnection or timeout answers `unknown`. For a question answer, the bridge sent nothing: answering again is safe |
 | `unconfirmed` | A question answer may have reached the agent, but its outcome was not confirmed (a timeout, or a disconnect after sending); check the question after the next sync before answering again |
 | `conflict` | What the request changes changed since the revision it names, or a request id was reused; nothing was changed. Refresh before deciding whether to retry |
+| `busy` | Another provisioning operation is running in this sandbox; nothing was changed. Try again once it ends |
+| `operation_failed` | The engine or installer refused or failed; the message says why. Check the sandbox on the host before retrying |
 | `internal` | The receiver failed on its side; nothing was changed, and trying again later may work |
 | `unsupported` | The runtime does not offer this routine control, delivery or question control; nothing was changed |
 | `not_found` | No such routine or question for this agent (one removed included); nothing was changed |
