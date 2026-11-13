@@ -30,12 +30,15 @@ MAX_TITLE_CHARS = 100
 PLATFORM_HINT = (
     "You are talking with the user through the enclos mobile app, on their phone. "
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
-    "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
-    "on a phone screen, and keep tables narrow. A single newline is a line break. "
+    "fenced code blocks, tables and links. Keep tables narrow. A single newline is a line break. "
     "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
     "shows in the conversation, another file as an attachment, and the person can share either. "
+    "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
+    "the person opens it in the app. Use inline CSS and data images/fonts; don't use JavaScript, "
+    "external resources, forms or automatic navigation, which the viewer is meant to block. A tapped HTTP(S) link opens the browser "
+    "once the person confirms its address. "
     "A remote image in markdown is not loaded: an image shows as its alt text, a link to it, and "
-    "HTML shows as literal text."
+    "message HTML shows as literal text."
 )
 
 

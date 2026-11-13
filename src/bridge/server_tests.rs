@@ -43,6 +43,28 @@ fn a_file_of_the_media_folder_is_moved_into_the_bridges() {
 }
 
 #[test]
+fn an_html_artefact_keeps_its_bytes_and_type_as_an_attachment() {
+    let (_dir, home, inbox, media) = folders();
+    let html = b"<!doctype html><meta charset=utf-8><style>h1{color:green}</style><h1>Report</h1>";
+    std::fs::write(inbox.join("report.html"), html).unwrap();
+    let a = OutAttachment {
+        file: "report.html".into(),
+        mime: "text/html".into(),
+        name: "report.html".into(),
+        size: html.len() as u64,
+    };
+    let taken = take_attachment(&home, &media, "c-1", &a).unwrap();
+    assert_eq!(std::fs::read(media.join(&taken.id)).unwrap(), html);
+    assert_eq!(taken.conversation, "c-1");
+    let info = attachment_info(taken);
+    assert_eq!(
+        (info.mime.as_str(), info.name.as_str()),
+        ("text/html", "report.html")
+    );
+    assert_eq!(info.size, html.len() as u64);
+}
+
+#[test]
 fn a_link_a_path_or_a_folder_is_refused() {
     let (dir, home, inbox, media) = folders();
     std::fs::write(dir.path().join("secret"), b"host file").unwrap();
@@ -159,6 +181,19 @@ fn a_strange_media_type_is_a_plain_file() {
     assert_eq!(
         take_attachment(&home, &media, "c-1", &a).unwrap().mime,
         "application/octet-stream"
+    );
+}
+
+#[test]
+fn an_attachment_name_loses_its_hidden_characters() {
+    let (_dir, home, inbox, media) = folders();
+    std::fs::write(inbox.join("a3.bin"), b"x").unwrap();
+    let mut a = out("a3.bin");
+    a.mime = "text/html".to_owned();
+    a.name = "report\u{202E}lmth.txt\nsecond line".to_owned();
+    assert_eq!(
+        take_attachment(&home, &media, "c-1", &a).unwrap().name,
+        "reportlmth.txtsecond line"
     );
 }
 

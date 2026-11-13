@@ -176,17 +176,31 @@ class Hint(unittest.TestCase):
     def test_it_says_how_files_go_and_what_is_not_drawn(self):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
-        self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
+        self.assertIn("message HTML shows as literal text", protocol.PLATFORM_HINT)
+
+    def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
+        for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
+                       "data images/fonts", "JavaScript", "external resources, forms or automatic navigation, which the viewer is meant to block",
+                       "A tapped HTTP(S) link opens the browser", "once the person confirms its address"):
+            self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_says_what_an_image_shows_as_the_protocol_does(self):
         # docs/protocol.md, "What the agent says is markdown", and the app's spec
         self.assertIn("an image shows as its alt text, a link to it", protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
-        self.assertLess(len(protocol.PLATFORM_HINT), 750)
+        self.assertLess(len(protocol.PLATFORM_HINT), 1000)
 
 
 class Files(unittest.TestCase):
+    def test_an_html_artefact_uses_an_ordinary_file_attachment(self):
+        expected = json.loads(fixture("from_plugin_message_out_html.json"))
+        message = protocol.message_out(
+            expected["conversation"], expected["text"], expected["reply_to"],
+            [protocol.attachment(**expected["attachments"][0])])
+        self.assertEqual({k: v for k, v in message.items() if k != "id"},
+                         {k: v for k, v in expected.items() if k != "id"})
+
     def test_a_reply_with_an_image_has_the_fixtures_shape(self):
         expected = json.loads(fixture("from_plugin_message_out_image.json"))
         a = expected["attachments"][0]

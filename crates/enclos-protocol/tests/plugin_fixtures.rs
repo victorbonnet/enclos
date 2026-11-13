@@ -73,6 +73,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         "commands",
         include_str!("fixtures/plugin/from_plugin_commands.json"),
     ),
+    (
+        "message_out_html",
+        include_str!("fixtures/plugin/from_plugin_message_out_html.json"),
+    ),
 ];
 
 fn json(bytes: &[u8]) -> serde_json::Value {

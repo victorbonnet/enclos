@@ -1902,8 +1902,9 @@ fn take_attachment(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
     });
-    // Shown and shared under this name: without the characters that would
-    // make it read as another (`U+202E` before `fdp.exe`).
+    // The name titles the artefact card, the viewer and the Share sheet: a
+    // bidirectional override or a line break in it would make the file read
+    // as another type or another line, so hidden characters are dropped.
     let name = enclos_protocol::visible::stripped(
         a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
         false,
