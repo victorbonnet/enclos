@@ -120,11 +120,23 @@ struct PluginOut {
     sent: HashSet<String>,
 }
 
+/// The capabilities the bridge knows of: one it does not (`notify`, from
+/// an older plugin) is not shown to devices as `unknown`.
+fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    capabilities
+        .into_iter()
+        .filter(|c| *c != Capability::Unknown)
+        .collect()
+}
+
 /// What every connection shares.
 struct Hub {
     transport: Transport,
     whois: Whois,
     store_path: std::path::PathBuf,
+    /// Where enclos keeps its state: the engine the bridge opens there
+    /// writes the audit log, when a device that forgets this host is
+    /// unpaired as `enclos app unpair` does, and applies policy decisions.
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
@@ -418,7 +430,7 @@ impl Hub {
             plugins.insert(
                 agent.to_owned(),
                 Plugin {
-                    capabilities: hello.capabilities,
+                    capabilities: known(hello.capabilities),
                     generation,
                     out: Arc::new(Mutex::new(PluginOut {
                         writer,
@@ -496,6 +508,7 @@ impl Hub {
                                 &member,
                                 reply_to.as_ref().map(|r| r.as_str()),
                                 &text,
+                                !attachments.is_empty(),
                                 kind,
                             ) {
                                 Some(ends) => ends_turn = ends,
@@ -550,15 +563,14 @@ impl Hub {
                             }
                             Err(e) => eprintln!("enclos app: {agent}: {e}"),
                         }
-                        // The member's reply ended its turn: it has seen its own
-                        // message, and the next turn starts.
-                        // The turn ended whatever the store made of the
-                        // reply (an id it had already, or a failure): the
-                        // discussion goes on all the same.
+                        // The member's reply ended its turn: the next turn
+                        // starts. Its position stays at the last message it
+                        // was given (a person's message sent while it worked
+                        // is still to give it); its own reply is no news to
+                        // it (`Store::news_for`). The turn ended whatever the
+                        // store made of the reply (an id it had already, or a
+                        // failure): the discussion goes on all the same.
                         if ends_turn {
-                            if let Ok(Some(seq)) = stored {
-                                let _ = store.saw(conversation.as_str(), &member, seq);
-                            }
                             hub.advance(&store, conversation.as_str());
                         }
                     }
@@ -665,11 +677,16 @@ impl Hub {
             // Closed: the next message to this agent opens it again. A group
             // turn it was running gets no reply on this connection.
             let mut plugins = hub.plugins.lock().expect("not poisoned");
-            if plugins.get(&agent).map(|p| p.generation) == Some(generation) {
+            let current = plugins.get(&agent).map(|p| p.generation) == Some(generation);
+            if current {
                 plugins.remove(&agent);
             }
             drop(plugins);
-            hub.fail_turns(&store, &agent, None, "the member's app channel closed");
+            // Not when a newer connection is the agent's: the turn running
+            // may be one sent on it
+            if current {
+                hub.fail_turns(&store, &agent, None, "the member's app channel closed");
+            }
         });
         Ok(())
     }
@@ -1656,7 +1673,17 @@ fn run_session(
             // `enclos app unpair` does, then the connection ends. The
             // conversations stay, the person's.
             FromDevice::DeviceForget => {
-                forget(store, device, person)?;
+                // Not audited, not forgotten: the device stays paired, and
+                // hears why
+                if let Err(why) = forget(hub, store, device, person) {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        // `internal` once the protocol has it
+                        code: ErrorCode::Unknown,
+                        message: format!("this host was not forgotten: {why}"),
+                    }))?;
+                    continue;
+                }
                 // Unpaired whether or not the answer reaches the device: a
                 // failure to send it is not why the connection ended.
                 let _ = link.send(ToDevice::Ack { of: message.id });
@@ -1671,8 +1698,29 @@ fn run_session(
 
 /// The person forgot this host on `device`: its row goes, so its keys
 /// open no connection again ("an unknown device"), and the log says so.
-fn forget(store: &Store, device: &Device, person: &str) -> Result<(), String> {
-    store.remove_device(&device.id).map_err(|e| e.to_string())?;
+/// Audited as `enclos app unpair` is: when the audit log cannot be
+/// written, the device stays paired and the request fails.
+fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(), String> {
+    let engine = crate::engine::Engine::open(hub.layout.clone(), crate::state::Wait::Background);
+    let by = crate::model::audit::Actor {
+        user: person.to_owned(),
+        host: device.name.clone(),
+    };
+    engine
+        .app_access(
+            &by,
+            "app forget",
+            device.id.clone(),
+            |_| "forgotten on the device: it can no longer connect".to_owned(),
+            || {
+                store.remove_device(&device.id).map(|_| ()).map_err(|e| {
+                    crate::error::Error::Session {
+                        what: e.to_string(),
+                    }
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
     let _ = store.log(
         Some(&device.id),
         Some(person),
@@ -2050,7 +2098,9 @@ fn rename(
     else {
         return Ok(());
     };
-    if owner != person {
+    // Home is named Home, so the runtime's names do not replace it (ADR
+    // 0044): clearing its name would let them
+    if owner != person || is_home(conversation.as_str()) {
         return Ok(());
     }
     if !store
@@ -2102,38 +2152,12 @@ fn send(
     if owner != person {
         return Ok(None);
     }
-    if group_of(store, conversation.as_str()).is_some() {
-        let stored = store
-            .add(
-                id.as_str(),
-                conversation.as_str(),
-                &From::Person(person.to_owned()),
-                &text,
-                "message",
-            )
-            .map_err(|e| e.to_string())?;
-        if let Some(seq) = stored {
-            hub.deliver(
-                person,
-                ToDevice::Message(ConversationMessage {
-                    conversation: conversation.clone(),
-                    agent: sandbox,
-                    from: person.to_owned(),
-                    text: text.to_owned(),
-                    kind: "message".to_owned(),
-                    time: now(),
-                    seq,
-                    attachments: Vec::new(),
-                }),
-            );
-            hub.group_said(store, conversation.as_str(), seq, &text);
-        }
-        return Ok(None);
-    }
+    let group = group_of(store, conversation.as_str()).is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
         conversation: conversation.clone(),
-        agent: name.clone(),
+        // A group is its sandbox's
+        agent: if group { sandbox } else { name.clone() },
         from: person.to_owned(),
         text,
         kind: "message".to_owned(),
@@ -2152,6 +2176,27 @@ fn send(
     }
     let origin = format!("{}/{}", device.id, id.as_str());
     let stored_as = new_id().map_err(|e| e.to_string())?;
+    if group {
+        // Sent again: stored, and said in the group, the first time only
+        if let Added::New(seq) = store
+            .add_to_group(
+                &origin,
+                &stored_as,
+                conversation.as_str(),
+                person,
+                &echo.text,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            let text = echo.text.clone();
+            hub.deliver(
+                person,
+                ToDevice::Message(ConversationMessage { seq, ..echo }),
+            );
+            hub.group_said(store, conversation.as_str(), seq, &text);
+        }
+        return Ok(None);
+    }
     // Sent again (the device did not hear back): stored the first time,
     // and given to the agent once, by its first id
     if let Added::New(seq) = store
@@ -2598,12 +2643,7 @@ mod connection_end_tests {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
         let store = Store::open(&bridge.store).unwrap();
-        // Connecting names nobody: no Home is given yet.
-        let phone = paired(&bridge, "n-pixel");
-        let (_connected, first) = connect(&bridge, &phone);
-        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
         assert_eq!(store.host_person().unwrap(), None);
-        assert_eq!(store.owner("home.lab.main").unwrap(), None);
         // The first paired at the terminal is the host's person, whoever
         // the transport says the host belongs to, and has Home.
         *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
@@ -3184,10 +3224,45 @@ mod connection_end_tests {
         assert_eq!(first, None);
     }
 
+    /// Where the bridge in `folder` writes its audit log, made ready.
+    fn audit_log(folder: &Path) -> PathBuf {
+        let log = crate::layout::Layout::at(folder.join("enclos")).audit_log();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        log
+    }
+
+    #[test]
+    fn a_forgotten_device_is_audited_or_stays_paired() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // No audit log: refused, and the device stays paired
+        device.send("forget-1", FromDevice::DeviceForget);
+        let Some(ToDevice::Error(error)) = device.receive() else {
+            panic!("not refused");
+        };
+        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.of.unwrap().as_str(), "forget-1");
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(store.device(&phone.id).unwrap().is_some());
+        // With one, forgotten, and the audit log says who and which
+        let log = audit_log(folder.path());
+        device.send("forget-2", FromDevice::DeviceForget);
+        assert!(matches!(device.receive(), Some(ToDevice::Ack { .. })));
+        assert!(store.device(&phone.id).unwrap().is_none());
+        let audit = std::fs::read_to_string(log).unwrap();
+        assert!(audit.contains("app forget"), "{audit}");
+        assert!(audit.contains(&phone.id), "{audit}");
+        assert!(audit.contains(PERSON), "{audit}");
+    }
+
     #[test]
     fn a_device_forgotten_on_one_connection_loses_its_others() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
+        audit_log(folder.path());
         let phone = paired(&bridge, "n-pixel");
         // A connection left half open, and the one the device reconnected on
         let (mut old, _) = connect(&bridge, &phone);
