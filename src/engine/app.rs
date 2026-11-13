@@ -17,6 +17,10 @@ pub struct AppEndpoint {
 }
 
 impl Engine {
+    pub fn app_layout(&self) -> crate::layout::Layout {
+        self.layout.clone()
+    }
+
     /// The socket of `agent`'s app channel in sandbox `name`, and the
     /// agent's token, read from the secret store now as the active policy
     /// grants it (`runtime configure <sandbox>/<agent> --channel app`).

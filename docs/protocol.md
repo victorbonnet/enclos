@@ -138,7 +138,7 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
 | `status.report` | bridge | as `enclos app status --json` | |
 | `push.token` | device | `kind`, `token` | A new push token for this device |
-| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. The conversations stay on the host |
+| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. Recorded in the audit log as `app forget` first: when that cannot be written the device stays paired and gets an `error`. The conversations stay on the host |
 | `ack`, `error` | either | as on the plugin leg | |
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
