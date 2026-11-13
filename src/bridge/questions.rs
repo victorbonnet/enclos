@@ -400,21 +400,27 @@ impl Hub {
         device: &Device,
         person: &str,
         id: &QuestionId,
-    ) -> Result<StoredQuestion, ()> {
+    ) -> Result<StoredQuestion, ErrorCode> {
+        // Foreign and unknown questions read the same, `not_found`; a
+        // database the bridge cannot read is its fault, `internal`
+        let storage = |e: rusqlite::Error| {
+            eprintln!("enclos app: a question could not be checked: {e}");
+            ErrorCode::Internal
+        };
         if device.person != person
             || !store
                 .devices()
-                .map_err(|_| ())?
+                .map_err(storage)?
                 .iter()
                 .any(|d| d.id == device.id && d.person == person)
         {
-            return Err(());
+            return Err(ErrorCode::NotFound);
         }
         store
             .question(id)
-            .map_err(|_| ())?
+            .map_err(storage)?
             .filter(|question| question.owner == person)
-            .ok_or(())
+            .ok_or(ErrorCode::NotFound)
     }
 
     pub(super) fn question_answer(
@@ -436,7 +442,14 @@ impl Hub {
         // up only those writing to it.
         let current = self
             .question_authority(store, device, person, &request.question)
-            .map_err(|_| failure(original.clone(), ErrorCode::NotFound, "No such question."))?;
+            .map_err(|code| match code {
+                ErrorCode::Internal => failure(
+                    original.clone(),
+                    code,
+                    "The question could not be checked. Try again later.",
+                ),
+                code => failure(original.clone(), code, "No such question."),
+            })?;
         let found = {
             let plugins = self.plugins.lock().expect("not poisoned");
             plugins.get(&current.info.agent).map(|plugin| {

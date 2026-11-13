@@ -1102,3 +1102,26 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
     socket.close(None).unwrap();
     assert_eq!(thread.join().unwrap(), Err("closed".into()));
 }
+
+#[test]
+fn an_answer_the_bridge_cannot_check_answers_internal_not_not_found() {
+    let (_dir, hub, store, device, _rx) = fixture();
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute_batch("DROP TABLE devices; CREATE TABLE devices (broken INTEGER);")
+        .unwrap();
+    let error = hub
+        .question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("answer").unwrap(),
+            AnswerRequest {
+                question: QuestionId::new("q-1").unwrap(),
+                revision: 0,
+                answer: QuestionAnswer::Skip,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+}
