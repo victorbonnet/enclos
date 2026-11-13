@@ -478,6 +478,7 @@ impl Hub {
                                 &member,
                                 reply_to.as_ref().map(|r| r.as_str()),
                                 &text,
+                                !attachments.is_empty(),
                                 kind,
                             ) {
                                 Some(ends) => ends_turn = ends,
@@ -532,15 +533,14 @@ impl Hub {
                             }
                             Err(e) => eprintln!("enclos app: {agent}: {e}"),
                         }
-                        // The member's reply ended its turn: it has seen its own
-                        // message, and the next turn starts.
-                        // The turn ended whatever the store made of the
-                        // reply (an id it had already, or a failure): the
-                        // discussion goes on all the same.
+                        // The member's reply ended its turn: the next turn
+                        // starts. Its position stays at the last message it
+                        // was given (a person's message sent while it worked
+                        // is still to give it); its own reply is no news to
+                        // it (`Store::news_for`). The turn ended whatever the
+                        // store made of the reply (an id it had already, or a
+                        // failure): the discussion goes on all the same.
                         if ends_turn {
-                            if let Ok(Some(seq)) = stored {
-                                let _ = store.saw(conversation.as_str(), &member, seq);
-                            }
                             hub.advance(&store, conversation.as_str());
                         }
                     }

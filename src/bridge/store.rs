@@ -673,6 +673,17 @@ impl Store {
         rows.collect()
     }
 
+    /// Whether group `id` holds, after `since`, a message to give member
+    /// `agent`: one that is neither its own nor a runtime's `status` line.
+    pub fn news_for(&self, id: &str, agent: &str, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation = ?1 AND seq > ?2
+             AND kind != 'status' AND (person IS NOT NULL OR speaker IS NULL OR speaker != ?3))",
+            params![id, since, agent],
+            |row| row.get(0),
+        )
+    }
+
     /// Member `agent` of group `id` has been given its messages up to `seq`.
     pub fn saw(&self, id: &str, agent: &str, seq: i64) -> rusqlite::Result<()> {
         self.db.execute(
@@ -1091,6 +1102,27 @@ mod tests {
         store.saw("g-1", "main", said).unwrap();
         store.saw("g-1", "main", you).unwrap();
         assert_eq!(store.members("g-1").unwrap()[0], ("main".to_owned(), said));
+    }
+
+    #[test]
+    fn a_members_news_is_what_others_said_after_its_position() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let members = ["main".to_owned(), "coder".to_owned()];
+        store.group("g-1", "lab", &members, "alice").unwrap();
+        let add = |id: &str, from: From, kind: &str| {
+            store.add(id, "g-1", &from, "x", kind).unwrap().unwrap()
+        };
+        let asked = add("p-1", From::Person("alice".into()), "message");
+        assert!(store.news_for("g-1", "main", 0).unwrap());
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        // Its own words and a runtime's status line are no news to it.
+        let own = add("m-1", From::Member("main".into()), "reply");
+        add("m-2", From::Member("main".into()), "status");
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        assert!(store.news_for("g-1", "coder", asked).unwrap());
+        add("c-1", From::Member("coder".into()), "reply");
+        assert!(store.news_for("g-1", "main", own).unwrap());
     }
 
     #[test]

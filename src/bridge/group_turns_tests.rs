@@ -284,8 +284,9 @@ fn a_reply_after_stop_and_the_answer_to_stop_are_dropped() {
     let store = hub.store().unwrap();
     running(&hub, &store);
     hub.group_stop(&store, "g-1");
-    let reply =
-        |member, to: Option<&str>, kind| hub.group_reply(&store, "g-1", member, to, "x", kind);
+    let reply = |member, to: Option<&str>, kind| {
+        hub.group_reply(&store, "g-1", member, to, "x", false, kind)
+    };
     assert_eq!(reply("main", Some("s-1"), "reply"), None);
     hub.stops.lock().unwrap().insert("stop-1".into());
     assert_eq!(reply("main", Some("stop-1"), "reply"), None);
@@ -314,18 +315,85 @@ fn a_late_reply_after_a_restart_is_kept_once_and_for_its_own_turn_only() {
     let status = |store: &Store| store.turn_sent("s-1", "g-1", "main").unwrap().unwrap().1;
     // Another member answering main's turn message does not end main's turn.
     assert_eq!(
-        hub.group_reply(&store, "g-1", "coder", Some("s-1"), "mine", "reply"),
+        hub.group_reply(&store, "g-1", "coder", Some("s-1"), "mine", false, "reply"),
         Some(false)
     );
     assert_eq!(status(&store), "failed");
     assert_eq!(
-        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", "reply"),
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", false, "reply"),
         Some(false)
     );
     assert_eq!(status(&store), "replied");
     assert_eq!(
-        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", "reply"),
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", false, "reply"),
         None
+    );
+}
+
+#[test]
+fn a_reply_that_is_only_a_file_ends_its_turn_and_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    running(&hub, &store);
+    // No text, one file: the member's reply, not a pass.
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "", true, "reply"),
+        Some(true)
+    );
+    let turn = store.turn_sent("s-1", "g-1", "main").unwrap().unwrap();
+    assert_eq!(turn.1, "replied");
+    // No text and no file is a pass, dropped.
+    running(&hub, &store);
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "", false, "reply"),
+        None
+    );
+}
+
+#[test]
+fn a_persons_message_sent_during_a_turn_reaches_that_member_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    group(&hub, &store);
+    // main answers its first turn only once the test says so, by then
+    // after the person's second message; any later turn at once.
+    let (go, wait) = channel::<()>();
+    let wait = Mutex::new(wait);
+    let to_main = member(
+        dir.path(),
+        "main",
+        Duration::ZERO,
+        Vec::new(),
+        move |sent, prompt| {
+            let text = if prompt.contains("@main first") {
+                let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                "the first answer"
+            } else {
+                "the second answer"
+            };
+            vec![(
+                new_id().unwrap(),
+                says("g-1", text, OutKind::Reply, Some(sent)),
+            )]
+        },
+    );
+    person_says(&hub, &store, "g-1", "p-1", "@main first");
+    let (_, first) = to_main.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(first.contains("@main first"), "{first}");
+    // Sent while main's first turn runs: it waits for that turn.
+    person_says(&hub, &store, "g-1", "p-2", "@main second");
+    go.send(()).unwrap();
+    // The reply came after the second message; main is still given it,
+    // without its own reply.
+    let (_, second) = to_main.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(second.contains("@main second"), "{second}");
+    assert!(!second.contains("the first answer"), "{second}");
+    until(|| state(&hub, &store, "g-1").state == "settled");
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
     );
 }
 
