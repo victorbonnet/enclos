@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0061
 ---
 
 # Agents come from the host only through the runtime's own export

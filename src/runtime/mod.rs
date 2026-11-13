@@ -49,6 +49,13 @@ impl HomeFile {
     }
 }
 
+/// The runtime's export command and the plain file it promises to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeExport {
+    pub command: SandboxCommand,
+    pub archive: PathBuf,
+}
+
 /// A command that runs inside a sandbox, under its policy. Anyone can make
 /// one; only the engine's code that starts programs in a sandbox can take
 /// its words out, so an adapter's command cannot be started on the host by
@@ -315,6 +322,10 @@ pub trait RuntimeAdapter {
     /// agent and its folder went, and treated with it as the delete. `None`
     /// (the default): such a failure is a failed delete.
     fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
+    /// Export one agent with the runtime's own command, inside its sandbox.
+    fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport> {
         None
     }
     /// The runtime's own command that creates agent `name` from `archive`,

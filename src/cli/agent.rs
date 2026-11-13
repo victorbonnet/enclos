@@ -40,6 +40,21 @@ enum AgentVerb {
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
     },
+    /// Export runtime data and the Enclos display name and image to one portable file.
+    Export {
+        agent: AgentTarget,
+        #[arg(long, value_name = "FILE")]
+        to: PathBuf,
+    },
+    /// Import an Enclos export, including its display name and image.
+    Import {
+        agent: AgentTarget,
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Restore only the name and image of an existing agent.
+        #[arg(long)]
+        metadata_only: bool,
+    },
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
     List { sandbox: SandboxName },
@@ -75,6 +90,48 @@ impl FromStr for AgentTarget {
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
+        AgentVerb::Export {
+            agent: AgentTarget { sandbox, agent },
+            to,
+        } => match engine.export_agent(by, &sandbox, &agent, &to, confirm)? {
+            Planned::DryRun(plan) => output::show_plan(&plan),
+            Planned::Done(archive) if output::json() => output::emit(&json!({
+                "agent": format!("{sandbox}/{agent}"), "path": output::path(&archive.path), "sha256": archive.sha256,
+            })),
+            Planned::Done(archive) => println!(
+                "Exported {sandbox}/{agent}, with its name and image, to {}.",
+                archive.path.display()
+            ),
+        },
+        AgentVerb::Import {
+            agent: AgentTarget { sandbox, agent },
+            from,
+            metadata_only,
+        } => {
+            match engine.import_agent_export(
+                by,
+                &sandbox,
+                agent.clone(),
+                &from,
+                metadata_only,
+                confirm,
+            )? {
+                Planned::DryRun(plan) => output::show_plan(&plan),
+                Planned::Done(manifest) if output::json() => output::emit(&json!({
+                    "agent": format!("{sandbox}/{agent}"), "metadata_only": metadata_only,
+                    "display_name": manifest.presentation.display_name, "has_image": manifest.presentation.avatar.is_some(),
+                })),
+                Planned::Done(_) => println!(
+                    "Imported {}for {sandbox}/{agent} from {}.",
+                    if metadata_only {
+                        "name and image "
+                    } else {
+                        "runtime data, name and image "
+                    },
+                    from.display()
+                ),
+            }
+        }
         AgentVerb::Add { agent, from } => {
             let AgentTarget { sandbox, agent } = agent;
             let planned = match &from {

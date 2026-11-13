@@ -4538,3 +4538,212 @@ fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
     other.kill().unwrap();
     other.wait().unwrap();
 }
+
+fn portable_installer() -> String {
+    INSTALLS.replace("exit 0\nSTUB", "if [ \"$1 $2\" = \"profile export\" ]; then cat \"$HOME/runtime-export-source\" > \"$5\"; fi\nexit 0\nSTUB")
+}
+
+fn portable_photo() -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 2)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+#[test]
+fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    let installer = portable_installer();
+    done(lab.install(&installer, Confirm::Yes).unwrap());
+    let source_agent: AgentName = "source".parse().unwrap();
+    let profile = lab.home.join(".hermes/profiles/source");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "model: source").unwrap();
+    let bytes = b"runtime data is opaque, including ../../pretend/path";
+    std::fs::write(lab.home.join("runtime-export-source"), bytes).unwrap();
+    let photo = portable_photo();
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    store
+        .import_presentation("home/source", Some("Gégé Commit"), Some(&photo))
+        .unwrap();
+    let archive = lab._dir.path().join("gege.enclos");
+    let exported = done(
+        lab.engine
+            .export_agent(&alice(), &lab.name, &source_agent, &archive, Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(exported.path, archive.canonicalize().unwrap());
+    assert_eq!(
+        store
+            .agent_name("home/source")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert!(profile.is_dir(), "export must leave the source in place");
+
+    let other: SandboxName = "other".parse().unwrap();
+    done(
+        lab.engine
+            .create_sandbox(
+                &alice(),
+                SandboxSpec {
+                    name: other.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "minimal".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    struct Stop<'a>(&'a Engine, SandboxName);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.stop_sandbox(&alice(), &self.1, Confirm::Yes);
+        }
+    }
+    let _stop = Stop(&lab.engine, other.clone());
+    let runtime = TestRuntime::new(lab._dir.path(), &installer);
+    done(
+        lab.engine
+            .install_runtime_with(&alice(), &other, &runtime, Confirm::Yes)
+            .unwrap(),
+    );
+    let policy_before = lab.engine.policy(&other).unwrap().version.version;
+    let manifest = done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &other,
+                "comptoir-dev".parse().unwrap(),
+                &archive,
+                false,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(manifest.source_agent, "home/source");
+    assert_eq!(
+        std::fs::read(
+            lab.engine
+                .sandbox_home(&other)
+                .join("imported-comptoir-dev")
+        )
+        .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        store
+            .agent_name("other/comptoir-dev")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert_eq!(
+        store.avatar("other/comptoir-dev").unwrap().image.as_deref(),
+        Some(photo.as_slice())
+    );
+    assert_eq!(
+        lab.engine.policy(&other).unwrap().version.version,
+        policy_before
+    );
+    assert!(profile.is_dir());
+    assert_eq!(
+        std::fs::read_dir(lab.engine.layout.data().join("agent-transfers"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(lab.audit().contains("agent export"));
+    assert!(lab.audit().contains("agent import presentation"));
+}
+
+#[test]
+fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let profile = lab.home.join(".hermes/profiles/main");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "model: existing").unwrap();
+    let path = lab._dir.path().join("presentation.enclos");
+    let mut file = std::fs::File::create(&path).unwrap();
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"opaque"),
+        &mut file,
+        RuntimeKind::Hermes,
+        "old/comptoir-dev".into(),
+        crate::agent_export::Presentation {
+            display_name: Some("Gégé Commit".into()),
+            avatar: None,
+        },
+    )
+    .unwrap();
+    let policy = lab.engine.policy(&lab.name).unwrap().version.version;
+    let before = lab.engine.audit(None).unwrap().len();
+    assert!(matches!(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::DryRun
+            )
+            .unwrap(),
+        Planned::DryRun(_)
+    ));
+    assert_eq!(lab.engine.audit(None).unwrap().len(), before);
+    assert!(!lab.engine.app_store_path().exists());
+    done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    assert_eq!(
+        store
+            .agent_name("home/main")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile.join("config.yaml")).unwrap(),
+        "model: existing"
+    );
+    assert_eq!(
+        lab.engine.policy(&lab.name).unwrap().version.version,
+        policy
+    );
+    assert!(!lab.home.join("hermes-calls").exists());
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::Yes
+            )
+            .is_err()
+    );
+    assert_eq!(store.agent_name("home/main").unwrap().revision, 1);
+}

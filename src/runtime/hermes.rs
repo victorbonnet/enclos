@@ -369,6 +369,18 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
+        let archive = prefix.with_extension("tar.gz");
+        let mut words: Vec<OsString> = [HERMES, "profile", "export", name.as_str(), "-o"]
+            .map(OsString::from)
+            .to_vec();
+        words.push(archive.as_os_str().to_owned());
+        Some(super::RuntimeExport {
+            command: SandboxCommand::new(words),
+            archive,
+        })
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or

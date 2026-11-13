@@ -521,6 +521,38 @@ impl Store {
         Ok(Some(next))
     }
 
+    /// Restores portable presentation in one transaction; revisions belong to this host.
+    pub fn import_presentation(
+        &self,
+        agent: &str,
+        display_name: Option<&str>,
+        image: Option<&[u8]>,
+    ) -> rusqlite::Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let revision = |table: &str| -> rusqlite::Result<i64> {
+            let current: i64 = tx
+                .query_row(
+                    &format!("SELECT revision FROM {table} WHERE agent=?1"),
+                    [agent],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            current
+                .checked_add(1)
+                .filter(|n| *n > 0)
+                .ok_or(rusqlite::Error::InvalidQuery)
+        };
+        let name_revision = revision("agent_names")?;
+        let image_revision = revision("agent_avatars")?;
+        tx.execute("INSERT INTO agent_names(agent,revision,display_name) VALUES (?1,?2,?3) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,display_name=excluded.display_name", params![agent,name_revision,display_name])?;
+        tx.execute("INSERT INTO agent_avatars(agent,revision,version,image) VALUES (?1,?2,?3,?4) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,version=excluded.version,image=excluded.image", params![agent,image_revision,image.map(crate::policy::sha256_hex),image])?;
+        tx.commit()
+    }
+
     /// The shared photo, or revision zero before the first edit.
     pub fn avatar(&self, agent: &str) -> rusqlite::Result<StoredAvatar> {
         self.db

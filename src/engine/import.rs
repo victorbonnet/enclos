@@ -46,9 +46,9 @@ pub struct LeftCopy {
 /// An archive the user named, opened once so the bytes hashed are the bytes
 /// copied. Refused when it is a link, not a plain file, or under a
 /// sandbox's folder, whose home the sandbox writes.
-struct Source {
-    path: PathBuf,
-    file: File,
+pub(super) struct Source {
+    pub(super) path: PathBuf,
+    pub(super) file: File,
 }
 
 impl Engine {
@@ -250,7 +250,7 @@ impl Source {
     /// without waiting on a pipe; the checks then hold for the opened file
     /// itself, wherever its path pointed while it was opened. A workspace a
     /// sandbox may write is not checked: an archive there is the user's call.
-    fn open(layout: &Layout, path: &Path) -> Result<Source> {
+    pub(super) fn open(layout: &Layout, path: &Path) -> Result<Source> {
         let path = std::path::absolute(path).map_err(|e| {
             failed(format!(
                 "cannot resolve the archive path {}: {e}",
@@ -306,7 +306,7 @@ impl Source {
     }
 
     /// The archive as it is now, with its SHA-256, for a dry run.
-    fn hash(mut self) -> Result<Archive> {
+    pub(super) fn hash(mut self) -> Result<Archive> {
         let sha256 = stream(&mut self.file, None).map_err(|e| {
             failed(format!(
                 "cannot read the archive at {}: {e}",
@@ -324,7 +324,7 @@ impl Source {
     /// writes to, hashing the bytes as they go. A copy that fails is
     /// removed, or reported when it cannot be; one cut short by enclos
     /// being killed stays.
-    fn stage(mut self, staged: &Path) -> Result<Archive> {
+    pub(super) fn stage(mut self, staged: &Path) -> Result<Archive> {
         let dir = staged.parent().unwrap_or(staged);
         std::fs::create_dir_all(dir)
             .map_err(|e| failed(format!("cannot create {}: {e}", dir.display())))?;
@@ -421,7 +421,7 @@ fn stream(file: &mut File, mut sink: Option<&mut File>) -> std::io::Result<Strin
 /// The path of an opened file, from the file itself, with every link
 /// resolved.
 #[cfg(target_os = "macos")]
-fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+pub(super) fn opened_path(file: &File) -> std::io::Result<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let path = rustix::fs::getpath(file)?;
     Ok(PathBuf::from(std::ffi::OsString::from_vec(
@@ -432,7 +432,7 @@ fn opened_path(file: &File) -> std::io::Result<PathBuf> {
 /// The path of an opened file, from the file itself, with every link
 /// resolved.
 #[cfg(not(target_os = "macos"))]
-fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+pub(super) fn opened_path(file: &File) -> std::io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }

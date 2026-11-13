@@ -25,6 +25,7 @@ mod net;
 mod pause;
 mod pending;
 mod policy;
+mod portable;
 mod probe;
 mod proxy;
 mod restart;
