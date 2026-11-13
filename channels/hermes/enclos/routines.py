@@ -456,7 +456,7 @@ class Manager:
             try:
                 self.provider().register_job(job)
             except Exception:
-                raise RoutineError("conflict", f"Routine {job['id']} was saved but scheduler registration failed. Refresh and enable it again; do not create another routine.") from None
+                raise RoutineError("unknown", f"Routine {job['id']} was saved but scheduler registration failed. Refresh and enable it again; do not create another routine.") from None
         return {"result": "routine", "routine": self._view(job, full=True)}
 
     def _notify(self):
@@ -534,7 +534,7 @@ class Manager:
         except RoutineError:
             raise
         except Exception:
-            raise RoutineError("conflict", "The operation's outcome is unknown. Refresh before trying again.") from None
+            raise RoutineError("unknown", "The operation's outcome is unknown. Refresh before trying again.") from None
 
     def _control(self, message):
         validate_request(message)
@@ -574,7 +574,7 @@ class Manager:
                 entry["error"] = (error.code, str(error))
                 raise
             except Exception:
-                error = RoutineError("conflict", "The operation's outcome is unknown. Refresh before trying again.")
+                error = RoutineError("unknown", "The operation's outcome is unknown. Refresh before trying again.")
                 entry["error"] = (error.code, str(error))
                 raise error from None
             finally:
@@ -699,6 +699,6 @@ class Manager:
         except (ValueError, TypeError) as error:
             raise RoutineError("bad_message", str(error)[:512]) from None
         except Exception:
-            raise RoutineError("conflict", "The runtime could not confirm this operation. Refresh before trying again.") from None
+            raise RoutineError("unknown", "The runtime could not confirm this operation. Refresh before trying again.") from None
         finally:
             self._allowed.reset(token)

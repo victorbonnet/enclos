@@ -125,14 +125,27 @@ impl Hub {
         person: &str,
         agent: &str,
         write: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), (ErrorCode, String)> {
+        // A database the bridge cannot read is its fault, not a refusal
         self.avatar_authority(store, device, person, agent, false)
-            .map_err(|e| e.message().to_owned())?;
+            .map_err(|e| match e {
+                super::avatars::PhotoError::Internal(_) => (
+                    ErrorCode::Internal,
+                    "The agent name could not be read or saved. Try again later.".to_owned(),
+                ),
+                e => (ErrorCode::NotAllowed, e.message().to_owned()),
+            })?;
         if !self.sees_agent(person, agent) {
-            return Err("This agent is not shared with you.".into());
+            return Err((
+                ErrorCode::NotAllowed,
+                "This agent is not shared with you.".into(),
+            ));
         }
         if write && self.known_host().as_deref() != Some(person) {
-            return Err("Only the host's person can change a shared agent name.".into());
+            return Err((
+                ErrorCode::NotAllowed,
+                "Only the host's person can change a shared agent name.".into(),
+            ));
         }
         Ok(())
     }
@@ -146,7 +159,7 @@ impl Hub {
         of: String,
     ) -> Result<ToDevice, ErrorBody> {
         self.name_authority(store, device, person, agent, false)
-            .map_err(|e| name_error(&of, ErrorCode::NotAllowed, e))?;
+            .map_err(|(code, why)| name_error(&of, code, why))?;
         let metadata = store.agent_name(agent).map_err(|e| storage_error(&of, e))?;
         Ok(name_message(agent, self.shown_name(agent, metadata), of))
     }
@@ -160,7 +173,7 @@ impl Hub {
         of: String,
     ) -> Result<ToDevice, ErrorBody> {
         self.name_authority(store, device, person, &edit.agent, true)
-            .map_err(|e| name_error(&of, ErrorCode::NotAllowed, e))?;
+            .map_err(|(code, why)| name_error(&of, code, why))?;
         let normalized = enclos_protocol::agent_name::normalize(edit.display_name.as_deref())
             .map_err(|e| name_error(&of, ErrorCode::BadMessage, e))?;
         if let Some(handle) = normalized
