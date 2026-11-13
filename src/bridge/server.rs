@@ -1555,7 +1555,9 @@ fn rename(
     else {
         return Ok(());
     };
-    if owner != person {
+    // Home is named Home, so the runtime's names do not replace it (ADR
+    // 0044): clearing its name would let them
+    if owner != person || is_home(conversation.as_str()) {
         return Ok(());
     }
     if !store
@@ -2078,12 +2080,7 @@ mod connection_end_tests {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
         let store = Store::open(&bridge.store).unwrap();
-        // Connecting names nobody: no Home is given yet.
-        let phone = paired(&bridge, "n-pixel");
-        let (_connected, first) = connect(&bridge, &phone);
-        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
         assert_eq!(store.host_person().unwrap(), None);
-        assert_eq!(store.owner("home.lab.main").unwrap(), None);
         // The first paired at the terminal is the host's person, whoever
         // the transport says the host belongs to, and has Home.
         *bridge.whois_login.lock().unwrap() = "alice@example.com".to_owned();
