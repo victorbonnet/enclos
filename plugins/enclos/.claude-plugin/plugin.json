@@ -1,6 +1,6 @@
 {
   "name": "enclos",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Teaches a host assistant what enclos is and every command it has, so that it can set up and run sandboxed agents on this host through the enclos CLI",
   "author": {
     "name": "Victor Bonnet",

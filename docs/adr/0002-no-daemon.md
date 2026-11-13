@@ -10,5 +10,5 @@ There is no enclos daemon. The CLI is a thin layer over a core library, and a ru
 
 - On macOS, services are launchd agents in the user's login session, so sandboxes run while the user is logged in. Running while logged out is not a goal for now.
 - The first milestone runs the proxy and the runtime's services under launchd while the user is logged in, alongside interactive sessions. Messaging comes later.
-- The web UI, MCP server and scripts are clients of the same core library, not of a server.
+- The web UI and scripts are clients of the same core library, not of a server. A host assistant runs the CLI itself, through the enclos plugin (design §10); there is no MCP server.
 - State can drift from reality (a unit removed by hand, a crash mid-command). `enclos state check` compares records with the service units, processes and files, and `enclos state repair` fixes them.
