@@ -87,6 +87,9 @@ pub enum FromBridge {
         conversation: ConversationId,
         title: String,
     },
+    /// Delete this chat through the runtime's session owner; Ack only after completion.
+    #[serde(rename = "conversation.delete")]
+    Delete { conversation: ConversationId },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -102,6 +105,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "hello",
     "message.in",
     "conversation.rename",
+    "conversation.delete",
     "ack",
     "error",
 ];
@@ -290,6 +294,8 @@ pub enum Capability {
     Routines,
     Questions,
     RuntimeApprovals,
+    /// It permanently deletes a conversation's native session history.
+    ConversationDelete,
     #[serde(other)]
     Unknown,
 }

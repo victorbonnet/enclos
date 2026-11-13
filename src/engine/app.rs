@@ -56,6 +56,22 @@ impl Engine {
         })
     }
 
+    /// Whether a removed agent has neither a native identity nor remaining data.
+    /// Retained profile data makes this return false, including after --keep-data.
+    pub(crate) fn app_agent_data_absent(
+        &self,
+        name: &SandboxName,
+        agent: &crate::model::agent::AgentName,
+    ) -> Result<bool> {
+        let runtime = crate::runtime::adapter(self.runtime_of(name)?);
+        let home = self.sandbox_home(name);
+        super::agent_rm::leftover(runtime.as_ref(), &home, agent)
+            .map(|left| left == super::agent_rm::Leftover::Nothing)
+            .map_err(|error| Error::Session {
+                what: error.to_string(),
+            })
+    }
+
     /// Every agent of every sandbox whose active policy grants it an app
     /// channel token, as `(sandbox, agent, runtime)`.
     pub fn app_agents(&self) -> Result<Vec<(SandboxName, String, String)>> {

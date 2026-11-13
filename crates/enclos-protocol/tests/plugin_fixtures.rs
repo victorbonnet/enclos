@@ -30,6 +30,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "routine_create",
         include_str!("fixtures/plugin/from_bridge_routine_create.json"),
     ),
+    (
+        "conversation_delete",
+        include_str!("fixtures/plugin/from_bridge_conversation_delete.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[

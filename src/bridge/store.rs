@@ -8,6 +8,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[path = "deletion_store.rs"]
+mod deletion_store;
 #[path = "question_store.rs"]
 mod question_store;
 pub use question_store::{
@@ -307,6 +309,21 @@ CREATE TABLE IF NOT EXISTS log (
     event TEXT NOT NULL,
     reason TEXT
 );
+CREATE TABLE IF NOT EXISTS conversation_deletions (
+    id TEXT PRIMARY KEY, owner TEXT NOT NULL, targets TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS deleted_conversation_new BEFORE INSERT ON conversations
+WHEN EXISTS (SELECT 1 FROM conversation_deletions WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'conversation deleted'); END;
+CREATE TRIGGER IF NOT EXISTS deleted_conversation_message BEFORE INSERT ON messages
+WHEN EXISTS (SELECT 1 FROM conversation_deletions WHERE id = NEW.conversation)
+BEGIN SELECT RAISE(ABORT, 'conversation deletion pending'); END;
+CREATE TRIGGER IF NOT EXISTS deleted_conversation_attachment BEFORE INSERT ON attachments
+WHEN EXISTS (SELECT 1 FROM conversation_deletions WHERE id = NEW.conversation)
+BEGIN SELECT RAISE(ABORT, 'conversation deletion pending'); END;
+CREATE TRIGGER IF NOT EXISTS deleted_conversation_question BEFORE INSERT ON questions
+WHEN EXISTS (SELECT 1 FROM conversation_deletions WHERE id = NEW.conversation)
+BEGIN SELECT RAISE(ABORT, 'conversation deletion pending'); END;
 CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1157,7 +1174,8 @@ impl Store {
         let mut query = self.db.prepare(
             "SELECT m.id, m.conversation, m.person, m.text FROM messages m
              JOIN conversations c ON c.id = m.conversation
-             WHERE m.pending = 1 AND c.sandbox = ?1 AND c.agent = ?2 ORDER BY m.seq",
+             WHERE m.pending = 1 AND c.sandbox = ?1 AND c.agent = ?2
+             AND NOT EXISTS (SELECT 1 FROM conversation_deletions d WHERE d.id = c.id) ORDER BY m.seq",
         )?;
         let rows = query.query_map(params![sandbox, agent], |row| {
             Ok(Pending {
