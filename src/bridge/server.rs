@@ -19,6 +19,9 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "group_turns.rs"]
+mod group_turns;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
@@ -30,7 +33,7 @@ use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    ToDevice, commands_for_devices, decode_from_device, split_text,
+    GroupState, MemberTurn, ToDevice, commands_for_devices, decode_from_device, split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
@@ -43,6 +46,9 @@ use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
+use super::groups::{
+    Discussion, Ended, MAX_MEMBERS, MAX_ROUNDS, MIN_MEMBERS, Said, TURN_TIMEOUT, prompt, turn_id,
+};
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
@@ -141,6 +147,12 @@ struct Hub {
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
     commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// Each group's discussion, while one runs or since the last ended
+    /// (ADR 0045, proposed); its turns are also in the database.
+    groups: Mutex<HashMap<String, Discussion>>,
+    /// The `/stop` messages the bridge sent members: the runtime's answer
+    /// to one (Hermes: "Stopped") is not the member speaking in the group.
+    stops: Mutex<std::collections::HashSet<String>>,
     /// How fast each agent may have its messages stored, kept across its
     /// plugin's connections.
     paces: Mutex<HashMap<String, Pace>>,
@@ -226,6 +238,8 @@ impl Hub {
             opening_all: AtomicBool::new(false),
             commands: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
+            groups: Mutex::new(HashMap::new()),
+            stops: Mutex::new(HashSet::new()),
             generations: AtomicU64::new(0),
             devices: Mutex::new(HashMap::new()),
             waiting: AtomicUsize::new(0),
@@ -351,7 +365,7 @@ impl Hub {
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
         if let Ok(Some(c)) = store.conversation_info(id)
-            && let Some(info) = conversation_info(c)
+            && let Some(info) = conversation_info(store, c)
         {
             self.deliver(person, ToDevice::Conversation(info));
         }
@@ -450,7 +464,7 @@ impl Hub {
                         text,
                         kind,
                         attachments,
-                        ..
+                        reply_to,
                     } => {
                         // Every runtime may send on its own: past a burst,
                         // at a pace, so that a loop fills neither the
@@ -461,17 +475,57 @@ impl Hub {
                             OutKind::Notify => "notify",
                             OutKind::Status => "status",
                         };
-                        let host = hub.known_host();
-                        let Some(conversation) =
+                        // A group this agent is a member of: its reply may end
+                        // its turn, or pass, or come too late to be kept.
+                        let member = agent
+                            .split_once('/')
+                            .map(|(_, n)| n.to_owned())
+                            .unwrap_or_default();
+                        let group =
+                            group_of(&store, conversation.as_str()).filter(|(sandbox, handles)| {
+                                agent.starts_with(&format!("{sandbox}/"))
+                                    && handles.contains(&member)
+                            });
+                        let mut ends_turn = false;
+                        if group.is_some() {
+                            match hub.group_reply(
+                                &store,
+                                conversation.as_str(),
+                                &member,
+                                reply_to.as_ref().map(|r| r.as_str()),
+                                &text,
+                                !attachments.is_empty(),
+                                kind,
+                            ) {
+                                Some(ends) => ends_turn = ends,
+                                None => {
+                                    let _ = acks.ack(&message.id);
+                                    continue;
+                                }
+                            }
+                        }
+                        // A conversation the bridge does not know, or another
+                        // agent's: the runtime's home channel as it was, or a
+                        // chat gone. It goes to this agent's Home, not nowhere.
+                        let conversation = if group.is_some() {
+                            Some(conversation)
+                        } else {
+                            let host = hub.known_host();
                             destination(&store, host.as_deref(), &agent, conversation)
-                        else {
+                        };
+                        let Some(conversation) = conversation else {
                             // Not stored, and acknowledged all the same: sent
                             // again, it would fail again at every connection.
                             let _ = acks.ack(&message.id);
                             continue;
                         };
+                        let from = if group.is_some() {
+                            From::Member(member.clone())
+                        } else {
+                            From::Agent
+                        };
                         let whole = ConversationMessage {
-                            conversation,
+                            conversation: conversation.clone(),
                             agent: agent.clone(),
                             from: "agent".to_owned(),
                             text,
@@ -481,12 +535,29 @@ impl Hub {
                             attachments: Vec::new(),
                         };
                         // Unacknowledged, the plugin sends it again
-                        match hub.store_agent_text(&store, &message.id, whole, &attachments, &home)
-                        {
-                            Ok(()) => {
+                        let stored = hub.store_agent_text(
+                            &store,
+                            &message.id,
+                            whole,
+                            &attachments,
+                            &home,
+                            &from,
+                        );
+                        match &stored {
+                            Ok(_) => {
                                 let _ = acks.ack(&message.id);
                             }
                             Err(e) => eprintln!("enclos app: {agent}: {e}"),
+                        }
+                        // The member's reply ended its turn: the next turn
+                        // starts. Its position stays at the last message it
+                        // was given (a person's message sent while it worked
+                        // is still to give it); its own reply is no news to
+                        // it (`Store::news_for`). The turn ended whatever the
+                        // store made of the reply (an id it had already, or a
+                        // failure): the discussion goes on all the same.
+                        if ends_turn {
+                            hub.advance(&store, conversation.as_str());
                         }
                     }
                     FromPlugin::Ack { of } => {
@@ -540,13 +611,32 @@ impl Hub {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
+                    // The plugin could not take a message of the bridge's
+                    // (a line too long for it): a group turn sent as that
+                    // message fails now, not after 15 minutes.
+                    FromPlugin::Error(ErrorBody {
+                        of: Some(of),
+                        message,
+                        ..
+                    }) => {
+                        let why = format!("the member's app channel refused the turn: {message}");
+                        hub.fail_turns(&store, &agent, Some(of.as_str()), &why);
+                    }
                     _ => {}
                 }
             }
-            // Closed: the next message to this agent opens it again.
+            // Closed: the next message to this agent opens it again. A group
+            // turn it was running gets no reply on this connection.
             let mut plugins = hub.plugins.lock().expect("not poisoned");
-            if plugins.get(&agent).map(|p| p.generation) == Some(generation) {
+            let current = plugins.get(&agent).map(|p| p.generation) == Some(generation);
+            if current {
                 plugins.remove(&agent);
+            }
+            drop(plugins);
+            // Not when a newer connection is the agent's: the turn running
+            // may be one sent on it
+            if current {
+                hub.fail_turns(&store, &agent, None, "the member's app channel closed");
             }
         });
         Ok(())
@@ -562,7 +652,8 @@ impl Hub {
         whole: ConversationMessage,
         attachments: &[OutAttachment],
         home: &Path,
-    ) -> Result<(), String> {
+        from: &From,
+    ) -> Result<Option<i64>, String> {
         // Measured with its files' details, which the first piece carries
         let measured = ConversationMessage {
             attachments: attachments
@@ -579,11 +670,12 @@ impl Hub {
         let pieces = pieces(id, &measured)?;
         let conversation = whole.conversation.as_str();
         let Some(seqs) = store
-            .add_pieces(&pieces, conversation, &From::Agent, &whole.kind)
+            .add_pieces(&pieces, conversation, from, &whole.kind)
             .map_err(|e| e.to_string())?
         else {
-            return Ok(());
+            return Ok(None);
         };
+        let last = seqs.last().copied();
         // A message stored once: its files taken once too, with its first
         // piece, whose id is the plugin's
         let mut files = take_attachments(
@@ -608,7 +700,7 @@ impl Hub {
                 );
             }
         }
-        Ok(())
+        Ok(last)
     }
 
     /// Gives `agent`'s plugin the messages still pending for it, opening
@@ -644,7 +736,7 @@ impl Hub {
                 text: message.text,
             };
             let id = MessageId::new(message.id.clone()).map_err(|e| e.to_string())?;
-            if let Err(e) = plugin.writer.send_as(id, body) {
+            if let Err(e) = plugin.writer.send_as(&id, body) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
                 drop(plugin);
@@ -769,6 +861,21 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     // Each agent's Home, the host's person's, before anything is sent to it.
     if let Ok(store) = hub.store() {
         hub.ensure_homes(&store);
+    }
+    // Turns left running when the bridge stopped: failed, and their
+    // discussions ended (ADR 0045).
+    if let Ok(store) = hub.store() {
+        hub.restarted(&store);
+    }
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let Ok(store) = hub.store() else { return };
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                hub.expire_turns(&store);
+            }
+        });
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -1316,6 +1423,30 @@ fn run_session(
                 // The person's other devices learn of it too.
                 hub.deliver_conversation(store, person, conversation.as_str());
             }
+            FromDevice::GroupNew {
+                conversation,
+                members,
+                title,
+            } => {
+                let made = group_turns::new_group(
+                    hub,
+                    store,
+                    person,
+                    conversation.as_str(),
+                    &members,
+                    title,
+                )?;
+                if let Err(why) = made {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                        message: why,
+                    }))?;
+                }
+            }
+            FromDevice::GroupStop { conversation } => {
+                group_turns::stop_group(hub, store, person, conversation.as_str())?;
+            }
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
                     // After the echo, which the outbox holds
@@ -1337,17 +1468,19 @@ fn run_session(
             FromDevice::Sync { since } => {
                 // Every conversation first, named or empty, then the messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
-                    if let Some(info) = conversation_info(c) {
+                    if let Some(info) = conversation_info(store, c) {
                         link.send(ToDevice::Conversation(info))?;
                     }
                 }
                 let mut last = since;
+                // Where each group's discussion is, before its messages.
+                for c in store.conversations(person).map_err(|e| e.to_string())? {
+                    if let Some(state) = hub.group_state(store, &c.id) {
+                        link.send(ToDevice::GroupState(state))?;
+                    }
+                }
                 for m in store.since(person, since).map_err(|e| e.to_string())? {
-                    let agent = store
-                        .conversation_of(&m.conversation)
-                        .map_err(|e| e.to_string())?
-                        .map(|(s, a, _)| format!("{s}/{a}"))
-                        .unwrap_or_default();
+                    let agent = message_agent(store, &m.conversation, &m.from);
                     last = m.seq;
                     let attachments = store
                         .attachments_of(&m.id)
@@ -1360,7 +1493,7 @@ fn run_session(
                             .map_err(|e| e.to_string())?,
                         agent,
                         from: match m.from {
-                            From::Agent => "agent".to_owned(),
+                            From::Agent | From::Member(_) => "agent".to_owned(),
                             From::Person(p) => p,
                         },
                         text: m.text,
@@ -1745,15 +1878,50 @@ fn destination(
 }
 
 /// A conversation for a device: `None` for an id the protocol refuses.
-fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
+fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo> {
+    let members: Vec<String> = store
+        .members(&c.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(a, _)| format!("{}/{a}", c.sandbox))
+        .collect();
     Some(ConversationInfo {
         home: is_home(&c.id),
+        // A group's agent is its sandbox; its members say who is in it.
+        agent: if members.is_empty() {
+            format!("{}/{}", c.sandbox, c.agent)
+        } else {
+            c.sandbox.clone()
+        },
         conversation: ConversationId::new(c.id).ok()?,
-        agent: format!("{}/{}", c.sandbox, c.agent),
         title: c.title,
         titled_by: c.titled_by,
         read: c.read,
+        members,
     })
+}
+
+/// A group's sandbox and its members' handles, in its order; none for a
+/// conversation that is not a group.
+fn group_of(store: &Store, id: &str) -> Option<(String, Vec<String>)> {
+    let members = store.members(id).ok()?;
+    if members.is_empty() {
+        return None;
+    }
+    let (sandbox, _, _) = store.conversation_of(id).ok()??;
+    Some((sandbox, members.into_iter().map(|(a, _)| a).collect()))
+}
+
+/// A message's `agent` for a device: the conversation's agent, a group
+/// member's `sandbox/agent` for what it said, and the group's sandbox for
+/// the person's message in a group.
+fn message_agent(store: &Store, conversation: &str, from: &From) -> String {
+    match (store.conversation_of(conversation), from) {
+        (Ok(Some((s, _, _))), From::Member(m)) => format!("{s}/{m}"),
+        (Ok(Some((s, a, _))), _) if a.is_empty() => s,
+        (Ok(Some((s, a, _))), _) => format!("{s}/{a}"),
+        _ => String::new(),
+    }
 }
 
 /// The person names one of their conversations (or clears its name): stored,
@@ -1828,10 +1996,12 @@ fn send(
     if owner != person {
         return Ok(None);
     }
+    let group = group_of(store, conversation.as_str()).is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
         conversation: conversation.clone(),
-        agent: name.clone(),
+        // A group is its sandbox's
+        agent: if group { sandbox } else { name.clone() },
         from: person.to_owned(),
         text,
         kind: "message".to_owned(),
@@ -1850,6 +2020,27 @@ fn send(
     }
     let origin = format!("{}/{}", device.id, id.as_str());
     let stored_as = new_id().map_err(|e| e.to_string())?;
+    if group {
+        // Sent again: stored, and said in the group, the first time only
+        if let Added::New(seq) = store
+            .add_to_group(
+                &origin,
+                &stored_as,
+                conversation.as_str(),
+                person,
+                &echo.text,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            let text = echo.text.clone();
+            hub.deliver(
+                person,
+                ToDevice::Message(ConversationMessage { seq, ..echo }),
+            );
+            hub.group_said(store, conversation.as_str(), seq, &text);
+        }
+        return Ok(None);
+    }
     // Sent again (the device did not hear back): stored the first time,
     // and given to the agent once, by its first id
     if let Added::New(seq) = store

@@ -13,6 +13,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub enum From {
     Person(String),
     Agent,
+    /// A member of a group, by its name in the group's sandbox.
+    Member(String),
 }
 
 /// One stored message.
@@ -27,6 +29,24 @@ pub struct Message {
     pub kind: String,
     /// When the bridge stored it, in seconds since the Unix epoch.
     pub at: i64,
+}
+
+fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+    let person: Option<String> = row.get(3)?;
+    let speaker: Option<String> = row.get(7)?;
+    Ok(Message {
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        conversation: row.get(2)?,
+        from: match (person, speaker) {
+            (Some(p), _) => From::Person(p),
+            (None, Some(m)) => From::Member(m),
+            (None, None) => From::Agent,
+        },
+        text: row.get(4)?,
+        kind: row.get(5)?,
+        at: row.get(6)?,
+    })
 }
 
 /// A conversation, with its name when it has one.
@@ -117,21 +137,17 @@ fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {
 /// Brings a database made by an earlier bridge up to [`SCHEMA`]: columns
 /// added since, which `CREATE TABLE IF NOT EXISTS` does not add.
 fn upgrade(db: &Connection) -> rusqlite::Result<()> {
-    let mut query = db.prepare("SELECT name FROM pragma_table_info('conversations')")?;
-    let columns = query
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Through `add_column`, which another process opening the database at
+    // the same moment does not trip up.
     for (column, kind) in [
         ("title", "TEXT"),
         ("titled_by", "TEXT"),
         ("read", "INTEGER"),
     ] {
-        if !columns.iter().any(|c| c == column) {
-            db.execute_batch(&format!(
-                "ALTER TABLE conversations ADD COLUMN {column} {kind}"
-            ))?;
-        }
+        add_column(db, "conversations", column, kind)?;
     }
+    // A group's agent messages say which member spoke (ADR 0045, proposed).
+    add_column(db, "messages", "speaker", "TEXT")?;
     Ok(())
 }
 
@@ -181,6 +197,25 @@ CREATE TABLE IF NOT EXISTS pairings (
     request_name TEXT,
     request_person TEXT,
     decision TEXT
+);
+CREATE TABLE IF NOT EXISTS members (
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    agent TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (conversation, agent)
+);
+CREATE TABLE IF NOT EXISTS turns (
+    id TEXT PRIMARY KEY,
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    source INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    status TEXT NOT NULL,
+    sent TEXT,
+    seen INTEGER,
+    error TEXT,
+    at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS log (
     at INTEGER NOT NULL,
@@ -323,7 +358,8 @@ impl Store {
         }
         db.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
-             CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
+             CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;
+             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation, seq);",
         )?;
         // A database whose devices were paired before the host's person
         // was kept: the first of them names it, as it would have, so the
@@ -494,13 +530,14 @@ impl Store {
         text: &str,
         kind: &str,
     ) -> rusqlite::Result<Option<i64>> {
-        let person = match from {
-            From::Person(p) => Some(p.as_str()),
-            From::Agent => None,
+        let (person, speaker) = match from {
+            From::Person(p) => (Some(p.as_str()), None),
+            From::Agent => (None, None),
+            From::Member(m) => (None, Some(m.as_str())),
         };
         let added = self.db.execute(
-            "INSERT OR IGNORE INTO messages (id, conversation, person, text, kind, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, conversation, person, text, kind, now()],
+            "INSERT OR IGNORE INTO messages (id, conversation, person, text, kind, at, speaker) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, conversation, person, text, kind, now(), speaker],
         )?;
         Ok((added == 1).then(|| self.db.last_insert_rowid()))
     }
@@ -549,6 +586,27 @@ impl Store {
         })
     }
 
+    /// A person's message in a group, from a device, as
+    /// [`Store::add_from_device`] stores one, but given to no plugin: the
+    /// bridge runs the group's turns itself.
+    pub fn add_to_group(
+        &self,
+        origin: &str,
+        id: &str,
+        conversation: &str,
+        person: &str,
+        text: &str,
+    ) -> rusqlite::Result<Added> {
+        let added = self.db.execute(
+            "INSERT OR IGNORE INTO messages (id, origin, pending, conversation, person, text, kind, at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'message', ?6)",
+            params![id, origin, conversation, person, text, now()],
+        )?;
+        Ok(match added {
+            1 => Added::New(self.db.last_insert_rowid()),
+            _ => Added::Again,
+        })
+    }
+
     /// The messages still to give `sandbox`/`agent`'s plugin, oldest first.
     pub fn pending(&self, sandbox: &str, agent: &str) -> rusqlite::Result<Vec<Pending>> {
         let mut query = self.db.prepare(
@@ -587,23 +645,172 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
-        let rows = query.query_map(params![owner, since], |row| {
-            let person: Option<String> = row.get(3)?;
-            Ok(Message {
-                seq: row.get(0)?,
-                id: row.get(1)?,
-                conversation: row.get(2)?,
-                from: person.map_or(From::Agent, From::Person),
-                text: row.get(4)?,
-                kind: row.get(5)?,
-                at: row.get(6)?,
-            })
-        })?;
+        let rows = query.query_map(params![owner, since], message_row)?;
         rows.collect()
+    }
+
+    /// The messages of conversation `id` after `since`, in order.
+    pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
+        let mut query = self.db.prepare(
+            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+             WHERE conversation = ?1 AND seq > ?2 ORDER BY seq",
+        )?;
+        let rows = query.query_map(params![id, since], message_row)?;
+        rows.collect()
+    }
+
+    /// The newest `at_most` of conversation `id`'s messages after `since`,
+    /// oldest first: a turn's prompt holds only so many, however long a
+    /// member has not been given any.
+    pub fn newest_after(
+        &self,
+        id: &str,
+        since: i64,
+        at_most: usize,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let mut query = self.db.prepare(
+            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+             WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = query.query_map(params![id, since, at_most as i64], message_row)?;
+        let mut newest = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        newest.reverse();
+        Ok(newest)
+    }
+
+    /// The `seq` of conversation `id`'s newest message; 0 with none.
+    pub fn newest(&self, id: &str) -> rusqlite::Result<i64> {
+        self.db.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Records group `id` of `sandbox`'s agents `members` (their names in
+    /// it, in the group's order), owned by `owner`: a conversation whose
+    /// agent is empty, and a member row for each. One already known keeps
+    /// its owner and members, which are returned.
+    pub fn group(
+        &self,
+        id: &str,
+        sandbox: &str,
+        members: &[String],
+        owner: &str,
+    ) -> rusqlite::Result<(String, Vec<String>)> {
+        // At once, so two `group.new` with one id cannot both find it new
+        // and mix their members
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let (made_in, agent, owner) = self.conversation(id, sandbox, "", owner)?;
+        // Another conversation with this id gets no members
+        let known = made_in != sandbox || !agent.is_empty() || !self.members(id)?.is_empty();
+        for (position, agent) in members.iter().enumerate().filter(|_| !known) {
+            self.db.execute(
+                "INSERT OR IGNORE INTO members (conversation, agent, position) VALUES (?1, ?2, ?3)",
+                params![id, agent, position as i64],
+            )?;
+        }
+        let members = self.members(id)?.into_iter().map(|(a, _)| a).collect();
+        transaction.commit()?;
+        Ok((owner, members))
+    }
+
+    /// A group's members, in its order, each with the `seq` of the last of
+    /// the group's messages it was given; none for a conversation that is
+    /// not a group.
+    pub fn members(&self, id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut query = self
+            .db
+            .prepare("SELECT agent, seen FROM members WHERE conversation = ?1 ORDER BY position")?;
+        let rows = query.query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Whether group `id` holds, after `since`, a message to give member
+    /// `agent`: one that is neither its own nor a runtime's `status` line.
+    pub fn news_for(&self, id: &str, agent: &str, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation = ?1 AND seq > ?2
+             AND kind != 'status' AND (person IS NOT NULL OR speaker IS NULL OR speaker != ?3))",
+            params![id, since, agent],
+            |row| row.get(0),
+        )
+    }
+
+    /// Member `agent` of group `id` has been given its messages up to `seq`.
+    pub fn saw(&self, id: &str, agent: &str, seq: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE members SET seen = MAX(seen, ?3) WHERE conversation = ?1 AND agent = ?2",
+            params![id, agent, seq],
+        )?;
+        Ok(())
+    }
+
+    /// Records turn `id`, or moves it to `status`; with the plugin message
+    /// it was `sent` as, the `seen` position it was given, and an `error`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turn(
+        &self,
+        id: &str,
+        conversation: &str,
+        source: i64,
+        round: u32,
+        agent: &str,
+        status: &str,
+        sent: Option<&str>,
+        seen: Option<i64>,
+        error: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO turns (id, conversation, source, round, agent, status, sent, seen, error, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET status = ?6, sent = COALESCE(?7, sent),
+               seen = COALESCE(?8, seen), error = COALESCE(?9, error), at = ?10",
+            params![id, conversation, source, round, agent, status, sent, seen, error, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Moves a recorded turn to `status`, with an `error` when it failed.
+    pub fn turn_status(&self, id: &str, status: &str, error: Option<&str>) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE turns SET status = ?2, error = COALESCE(?3, error), at = ?4 WHERE id = ?1",
+            params![id, status, error, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The turns left running when the bridge stopped: `(id, conversation, agent)`.
+    pub fn running_turns(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut query = self
+            .db
+            .prepare("SELECT id, conversation, agent FROM turns WHERE status = 'running'")?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// The turn of member `agent` in group `conversation` sent to it as
+    /// plugin message `sent`: `(id, status, seen)`.
+    pub fn turn_sent(
+        &self,
+        sent: &str,
+        conversation: &str,
+        agent: &str,
+    ) -> rusqlite::Result<Option<(String, String, Option<i64>)>> {
+        self.db
+            .query_row(
+                "SELECT id, status, seen FROM turns WHERE sent = ?1 AND conversation = ?2 AND agent = ?3",
+                params![sent, conversation, agent],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
     }
 
     /// A known conversation's sandbox, agent and owner.
@@ -905,6 +1112,144 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_keeps_its_members_their_positions_and_who_said_what() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        let members = vec!["main".to_owned(), "coder".to_owned()];
+        let (o, m) = store.group("g-1", "lab", &members, owner).unwrap();
+        assert_eq!((o.as_str(), m.clone()), (owner, members.clone()));
+        // Known already: keeps its owner and members.
+        assert_eq!(
+            store.group("g-1", "lab", &["x".into()], "other").unwrap(),
+            (owner.to_owned(), members)
+        );
+        assert!(store.members("c-none").unwrap().is_empty());
+        let you = store
+            .add(
+                "p-1",
+                "g-1",
+                &From::Person(owner.into()),
+                "@all hi",
+                "message",
+            )
+            .unwrap()
+            .unwrap();
+        let said = store
+            .add(
+                "a-1",
+                "g-1",
+                &From::Member("coder".into()),
+                "hello",
+                "reply",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.newest("g-1").unwrap(), said);
+        let after: Vec<From> = store
+            .messages_after("g-1", you)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.from)
+            .collect();
+        assert_eq!(after, [From::Member("coder".into())]);
+        assert_eq!(
+            store.since(owner, 0).unwrap()[1].from,
+            From::Member("coder".into())
+        );
+        // Positions only move forward.
+        store.saw("g-1", "main", said).unwrap();
+        store.saw("g-1", "main", you).unwrap();
+        assert_eq!(store.members("g-1").unwrap()[0], ("main".to_owned(), said));
+    }
+
+    #[test]
+    fn a_members_news_is_what_others_said_after_its_position() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let members = ["main".to_owned(), "coder".to_owned()];
+        store.group("g-1", "lab", &members, "alice").unwrap();
+        let add = |id: &str, from: From, kind: &str| {
+            store.add(id, "g-1", &from, "x", kind).unwrap().unwrap()
+        };
+        let asked = add("p-1", From::Person("alice".into()), "message");
+        assert!(store.news_for("g-1", "main", 0).unwrap());
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        // Its own words and a runtime's status line are no news to it.
+        let own = add("m-1", From::Member("main".into()), "reply");
+        add("m-2", From::Member("main".into()), "status");
+        assert!(!store.news_for("g-1", "main", asked).unwrap());
+        assert!(store.news_for("g-1", "coder", asked).unwrap());
+        add("c-1", From::Member("coder".into()), "reply");
+        assert!(store.news_for("g-1", "main", own).unwrap());
+    }
+
+    #[test]
+    fn turns_are_kept_with_what_they_were_sent_as() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .group("g-1", "lab", &["main".into(), "coder".into()], "v")
+            .unwrap();
+        store
+            .turn("t-1", "g-1", 1, 0, "main", "queued", None, None, None)
+            .unwrap();
+        store
+            .turn(
+                "t-1",
+                "g-1",
+                1,
+                0,
+                "main",
+                "running",
+                Some("sent-1"),
+                Some(4),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.running_turns().unwrap(),
+            [("t-1".to_owned(), "g-1".to_owned(), "main".to_owned())]
+        );
+        store
+            .turn_status("t-1", "failed", Some("the bridge restarted"))
+            .unwrap();
+        assert!(store.running_turns().unwrap().is_empty());
+        assert_eq!(
+            store.turn_sent("sent-1", "g-1", "main").unwrap(),
+            Some(("t-1".to_owned(), "failed".to_owned(), Some(4)))
+        );
+        assert_eq!(store.turn_sent("sent-2", "g-1", "main").unwrap(), None);
+        // Another member's turn, or another group's, is not this one.
+        assert_eq!(store.turn_sent("sent-1", "g-1", "coder").unwrap(), None);
+        assert_eq!(store.turn_sent("sent-1", "g-2", "main").unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_from_before_groups_gets_their_tables_and_speakers() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, sandbox TEXT NOT NULL,
+                 agent TEXT NOT NULL, owner TEXT NOT NULL, created INTEGER NOT NULL);
+                 CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                 conversation TEXT NOT NULL, person TEXT, text TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
+                 INSERT INTO conversations VALUES ('c-1', 'lab', 'main', 'v', 1);
+                 INSERT INTO messages (id, conversation, person, text, kind, at) VALUES ('m-1', 'c-1', NULL, 'hi', 'reply', 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.since("v", 0).unwrap()[0].from, From::Agent);
+        store
+            .group("g-1", "lab", &["main".into(), "coder".into()], "v")
+            .unwrap();
+        assert_eq!(store.members("g-1").unwrap().len(), 2);
+    }
 
     #[test]
     fn the_persons_name_wins_over_the_runtimes() {

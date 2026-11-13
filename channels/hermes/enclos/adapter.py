@@ -29,7 +29,7 @@ from gateway.platforms._shared import get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
-from . import protocol
+from . import lines, protocol
 from .outbox import Outbox
 
 logger = logging.getLogger(__name__)
@@ -97,11 +97,9 @@ class EnclosAdapter(BasePlatformAdapter):
             except OSError:
                 listener.close()
                 raise
-            # A line may hold a whole protocol message and its line break;
-            # asyncio's default limit (64 KiB) would end the connection on
-            # an ordinary long message
+            # A line as long as the protocol allows, not asyncio's 64 KiB.
             self._server = await asyncio.start_unix_server(
-                self._on_connection, sock=listener, limit=protocol.MAX_MESSAGE_BYTES + 1)
+                self._on_connection, sock=listener, limit=lines.LIMIT)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
@@ -166,12 +164,14 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._write(message)
             while True:
                 try:
-                    line = await reader.readline()
-                except ValueError:
-                    # A line past the protocol's limit: no message of the
-                    # bridge's is, so the connection is not one to go on with
+                    line = await lines.read_line(reader)
+                except lines.TooLong as e:
+                    # Said at once, naming it when its first bytes do, then
+                    # the end: no message of the bridge's is this long, so
+                    # the connection is not one to go on with
+                    # (`docs/protocol.md`, Messages)
                     logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
-                    await self._write(protocol.error("bad_message", "larger than 1 MiB", None))
+                    await self._write(protocol.error("bad_message", str(e), e.message_id))
                     break
                 if not line or not await self._on_line(line):
                     break

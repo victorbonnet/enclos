@@ -40,6 +40,18 @@ pub enum FromDevice {
         conversation: ConversationId,
         agent: String,
     },
+    /// Starts a group with two to six agents of one sandbox.
+    #[serde(rename = "group.new")]
+    GroupNew {
+        conversation: ConversationId,
+        /// `<sandbox>/<agent>` each.
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Stops a group's discussion; what was said stays.
+    #[serde(rename = "group.stop")]
+    GroupStop { conversation: ConversationId },
     #[serde(rename = "message.send")]
     MessageSend {
         conversation: ConversationId,
@@ -82,6 +94,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "pair.request",
     "agents",
     "conversation.new",
+    "group.new",
+    "group.stop",
     "message.send",
     "conversation.rename",
     "conversation.read",
@@ -124,6 +138,9 @@ pub enum ToDevice {
     /// The commands a person may type to an agent's runtime, whole, as its
     /// plugin listed them ([`commands_for_devices`]): after `agents.list`,
     /// and again when they change.
+    /// Where a group's discussion is: at `sync` and whenever it changes.
+    #[serde(rename = "group.state")]
+    GroupState(GroupState),
     #[serde(rename = "commands")]
     Commands {
         /// `<sandbox>/<agent>`.
@@ -163,6 +180,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "typing",
     "tool",
     "commands",
+    "group.state",
     "attachment.data",
     "synced",
     "ack",
@@ -264,6 +282,37 @@ pub struct ConversationInfo {
     /// (cron jobs, the runtime's notices). Shown first, never empty.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub home: bool,
+    /// A group's members, `<sandbox>/<agent>` each, in its order; none for
+    /// a conversation with one agent. A group's `agent` is its sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+/// Where a group's discussion is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupState {
+    pub conversation: ConversationId,
+    /// `working`, `settled`, `bounded`, `stopped` or `failed`.
+    pub state: String,
+    /// The round running, from 0, and how many a discussion may have.
+    pub round: u32,
+    pub max_rounds: u32,
+    /// Each member and its turn in this discussion.
+    pub members: Vec<MemberTurn>,
+    /// Why it ended, when it did not settle (`max_rounds`, `max_replies`,
+    /// a turn's error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A member of a group and its turn: `queued`, `working`, `replied`,
+/// `passed`, `failed`, `cancelled`, or none yet in this discussion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberTurn {
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -469,6 +518,14 @@ mod tests {
                 text: "hi".into(),
             },
             FromDevice::Sync { since: 4 },
+            FromDevice::GroupNew {
+                conversation: ConversationId::new("g-1").unwrap(),
+                members: vec!["lab/main".into(), "lab/coder".into()],
+                title: None,
+            },
+            FromDevice::GroupStop {
+                conversation: ConversationId::new("g-1").unwrap(),
+            },
             FromDevice::ConversationRead {
                 conversation: ConversationId::new("c-1").unwrap(),
                 seq: 7,
@@ -519,6 +576,7 @@ mod tests {
             titled_by: Some("agent".into()),
             read: Some(7),
             home: false,
+            members: Vec::new(),
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
@@ -531,7 +589,42 @@ mod tests {
             titled_by: Some("person".into()),
             read: None,
             home: true,
+            members: Vec::new(),
         });
+        let line = encode_line(&Envelope::new(id(), home.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, home);
+        // A group: its sandbox, its members, and where its discussion is.
+        let group = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("g-1").unwrap(),
+            agent: "lab".into(),
+            title: Some("Launch".into()),
+            titled_by: Some("person".into()),
+            read: None,
+            home: false,
+            members: vec!["lab/main".into(), "lab/coder".into()],
+        });
+        let line = encode_line(&Envelope::new(id(), group.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""members":["lab/main","lab/coder"]"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, group);
+        let state = ToDevice::GroupState(GroupState {
+            conversation: ConversationId::new("g-1").unwrap(),
+            state: "working".into(),
+            round: 0,
+            max_rounds: 3,
+            members: vec![
+                MemberTurn {
+                    agent: "lab/main".into(),
+                    turn: Some("replied".into()),
+                },
+                MemberTurn {
+                    agent: "lab/coder".into(),
+                    turn: Some("working".into()),
+                },
+            ],
+            reason: None,
+        });
+        let line = encode_line(&Envelope::new(id(), state.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, state);
         let line = encode_line(&Envelope::new(id(), home.clone()));
         assert!(String::from_utf8_lossy(&line).contains(r#""home":true"#));
         assert_eq!(decode_to_device(&line).unwrap().body, home);

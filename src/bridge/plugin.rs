@@ -156,14 +156,16 @@ impl PluginWriter {
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        self.send_as(id.clone(), body)?;
+        self.send_as(&id, body)?;
         Ok(id)
     }
 
-    /// Sends `body` with `id`: the same on every try of one message, so the
-    /// plugin knows a message it has had already.
-    pub fn send_as(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
-        let line = encode_line(&Envelope::new(id, body));
+    /// Sends `body` as message `id`, which the caller made ([`new_id`]) so
+    /// as to know it before an answer to it can come, or which it stored
+    /// the message with: the same on every try, so the plugin knows a
+    /// message it has had already.
+    pub fn send_as(&mut self, id: &MessageId, body: FromBridge) -> Result<(), PluginError> {
+        let line = encode_line(&Envelope::new(id.clone(), body));
         let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.stream.write_all(&line)?;
         Ok(())
@@ -171,7 +173,7 @@ impl PluginWriter {
 
     /// Sends `body` with `id`, one the bridge made, and stored, first.
     pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
-        self.send_as(id, body)
+        self.send_as(&id, body)
     }
 
     /// Answers the plugin's message `of` (when its id could be read) with
