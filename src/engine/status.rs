@@ -57,10 +57,11 @@ impl Engine {
         let now = now();
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
+        let dashboard_services = super::listener::HostServices::default();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
-            match self.sandbox_status(record, runtime.as_deref(), now) {
+            match self.sandbox_status_in(record, runtime.as_deref(), now, &dashboard_services) {
                 Ok(s) => sandboxes.push(s),
                 Err(e) => unlisted.push(Unlisted {
                     name,
@@ -81,11 +82,27 @@ impl Engine {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn sandbox_status(
         &self,
         record: SandboxRecord,
         runtime: Option<&dyn RuntimeAdapter>,
         now: Timestamp,
+    ) -> Result<SandboxStatus> {
+        self.sandbox_status_in(
+            record,
+            runtime,
+            now,
+            &super::listener::HostServices::default(),
+        )
+    }
+
+    fn sandbox_status_in(
+        &self,
+        record: SandboxRecord,
+        runtime: Option<&dyn RuntimeAdapter>,
+        now: Timestamp,
+        dashboard_services: &super::listener::HostServices,
     ) -> Result<SandboxStatus> {
         let name = record.name.clone();
         let dir = self.layout.sandbox_dir(name.as_str());
@@ -146,28 +163,10 @@ impl Engine {
             true => Fact::NotProvided,
             false => network_listeners(&look, &running),
         };
-        // Only offer an operational, installed runtime. Opening a dashboard
-        // is an explicit command with a lock and audit, never a plain exec.
         let dashboard_command = runtime.and_then(|rt| {
-            let dashboard = rt.dashboard()?;
-            let installed = rt
-                .runtime_facts()
-                .install
-                .is_some_and(|file| matches!(exists(&home, &file), Fact::Known(true)));
-            let service_runs = rt.listener().is_some_and(|listener| {
-                running.iter().any(|session| {
-                    session.kind == SessionKind::Service
-                        && session.service.as_deref() == Some(listener.service.as_str())
-                })
-            });
-            let service_ready = own_network
-                || (installed && service_runs && matches!(self.service_port(&record), Ok(Some(_))));
-            (record.state == crate::model::sandbox::SandboxState::Running
-                && installed
-                && (own_network || service_runs)
-                && service_ready
-                && (own_network || dashboard.socket.is_some()))
-            .then(|| format!("enclos dashboard {name}"))
+            self.dashboard_of(&record, rt, dashboard_services)
+                .ok()
+                .map(|_| format!("enclos dashboard {name}"))
         });
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {

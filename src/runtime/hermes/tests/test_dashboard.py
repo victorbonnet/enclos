@@ -18,6 +18,19 @@ spec.loader.exec_module(dashboard)
 
 
 class DashboardTests(unittest.TestCase):
+    def test_the_one_shot_adapter_removes_its_source_and_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "_enclos_dashboard.py"
+            cache = Path(importlib.util.cache_from_source(str(source)))
+            cache.parent.mkdir()
+            source.write_text("adapter")
+            cache.write_bytes(b"bytecode")
+            dashboard.remove_adapter(str(source))
+            self.assertFalse(source.exists())
+            self.assertFalse(cache.exists())
+            # Cleanup also works with bytecode writing disabled or absent.
+            dashboard.remove_adapter(str(source))
+
     def test_the_inherited_socket_and_authenticated_peer_reach_hermes(self):
         with tempfile.TemporaryDirectory() as directory:
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

@@ -597,7 +597,7 @@ impl RuntimeAdapter for Hermes {
                 launcher: SandboxCommand::from_words(&[
                     "/bin/sh",
                     "-c",
-                    "set -eu\n/bin/cp \"$1\" \"$HOME/.hermes/hermes-agent/_enclos_dashboard.py\"\nexec hermes --run-module _enclos_dashboard \"$2\"",
+                    "set -eu\nadapter=\"$HOME/.hermes/hermes-agent/_enclos_dashboard.py\"\ntrap '/bin/rm -f \"$adapter\"' EXIT\n/bin/cp \"$1\" \"$adapter\"\nhermes --run-module _enclos_dashboard \"$2\"",
                     "enclos-dashboard",
                 ]),
             }),

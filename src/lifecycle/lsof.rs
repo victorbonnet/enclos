@@ -28,6 +28,10 @@ pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersEr
     lsof(&[&format!("-iTCP@127.0.0.1:{port}"), "-sTCP:LISTEN"])
 }
 
+pub fn all_tcp_listeners() -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    lsof(&["-iTCP", "-sTCP:LISTEN"])
+}
+
 /// The uid of the connected client socket. The reverse (accepted) socket
 /// belongs to enclos and must never be mistaken for the caller. Missing,
 /// unreadable, malformed or conflicting ownership fails closed.

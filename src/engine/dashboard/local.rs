@@ -1,6 +1,6 @@
 //! A dashboard on the host's network: its upstream is an inherited Unix
 //! listener in the host-only run folder. The browser's TCP port comes from
-//! the proxy range, which sandbox sessions cannot dial (ADR 0028).
+//! outside the proxy range, so it cannot take another install's reservation.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -33,22 +33,17 @@ impl Local {
         runtime: RuntimeSocketDashboard,
     ) -> Result<Self> {
         let prepare = || -> io::Result<Self> {
-            // Serialize selection against sandbox creation in this install.
-            // The listener stays bound after this short lock is released.
-            let _lock = engine.state.lock().map_err(io::Error::other)?;
-            let reserved: Vec<_> = engine
-                .state
-                .list()
-                .map_err(io::Error::other)?
-                .into_iter()
-                .map(|record| record.proxy_port)
-                .collect();
-            let front = (PORT_FIRST..=PORT_LAST)
-                .filter(|port| !reserved.contains(port))
-                .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
-                .ok_or_else(|| {
-                    io::Error::other("no free dashboard port in enclos's proxy range")
-                })?;
+            // A host can configure its ephemeral range to overlap enclos's.
+            // Keep rejected listeners held until selection ends, so the
+            // kernel cannot keep handing back the same reserved port.
+            let mut rejected = Vec::new();
+            let front = loop {
+                let candidate = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+                if !(PORT_FIRST..=PORT_LAST).contains(&candidate.local_addr()?.port()) {
+                    break candidate;
+                }
+                rejected.push(candidate);
+            };
             let port = front.local_addr()?.port();
             let mut random = [0u8; 32];
             getrandom::fill(&mut random).map_err(io::Error::other)?;

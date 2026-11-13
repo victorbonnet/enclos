@@ -164,7 +164,7 @@ while True:
     let mut shown = None;
     let result = engine.dashboard_until(&alice(), &name, &ended, &mut |open| {
         assert!(
-            (crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
+            !(crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
                 .contains(&open.port)
         );
         assert!(
@@ -181,6 +181,10 @@ while True:
             second.to_string().contains("already has a dashboard"),
             "{second}"
         );
+        let capability = open.url.split('/').nth(3).unwrap();
+        assert!(!second.to_string().contains(capability));
+        let lock = std::fs::read_to_string(engine.layout.dashboard_lock(name.as_str())).unwrap();
+        assert!(!lock.contains(capability));
         let mut client = TcpStream::connect(("127.0.0.1", open.port)).unwrap();
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -210,6 +214,11 @@ while True:
     let shown = shown.expect("opened");
     assert!(TcpStream::connect(("127.0.0.1", shown.port)).is_err());
     assert!(!engine.layout.dashboard_socket(name.as_str()).exists());
+    assert!(
+        !home
+            .join(".hermes/hermes-agent/_enclos_dashboard.py")
+            .exists()
+    );
     assert!(
         engine
             .state

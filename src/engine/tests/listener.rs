@@ -263,7 +263,6 @@ fn status_shows_a_dedicated_dashboard_command_instead_of_the_gateway_url() {
     let (child, _) = gateway(&engine, &name, 1);
     ready(&engine, &name);
     let up = status_of(&engine, &name);
-    end(child);
     let command = Some(format!("enclos dashboard {name}"));
     assert!(
         serde_json::to_value(&up)
@@ -272,6 +271,26 @@ fn status_shows_a_dedicated_dashboard_command_instead_of_the_gateway_url() {
             .is_none()
     );
     assert_eq!(up.dashboard_command, command);
+    let mut unsupported = engine.record(&name).unwrap();
+    unsupported.backend = crate::model::sandbox::BackendKind::Bubblewrap;
+    let runtime = crate::runtime::adapter(unsupported.runtime.unwrap());
+    assert!(
+        engine
+            .dashboard_of(
+                &unsupported,
+                runtime.as_ref(),
+                &super::super::listener::HostServices::default()
+            )
+            .is_err()
+    );
+    assert!(
+        engine
+            .sandbox_status(unsupported, Some(runtime.as_ref()), crate::model::now())
+            .unwrap()
+            .dashboard_command
+            .is_none()
+    );
+    end(child);
     // On loopback alone: nothing the host's network reaches.
     assert_eq!(up.network_listeners, Fact::Known(Vec::new()));
     let stopped = status_of(&engine, &name);

@@ -10,12 +10,12 @@
 //! raw TCP upstream on macOS. The owner check has no setting.
 
 use std::collections::BTreeSet;
-use std::io::{self, Write};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -136,7 +136,7 @@ impl Door {
         let door = Arc::new(self);
         let open = Arc::new(AtomicUsize::new(0));
         // Each refused owner said once, not for every connection.
-        let mut refused = BTreeSet::new();
+        let refused = Arc::new(Mutex::new(BTreeSet::new()));
         while !stop.load(Ordering::Relaxed) {
             let (client, peer) = match listener.accept() {
                 Ok(accepted) => accepted,
@@ -146,25 +146,29 @@ impl Door {
                     continue;
                 }
             };
-            let owner = client
-                .local_addr()
-                .ok()
-                .and_then(|server| (door.owner)(peer, server));
-            if owner != Some(door.user) {
-                // Dropped unread: closed before a byte reaches the service.
-                drop(client);
-                if refused.insert(owner) {
-                    crate::notes::say(&refusal(owner, door.user));
-                }
-                continue;
-            }
             // Over the limit, closed with nothing said: a browser opens it again.
             let Some(slot) = Slot::take(&open, CONNECTIONS) else {
                 continue;
             };
             let door = Arc::clone(&door);
+            let refused = Arc::clone(&refused);
             let _ = thread::Builder::new().spawn(move || {
                 let _slot = slot;
+                let owner = client
+                    .local_addr()
+                    .ok()
+                    .and_then(|server| (door.owner)(peer, server));
+                if owner != Some(door.user) {
+                    // Close unread, before any connection to the runtime.
+                    if refused
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(owner)
+                    {
+                        crate::notes::say(&refusal(owner, door.user));
+                    }
+                    return;
+                }
                 door.pass(client);
             });
         }
@@ -180,13 +184,16 @@ impl Door {
         let first = match &self.upstream {
             Upstream::Local { prefix, .. } => match super::http::authorize(&mut client, prefix) {
                 Ok(first) => Some(first),
-                Err(_) => return,
+                Err(error) => {
+                    super::http::reject(&mut client, &error);
+                    return;
+                }
             },
             Upstream::Namespace { .. } => None,
         };
         if let Ok(mut upstream) = self.upstream.connect() {
             if let Some(first) = first
-                && upstream.write_all(&first).is_err()
+                && super::http::begin(&mut client, &mut upstream, first).is_err()
             {
                 return;
             }
@@ -315,8 +322,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             write!(client, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-            let mut bytes = [0; 32];
-            assert!(matches!(client.read(&mut bytes), Ok(0) | Err(_)));
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            assert!(answer.starts_with("HTTP/1.1 403 Forbidden\r\n"));
             assert_eq!(
                 upstream.accept().unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
@@ -422,6 +430,40 @@ mod tests {
     fn the_user_running_it_reaches_the_dashboards_port() {
         let (_listening, port, _folder) = listening(|_, _| Some(ME));
         assert_eq!(fetched(port), b"37000 GET");
+    }
+
+    #[test]
+    fn one_slow_owner_lookup_does_not_hold_up_other_connections() {
+        static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        let (_listening, port, _folder) = listening(|_, _| {
+            LOOKUPS.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !RELEASE.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(POLL);
+            }
+            Some(ME)
+        });
+        let mut first = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        for client in [&mut first, &mut second] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client.write_all(b"GET").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while LOOKUPS.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(POLL);
+        }
+        let count = LOOKUPS.load(Ordering::SeqCst);
+        RELEASE.store(true, Ordering::SeqCst);
+        assert_eq!(count, 2, "owner lookups were serialized");
+        for client in [&mut first, &mut second] {
+            let mut answer = [0; 9];
+            client.read_exact(&mut answer).unwrap();
+            assert_eq!(&answer, b"37000 GET");
+        }
     }
 
     #[test]

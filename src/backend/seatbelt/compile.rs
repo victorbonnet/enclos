@@ -357,8 +357,8 @@ pub fn compile(
     // passes its descriptor to this dashboard alone. Never fall back to
     // TCP, even if the runtime changes how it builds its HTTP server.
     line(format!(
-        "(if (param \"ENCLOS_DASHBOARD\")\n  (begin\n    (deny network-bind)\n    (allow network-inbound (local unix-socket {}))))",
-        literal(&ctx.inward_socket.with_file_name("dashboard.sock"))?
+        "(if (param \"ENCLOS_DASHBOARD\")\n  (begin\n    (deny network-bind (local tcp))\n    (allow network-inbound (local unix-socket {}))))",
+        literal(&ctx.dashboard_socket)?
     ));
     if policy.net.listen {
         // A runtime's own listener (ADR 0028). Seatbelt refuses `localhost:0`
@@ -571,7 +571,9 @@ mod tests {
         let text = compile(&policy(), &ctx(base), Baseline::DenyDefault)
             .unwrap()
             .text;
-        assert_eq!(text.matches("(local tcp").count(), 0, "{text}");
+        // The dashboard's TCP deny is present even without an allowance.
+        assert_eq!(text.matches("(local tcp").count(), 1, "{text}");
+        assert!(text.contains("(deny network-bind (local tcp))"));
         assert_eq!(text.matches("(allow network-bind").count(), 1, "{text}");
         assert!(text.contains("(allow network-bind network-inbound (local unix-socket"));
         // Nor reaches a service of its runtime: it has none that listens.
@@ -604,7 +606,8 @@ mod tests {
         let allow = at("(allow network-bind network-inbound (local tcp \"localhost:*\"))");
         // Later rules win: each deny comes after the allow, on every address,
         // for the whole range, not only the ports reserved now.
-        assert_eq!(text.matches("(deny network-bind (local tcp").count(), 1000);
+        // The dashboard's all-TCP deny plus the 1,000 reserved ports.
+        assert_eq!(text.matches("(deny network-bind (local tcp").count(), 1001);
         for port in [PORT_FIRST, 41001, 41500, PORT_LAST] {
             let deny = at(&format!(
                 "(deny network-bind (local tcp \"*:{port}\") (with message \"enclos:home\"))"
@@ -1217,5 +1220,18 @@ mod tests {
         p.fs.write.push("/tmp/evil\") (allow default".into());
         let err = compile(&p, &ctx(Path::new("/x")), Baseline::DenyDefault).unwrap_err();
         assert!(err.to_string().contains("quote"), "{err}");
+    }
+
+    #[test]
+    fn the_dashboard_allowance_uses_the_contexts_socket_path() {
+        let mut context = ctx(Path::new("/nonexistent-enclos-test"));
+        context.dashboard_socket = "/private/dashboard-location.sock".into();
+        let text = compile(&policy(), &context, Baseline::DenyDefault)
+            .unwrap()
+            .text;
+        assert!(
+            text.contains("(local unix-socket (literal \"/private/dashboard-location.sock\"))")
+        );
+        assert!(!text.contains("/run/home/dashboard.sock"));
     }
 }

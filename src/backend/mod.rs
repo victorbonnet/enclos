@@ -85,6 +85,8 @@ pub struct SandboxContext {
     /// The socket of the namespace holder's relay from the host to a port in
     /// the sandbox's network namespace (ADR 0040).
     pub inward_socket: PathBuf,
+    /// The private listener the macOS dashboard inherits from the host.
+    pub dashboard_socket: PathBuf,
     /// What enclos stages for an install or an import, which the sandbox
     /// reads and never writes.
     pub installers: PathBuf,
@@ -115,6 +117,7 @@ impl SandboxContext {
             proxy_socket: layout.proxy_socket(name.as_str()),
             holder_socket: layout.holder_socket(name.as_str()),
             inward_socket: layout.inward_socket(name.as_str()),
+            dashboard_socket: layout.dashboard_socket(name.as_str()),
             installers: layout.sandbox_installers(name.as_str()),
             program: Some(Vec::new()),
         }

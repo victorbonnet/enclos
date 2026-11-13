@@ -10,6 +10,20 @@ import socket
 import sys
 
 
+def remove_adapter(source):
+    """The launcher imports this one-shot module inside Hermes's environment.
+
+    Remove both files before serving, including the cache Python may have
+    written while loading the module. A killed session leaves no adapter
+    in the runtime checkout.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    Path(importlib.util.cache_from_source(source)).unlink(missing_ok=True)
+    Path(source).unlink(missing_ok=True)
+
+
 def main():
     listener = socket.socket(fileno=int(os.environ.pop("ENCLOS_DASHBOARD_FD")))
     if (
@@ -77,4 +91,5 @@ def main():
 
 
 if __name__ == "__main__":
+    remove_adapter(__file__)
     main()

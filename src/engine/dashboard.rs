@@ -29,7 +29,7 @@ use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::SessionId;
-use crate::runtime::{RuntimeDashboard, adapter};
+use crate::runtime::{RuntimeAdapter, RuntimeDashboard, adapter};
 use local::Local;
 use lock::{DashboardLock, Running};
 
@@ -42,8 +42,8 @@ const LISTEN_WAIT: Duration = Duration::from_secs(300);
 pub struct DashboardOpen {
     pub sandbox: SandboxName,
     pub session: SessionId,
-    /// A host loopback port in enclos's proxy range. On Linux this is the
-    /// sandbox's reserved port; on macOS it is another free port.
+    /// A host loopback port: the sandbox's reserved proxy-range port on
+    /// Linux, a kernel-chosen port outside that range on macOS.
     pub port: u16,
     /// The host-verified URL. On macOS its random path is a credential.
     pub url: String,
@@ -86,7 +86,12 @@ impl Engine {
         opened: &mut dyn FnMut(&DashboardOpen),
     ) -> Result<DashboardEnd> {
         let record = self.record(name)?;
-        let (holder, dashboard) = self.dashboard_of(&record)?;
+        let runtime = adapter(self.runtime_of(name)?);
+        let (holder, dashboard) = self.dashboard_of(
+            &record,
+            runtime.as_ref(),
+            &super::listener::HostServices::default(),
+        )?;
         let mut url = format!("http://127.0.0.1:{}{}", record.proxy_port, dashboard.page);
         self.layout
             .create_sandbox_run_dir(name.as_str())
@@ -98,7 +103,6 @@ impl Engine {
             pid: std::process::id(),
             session: None,
             since: now(),
-            url: url.clone(),
         };
         let mut lock =
             DashboardLock::take(&self.layout.dashboard_lock(name.as_str()), name, &running)?;
@@ -119,8 +123,6 @@ impl Engine {
                 local.prefix,
                 dashboard.page.trim_start_matches('/')
             );
-            running.url = url.clone();
-            let _ = lock.say(&running);
         }
         self.wait_service_proxy(name)?;
         let namespace = if let Some(holder) = holder {
@@ -268,15 +270,16 @@ impl Engine {
 
     /// The namespace holder whose way in reaches `record`'s sandbox, and its
     /// runtime's dashboard, or why `enclos dashboard` has none to serve.
-    fn dashboard_of(
+    pub(super) fn dashboard_of(
         &self,
         record: &SandboxRecord,
+        runtime: &dyn RuntimeAdapter,
+        services: &super::listener::HostServices,
     ) -> Result<(Option<&dyn NamespaceHolder>, RuntimeDashboard)> {
         let name = &record.name;
         let refused = |what: String| Error::Dashboard { what };
         let holder = self.holder_of(record.backend);
-        let kind = self.runtime_of(name)?;
-        let runtime = adapter(kind);
+        let kind = runtime.kind();
         if holder.is_none() && record.state != crate::model::sandbox::SandboxState::Running {
             return Err(refused(format!(
                 "sandbox {name} is not running: run `enclos sandbox start {name}` first"
@@ -317,7 +320,7 @@ impl Engine {
             )));
         }
         if holder.is_none() {
-            match self.service_port(record) {
+            match services.port(self.state.as_ref(), record) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(refused(format!(

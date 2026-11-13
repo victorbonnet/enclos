@@ -184,6 +184,12 @@ fn a_private_dashboard_inherits_its_listener_and_cannot_bind_or_dial_its_path() 
     let code = r#"import os, socket
 s = socket.socket(fileno=int(os.environ['ENCLOS_DASHBOARD_FD']))
 assert s.family == socket.AF_UNIX
+ipc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ipc_path = os.path.join(os.environ['HOME'], 'dashboard-ipc.sock')
+ipc.bind(ipc_path)
+ipc.listen()
+ipc.close()
+os.unlink(ipc_path)
 for family, address in [(socket.AF_INET, ('127.0.0.1', 0)), (socket.AF_INET6, ('::', 0))]:
     raw = socket.socket(family, socket.SOCK_STREAM)
     try: raw.bind(address)
