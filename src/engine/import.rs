@@ -71,15 +71,33 @@ impl Engine {
         from: &Path,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
+        self.import_agent_data(by, name, agent, from, None, confirm)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn import_agent_data(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        from: &Path,
+        portable: Option<(&str, &str)>,
+        confirm: Confirm,
+    ) -> Result<Planned<AgentAdded>> {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
         // One copy per enclos process, so two imports of the same name never
         // share it.
         let installers = self.layout.sandbox_installers(name.as_str());
-        let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.tar.gz"));
+        let suffix = if portable.is_some() { "data" } else { "tar.gz" };
+        let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.{suffix}"));
         let staged = copy_named(&std::process::id().to_string());
-        let Some(command) = runtime.import_agent(&agent, &staged) else {
+        let command_for = |path: &Path| match portable {
+            Some((format, context)) => runtime.import_export(&agent, path, format, context),
+            None => runtime.import_agent(&agent, path),
+        };
+        let Some(command) = command_for(&staged) else {
             return Err(failed(format!(
                 "{shown} cannot import an agent from an archive. `enclos agent add {name}/{agent}` creates a new one"
             )));
@@ -117,7 +135,7 @@ impl Engine {
             let Archive { path, sha256 } = source.hash()?;
             // The real run names its copy after its own process.
             let planned = copy_named("<pid>");
-            let command = runtime.import_agent(&agent, &planned).unwrap_or(command);
+            let command = command_for(&planned).unwrap_or(command);
             return Ok(Planned::DryRun(Plan {
                 changes: vec![
                     format!(
@@ -230,7 +248,9 @@ impl Engine {
                 Added::Imported { copy_left, .. } => with_copy_left(e, copy_left.clone()),
                 _ => e,
             })?;
-        self.restart_for(by, name, &agent, restart, "importing")?;
+        if portable.is_none() {
+            self.restart_for(by, name, &agent, restart, "importing")?;
+        }
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,

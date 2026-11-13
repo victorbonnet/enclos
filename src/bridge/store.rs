@@ -157,7 +157,7 @@ pub fn conversation_title(text: &str) -> String {
 }
 
 pub struct Store {
-    db: Connection,
+    pub(super) db: Connection,
 }
 
 fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {

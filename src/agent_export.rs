@@ -9,6 +9,18 @@ use crate::model::{agent::AgentName, runtime::RuntimeKind, sandbox::SandboxName}
 
 const MAGIC: &[u8] = b"ENCLOS_AGENT_EXPORT_V1\n";
 const MAX_HEADER: usize = 64 * 1024;
+const MAX_STATE: u64 = 256 * 1024 * 1024;
+use crate::bridge::portable::HostState;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateSection {
+    pub bytes: u64,
+    pub sha256: String,
+}
+fn native_format() -> String {
+    "native".into()
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,11 +82,18 @@ pub struct Manifest {
     pub presentation: Presentation,
     pub payload_bytes: u64,
     pub payload_sha256: String,
+    #[serde(default = "native_format", skip_serializing_if = "is_native")]
+    pub runtime_format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateSection>,
+}
+fn is_native(value: &str) -> bool {
+    value == "native"
 }
 
 impl Manifest {
     fn validate(&self) -> io::Result<()> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(invalid("unsupported agent export version"));
         }
         self.runtime.parse::<RuntimeKind>().map_err(invalid)?;
@@ -93,6 +112,32 @@ impl Manifest {
         {
             return Err(invalid("invalid runtime export size or checksum"));
         }
+        if self.runtime_format.is_empty()
+            || self.runtime_format.len() > 64
+            || !self
+                .runtime_format
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(invalid("invalid runtime data format"));
+        }
+        if self.schema_version == 1 && (self.state.is_some() || self.runtime_format != "native") {
+            return Err(invalid("invalid legacy export"));
+        }
+        if self.schema_version == 2 && self.state.is_none() {
+            return Err(invalid("complete export has no Enclos data"));
+        }
+        if let Some(s) = &self.state
+            && (s.bytes == 0
+                || s.bytes > MAX_STATE
+                || s.sha256.len() != 64
+                || !s
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            return Err(invalid("invalid Enclos data size or checksum"));
+        }
         self.presentation.validate()
     }
 }
@@ -105,15 +150,72 @@ pub fn write(
     source_agent: String,
     presentation: Presentation,
 ) -> io::Result<Manifest> {
+    write_parts(
+        payload,
+        output,
+        runtime,
+        source_agent,
+        presentation,
+        "native",
+        None,
+    )
+}
+
+/// A complete export carries a separately hashed, bounded host-owned section.
+/// This contains credentials: it must never be printed in plans or audit logs.
+pub fn write_complete(
+    payload: &mut (impl Read + Seek),
+    output: &mut impl Write,
+    runtime: RuntimeKind,
+    source_agent: String,
+    presentation: Presentation,
+    format: &str,
+    state: &HostState,
+) -> io::Result<Manifest> {
+    state.validate()?;
+    let bytes = zeroize::Zeroizing::new(
+        serde_json::to_vec(state).map_err(|_| invalid("cannot serialize Enclos data"))?,
+    );
+    if bytes.len() as u64 > MAX_STATE {
+        return Err(invalid(
+            "Enclos history and attachments exceed the 256 MiB export limit",
+        ));
+    }
+    write_parts(
+        payload,
+        output,
+        runtime,
+        source_agent,
+        presentation,
+        format,
+        Some(&bytes),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_parts(
+    payload: &mut (impl Read + Seek),
+    output: &mut impl Write,
+    runtime: RuntimeKind,
+    source_agent: String,
+    presentation: Presentation,
+    format: &str,
+    state: Option<&[u8]>,
+) -> io::Result<Manifest> {
     payload.seek(SeekFrom::Start(0))?;
     let (payload_bytes, payload_sha256) = copy(payload, &mut io::sink())?;
     let manifest = Manifest {
-        schema_version: 1,
+        schema_version: if state.is_some() { 2 } else { 1 },
         runtime: runtime.to_string(),
         source_agent,
         presentation,
         payload_bytes,
         payload_sha256,
+        runtime_format: format.into(),
+        state: state.map(|s| StateSection {
+            bytes: s.len() as u64,
+            sha256: crate::policy::sha256_hex(s),
+        }),
     };
     manifest.validate()?;
     let header = serde_json::to_vec(&manifest).map_err(invalid)?;
@@ -123,6 +225,9 @@ pub fn write(
     output.write_all(MAGIC)?;
     output.write_all(&(header.len() as u32).to_be_bytes())?;
     output.write_all(&header)?;
+    if let Some(state) = state {
+        output.write_all(state)?;
+    }
     payload.seek(SeekFrom::Start(0))?;
     let (size, digest) = copy(payload, output)?;
     if size != manifest.payload_bytes || digest != manifest.payload_sha256 {
@@ -133,6 +238,13 @@ pub fn write(
 
 /// Validates metadata and streams the opaque payload; refuses truncation, changes and trailing bytes.
 pub fn read(input: &mut impl Read, payload: &mut impl Write) -> io::Result<Manifest> {
+    read_complete(input, payload).map(|(manifest, _)| manifest)
+}
+
+pub fn read_complete(
+    input: &mut impl Read,
+    payload: &mut impl Write,
+) -> io::Result<(Manifest, Option<HostState>)> {
     let mut magic = vec![0; MAGIC.len()];
     input.read_exact(&mut magic)?;
     if magic != MAGIC {
@@ -150,6 +262,23 @@ pub fn read(input: &mut impl Read, payload: &mut impl Write) -> io::Result<Manif
     input.read_exact(&mut header)?;
     let manifest: Manifest = serde_json::from_slice(&header).map_err(invalid)?;
     manifest.validate()?;
+    let state = if let Some(section) = &manifest.state {
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        input.take(section.bytes).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != section.bytes
+            || crate::policy::sha256_hex(&bytes) != section.sha256
+        {
+            return Err(invalid(
+                "Enclos data is truncated or its checksum does not match",
+            ));
+        }
+        let state: HostState =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid Enclos data"))?;
+        state.validate()?;
+        Some(state)
+    } else {
+        None
+    };
     let (size, digest) = copy(&mut input.take(manifest.payload_bytes), payload)?;
     if size != manifest.payload_bytes || digest != manifest.payload_sha256 {
         return Err(invalid(
@@ -160,7 +289,7 @@ pub fn read(input: &mut impl Read, payload: &mut impl Write) -> io::Result<Manif
     if input.read(&mut extra)? != 0 {
         return Err(invalid("unexpected bytes after the runtime export"));
     }
-    Ok(manifest)
+    Ok((manifest, state))
 }
 
 fn copy(input: &mut impl Read, output: &mut impl Write) -> io::Result<(u64, String)> {
@@ -258,5 +387,45 @@ mod tests {
         ] {
             assert!(p.validate().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod complete_tests {
+    use super::*;
+    #[test]
+    fn complete_sections_round_trip_and_tampering_is_refused() {
+        let state = HostState {
+            credentials: vec![crate::bridge::portable::Credential {
+                variable: "API_TOKEN".into(),
+                value: crate::model::secret::SecretValue::new("sensitive-token".into()).unwrap(),
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        let manifest = write_complete(
+            &mut io::Cursor::new(b"opaque runtime"),
+            &mut bytes,
+            RuntimeKind::Hermes,
+            "old/main".into(),
+            Presentation::default(),
+            "hermes-data-v1",
+            &state,
+        )
+        .unwrap();
+        assert_eq!(manifest.schema_version, 2);
+        let mut payload = Vec::new();
+        let (_, read) = read_complete(&mut io::Cursor::new(&bytes), &mut payload).unwrap();
+        assert_eq!(payload, b"opaque runtime");
+        assert_eq!(
+            read.unwrap().credentials[0].value.expose(),
+            "sensitive-token"
+        );
+        let index = bytes
+            .windows(15)
+            .position(|w| w == b"sensitive-token")
+            .unwrap();
+        bytes[index] ^= 1;
+        assert!(read_complete(&mut io::Cursor::new(&bytes), &mut Vec::new()).is_err());
     }
 }

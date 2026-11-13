@@ -4554,7 +4554,11 @@ fn portable_photo() -> Vec<u8> {
 #[test]
 fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let lab = Lab::new();
+    let root = super::Root {
+        parent: PathBuf::from("/tmp"),
+        leaf: "e".into(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(crate::secrets::InMemory::default()), &root);
     let installer = portable_installer();
     done(lab.install(&installer, Confirm::Yes).unwrap());
     let source_agent: AgentName = "source".parse().unwrap();
@@ -4562,11 +4566,50 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     std::fs::create_dir_all(&profile).unwrap();
     std::fs::write(profile.join("config.yaml"), "model: source").unwrap();
     let bytes = b"runtime data is opaque, including ../../pretend/path";
-    std::fs::write(lab.home.join("runtime-export-source"), bytes).unwrap();
+    std::fs::write(profile.join("memory.md"), bytes).unwrap();
     let photo = portable_photo();
     let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
     store
         .import_presentation("home/source", Some("Gégé Commit"), Some(&photo))
+        .unwrap();
+    store.set_host("owner").unwrap();
+    store.ensure_home("home/source", "owner", true).unwrap();
+    let source_home = crate::bridge::store::home_id("home/source");
+    store
+        .add(
+            "original-message",
+            &source_home,
+            &crate::bridge::store::From::Agent,
+            "history survives",
+            "reply",
+        )
+        .unwrap();
+    let secret = "home/source-api".parse().unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &secret,
+            Some(
+                &crate::model::secret::SecretValue::new("credential-survives-privately".into())
+                    .unwrap(),
+            ),
+            Confirm::Yes,
+        )
+        .unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"home/source-app".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("old-bridge-token".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.source]\nenv = {{ API_TOKEN = \"secret:home/source-api\", MOBILE_APP_TOKEN = \"secret:home/source-app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
         .unwrap();
     let archive = lab._dir.path().join("gege.enclos");
     let exported = done(
@@ -4612,7 +4655,7 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             .install_runtime_with(&alice(), &other, &runtime, Confirm::Yes)
             .unwrap(),
     );
-    let policy_before = lab.engine.policy(&other).unwrap().version.version;
+    let policy_before = lab.engine.policy(&other).unwrap().snapshot.policy;
     let manifest = done(
         lab.engine
             .import_agent_export(
@@ -4630,7 +4673,7 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
         std::fs::read(
             lab.engine
                 .sandbox_home(&other)
-                .join("imported-comptoir-dev")
+                .join(".hermes/profiles/comptoir-dev/memory.md")
         )
         .unwrap(),
         bytes
@@ -4647,10 +4690,33 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
         store.avatar("other/comptoir-dev").unwrap().image.as_deref(),
         Some(photo.as_slice())
     );
+    let policy_after = lab.engine.policy(&other).unwrap().snapshot.policy;
+    assert_eq!(policy_after.fs, policy_before.fs);
+    assert_eq!(policy_after.net, policy_before.net);
+    assert!(policy_after.secrets.is_empty());
+    let grants = &policy_after.agent_secrets["comptoir-dev"];
     assert_eq!(
-        lab.engine.policy(&other).unwrap().version.version,
-        policy_before
+        lab.engine.granted_values(grants).unwrap()[0].1.expose(),
+        "credential-survives-privately"
     );
+    assert_ne!(grants["API_TOKEN"].0, secret);
+    let app = lab.engine.app_endpoint(&other, "comptoir-dev").unwrap();
+    assert_ne!(app.token.expose(), "old-bridge-token");
+    assert!(app.socket.to_string_lossy().contains("comptoir-dev"));
+    let target_home = crate::bridge::store::home_id("other/comptoir-dev");
+    assert_eq!(
+        store.messages_after(&target_home, 0).unwrap()[0].text,
+        "history survives"
+    );
+    assert_eq!(
+        store.messages_after(&source_home, 0).unwrap()[0].id,
+        "original-message"
+    );
+    assert_eq!(
+        std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!lab.audit().contains("credential-survives-privately"));
     assert!(profile.is_dir());
     assert_eq!(
         std::fs::read_dir(lab.engine.layout.data().join("agent-transfers"))

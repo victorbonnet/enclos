@@ -88,11 +88,11 @@ An agent the runtime has in a sandbox that enclos has no record of, usually made
 _Avoid_: orphan, rogue agent, unknown agent
 
 **Export**:
-A portable copy of an agent that can be imported on another host or in another sandbox. An Enclos export includes the agent's display name and image alongside its runtime export.
+A portable copy of an agent's runtime data, credentials, presentation and direct conversation history that can be imported on another host or in another sandbox, independent of the host's identities and sandbox policy.
 _Avoid_: backup, bundle, snapshot (a policy's word)
 
 **Runtime export**:
-The runtime's own portable representation of an agent's data, which that runtime imports.
+A runtime-specific portable representation of an agent's data, including its runtime-held logins.
 _Avoid_: backup, bundle, snapshot (a policy's word)
 
 **Session**:

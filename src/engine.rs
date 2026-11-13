@@ -26,6 +26,7 @@ mod pause;
 mod pending;
 mod policy;
 mod portable;
+mod portable_state;
 mod probe;
 mod proxy;
 mod restart;

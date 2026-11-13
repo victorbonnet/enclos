@@ -40,13 +40,13 @@ enum AgentVerb {
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
     },
-    /// Export runtime data and the Enclos display name and image to one portable file.
+    /// Export complete agent data, credentials, presentation and app history to a private file.
     Export {
         agent: AgentTarget,
         #[arg(long, value_name = "FILE")]
         to: PathBuf,
     },
-    /// Import an Enclos export, including its display name and image.
+    /// Import an Enclos export: runtime data, credentials, presentation and app history.
     Import {
         agent: AgentTarget,
         #[arg(long, value_name = "FILE")]
@@ -96,10 +96,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
         } => match engine.export_agent(by, &sandbox, &agent, &to, confirm)? {
             Planned::DryRun(plan) => output::show_plan(&plan),
             Planned::Done(archive) if output::json() => output::emit(&json!({
-                "agent": format!("{sandbox}/{agent}"), "path": output::path(&archive.path), "sha256": archive.sha256,
+                "agent": format!("{sandbox}/{agent}"), "path": output::path(&archive.path), "sha256": archive.sha256, "contains_credentials": true,
             })),
             Planned::Done(archive) => println!(
-                "Exported {sandbox}/{agent}, with its name and image, to {}.",
+                "Exported complete data for {sandbox}/{agent} to {}. This file contains credentials; keep it private.",
                 archive.path.display()
             ),
         },
@@ -119,14 +119,14 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 Planned::DryRun(plan) => output::show_plan(&plan),
                 Planned::Done(manifest) if output::json() => output::emit(&json!({
                     "agent": format!("{sandbox}/{agent}"), "metadata_only": metadata_only,
-                    "display_name": manifest.presentation.display_name, "has_image": manifest.presentation.avatar.is_some(),
+                    "display_name": manifest.presentation.display_name, "has_image": manifest.presentation.avatar.is_some(), "format_version": manifest.schema_version,
                 })),
                 Planned::Done(_) => println!(
                     "Imported {}for {sandbox}/{agent} from {}.",
                     if metadata_only {
                         "name and image "
                     } else {
-                        "runtime data, name and image "
+                        "agent data, credentials, presentation and app history "
                     },
                     from.display()
                 ),

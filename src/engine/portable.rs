@@ -76,6 +76,7 @@ impl Engine {
             ))
         })?;
         let runtime_path = export.archive;
+        let format = export.format;
         let command = export.command;
         if runtime_path.parent() != Some(home.as_path()) {
             return Err(failed(
@@ -84,66 +85,96 @@ impl Engine {
         }
         if confirm == Confirm::DryRun {
             return Ok(Planned::DryRun(Plan { create: vec![to], changes: vec![
-                format!("run `{}` in sandbox {name}", command.shown()),
-                "save the opaque runtime export, display name and image; no Enclos credentials or policy grants".into(),
+                format!("run {}'s complete export inside sandbox {name}", kind.display_name()),
+                "save complete runtime data, credentials, display name, image and app history in a private, unencrypted file".into(),
             ] }));
         }
-        let mut _runtime_cleanup = Temporary::new(runtime_path.clone());
-        _runtime_cleanup.keep = false;
-        let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
-        if ended.exit != 0 {
-            return Err(failed(format!(
-                "the runtime export exited with {}",
-                ended.exit
-            )));
+        if confirm == Confirm::Ask {
+            self.plan_restart(name)?
+                .confirm(&format!("exporting {name}/{agent}"))?;
         }
-        let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits();
-        let mut payload = OpenOptions::new()
-            .read(true)
-            .custom_flags(flags as i32)
-            .open(&runtime_path)
-            .map_err(failed)?;
-        if !payload.metadata().map_err(failed)?.is_file()
-            || !opened_path(&payload)
-                .map_err(failed)?
-                .starts_with(home.canonicalize().map_err(failed)?)
-        {
-            return Err(failed(
-                "the runtime export is not a plain file in the sandbox home",
-            ));
-        }
-        let presentation = self.export_presentation(&format!("{name}/{agent}"))?;
-        let mut output_cleanup = Temporary::new(to.clone());
-        // A failed create must never let cleanup delete an existing destination.
-        output_cleanup.keep = true;
-        let mut output = output_cleanup.create()?;
-        output_cleanup.keep = false;
-        let exported = self.write(
-            by,
-            "agent export",
-            Some(format!("{name}/{agent}")),
-            |a: &Archive| {
-                format!(
-                    "exported {} (sha256 {}) with its display name and image",
-                    a.path.display(),
-                    a.sha256
-                )
-            },
-            |_| {
-                agent_export::write(
-                    &mut payload,
-                    &mut output,
-                    kind,
-                    format!("{name}/{agent}"),
-                    presentation,
-                )
+        let paused = self.pause_runtime(by, name, "agent export")?;
+        let result = (|| {
+            let state = self.export_host_state(name, agent)?;
+            let mut _runtime_cleanup = Temporary::new(runtime_path.clone());
+            _runtime_cleanup.keep = false;
+            let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
+            if ended.exit != 0 {
+                return Err(failed(format!(
+                    "the runtime export exited with {}",
+                    ended.exit
+                )));
+            }
+            let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits();
+            let mut payload = OpenOptions::new()
+                .read(true)
+                .custom_flags(flags as i32)
+                .open(&runtime_path)
                 .map_err(failed)?;
-                output.sync_all().map_err(failed)?;
-                Source::open(&self.layout, &to)?.hash()
-            },
-        )?;
-        output_cleanup.keep = true;
-        Ok(Planned::Done(exported))
+            if !payload.metadata().map_err(failed)?.is_file()
+                || !opened_path(&payload)
+                    .map_err(failed)?
+                    .starts_with(home.canonicalize().map_err(failed)?)
+            {
+                return Err(failed(
+                    "the runtime export is not a plain file in the sandbox home",
+                ));
+            }
+            let presentation = self.export_presentation(&format!("{name}/{agent}"))?;
+            let scratch =
+                to.with_file_name(format!(".enclos-export-{}.tmp", new_id().map_err(failed)?));
+            let mut output_cleanup = Temporary::new(scratch.clone());
+            // A failed create must never let cleanup delete an existing destination.
+            output_cleanup.keep = true;
+            let mut output = output_cleanup.create()?;
+            output_cleanup.keep = false;
+            let exported = self.write(
+                by,
+                "agent export",
+                Some(format!("{name}/{agent}")),
+                |a: &Archive| {
+                    format!(
+                        "exported complete private agent data to {} (sha256 {})",
+                        a.path.display(),
+                        a.sha256
+                    )
+                },
+                |_| {
+                    agent_export::write_complete(
+                        &mut payload,
+                        &mut output,
+                        kind,
+                        format!("{name}/{agent}"),
+                        presentation,
+                        format,
+                        &state,
+                    )
+                    .map_err(failed)?;
+                    output.sync_all().map_err(failed)?;
+                    let hash = Source::open(&self.layout, &scratch)?.hash()?.sha256;
+                    // Publish a complete file without replacing a path created
+                    // concurrently. Both names are on the same filesystem.
+                    std::fs::hard_link(&scratch, &to).map_err(failed)?;
+                    Ok(Archive {
+                        path: to.clone(),
+                        sha256: hash,
+                    })
+                },
+            )?;
+            Ok(Planned::Done(exported))
+        })();
+        let resumed = self.resume_runtime(by, name, paused);
+        match (result, resumed) {
+            (Ok(exported), Ok(())) => Ok(exported),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(Error::FailedAfter {
+                error: Box::new(error),
+                done: "writing the complete export".into(),
+            }),
+            (Err(error), Err(resume)) => Err(failed(format!(
+                "{error}; also could not resume runtime: {resume}"
+            ))),
+        }
     }
 
     /// Imports an Enclos export; the runtime still extracts its own payload inside the sandbox.
@@ -160,7 +191,15 @@ impl Engine {
         let mut source = Source::open(&self.layout, from)?;
         // A dry run validates every byte but writes no temporary file or database.
         if confirm == Confirm::DryRun {
-            let manifest = agent_export::read(&mut source.file, &mut io::sink()).map_err(failed)?;
+            let (manifest, state) =
+                agent_export::read_complete(&mut source.file, &mut io::sink()).map_err(failed)?;
+            if !metadata_only {
+                self.preflight_host_import(name, &agent, state.as_ref())?;
+            }
+            if !metadata_only && runtime_import_unsupported(kind, &agent, &manifest.runtime_format)
+            {
+                return Err(failed("unsupported runtime export format"));
+            }
             if manifest.runtime != kind.as_str() {
                 return Err(failed(
                     "the export's runtime differs from the destination sandbox",
@@ -180,7 +219,7 @@ impl Engine {
                         },
                         source.path.display()
                     ),
-                    "restore the display name and image, without policy grants or device pairings"
+                    "restore presentation and, for a complete import, agent credentials and app history; retain destination host policy and pairings"
                         .into(),
                 ],
                 ..Plan::default()
@@ -216,9 +255,9 @@ impl Engine {
         )?;
         let mut payload = Temporary::new(dir.join(format!("{id}.runtime")));
         let mut input = File::open(&outer.path).map_err(failed)?;
-        let manifest = {
+        let (manifest, state) = {
             let mut output = payload.create()?;
-            agent_export::read(&mut input, &mut output).map_err(failed)?
+            agent_export::read_complete(&mut input, &mut output).map_err(failed)?
         };
         if manifest.runtime != kind.as_str() {
             return Err(failed(
@@ -226,7 +265,49 @@ impl Engine {
             ));
         }
         if !metadata_only {
-            self.import_agent(by, name, agent.clone(), &payload.path, confirm)?;
+            self.preflight_host_import(name, &agent, state.as_ref())?;
+            if runtime_import_unsupported(kind, &agent, &manifest.runtime_format) {
+                return Err(failed("unsupported runtime export format"));
+            }
+        }
+        let conversations = state
+            .as_ref()
+            .map(|s| s.history.conversation_map(&format!("{name}/{agent}")))
+            .transpose()
+            .map_err(failed)?
+            .unwrap_or_default();
+        let context =
+            serde_json::json!({"source_agent":manifest.source_agent,"conversations":conversations})
+                .to_string();
+        let paused = if !metadata_only {
+            if confirm == Confirm::Ask {
+                self.plan_restart(name)?
+                    .confirm(&format!("importing {name}/{agent}"))?;
+            }
+            Some(self.pause_runtime(by, name, "agent import")?)
+        } else {
+            None
+        };
+        if !metadata_only {
+            let imported = self.import_agent_data(
+                by,
+                name,
+                agent.clone(),
+                &payload.path,
+                Some((&manifest.runtime_format, &context)),
+                Confirm::Yes,
+            );
+            if let Err(error) = imported {
+                return Err(Error::WithContext {
+                    error: Box::new(error),
+                    what: format!(
+                        "import did not finish; sandbox {name}'s runtime remains stopped. Inspect the destination before restarting it"
+                    ),
+                });
+            }
+            if let Some(state) = &state {
+                self.restore_host_state(by, name, &agent, state, &conversations).map_err(|error| Error::FailedAfter { error: Box::new(error), done: format!("importing {name}/{agent}'s runtime data; its runtime remains stopped. Remove the imported agent and retry after fixing the cause") })?;
+            }
         }
         let image = manifest.presentation.image().map_err(failed)?;
         self.write(by, "agent import presentation", Some(format!("{name}/{agent}")),
@@ -237,6 +318,9 @@ impl Engine {
             }).map_err(|error| if metadata_only { error } else { Error::FailedAfter {
                 error: Box::new(error), done: format!("importing {name}/{agent}; restore its name and image with agent import --metadata-only"),
             }})?;
+        if let Some(paused) = paused {
+            self.resume_runtime(by, name, paused)?;
+        }
         Ok(Planned::Done(manifest))
     }
 
@@ -298,4 +382,14 @@ fn failed(e: impl std::fmt::Display) -> Error {
     Error::Session {
         what: e.to_string(),
     }
+}
+
+fn runtime_import_unsupported(
+    kind: crate::model::runtime::RuntimeKind,
+    agent: &AgentName,
+    format: &str,
+) -> bool {
+    adapter(kind)
+        .import_export(agent, Path::new("/export/runtime"), format, "{}")
+        .is_none()
 }

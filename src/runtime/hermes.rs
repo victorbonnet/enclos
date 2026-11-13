@@ -371,14 +371,25 @@ impl RuntimeAdapter for Hermes {
 
     fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
         let archive = prefix.with_extension("tar.gz");
-        let mut words: Vec<OsString> = [HERMES, "profile", "export", name.as_str(), "-o"]
-            .map(OsString::from)
-            .to_vec();
-        words.push(archive.as_os_str().to_owned());
         Some(super::RuntimeExport {
-            command: SandboxCommand::new(words),
+            format: "hermes-data-v1",
+            command: transfer("export", name, &archive, "{}"),
             archive,
         })
+    }
+
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        context: &str,
+    ) -> Option<SandboxCommand> {
+        match format {
+            "native" => self.import_agent(name, archive),
+            "hermes-data-v1" => Some(transfer("import", name, archive, context)),
+            _ => None,
+        }
     }
 
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
@@ -651,6 +662,12 @@ impl RuntimeAdapter for Hermes {
         names.sort();
         Ok(names)
     }
+}
+
+fn transfer(operation: &str, name: &AgentName, path: &Path, context: &str) -> SandboxCommand {
+    SandboxCommand::new(vec!["/bin/sh".into(), "-c".into(),
+        "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; exec \"$python\" -c \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"".into(),
+        "enclos-hermes-transfer".into(), include_str!("hermes/transfer.py").into(), operation.into(), name.as_str().into(), path.as_os_str().to_owned(), context.into()])
 }
 
 #[cfg(test)]
