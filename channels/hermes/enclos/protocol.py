@@ -39,6 +39,73 @@ PLATFORM_HINT = (
 )
 
 
+HOME_COMMANDS = ("/sethome", "/set-home")
+# Commands of the runtime the app does not offer: /sethome is answered here,
+# /start and /topic are Telegram's.
+COMMANDS_LEFT_OUT = ("sethome", "set-home", "start", "topic")
+# The answer to /sethome: enclos keeps the agent's home channel (ADR 0044).
+HOME_ANSWER = (
+    "In the enclos app, this agent's home channel is its **Home** conversation, which enclos "
+    "keeps: cron jobs that belong to no conversation, messages with no other place to go, and "
+    "Hermes's own notices land there. There is nothing to set."
+)
+
+# Hermes's notices about itself (gateway online, shutting down, restarting,
+# no home channel), by their keys in its translations, sent as `status`:
+# Hermes marks them as such for Discord only, so they are told by their
+# text, in the gateway's own language.
+NOTICE_KEYS = (
+    "gateway.startup.online",
+    "gateway.shutdown.notice_shutdown",
+    "gateway.shutdown.notice_restart",
+    "gateway.restart.restarting",
+    "gateway.notify.no_home_channel",
+)
+# Their English beginnings, for when Hermes's translations cannot be read.
+NOTICE_STARTS = (
+    "♻️ Gateway online",
+    "⚠️ Hermes is shutting down",
+    "⚠️ Hermes is restarting",
+    "♻ Restarting gateway",
+    "📬 No home channel is set",
+)
+_notice_starts: tuple[str, ...] | None = None
+
+
+def _translated_starts() -> list[str]:
+    """Each notice's text up to its first placeholder, from Hermes's `t`."""
+    try:
+        from agent.i18n import t  # Hermes's; absent outside the gateway
+    except Exception:
+        return []
+    mark = "\x00"
+    starts = []
+    for key in NOTICE_KEYS:
+        try:
+            text = t(key, platform=mark, sethome_cmd=mark, name=mark, chat_id=mark)
+        except Exception:
+            continue
+        start = str(text).split(mark)[0].strip()
+        if len(start) >= 8 and start != key:
+            starts.append(start)
+    return starts
+
+
+def is_notice(text: str) -> bool:
+    """Whether `text` is one of Hermes's notices about itself."""
+    global _notice_starts
+    if _notice_starts is None:
+        _notice_starts = tuple(dict.fromkeys([*_translated_starts(), *NOTICE_STARTS]))
+    stripped = text.strip()
+    return any(stripped.startswith(start) for start in _notice_starts)
+
+
+def is_home_command(text: str) -> bool:
+    """Whether the person's `text` is `/sethome` (or `/set-home`), with or without arguments."""
+    words = text.strip().split()
+    return bool(words) and words[0].lower() in HOME_COMMANDS
+
+
 class DecodeError(Exception):
     """Why a line is not a message to act on. `code` is the protocol's."""
 
@@ -102,6 +169,8 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         _check_id(message.get("id"), "id")
         if kind == "hello":
             _check_text(message.get("token"), "token")
+            if message.get("home") is not None:
+                _check_id(message.get("home"), "home")
         elif kind == "message.in":
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
@@ -156,16 +225,37 @@ def _message(message_type: str, /, **fields: Any) -> dict[str, Any]:
     return {"v": VERSION, "id": new_id(), "type": message_type, **fields}
 
 
-def hello(runtime: str, agent: str) -> dict[str, Any]:
-    return _message("hello", runtime=runtime, agent=agent, capabilities=list(CAPABILITIES))
+def hello(runtime: str, agent: str, extra: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The plugin's hello; `extra` adds capabilities it has this time (`commands`, once listed)."""
+    return _message("hello", runtime=runtime, agent=agent, capabilities=[*CAPABILITIES, *extra])
+
+
+def commands(listed: list[tuple[str, str, str]]) -> dict[str, Any]:
+    """The commands a person may type to the runtime, from (name, description, args)
+    rows: each name once, without its `/`, those in COMMANDS_LEFT_OUT left out. The
+    bridge keeps names, lengths and the total within what a device takes."""
+    seen: set[str] = set()
+    rows = []
+    for name, description, args in listed:
+        name = str(name).strip().lstrip("/")
+        if not name or name in seen or name in COMMANDS_LEFT_OUT:
+            continue
+        seen.add(name)
+        row: dict[str, Any] = {"name": name, "description": " ".join(str(description or "").split())}
+        if args and str(args).strip():
+            row["args"] = " ".join(str(args).split())
+        rows.append(row)
+    return _message("commands", commands=rows)
 
 
 def message_out(conversation: str, text: str, reply_to: str | None = None,
-                attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """A reply when it answers a message, `notify` otherwise (a cron job, background work);
-    with the files it carries, each already in the channel's media folder (`attachment`)."""
+                attachments: list[dict[str, Any]] | None = None,
+                kind: str | None = None) -> dict[str, Any]:
+    """A reply when it answers a message, `notify` otherwise (a cron job, background work),
+    or the `kind` given (`status`: the runtime about itself); with the files it carries,
+    each already in the channel's media folder (`attachment`)."""
     fields: dict[str, Any] = {"conversation": conversation, "text": text,
-                              "kind": "reply" if reply_to else "notify"}
+                              "kind": kind or ("reply" if reply_to else "notify")}
     if reply_to:
         fields["reply_to"] = reply_to
     if attachments:

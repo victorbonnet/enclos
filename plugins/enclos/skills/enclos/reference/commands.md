@@ -336,6 +336,16 @@ enclos app unpair [OPTIONS] <DEVICE>
 
 - `<DEVICE>`
 
+#### `enclos app host`
+
+Show the host's person, whose each agent's Home is: the person of the first device paired. With a person, make it them instead; they must have a paired device, and get every Home with what it holds
+
+```text
+enclos app host [OPTIONS] [PERSON]
+```
+
+- `[PERSON]`
+
 #### `enclos app status`
 
 Who can reach the agents, from which devices, and when each was last seen

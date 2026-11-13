@@ -28,9 +28,16 @@ fn line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromBridge {
-    /// First on every connection: the agent's token.
+    /// First on every connection: the agent's token, and its Home
+    /// conversation, where what has no conversation of its own goes (the
+    /// runtime's home channel: Hermes's cron jobs, `send_message` with no
+    /// target).
     #[serde(rename = "hello")]
-    Hello { token: String },
+    Hello {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<ConversationId>,
+    },
     /// A person's message to the agent.
     #[serde(rename = "message.in")]
     MessageIn {
@@ -100,6 +107,10 @@ pub enum FromPlugin {
     /// A step of the agent's work on an answer: a tool it starts, or ends.
     #[serde(rename = "tool")]
     Tool(ToolStep),
+    /// The commands a person may type to the runtime (`/new`, `/model`),
+    /// whole: after the `hello`, and again when they change.
+    #[serde(rename = "commands")]
+    Commands { commands: Vec<Command> },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -113,9 +124,24 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "typing",
     "conversation.title",
     "tool",
+    "commands",
     "ack",
     "error",
 ];
+
+/// A command the person may type to the runtime: `/` and its name, then
+/// what `args` says, if anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    /// Without the `/`: `new`, `model`.
+    pub name: String,
+    /// What it does, one line.
+    #[serde(default)]
+    pub description: String,
+    /// What follows it, as the runtime writes it (`[name]`, `<prompt>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+}
 
 /// A file the agent sends, which the plugin put in the channel's `media`
 /// folder (beside its socket, in the sandbox home): the bridge takes it from
@@ -167,6 +193,9 @@ pub enum OutKind {
     Reply,
     /// Sent with nobody asking now: a cron job, background work.
     Notify,
+    /// Not the agent speaking but its runtime, about itself: Hermes's
+    /// gateway going online or shutting down. Shown as a quiet line.
+    Status,
 }
 
 /// What a runtime can do; an unknown one, from a newer plugin, reads as
@@ -184,6 +213,8 @@ pub enum Capability {
     Titles,
     /// It reports the tools it runs while it works (`tool`).
     Tools,
+    /// It lists the commands a person may type to it (`commands`).
+    Commands,
     #[serde(other)]
     Unknown,
 }
