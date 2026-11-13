@@ -149,7 +149,6 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `sandbox.policy.preview` | device | `sandbox`, `base`, `change`: `{field,before?,after?}` | Validate a single-field add, edit or removal against the active policy |
 | `sandbox.policy.preview` | bridge | `sandbox`, `base`, `revision`, `change`, `changes`, `restart`, `of` | Exact host-generated effects and restart requirement |
 | `sandbox.policy.apply` | device | `sandbox`, `base`, `revision`, `change` | Apply only the freshly reviewed edit, revalidated under the engine state lock |
-
 | `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, including archived ones, then every `message` of them after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |

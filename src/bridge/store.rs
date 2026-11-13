@@ -795,12 +795,12 @@ impl Store {
             }
             let changed = if host {
                 self.db.execute(
-                    "UPDATE conversations SET owner = ?2, revision = revision + 1 WHERE id = ?1 AND owner != ?2",
+                    "UPDATE conversations SET owner = ?2, archived = 0, revision = revision + 1 WHERE id = ?1 AND owner != ?2",
                     params![id, owner],
                 )?
             } else {
                 self.db.execute(
-                    "UPDATE conversations SET owner = ?2, revision = revision + 1 WHERE id = ?1 AND owner = ''",
+                    "UPDATE conversations SET owner = ?2, archived = 0, revision = revision + 1 WHERE id = ?1 AND owner = ''",
                     params![id, owner],
                 )?
             };
@@ -1136,7 +1136,9 @@ impl Store {
             params![HOST_PERSON, person],
         )?;
         transaction.execute(
-            "UPDATE conversations SET owner = ?1 WHERE id LIKE 'home.%'",
+            // Not `LIKE`, which ignores case: `Home.x` is a device's. Unarchived:
+            // the new owner did not archive it
+            "UPDATE conversations SET owner = ?1, archived = 0, revision = revision + 1 WHERE substr(id, 1, 5) = 'home.'",
             params![person],
         )?;
         transaction.commit()
@@ -2207,5 +2209,27 @@ mod tests {
         ] {
             assert_eq!(store.owner(id).unwrap().as_deref(), Some(owner), "{id}");
         }
+    }
+
+    #[test]
+    fn home_taken_by_the_hosts_person_is_not_archived_for_them() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .ensure_home("lab/main", "guest@example.com", false)
+            .unwrap();
+        store
+            .set_archived("home.lab.main", "guest@example.com", true)
+            .unwrap();
+        store
+            .ensure_home("lab/main", "victor@example.com", true)
+            .unwrap();
+        let home = store
+            .conversations("victor@example.com")
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "home.lab.main")
+            .unwrap();
+        assert!(!home.archived);
     }
 }
