@@ -23,6 +23,8 @@ mod tests;
 mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "audit.rs"]
+mod audit;
 #[path = "avatars.rs"]
 mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
@@ -1392,6 +1394,11 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
         }
     };
     link.send(ToDevice::Authenticated {
+        capabilities: if hub.known_host().as_deref() == Some(&person) {
+            vec!["audit".to_owned()]
+        } else {
+            vec![]
+        },
         person: person.clone(),
     })?;
     // Authenticated: no longer among the callers that are few at once
@@ -1593,6 +1600,12 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::Audit { before } => {
+                let response = hub
+                    .host_audit(store, device, person, message.id, before)
+                    .unwrap_or_else(ToDevice::Error);
+                link.send(response)?;
+            }
             FromDevice::AgentNameGet { agent } => {
                 match hub.get_agent_name(store, device, person, &agent, message.id.to_string()) {
                     Ok(name) => link.send(name)?,

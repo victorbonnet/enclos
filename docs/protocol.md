@@ -108,7 +108,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `type` | From | Fields |
 | --- | --- | --- |
 | `auth` | device | `device`, `sig` (base64url DER signature of `enclos auth v1` ‖ the handshake hash) |
-| `authenticated` | bridge | `person` |
+| `authenticated` | bridge | `person`, `capabilities`? (`["audit"]` for the host's person) |
 | `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of `enclos pair proof v1` ‖ the handshake hash, keyed with `code`), `sig` (base64url DER signature, by `device_key`, of `enclos pair v1` ‖ the handshake hash), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `bad_signature`, `declined` |
@@ -232,6 +232,17 @@ Hermes uses `_send_exec_approval_prompt(ExecApprovalPrompt)` while retaining its
 Client fallback does not imply binary downgrade compatibility: once a bridge stores an `approval` answer or `resolved` state, the preceding question-only binary cannot deserialize those linked records during history sync. Retained approval data needs an approval-aware bridge reader; an operational rollback needs a compatible reader or a pre-feature database restore. No down-conversion or history deletion is automatic.
 
 Structured approval controls bypass a running group's queue of ordinary messages and work for a member's exact request; older group clients need a supporting app and bridge.
+
+### Host audit
+
+The bridge advertises `audit` only to the host's person, as recorded by pairing or `enclos app host`. Each request rereads that identity and the device's paired identity and keys; another person, unknown ownership or a revoked device receives `not_allowed`. A read failure returns a correlated `internal` error.
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `audit` | device | `before`? (entry sequence) | Newest audit entries first; only entries with a smaller sequence when `before` is given |
+| `audit.list` | bridge | `of`, `entries`, `next_before` (sequence or `null`) | Up to 25 entries, bounded to fit one Noise message; use `next_before` to request older entries |
+
+Each entry has `seq`, `time` (Unix seconds), `user`, `host`, `command`, `target` (or `null`), `result` (`ok`, `failed`, `unfinished`), `message` (or `null`) and `finished` (Unix seconds or `null`). Unfinished means no outcome was recorded, including a command still running. Text fields over 1 KiB are shortened with an ellipsis for display; full entries remain on the host. `of` correlates the page with its request. Reading entries does not verify the hash chain; `enclos audit verify` remains the integrity check. Older bridges advertise no `audit` capability and are not sent these requests.
 
 ### Notifications
 
