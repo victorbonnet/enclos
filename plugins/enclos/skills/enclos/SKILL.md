@@ -1,7 +1,6 @@
 ---
 name: enclos
 description: enclos creates sandboxes on this host, installs agent runtimes such as Hermes in them and runs agents there, with a policy, a network log and an audit log. Use when the user asks what enclos is or can do, wants to install or set it up, wants to run, sandbox, isolate or review AI agents (Hermes) on this host, asks what an agent reached or was refused, or wants to change a sandbox's policy, secrets, bots or mobile app pairing.
-allowed-tools: Bash(enclos *)
 ---
 
 # enclos
@@ -12,15 +11,15 @@ You are a **host assistant**: you run on the host, outside every sandbox, and yo
 
 ## What a sandbox holds an agent to
 
-- **Files:** it writes only to its own home (`sandboxes/<name>/home` in enclos's data folder) and to folders the policy adds. It reads broadly, except a deny list of sensitive paths: `~/.ssh`, cloud credentials and other tools' logins, keychains, password managers, browser data, mail, shell history, the configuration of assistants on the host (`~/.claude`, `~/.codex`, `~/.hermes` and others), other sandboxes and enclos's own files.
-- **Network:** the connections it opens go out only through its own proxy, which logs every connection it decides on. The proxy never connects to loopback (the host's own services, other sandboxes' proxies), link-local or cloud metadata addresses, whatever the policy says; it reaches a private address on the local network only for a host the policy both allows and names in `private` (ADR 0017). The `assistant` template reaches the public web (ports 80 and 443); the `minimal` template, or `mode = "allowlist"`, reaches only listed hosts (plus the runtime's own once it is installed).
+- **Files:** it writes only to its own home (`sandboxes/<name>/home` in enclos's data folder) and to folders the policy adds, except a sandbox made from `autonomous`, which writes everywhere the user can but the sensitive paths, enclos's own files and its read-only paths (the shell's startup files): it can change or remove the user's own files. It reads broadly, except a deny list of sensitive paths: `~/.ssh`, cloud credentials and other tools' logins, keychains, password managers, browser data, mail, shell history, the configuration of assistants on the host (`~/.claude`, `~/.codex`, `~/.hermes` and others), other sandboxes and enclos's own files.
+- **Network:** the connections it opens go out only through its own proxy, which logs every connection it decides on. The proxy never connects to loopback (the host's own services, other sandboxes' proxies), link-local or cloud metadata addresses, whatever the policy says; it reaches a private address on the local network only for a host the policy both allows and names in `private` (ADR 0017). The `assistant` template reaches the public web (ports 80 and 443), `autonomous` any public address on any port; the `minimal` template, or `mode = "allowlist"`, reaches only listed hosts (plus the runtime's own once it is installed).
 - **The exception: listening.** A runtime that declares a listening service, as Hermes does for its gateway, sets its sandbox's `listen`. Anything in that sandbox may then accept connections on any TCP port outside enclos's proxy range (41000 to 41999), on every address the host has, and answer over them without the proxy or the network log (ADR 0028). `enclos policy show` and `enclos policy test` say when listening is open, and `enclos status` names each listener. Never tell the user that everything a sandbox sends goes through the proxy or the log.
 - **The rest of the host:** opening apps, Apple Events, launchd jobs, preferences, the pasteboard and signals to other processes are blocked.
 - **A record:** every command that changes something is an audit entry, and `enclos audit verify` checks that no one edited the log.
 
 What it is **not**: a defense against malicious code exploiting the kernel. The threat model is accidental damage by agents the user mostly trusts. Agents in one sandbox share its files, policy, proxy and login: the sandbox, not the agent, is the permission boundary. Say this plainly when the user's expectations go further, and never describe a protection as tested or enforced unless enclos's own output (`policy test`, `doctor`) says so on this host. Known gaps are in [troubleshooting](reference/troubleshooting.md#known-gaps).
 
-Platforms: Apple silicon Macs with macOS 15 or later (Seatbelt backend), in releases. Linux (bubblewrap backend, systemd 254 or later) is in development. `enclos doctor` says which backend runs on this host.
+Platforms: Apple silicon Macs with macOS 15 or later (Seatbelt backend), and Linux on x86_64 or arm64 with systemd 254 or later (bubblewrap backend), from 0.3.0 on. `autonomous` is macOS only for now. `enclos doctor` says which backend runs on this host.
 
 ## The words
 
@@ -31,7 +30,7 @@ Use these; the user's docs and enclos's messages do.
 | Host | This machine, where enclos runs and keeps its state in its **data folder**: `~/.enclos` on macOS, `$XDG_DATA_HOME/enclos` (else `~/.local/share/enclos`) on Linux, or `$ENCLOS_HOME` on either when it is set. `enclos status` prints the one in use as `data`. |
 | Sandbox | A named isolated environment: its own home, policy, proxy and services. The permission boundary. |
 | Backend | The isolation technology: `seatbelt` (macOS) or `bubblewrap` (Linux). |
-| Template | What a policy starts from: `assistant` (the public web) or `minimal` (only listed hosts). |
+| Template | What a policy starts from: `assistant` (the public web), `minimal` (only listed hosts) or `autonomous` (writes everywhere but the sensitive paths, any public port; macOS only, proposed in ADR 0058). |
 | Policy | What a sandbox may do with files, network, host services, resources and secrets. Stored as numbered versions; `policy.toml` holds the sandbox's own changes on top of its template. |
 | Active / pending policy | The version in force; a change waiting for running sessions to restart (`policy apply`). |
 | Runtime | The software in a sandbox that runs its agents, such as Hermes. One per sandbox. |

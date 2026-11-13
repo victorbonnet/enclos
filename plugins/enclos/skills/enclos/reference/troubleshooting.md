@@ -37,7 +37,7 @@ Both exit 1 when they find something, and say what to do. `enclos state repair` 
 From the release notes (https://github.com/victorbonnet/enclos/tree/main/docs/release-notes); read the latest ones there when they matter.
 
 - **Threat model:** accidental damage by agents the user mostly trusts; not malicious code exploiting the kernel.
-- **Platforms:** Apple silicon Macs in releases; Linux in development. Hermes is the only runtime.
+- **Platforms:** Apple silicon Macs and Linux (x86_64, arm64; systemd 254 or later) in releases, Linux from 0.3.0; `autonomous` is macOS only. Hermes is the only runtime.
 - **Environment variables:** any process of the user's can read another's start-up environment, sandboxed or not, Apple's own programs aside. A Hermes gateway gets its secrets through a file, but a `connect` or `exec` session gets them as variables. Advise against keeping secrets in exported shell variables while sandboxes run.
 - **Processes are visible:** a sandbox can list what runs on the host.
 - **Agents share a sandbox's files:** isolation is per sandbox; a secret granted to one agent is kept apart from the others, not hidden from them.

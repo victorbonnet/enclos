@@ -4,7 +4,7 @@ How to do each thing enclos does, as a host assistant. The commands are the user
 
 ## Install enclos
 
-Requirements: an Apple silicon Mac with macOS 15 or later (`uname -m` is `arm64`, `sw_vers -productVersion` 15 or more), and an account with a model provider Hermes supports. About 2.5 GB free per sandbox. Linux is in development and not in a release yet.
+Requirements: an Apple silicon Mac with macOS 15 or later (`uname -m` is `arm64`, `sw_vers -productVersion` 15 or more), or Linux on x86_64 or arm64 with systemd 254 or later ([On Linux](#on-linux)), and an account with a model provider Hermes supports. About 2.5 GB free per sandbox.
 
 ```bash
 curl -fsSL https://enclos.dev/install.sh | bash
@@ -26,7 +26,7 @@ enclos sandbox create lab --template assistant   # or --template minimal: only t
 enclos runtime install hermes --sandbox lab      # Hermes's own installer, inside the sandbox; a few minutes
 ```
 
-Ask the user which template: `assistant` lets agents reach the public web on ports 80 and 443; `minimal` reaches only Hermes's own hosts (its install sources and the ChatGPT subscription's) plus what is allowed later. The template is required on purpose, so the widest is never picked by leaving it out. Avoid the sandbox name `home`.
+Ask the user which template: `assistant` lets agents reach the public web on ports 80 and 443; `minimal` reaches only Hermes's own hosts (its install sources and the ChatGPT subscription's) plus what is allowed later; `autonomous`, macOS only, also writes everywhere the user can but the sensitive paths, so it can change or remove their files: offer it only when they ask for an agent that looks after the host, and say that. The template is required on purpose, so the widest is never picked by leaving it out. Avoid the sandbox name `home`.
 
 The login is the user's: give them
 
@@ -200,4 +200,4 @@ enclos sandbox rm lab --keep-data     # its record and secrets, keeping its home
 
 ## On Linux
 
-In development, not in a release. It needs systemd 254 or later (Debian 13, Ubuntu 24.04; not Debian 12) and the `bubblewrap` package, and sandboxes are made with `--backend bubblewrap`. On Ubuntu 24.04, AppArmor may need a profile for `/usr/bin/bwrap`; that and any `sudo` step are the user's. `enclos doctor` says what the backend enforces here, such as writes held by mounts alone where the kernel has no Landlock.
+In releases from 0.3.0 on, on x86_64 or arm64; the installer above works as on a Mac. It needs systemd 254 or later (Debian 13, Ubuntu 24.04; not Debian 12) and the `bubblewrap` package, installed before `enclos init`, which then makes bubblewrap the default backend, so the commands are the same as on a Mac. `autonomous` cannot be used there yet. On Ubuntu 24.04, AppArmor may need a profile for `/usr/bin/bwrap`; that and any `sudo` step are the user's. `enclos doctor` says what the backend enforces here, such as writes held by mounts alone where the kernel has no Landlock.
