@@ -149,7 +149,7 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `group.new` | device | `conversation`, `members` (two to six agents of one sandbox, `sandbox/agent` each), `title`? | Start a [group](#groups) with those agents; its owner is the device's person. The same again, from its owner with the same members (an answer lost), is answered with the group as it is; anything else under an id in use is refused |
 | `group.stop` | device | `conversation` | Stop the group's discussion: queued turns are cancelled and a running one stopped; what was said stays |
 | `group.state` | bridge | `conversation`, `state` (`working`, `settled`, `bounded`, `stopped` or `failed`), `round`, `max_rounds`, `members`: `[{agent, turn}]` (`turn`: `queued`, `working`, `replied`, `passed`, `failed`, `cancelled`, or none), `reason`? | Where the group's discussion is: at `sync` for each group, and whenever it changes |
-| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. The conversations stay on the host |
+| `device.forget` | device | (none) | The person forgot this host on the device: the bridge unpairs the device, as `enclos app unpair` does, sends `ack` and ends the connection. Recorded in the audit log as `app forget` first: when that cannot be written the device stays paired and gets an `error`. The conversations stay on the host |
 | `ack`, `error` | either | as on the plugin leg | |
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
@@ -212,7 +212,7 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 
 ## Versions
 
-`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
+`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A new value of a field with a fixed set, such as a `message.out` `kind`, is a change an older peer would misread: a `kind` the receiver does not know is a version mismatch, not an optional addition. The bridge answers such a message `bad_message` and the plugin keeps it until an `ack`, so it would come back after every `hello`. `status` joined version 1 before any release: version 1 is not released yet, and the plugin and the bridge come in the same enclos binary. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
 
 ## Sandbox policy requests
 
