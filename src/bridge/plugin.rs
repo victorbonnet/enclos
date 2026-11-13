@@ -402,7 +402,7 @@ mod tests {
                 FromPlugin::Hello {
                     runtime: "hermes".into(),
                     agent: "main".into(),
-                    capabilities: vec![Capability::Notify],
+                    capabilities: vec![Capability::Typing],
                 },
             );
             loop {
@@ -443,7 +443,7 @@ mod tests {
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
         let (hello, mut reader, mut writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert_eq!(hello.agent, "main");
-        assert_eq!(hello.capabilities, [Capability::Notify]);
+        assert_eq!(hello.capabilities, [Capability::Typing]);
         let conversation = ConversationId::new("c-1").unwrap();
         let sent = writer
             .message(

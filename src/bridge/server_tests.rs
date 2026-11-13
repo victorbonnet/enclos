@@ -551,3 +551,10 @@ fn home_keeps_its_name() {
         .unwrap();
     assert_eq!(titled.title.as_deref(), Some("Home"));
 }
+
+#[test]
+fn a_capability_the_bridge_does_not_know_is_not_shown() {
+    let announced: Vec<Capability> =
+        serde_json::from_value(serde_json::json!(["notify", "commands"])).unwrap();
+    assert_eq!(known(announced), vec![Capability::Commands]);
+}

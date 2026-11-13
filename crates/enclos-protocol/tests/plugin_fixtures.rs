@@ -242,12 +242,16 @@ fn a_message_reads_as_its_fields_say() {
 
 #[test]
 fn unknown_fields_and_capabilities_are_ignored() {
-    let line = br#"{"v":1,"id":"m1","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","teleport"],"later":true}"#;
+    // `notify`, which older plugins announce and every runtime now has, reads as unknown too.
+    let line = br#"{"v":1,"id":"m1","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","typing","teleport"],"later":true}"#;
     let message = decode_from_plugin(line).unwrap();
     let FromPlugin::Hello { capabilities, .. } = message.body else {
         panic!("not a hello: {:?}", message.body);
     };
-    assert_eq!(capabilities, vec![Capability::Notify, Capability::Unknown]);
+    assert_eq!(
+        capabilities,
+        vec![Capability::Unknown, Capability::Typing, Capability::Unknown]
+    );
 }
 
 #[test]

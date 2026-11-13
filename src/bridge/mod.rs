@@ -5,6 +5,7 @@
 
 pub mod ids;
 pub mod keys;
+pub mod pace;
 pub mod page;
 pub mod plugin;
 pub mod server;

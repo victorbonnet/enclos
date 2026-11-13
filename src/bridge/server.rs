@@ -44,6 +44,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 use super::ids::{new_id, random_bytes};
+use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::store::{
     Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
@@ -109,6 +110,15 @@ struct PluginOut {
     sent: HashSet<String>,
 }
 
+/// The capabilities the bridge knows of: one it does not (`notify`, from
+/// an older plugin) is not shown to devices as `unknown`.
+fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    capabilities
+        .into_iter()
+        .filter(|c| *c != Capability::Unknown)
+        .collect()
+}
+
 /// What every connection shares.
 struct Hub {
     transport: Transport,
@@ -131,6 +141,9 @@ struct Hub {
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
     commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// How fast each agent may have its messages stored, kept across its
+    /// plugin's connections.
+    paces: Mutex<HashMap<String, Pace>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -157,6 +170,27 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    /// Returns once `agent` may have one more message stored ([`Pace`]):
+    /// at once in a burst, else after a wait, in which its plugin's
+    /// connection is not read.
+    fn pace(&self, agent: &str) {
+        loop {
+            let wait = {
+                let mut paces = self.paces.lock().expect("not poisoned");
+                let now = std::time::Instant::now();
+                match paces
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| Pace::new(now))
+                    .take(now)
+                {
+                    Ok(()) => return,
+                    Err(wait) => wait,
+                }
+            };
+            std::thread::sleep(wait);
+        }
+    }
+
     // Each is one thing the bridge is given at start; tests pass their own
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -191,6 +225,7 @@ impl Hub {
             opening,
             opening_all: AtomicBool::new(false),
             commands: Mutex::new(HashMap::new()),
+            paces: Mutex::new(HashMap::new()),
             generations: AtomicU64::new(0),
             devices: Mutex::new(HashMap::new()),
             waiting: AtomicUsize::new(0),
@@ -367,7 +402,7 @@ impl Hub {
             plugins.insert(
                 agent.to_owned(),
                 Plugin {
-                    capabilities: hello.capabilities,
+                    capabilities: known(hello.capabilities),
                     generation,
                     out: Arc::new(Mutex::new(PluginOut {
                         writer,
@@ -417,6 +452,10 @@ impl Hub {
                         attachments,
                         ..
                     } => {
+                        // Every runtime may send on its own: past a burst,
+                        // at a pace, so that a loop fills neither the
+                        // database nor the devices' queues.
+                        hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
                             OutKind::Notify => "notify",
