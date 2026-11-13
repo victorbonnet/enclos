@@ -25,6 +25,7 @@ mod agent_names;
 mod approvals;
 #[path = "avatars.rs"]
 mod avatars;
+pub(crate) use avatars::normalize as normalize_photo;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -175,6 +176,8 @@ struct Hub {
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
     devices: Mutex<HashMap<String, Route>>,
+    /// Revisions last observed by the cross-process presentation watcher.
+    presentation_revisions: Mutex<HashMap<String, (u64, i64)>>,
     /// Connections not yet authenticated.
     waiting: AtomicUsize,
     /// Refusals logged per caller address in the current minute.
@@ -263,6 +266,7 @@ impl Hub {
             stops: Mutex::new(HashSet::new()),
             generations: AtomicU64::new(0),
             devices: Mutex::new(HashMap::new()),
+            presentation_revisions: Mutex::new(HashMap::new()),
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
             silence,
@@ -1049,10 +1053,13 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
             loop {
-                if let Ok(store) = hub.store()
-                    && let Err(e) = hub.collect_refusals(&store)
-                {
-                    eprintln!("enclos app approvals: {e}");
+                if let Ok(store) = hub.store() {
+                    if let Err(e) = hub.collect_refusals(&store) {
+                        eprintln!("enclos app approvals: {e}");
+                    }
+                    if let Err(e) = hub.broadcast_presentation_changes(&store) {
+                        eprintln!("enclos app presentation: {e}");
+                    }
                 }
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.

@@ -49,6 +49,14 @@ impl HomeFile {
     }
 }
 
+/// The runtime's export command and the plain file it promises to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeExport {
+    pub format: &'static str,
+    pub command: SandboxCommand,
+    pub archive: PathBuf,
+}
+
 /// A command that runs inside a sandbox, under its policy. Anyone can make
 /// one; only the engine's code that starts programs in a sandbox can take
 /// its words out, so an adapter's command cannot be started on the host by
@@ -316,6 +324,23 @@ pub trait RuntimeAdapter {
     /// (the default): such a failure is a failed delete.
     fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
+    }
+    /// Export one agent with the runtime's own command, inside its sandbox.
+    fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport> {
+        None
+    }
+    /// Restores a complete adapter-owned payload; raw runtime exports keep
+    /// using `import_agent`. Context contains only identifier remapping.
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        _context: &str,
+    ) -> Option<SandboxCommand> {
+        (format == "native")
+            .then(|| self.import_agent(name, archive))
+            .flatten()
     }
     /// The runtime's own command that creates agent `name` from `archive`,
     /// an export made with the runtime's own command (for Hermes, `hermes

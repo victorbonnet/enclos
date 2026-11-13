@@ -247,7 +247,7 @@ enclos runtime configure [OPTIONS] <TARGET>
 
 ### `enclos agent`
 
-Add, list or remove the runtime's agents
+Add, list, remove, export or import the runtime's agents
 
 #### `enclos agent add`
 
@@ -259,6 +259,29 @@ enclos agent add [OPTIONS] <AGENT>
 
 - `<AGENT>`
 - `--from <ARCHIVE>`: An export the runtime's own command made on the host (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
+
+#### `enclos agent export`
+
+Export complete agent data, credentials, presentation and app history to a private file
+
+```text
+enclos agent export [OPTIONS] --to <FILE> <AGENT>
+```
+
+- `<AGENT>`
+- `--to <FILE>`
+
+#### `enclos agent import`
+
+Import an Enclos export: runtime data, credentials, presentation and app history
+
+```text
+enclos agent import [OPTIONS] --from <FILE> <AGENT>
+```
+
+- `<AGENT>`
+- `--from <FILE>`
+- `--metadata-only`: Restore only the name and image of an existing agent.
 
 #### `enclos agent list`
 

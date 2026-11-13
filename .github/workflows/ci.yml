@@ -421,7 +421,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python3 -I -m unittest discover -s channels/hermes/tests -v
+      - run: |
+          python3 -I -m unittest discover -s channels/hermes/tests
+          python3 -I -m unittest discover -s src/runtime/hermes/tests -v
 
   # The same tests against the latest Hermes, its default branch, never
   # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`),

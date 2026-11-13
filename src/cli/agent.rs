@@ -40,6 +40,21 @@ enum AgentVerb {
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
     },
+    /// Export complete agent data, credentials, presentation and app history to a private file.
+    Export {
+        agent: AgentTarget,
+        #[arg(long, value_name = "FILE")]
+        to: PathBuf,
+    },
+    /// Import an Enclos export: runtime data, credentials, presentation and app history.
+    Import {
+        agent: AgentTarget,
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Restore only the name and image of an existing agent.
+        #[arg(long)]
+        metadata_only: bool,
+    },
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
     List { sandbox: SandboxName },
@@ -75,6 +90,83 @@ impl FromStr for AgentTarget {
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
+        AgentVerb::Export {
+            agent: AgentTarget { sandbox, agent },
+            to,
+        } => match engine.export_agent(by, &sandbox, &agent, &to, confirm)? {
+            Planned::DryRun(plan) => output::show_plan(&plan),
+            Planned::Done(archive) if output::json() => output::emit(&json!({
+                "agent": format!("{sandbox}/{agent}"), "path": output::path(&archive.path), "sha256": archive.sha256, "contains_credentials": true,
+            })),
+            Planned::Done(archive) => println!(
+                "Exported complete data for {sandbox}/{agent} to {}. This file contains credentials; keep it private.",
+                archive.path.display()
+            ),
+        },
+        AgentVerb::Import {
+            agent: AgentTarget { sandbox, agent },
+            from,
+            metadata_only,
+        } => {
+            match engine.import_agent_export(
+                by,
+                &sandbox,
+                agent.clone(),
+                &from,
+                metadata_only,
+                confirm,
+            )? {
+                Planned::DryRun(plan) => output::show_plan(&plan),
+                Planned::Done(imported) => {
+                    let manifest = &imported.manifest;
+                    let added = imported.added.as_ref();
+                    let (session, copy_left) = match added.map(|a| &a.how) {
+                        Some(Added::Imported { end, copy_left, .. }) => (
+                            Some(output::session(end)),
+                            copy_left.as_ref().map(ToString::to_string),
+                        ),
+                        _ => (None, None),
+                    };
+                    if output::json() {
+                        output::emit(&json!({
+                            "agent":format!("{sandbox}/{agent}"), "metadata_only":metadata_only,
+                            "display_name":manifest.presentation.display_name,"has_photo":manifest.presentation.photo.is_some(),"has_image":manifest.presentation.photo.is_some(),"format_version":manifest.schema_version,
+                            "session":session,"copy_left":copy_left,
+                            "archive":{"path":output::path(&imported.archive.path),"sha256":imported.archive.sha256},
+                            "talk":added.map(|a|format!("enclos connect {sandbox} -- {}",a.talk)),
+                            "choose_provider":added.and_then(|a|a.choose_provider.as_ref()).map(|c|format!("enclos connect {sandbox} -- {c}")),
+                        }));
+                    } else {
+                        if let Some(added) = added {
+                            if let Added::Imported { end, .. } = &added.how {
+                                super::connect::report_end(&sandbox, end);
+                            }
+                            if let Some(left) = copy_left {
+                                eprintln!("enclos: {left}.");
+                            }
+                            println!(
+                                "Talk to the agent: enclos connect {sandbox} -- {}",
+                                added.talk
+                            );
+                            if let Some(choose) = &added.choose_provider {
+                                println!(
+                                    "Choose its provider and model: enclos connect {sandbox} -- {choose}"
+                                );
+                            }
+                        }
+                        println!(
+                            "Imported {}for {sandbox}/{agent} from {}.",
+                            if metadata_only {
+                                "name and photo "
+                            } else {
+                                "agent data, credentials, presentation and app history "
+                            },
+                            from.display()
+                        );
+                    }
+                }
+            }
+        }
         AgentVerb::Add { agent, from } => {
             let AgentTarget { sandbox, agent } = agent;
             let planned = match &from {

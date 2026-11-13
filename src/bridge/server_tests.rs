@@ -2602,3 +2602,59 @@ fn an_approval_request_is_one_per_scope_and_a_failed_one_is_asked_again() {
         "pending"
     );
 }
+
+#[test]
+fn review_presentation_import_is_recorded_in_the_device_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    store
+        .import_presentation("lab/coder", Some("Imported name"), Some(b"photo"))
+        .unwrap();
+    let log = store.log_lines(10).unwrap();
+    assert!(log.iter().any(|line| line.event == "agent.name.set"));
+    assert!(log.iter().any(|line| line.event == "agent.avatar.set"));
+}
+
+#[test]
+fn review_imported_presentation_reaches_connected_paired_devices_without_relisting() {
+    let (_dir, hub, store) = photo_hub();
+    let phone = avatar_device("phone", "owner@example.com");
+    store.add_device(&phone).unwrap();
+    let (tx, rx) = channel();
+    let (unpaired_tx, unpaired_rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert(phone.id.clone(), (phone.person.clone(), tx, 1));
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("unpaired".into(), (phone.person.clone(), unpaired_tx, 2));
+    hub.broadcast_presentation_changes(&store).unwrap();
+    assert!(rx.try_recv().is_err());
+    store
+        .import_presentation("lab/coder", Some("Imported name"), Some(b"photo"))
+        .unwrap();
+    hub.broadcast_presentation_changes(&store).unwrap();
+    let ToDevice::AgentName(name) = rx.try_recv().unwrap() else {
+        panic!("missing name")
+    };
+    assert_eq!(name.display_name.as_deref(), Some("Imported name"));
+    let ToDevice::AgentAvatar(photo) = rx.try_recv().unwrap() else {
+        panic!("missing photo")
+    };
+    assert!(photo.image.is_some());
+    assert!(unpaired_rx.try_recv().is_err());
+    hub.broadcast_presentation_changes(&store).unwrap();
+    assert!(rx.try_recv().is_err());
+    store.import_presentation("lab/coder", None, None).unwrap();
+    hub.broadcast_presentation_changes(&store).unwrap();
+    let ToDevice::AgentName(name) = rx.try_recv().unwrap() else {
+        panic!("missing clear")
+    };
+    assert!(name.display_name.is_none());
+    let ToDevice::AgentAvatar(photo) = rx.try_recv().unwrap() else {
+        panic!("missing clear")
+    };
+    assert!(photo.image.is_none());
+}

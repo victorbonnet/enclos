@@ -46,9 +46,15 @@ pub struct LeftCopy {
 /// An archive the user named, opened once so the bytes hashed are the bytes
 /// copied. Refused when it is a link, not a plain file, or under a
 /// sandbox's folder, whose home the sandbox writes.
-struct Source {
-    path: PathBuf,
-    file: File,
+pub(super) struct Source {
+    pub(super) path: PathBuf,
+    pub(super) file: File,
+}
+
+/// Only engine-owned, validated runtime payloads may bypass host-file staging.
+pub(super) enum ImportArchive<'a> {
+    Host(&'a Path),
+    Staged(Archive),
 }
 
 impl Engine {
@@ -71,15 +77,46 @@ impl Engine {
         from: &Path,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
+        self.import_agent_data(by, name, agent, ImportArchive::Host(from), None, confirm)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn import_agent_data(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        from: ImportArchive<'_>,
+        portable: Option<(&str, &str)>,
+        confirm: Confirm,
+    ) -> Result<Planned<AgentAdded>> {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
         // One copy per enclos process, so two imports of the same name never
         // share it.
         let installers = self.layout.sandbox_installers(name.as_str());
-        let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.tar.gz"));
-        let staged = copy_named(&std::process::id().to_string());
-        let Some(command) = runtime.import_agent(&agent, &staged) else {
+        let suffix = if portable.is_some() { "data" } else { "tar.gz" };
+        let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.{suffix}"));
+        let supplied = match &from {
+            ImportArchive::Staged(archive) => Some(archive.clone()),
+            _ => None,
+        };
+        let staged = supplied
+            .as_ref()
+            .map(|a| a.path.clone())
+            .unwrap_or_else(|| copy_named(&std::process::id().to_string()));
+        if supplied.is_some() && staged.parent() != Some(installers.as_path()) {
+            return Err(failed(
+                "a validated runtime payload must be staged in this sandbox's installers folder"
+                    .into(),
+            ));
+        }
+        let command_for = |path: &Path| match portable {
+            Some((format, context)) => runtime.import_export(&agent, path, format, context),
+            None => runtime.import_agent(&agent, path),
+        };
+        let Some(command) = command_for(&staged) else {
             return Err(failed(format!(
                 "{shown} cannot import an agent from an archive. `enclos agent add {name}/{agent}` creates a new one"
             )));
@@ -108,16 +145,22 @@ impl Engine {
                 path.display()
             )));
         }
-        let source = Source::open(&self.layout, from)?;
+        let source = match from {
+            ImportArchive::Host(path) => Some(Source::open(&self.layout, path)?),
+            ImportArchive::Staged(_) => None,
+        };
         // As for `agent add`: the runtime's services start again once the
         // imported agent exists.
         let restart = self.plan_restart(name)?;
         if confirm == Confirm::DryRun {
             let version = self.policy(name)?.version.version;
-            let Archive { path, sha256 } = source.hash()?;
+            let Archive { path, sha256 } = match source {
+                Some(source) => source.hash()?,
+                None => supplied.clone().expect("staged archive"),
+            };
             // The real run names its copy after its own process.
             let planned = copy_named("<pid>");
-            let command = runtime.import_agent(&agent, &planned).unwrap_or(command);
+            let command = command_for(&planned).unwrap_or(command);
             return Ok(Planned::DryRun(Plan {
                 changes: vec![
                     format!(
@@ -148,15 +191,26 @@ impl Engine {
             "agent import",
             Some(format!("{name}/{agent}")),
             |a: &Archive| {
-                format!(
-                    "copied {} (sha256 {}) to {}",
-                    a.path.display(),
-                    a.sha256,
-                    staged.display()
-                )
+                if supplied.is_some() {
+                    format!(
+                        "using validated runtime payload {} (sha256 {}) without another copy",
+                        a.path.display(),
+                        a.sha256
+                    )
+                } else {
+                    format!(
+                        "copied {} (sha256 {}) to {}",
+                        a.path.display(),
+                        a.sha256,
+                        staged.display()
+                    )
+                }
             },
             |_| {
-                let archive = source.stage(&staged)?;
+                let archive = match source {
+                    Some(source) => source.stage(&staged)?,
+                    None => supplied.clone().expect("staged archive"),
+                };
                 copied.set(true);
                 Ok(archive)
             },
@@ -230,7 +284,9 @@ impl Engine {
                 Added::Imported { copy_left, .. } => with_copy_left(e, copy_left.clone()),
                 _ => e,
             })?;
-        self.restart_for(by, name, &agent, restart, "importing")?;
+        if portable.is_none() {
+            self.restart_for(by, name, &agent, restart, "importing")?;
+        }
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,
@@ -250,7 +306,7 @@ impl Source {
     /// without waiting on a pipe; the checks then hold for the opened file
     /// itself, wherever its path pointed while it was opened. A workspace a
     /// sandbox may write is not checked: an archive there is the user's call.
-    fn open(layout: &Layout, path: &Path) -> Result<Source> {
+    pub(super) fn open(layout: &Layout, path: &Path) -> Result<Source> {
         let path = std::path::absolute(path).map_err(|e| {
             failed(format!(
                 "cannot resolve the archive path {}: {e}",
@@ -306,7 +362,7 @@ impl Source {
     }
 
     /// The archive as it is now, with its SHA-256, for a dry run.
-    fn hash(mut self) -> Result<Archive> {
+    pub(super) fn hash(mut self) -> Result<Archive> {
         let sha256 = stream(&mut self.file, None).map_err(|e| {
             failed(format!(
                 "cannot read the archive at {}: {e}",
@@ -324,13 +380,14 @@ impl Source {
     /// writes to, hashing the bytes as they go. A copy that fails is
     /// removed, or reported when it cannot be; one cut short by enclos
     /// being killed stays.
-    fn stage(mut self, staged: &Path) -> Result<Archive> {
+    pub(super) fn stage(mut self, staged: &Path) -> Result<Archive> {
         let dir = staged.parent().unwrap_or(staged);
         std::fs::create_dir_all(dir)
             .map_err(|e| failed(format!("cannot create {}: {e}", dir.display())))?;
         let mut target = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(staged)
             .map_err(|e| {
                 failed(format!(
@@ -421,7 +478,7 @@ fn stream(file: &mut File, mut sink: Option<&mut File>) -> std::io::Result<Strin
 /// The path of an opened file, from the file itself, with every link
 /// resolved.
 #[cfg(target_os = "macos")]
-fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+pub(super) fn opened_path(file: &File) -> std::io::Result<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let path = rustix::fs::getpath(file)?;
     Ok(PathBuf::from(std::ffi::OsString::from_vec(
@@ -432,7 +489,7 @@ fn opened_path(file: &File) -> std::io::Result<PathBuf> {
 /// The path of an opened file, from the file itself, with every link
 /// resolved.
 #[cfg(not(target_os = "macos"))]
-fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+pub(super) fn opened_path(file: &File) -> std::io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }

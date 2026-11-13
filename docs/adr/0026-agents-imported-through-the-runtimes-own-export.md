@@ -10,6 +10,8 @@ So an agent comes in only from an export the user made with the runtime's own co
 
 This narrows [0001](0001-manage-only-created-sandboxes.md): enclos still never looks for agents on the host; it imports one only from an archive the user names.
 
+[Proposed ADR 0061](0061-agent-exports-include-enclos-presentation.md) proposes an extension for complete Enclos exports; this accepted decision remains in force for raw runtime imports until that proposal is accepted.
+
 ## Considered options
 
 - **An archive format of enclos's own:** one format across runtimes, but enclos would have to know what each runtime keeps and leaves out, including its secrets.

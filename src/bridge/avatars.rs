@@ -4,7 +4,7 @@ use super::*;
 use enclos_protocol::avatar::{AgentAvatar, AvatarSet, MAX_AVATAR_BYTES};
 use enclos_protocol::plugin::{ErrorBody, ErrorCode};
 
-pub(super) fn normalize(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn normalize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
         return Err("Choose a smaller image.".into());
     }
@@ -98,7 +98,7 @@ fn internal(e: impl std::fmt::Display) -> PhotoError {
     PhotoError::Internal("The agent photo could not be read or saved. Try again later.".into())
 }
 
-fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToDevice {
+pub(super) fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToDevice {
     ToDevice::AgentAvatar(AgentAvatar {
         agent: agent.into(),
         revision: photo.revision,

@@ -60,7 +60,7 @@ enum Command {
     State(cli::state::StateArgs),
     /// Install a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot.
     Runtime(cli::runtime::RuntimeArgs),
-    /// Add, list or remove the runtime's agents.
+    /// Add, list, remove, export or import the runtime's agents.
     Agent(cli::agent::AgentArgs),
     /// The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, or chat with an agent through its app channel.
     App(cli::app::AppArgs),

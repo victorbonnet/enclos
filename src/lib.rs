@@ -2,6 +2,7 @@
 //! there, with policy and an audit log. The `enclos` binary is a thin CLI
 //! over this library; every client calls the [`engine::Engine`].
 
+pub mod agent_export;
 pub mod audit;
 pub mod backend;
 pub mod bridge;

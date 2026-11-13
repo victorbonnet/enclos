@@ -369,6 +369,35 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
+        let archive = prefix.with_extension("tar.gz");
+        Some(super::RuntimeExport {
+            format: "hermes-data-v1",
+            command: transfer(
+                "export",
+                name,
+                &archive,
+                &serde_json::json!({"max_bytes": crate::agent_export::MAX_PAYLOAD_BYTES})
+                    .to_string(),
+            ),
+            archive,
+        })
+    }
+
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        context: &str,
+    ) -> Option<SandboxCommand> {
+        match format {
+            "native" => self.import_agent(name, archive),
+            "hermes-data-v1" => Some(transfer("import", name, archive, context)),
+            _ => None,
+        }
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
@@ -639,6 +668,12 @@ impl RuntimeAdapter for Hermes {
         names.sort();
         Ok(names)
     }
+}
+
+fn transfer(operation: &str, name: &AgentName, path: &Path, context: &str) -> SandboxCommand {
+    SandboxCommand::new(vec!["/bin/sh".into(), "-c".into(),
+        "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; exec \"$python\" -c \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"".into(),
+        "enclos-hermes-transfer".into(), include_str!("hermes/transfer.py").into(), operation.into(), name.as_str().into(), path.as_os_str().to_owned(), context.into()])
 }
 
 #[cfg(test)]
