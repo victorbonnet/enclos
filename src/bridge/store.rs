@@ -68,6 +68,19 @@ pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
 pub const BY_PERSON: &str = "person";
 
+/// The id of agent `<sandbox>/<agent>`'s Home conversation, where what has
+/// no conversation of its own goes (ADR 0044). Fixed, so the bridge and the
+/// runtime, which `runtime configure` tells, agree on it without asking;
+/// without `:` or `/`, which runtimes put in their own keys.
+pub fn home_id(agent: &str) -> String {
+    format!("home.{}", agent.replace('/', "."))
+}
+
+/// Whether conversation `id` is an agent's Home: a device's own ids are UUIDs.
+pub fn is_home(id: &str) -> bool {
+    id.starts_with("home.")
+}
+
 /// The longest name a conversation keeps, in characters.
 pub const MAX_TITLE_CHARS: usize = 100;
 
@@ -176,7 +189,14 @@ CREATE TABLE IF NOT EXISTS log (
     event TEXT NOT NULL,
     reason TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
+
+/// The `settings` row naming the host's person (ADR 0044).
+const HOST_PERSON: &str = "host_person";
 
 /// Columns added after the first version of the database, which an older
 /// `app.db` gets when it is opened.
@@ -305,6 +325,14 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
              CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
         )?;
+        // A database whose devices were paired before the host's person
+        // was kept: the first of them names it, as it would have, so the
+        // next device paired, a guest's perhaps, does not (ADR 0044)
+        db.execute(
+            "INSERT OR IGNORE INTO settings (name, value)
+             SELECT ?1, person FROM devices ORDER BY paired, rowid LIMIT 1",
+            params![HOST_PERSON],
+        )?;
         Ok(Store { db })
     }
 
@@ -416,6 +444,44 @@ impl Store {
             params![id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+    }
+
+    /// Makes the Home conversation of `agent` (`<sandbox>/<agent>`), owned
+    /// by `owner` (`""`: nobody yet) and named Home, so the runtime's names
+    /// do not replace it. With `host` true, `owner` is the host's person
+    /// ([`Store::host_person`]), and takes Home from anyone else. Otherwise
+    /// `owner` takes it only when it has no owner. Whether it was made or
+    /// changed owner.
+    pub fn ensure_home(&self, agent: &str, owner: &str, host: bool) -> rusqlite::Result<bool> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Ok(false);
+        };
+        let id = home_id(agent);
+        if let Some((s, a, _)) = self.conversation_of(&id)? {
+            // Not this agent's: a device chose the id, before the bridge
+            // kept `home.` for itself. It is not Home, and keeps its owner.
+            if (s.as_str(), a.as_str()) != (sandbox, name) {
+                return Ok(false);
+            }
+            if owner.is_empty() {
+                return Ok(false);
+            }
+            let changed = if host {
+                self.db.execute(
+                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner != ?2",
+                    params![id, owner],
+                )?
+            } else {
+                self.db.execute(
+                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner = ''",
+                    params![id, owner],
+                )?
+            };
+            return Ok(changed == 1);
+        }
+        self.conversation(&id, sandbox, name, owner)?;
+        self.name(&id, "Home", BY_PERSON)?;
+        Ok(true)
     }
 
     /// Stores a message once: a second with the same id is a duplicate
@@ -581,6 +647,45 @@ impl Store {
 
     const DEVICE_COLUMNS: &'static str =
         "id, name, person, noise_key, device_key, push_key, push_token, paired, seen, node";
+
+    /// The host's person (ADR 0044): the person of the first device paired
+    /// at the host's terminal, or the one `enclos app host` named since.
+    /// `None` until a device is paired.
+    pub fn host_person(&self) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT value FROM settings WHERE name = ?1",
+                params![HOST_PERSON],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Names `person` the host's person when nobody is yet: the first
+    /// device paired does. Whether they now are, by this call.
+    pub fn claim_host(&self, person: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO settings (name, value) VALUES (?1, ?2)",
+            params![HOST_PERSON, person],
+        )? == 1)
+    }
+
+    /// Names `person` the host's person in place of anyone before, and
+    /// gives them every agent's Home, with what it holds.
+    pub fn set_host(&self, person: &str) -> rusqlite::Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO settings (name, value) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            params![HOST_PERSON, person],
+        )?;
+        transaction.execute(
+            // Not `LIKE`, which ignores case: `Home.x` is a device's
+            "UPDATE conversations SET owner = ?1 WHERE substr(id, 1, 5) = 'home.'",
+            params![person],
+        )?;
+        transaction.commit()
+    }
 
     pub fn add_device(&self, device: &Device) -> rusqlite::Result<()> {
         self.db.execute(
@@ -1159,5 +1264,190 @@ mod tests {
             .unwrap();
         assert_eq!(store.paired_device(b"three").unwrap(), None);
         assert_eq!(decision(&store, b"three").as_deref(), Some("decline"));
+    }
+
+    #[test]
+    fn an_agents_home_is_made_once_named_home_for_its_owner() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        assert_eq!(home_id("lab/main"), "home.lab.main");
+        assert!(is_home("home.lab.main") && !is_home("a47e17c0-eaad-4d1d-8853-56aa0b69e1e2"));
+        assert!(
+            store
+                .ensure_home("lab/main", "victor@example.com", true)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ensure_home("lab/main", "victor@example.com", true)
+                .unwrap()
+        );
+        // Once: a second person, who is not the host, does not take it.
+        assert!(
+            !store
+                .ensure_home("lab/main", "alice@example.com", false)
+                .unwrap()
+        );
+        assert_eq!(
+            store.owner("home.lab.main").unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        let home = store.conversation_info("home.lab.main").unwrap().unwrap();
+        assert_eq!(
+            (home.sandbox.as_str(), home.agent.as_str()),
+            ("lab", "main")
+        );
+        assert_eq!(
+            (home.title.as_deref(), home.titled_by.as_deref()),
+            (Some("Home"), Some(BY_PERSON))
+        );
+        // The runtime's name for its session does not replace Home.
+        assert!(
+            !store
+                .name("home.lab.main", "Gateway notices", BY_AGENT)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ensure_home("no-slash", "victor@example.com", true)
+                .unwrap()
+        );
+        // Made before anyone was known: the first person takes it, once.
+        assert!(store.ensure_home("lab/scout", "", false).unwrap());
+        assert_eq!(store.owner("home.lab.scout").unwrap().as_deref(), Some(""));
+        assert!(
+            store
+                .ensure_home("lab/scout", "alice@example.com", false)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ensure_home("lab/scout", "victor@example.com", false)
+                .unwrap()
+        );
+        assert_eq!(
+            store.owner("home.lab.scout").unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        // Given as the host's person's, Home is theirs.
+        assert!(
+            store
+                .ensure_home("lab/scout", "victor@example.com", true)
+                .unwrap()
+        );
+        assert_eq!(
+            store.owner("home.lab.scout").unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        assert!(!store.ensure_home("lab/scout", "", false).unwrap());
+    }
+
+    #[test]
+    fn the_first_person_named_is_the_host_until_another_is_set() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.host_person().unwrap(), None);
+        assert!(store.claim_host("victor@example.com").unwrap());
+        // A second device's person does not take it.
+        assert!(!store.claim_host("alice@example.com").unwrap());
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .host_person()
+                .unwrap()
+                .as_deref(),
+            Some("victor@example.com")
+        );
+        // Set: the host's person, with every agent's Home, and no other
+        // conversation.
+        store
+            .ensure_home("lab/main", "victor@example.com", true)
+            .unwrap();
+        store.ensure_home("lab/scout", "", false).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@example.com")
+            .unwrap();
+        store.set_host("alice@example.com").unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        for (id, owner) in [
+            ("home.lab.main", "alice@example.com"),
+            ("home.lab.scout", "alice@example.com"),
+            ("c-1", "victor@example.com"),
+        ] {
+            assert_eq!(store.owner(id).unwrap().as_deref(), Some(owner), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_device_chosen_id_is_never_a_home() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        // `LIKE` would take this one: it ignores case
+        store
+            .conversation("Home.lab.main", "lab", "main", "bob@example.com")
+            .unwrap();
+        // Made by a device before the bridge kept `home.`, for another agent
+        store
+            .conversation("home.lab.scout", "lab", "main", "bob@example.com")
+            .unwrap();
+        assert!(
+            !store
+                .ensure_home("lab/scout", "victor@example.com", true)
+                .unwrap()
+        );
+        store.set_host("victor@example.com").unwrap();
+        assert_eq!(
+            store.owner("Home.lab.main").unwrap().as_deref(),
+            Some("bob@example.com")
+        );
+        assert_eq!(
+            store
+                .conversation_of("home.lab.scout")
+                .unwrap()
+                .map(|c| c.0),
+            Some("lab".to_owned())
+        );
+    }
+
+    #[test]
+    fn devices_paired_before_the_host_was_kept_name_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        for (id, person, paired) in [
+            ("d-2", "alice@example.com", 20),
+            ("d-1", "victor@example.com", 10),
+        ] {
+            store
+                .add_device(&Device {
+                    id: id.to_owned(),
+                    name: "Pixel".to_owned(),
+                    person: person.to_owned(),
+                    noise_key: vec![paired as u8; 32],
+                    device_key: vec![2; 32],
+                    push_key: vec![3; 32],
+                    push_token: None,
+                    paired,
+                    seen: None,
+                    node: None,
+                })
+                .unwrap();
+        }
+        // As a database from before the setting
+        store
+            .db
+            .execute("DELETE FROM settings WHERE name = ?1", params![HOST_PERSON])
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        // So the next device's person does not become it
+        assert!(!store.claim_host("bob@example.com").unwrap());
     }
 }

@@ -149,6 +149,7 @@ class EnclosAdapter(BasePlatformAdapter):
             return
         self._bridge = writer
         logger.info("[%s] Bridge connected", self.name)
+        self._adopt_home(hello.get("home"))
         try:
             await self._write(protocol.hello("hermes", self._agent))
             for message in self._outbox.pending():
@@ -184,6 +185,32 @@ class EnclosAdapter(BasePlatformAdapter):
                 self._bridge = None
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
+
+    def _adopt_home(self, home: Optional[str]) -> None:
+        """Makes the agent's Home conversation, which the bridge names, this
+        platform's home channel (ADR 0044): in the running gateway, where its
+        notices and `send_message` look, in the environment, where cron looks
+        first, and in Hermes's config, as /sethome would, so it holds after a
+        restart. What a /sethome set before is replaced."""
+        if not home:
+            return
+        os.environ["MOBILE_APP_HOME_CHANNEL"] = home
+        try:
+            from gateway.config import HomeChannel, persist_home_channel
+            channel = HomeChannel(platform=self.platform, chat_id=home, name="Home")
+            config = getattr(getattr(self, "gateway_runner", None), "config", None)
+            if config is not None:
+                current = config.platforms.setdefault(self.platform, PlatformConfig(enabled=True))
+                stale = getattr(current.home_channel, "chat_id", None) != home
+                current.home_channel = channel
+                if stale:
+                    persist_home_channel(channel)
+            if self.config is not None:
+                self.config.home_channel = channel
+        except Exception:
+            # Hermes internals, not a plugin API: when a release moves them,
+            # Hermes asks for /sethome again, and this line says why.
+            logger.info("[%s] Cannot set Home as the home channel", self.name, exc_info=True)
 
     async def _write(self, message: dict[str, Any]) -> bool:
         writer = self._bridge
@@ -226,6 +253,12 @@ class EnclosAdapter(BasePlatformAdapter):
     async def _on_message(self, message: dict[str, Any]) -> None:
         if message["id"] in self._seen:
             # The runtime has it: the ack was lost on the way
+            await self._write(protocol.ack(message["id"]))
+            return
+        # enclos keeps the home channel (the agent's Home): /sethome is
+        # answered here, not run, which would move it into this conversation.
+        if protocol.is_home_command(message["text"]):
+            await self.send(message["conversation"], protocol.HOME_ANSWER, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
         self._last_in[message["conversation"]] = (message["id"], asyncio.get_running_loop().time())
@@ -349,7 +382,9 @@ class EnclosAdapter(BasePlatformAdapter):
         files = [(sendable[p], None) for _, p in images]
         if files:
             return await self._send_files(chat_id, files, rest, reply_to)
-        message = protocol.message_out(chat_id, content, reply_to)
+        # Hermes about itself (gateway online, shutting down): a quiet line.
+        notice = protocol.is_notice(content)
+        message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
         reason = protocol.unsendable(message)
         if reason:
             # The bridge would refuse it, and kept, it would come first in
@@ -359,7 +394,8 @@ class EnclosAdapter(BasePlatformAdapter):
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
         await self._write(message)  # if it is not connected, it gets the message on its next hello
-        self._check_title_soon(chat_id)
+        if not notice:
+            self._check_title_soon(chat_id)
         return SendResult(success=True, message_id=message["id"])
 
     # Conversation titles. Hermes names each session (a title cut from the

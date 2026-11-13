@@ -220,6 +220,41 @@ fn only_the_owner_moves_how_far_a_conversation_was_read() {
 }
 
 #[test]
+fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let host = Some("victor@example.com");
+    store
+        .conversation("c-a", "lab", "a", "alice@example.com")
+        .unwrap();
+    store
+        .conversation("c-b", "lab", "b", "bob@example.com")
+        .unwrap();
+    let id = |s: &str| ConversationId::new(s).unwrap();
+    assert_eq!(
+        destination(&store, host, "lab/a", id("c-a")),
+        Some(id("c-a"))
+    );
+    // Another agent's conversation, or one the bridge does not know: Home,
+    // the host's person's.
+    for other in ["c-b", "c-unknown"] {
+        assert_eq!(
+            destination(&store, host, "lab/a", id(other)),
+            Some(id("home.lab.a"))
+        );
+    }
+    assert_eq!(
+        store.owner("home.lab.a").unwrap().as_deref(),
+        Some("victor@example.com")
+    );
+    // An agent whose Home's id the protocol refuses (longer than an id may
+    // be): nothing, which the caller acknowledges.
+    let long = format!("lab/{}", "a".repeat(130));
+    assert_eq!(destination(&store, host, &long, id("c-unknown")), None);
+    assert_eq!(store.conversation_info(&home_id(&long)).unwrap(), None);
+}
+
+#[test]
 fn a_forgotten_device_is_unpaired_and_logged() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("app.db")).unwrap();
@@ -309,4 +344,27 @@ fn a_file_that_cannot_be_recorded_leaves_none_behind() {
     );
     assert!(taken.is_empty());
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
+}
+
+#[test]
+fn home_keeps_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _received) = hub_with(dir.path(), &["alice@example.com"]);
+    let hub = Arc::new(hub);
+    let store = hub.store().unwrap();
+    store
+        .ensure_home("lab/main", "alice@example.com", true)
+        .unwrap();
+    let home = ConversationId::new("home.lab.main").unwrap();
+    // Neither renamed nor cleared, which would let the runtime's names in
+    for title in ["Mine", ""] {
+        rename(&hub, &store, "alice@example.com", &home, title).unwrap();
+    }
+    let titled = store
+        .conversations("alice@example.com")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == "home.lab.main")
+        .unwrap();
+    assert_eq!(titled.title.as_deref(), Some("Home"));
 }
