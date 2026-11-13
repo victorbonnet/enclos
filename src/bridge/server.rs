@@ -163,8 +163,8 @@ impl Hub {
         }
     }
 
-    /// Sends conversation `id`, with its name, to every connected device of
-    /// `person`: after its name changed.
+    /// Sends conversation `id`, with its name and how far it was read, to
+    /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
         if let Ok(Some(c)) = store.conversation_info(id)
             && let Some(info) = conversation_info(c)
@@ -1089,6 +1089,9 @@ fn run_session(
             } => {
                 rename(hub, store, person, &conversation, &title)?;
             }
+            FromDevice::ConversationRead { conversation, seq } => {
+                read(hub, store, person, &conversation, seq)?;
+            }
             FromDevice::Sync { since } => {
                 // Every conversation first, named or empty, then the messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
@@ -1395,6 +1398,25 @@ fn attachment_info(a: StoredAttachment) -> Attachment {
     }
 }
 
+/// How far `person` read `conversation`: kept, and sent to all their
+/// devices, so a message read on one is not unread on another. Only the
+/// conversation's owner moves it; anyone else changes and learns nothing.
+fn read(
+    hub: &Hub,
+    store: &Store,
+    person: &str,
+    conversation: &ConversationId,
+    seq: i64,
+) -> Result<(), String> {
+    let id = conversation.as_str();
+    if store.owner(id).map_err(|e| e.to_string())?.as_deref() == Some(person)
+        && store.mark_read(id, seq).map_err(|e| e.to_string())?
+    {
+        hub.deliver_conversation(store, person, id);
+    }
+    Ok(())
+}
+
 /// A conversation for a device: `None` for an id the protocol refuses.
 fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
     Some(ConversationInfo {
@@ -1402,6 +1424,7 @@ fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
         agent: format!("{}/{}", c.sandbox, c.agent),
         title: c.title,
         titled_by: c.titled_by,
+        read: c.read,
     })
 }
 

@@ -52,6 +52,13 @@ pub enum FromDevice {
         conversation: ConversationId,
         title: String,
     },
+    /// The person read the conversation up to message `seq`, on this
+    /// device: the bridge keeps it, for their other devices and the next.
+    #[serde(rename = "conversation.read")]
+    ConversationRead {
+        conversation: ConversationId,
+        seq: i64,
+    },
     /// The bytes of an attachment of one of the person's messages, from
     /// `offset`: the bridge answers with one `attachment.data`.
     #[serde(rename = "attachment.get")]
@@ -73,6 +80,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "conversation.new",
     "message.send",
     "conversation.rename",
+    "conversation.read",
     "attachment.get",
     "sync",
     "push.token",
@@ -94,7 +102,7 @@ pub enum ToDevice {
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
     /// One of the person's conversations: each at `sync`, before the
-    /// messages, and again whenever its name changes.
+    /// messages, and again whenever its name or how far it was read changes.
     #[serde(rename = "conversation")]
     Conversation(ConversationInfo),
     #[serde(rename = "message")]
@@ -162,7 +170,8 @@ pub struct AgentInfo {
     pub abilities: Vec<String>,
 }
 
-/// A conversation: its agent, and its name when it has one.
+/// A conversation: its agent, its name when it has one, and how far the
+/// person read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationInfo {
     pub conversation: ConversationId,
@@ -173,6 +182,10 @@ pub struct ConversationInfo {
     /// Who named it: `agent` (its runtime), or `person`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub titled_by: Option<String>,
+    /// The `seq` of the last message the person read, on any of their
+    /// devices; none before they read any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<i64>,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -318,6 +331,10 @@ mod tests {
                 text: "hi".into(),
             },
             FromDevice::Sync { since: 4 },
+            FromDevice::ConversationRead {
+                conversation: ConversationId::new("c-1").unwrap(),
+                seq: 7,
+            },
             FromDevice::AttachmentGet {
                 attachment: "a-1".into(),
                 offset: 45_000,
@@ -356,6 +373,22 @@ mod tests {
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
+        let body = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("c-1").unwrap(),
+            agent: "lab/main".into(),
+            title: Some("Weather in Lyon".into()),
+            titled_by: Some("agent".into()),
+            read: Some(7),
+        });
+        let line = encode_line(&Envelope::new(id(), body.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, body);
+        // A conversation never read carries no `read`.
+        let unread =
+            br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main"}"#;
+        assert!(matches!(
+            decode_to_device(unread).unwrap().body,
+            ToDevice::Conversation(ConversationInfo { read: None, .. })
+        ));
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
     }
 

@@ -124,7 +124,8 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `conversation.new` | device | `conversation`, `agent` | Start one; its owner is the device's person |
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
 | `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
-| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts or its name changes |
+| `conversation.read` | device | `conversation`, `seq` | The person read it up to that message, on this device |
+| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name changes or it was read further |
 | `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq`, `attachments`? (`[{id, mime, name, size}]`) | A message of a conversation, sent and received alike, in order |
 | `attachment.get` | device | `attachment` (its id), `offset` | The bytes of a file of one of the person's messages, from `offset` |
 | `attachment.data` | bridge | `attachment`, `offset`, `size` (the file's), `data` (base64url, at most 45,000 bytes) | One part of it: a Noise message holds 64 KiB. A device asks for the next `offset` until it has `size` |
@@ -138,6 +139,8 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `ack`, `error` | either | as on the plugin leg | |
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
+
+**How far a conversation was read** is the bridge's too, not the runtime's: the agent does not see what the person reads in the app. A device sends `conversation.read` when the person opens the conversation or reads a message arriving in it; the bridge keeps the highest `seq`, from the conversation's owner only and never past its newest message, and sends the `conversation` again to all of the person's devices. A device that syncs, a new one or one that was away, so counts as unread only the agent's messages after `read`.
 
 ### Notifications
 
