@@ -78,10 +78,12 @@ impl Hub {
             };
             let (source, round) = (d.source, d.round);
             let turn = turn_id(id, source, round, &member);
-            // What the member is given: every message after its position;
-            // its position then moves to the last of them, and no further.
+            // What the member is given: the messages after its position,
+            // the newest that a prompt holds and one more, which tells it
+            // that earlier ones were left out; its position then moves to
+            // the last of them, and no further.
             let unseen = store
-                .messages_after(id, position(&member))
+                .newest_after(id, position(&member), crate::bridge::groups::MAX_UNSEEN + 1)
                 .unwrap_or_default();
             let given = unseen.last().map_or(position(&member), |m| m.seq);
             // Running before it is sent, under the lock: a second call (the
@@ -447,9 +449,13 @@ pub(super) fn new_group(
             return Ok(Err(format!("conversation {id} exists already")));
         }
     } else {
-        store
+        // Made meanwhile by another `group.new` with this id: theirs
+        let (owner, made) = store
             .group(id, &sandbox, &names, person)
             .map_err(|e| e.to_string())?;
+        if owner != person || made != names {
+            return Ok(Err(format!("conversation {id} exists already")));
+        }
         let name = title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| names.join(", "));
