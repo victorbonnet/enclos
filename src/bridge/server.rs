@@ -1677,8 +1677,7 @@ fn run_session(
                 if let Err(why) = forget(hub, store, device, person) {
                     link.send(ToDevice::Error(ErrorBody {
                         of: Some(message.id),
-                        // `internal` once the protocol has it
-                        code: ErrorCode::Unknown,
+                        code: ErrorCode::Internal,
                         message: format!("this host was not forgotten: {why}"),
                     }))?;
                     continue;
@@ -3242,7 +3241,7 @@ mod connection_end_tests {
         let Some(ToDevice::Error(error)) = device.receive() else {
             panic!("not refused");
         };
-        assert_eq!(error.code, ErrorCode::Unknown);
+        assert_eq!(error.code, ErrorCode::Internal);
         assert_eq!(error.of.unwrap().as_str(), "forget-1");
         let store = Store::open(&bridge.store).unwrap();
         assert!(store.device(&phone.id).unwrap().is_some());
