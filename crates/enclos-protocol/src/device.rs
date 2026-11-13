@@ -75,6 +75,18 @@ pub enum FromDevice {
     },
     #[serde(rename = "agents")]
     Agents,
+    #[serde(rename = "sandboxes")]
+    Sandboxes,
+    #[serde(rename = "runtimes")]
+    Runtimes,
+    #[serde(rename = "sandbox.create")]
+    SandboxCreate {
+        sandbox: String,
+        #[serde(default = "minimal_template")]
+        template: String,
+    },
+    #[serde(rename = "runtime.install")]
+    RuntimeInstall { sandbox: String, runtime: String },
     #[serde(rename = "conversation.new")]
     ConversationNew {
         conversation: ConversationId,
@@ -149,6 +161,10 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "pair.request",
     "approval.decide",
     "agents",
+    "sandboxes",
+    "runtimes",
+    "sandbox.create",
+    "runtime.install",
     "conversation.new",
     "group.new",
     "group.stop",
@@ -195,13 +211,37 @@ pub enum ToDevice {
     Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
     #[serde(rename = "authenticated")]
-    Authenticated { person: String },
+    Authenticated {
+        person: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
     #[serde(rename = "pair.refused")]
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
+    #[serde(rename = "sandboxes.list")]
+    SandboxesList { sandboxes: Vec<SandboxInfo> },
+    #[serde(rename = "runtimes.list")]
+    RuntimesList { runtimes: Vec<RuntimeInfo> },
+    #[serde(rename = "operation.progress")]
+    OperationProgress {
+        of: MessageId,
+        operation: String,
+        sandbox: String,
+        message: String,
+    },
+    #[serde(rename = "sandbox.created")]
+    SandboxCreated { of: MessageId, sandbox: String },
+    #[serde(rename = "runtime.installed")]
+    RuntimeInstalled {
+        of: MessageId,
+        sandbox: String,
+        runtime: String,
+        login: String,
+    },
     /// One of the person's conversations: each at `sync`, before the
     /// messages, and again whenever its name, read position or archive state changes.
     #[serde(rename = "conversation")]
@@ -265,6 +305,11 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "pair.accepted",
     "pair.refused",
     "agents.list",
+    "sandboxes.list",
+    "runtimes.list",
+    "operation.progress",
+    "sandbox.created",
+    "runtime.installed",
     "conversation",
     "message",
     "typing",
@@ -432,6 +477,26 @@ pub struct MemberTurn {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
+}
+
+fn minimal_template() -> String {
+    "minimal".to_owned()
+}
+
+/// A sandbox on the owner's host, including one with no runtime or app channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxInfo {
+    pub sandbox: String,
+    pub runtime: Option<String>,
+    pub state: String,
+}
+
+/// A runtime this host can install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    pub runtime: String,
+    pub name: String,
+    pub description: String,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -837,5 +902,68 @@ mod tests {
         ));
         // A Noise transport message is 65,535 bytes, its tag 16 of them.
         assert!(line.len() <= 65_535 - 16, "{} bytes", line.len());
+    }
+    #[test]
+    fn provisioning_responses_round_trip_and_older_auth_still_reads() {
+        let id = MessageId::new("request").unwrap();
+        for body in [
+            ToDevice::Authenticated {
+                person: "owner@example.org".into(),
+                capabilities: vec!["sandboxes".into()],
+            },
+            ToDevice::SandboxesList {
+                sandboxes: vec![SandboxInfo {
+                    sandbox: "lab".into(),
+                    runtime: None,
+                    state: "created".into(),
+                }],
+            },
+            ToDevice::RuntimesList {
+                runtimes: vec![RuntimeInfo {
+                    runtime: "hermes".into(),
+                    name: "Hermes".into(),
+                    description: "An agent runtime".into(),
+                }],
+            },
+            ToDevice::OperationProgress {
+                of: id.clone(),
+                operation: "runtime.install".into(),
+                sandbox: "lab".into(),
+                message: "Installing".into(),
+            },
+            ToDevice::SandboxCreated {
+                of: id.clone(),
+                sandbox: "lab".into(),
+            },
+            ToDevice::RuntimeInstalled {
+                of: id.clone(),
+                sandbox: "lab".into(),
+                runtime: "hermes".into(),
+                login: "enclos connect lab -- hermes setup".into(),
+            },
+        ] {
+            let line = encode_line(&Envelope::new(id.clone(), body.clone()));
+            assert_eq!(decode_to_device(&line).unwrap().body, body);
+        }
+        assert_eq!(
+            decode_to_device(
+                br#"{"v":1,"id":"m","type":"authenticated","person":"owner@example.org"}"#
+            )
+            .unwrap()
+            .body,
+            ToDevice::Authenticated {
+                person: "owner@example.org".into(),
+                capabilities: vec![]
+            }
+        );
+        assert_eq!(
+            decode_from_device(br#"{"v":1,"id":"m","type":"sandbox.create","sandbox":"lab"}"#)
+                .unwrap()
+                .body,
+            FromDevice::SandboxCreate {
+                sandbox: "lab".into(),
+                template: "minimal".into()
+            }
+        );
     }
 }

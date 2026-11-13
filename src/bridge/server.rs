@@ -65,6 +65,7 @@ use super::groups::{
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
+use super::provisioning::{Completed, Host, Operation};
 use super::store::{
     Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
     StoredAttachment, conversation_title, home_id, is_home, now,
@@ -149,6 +150,8 @@ struct Hub {
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
+    provisioning: Option<Host>,
+    provisioning_busy: Mutex<HashSet<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
@@ -204,6 +207,119 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    fn begin(
+        self: &Arc<Self>,
+        operation: Operation,
+        of: MessageId,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), ErrorBody> {
+        if !self
+            .provisioning
+            .as_ref()
+            .is_some_and(|h| h.is_owner(person))
+        {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::NotAllowed,
+                message: "only the host's user can manage sandboxes".to_owned(),
+            });
+        }
+        let sandbox = operation.sandbox().to_owned();
+        let verb = operation.verb().to_owned();
+        let mut busy = self.provisioning_busy.lock().expect("not poisoned");
+        if !busy.insert(sandbox.clone()) {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Busy,
+                message: format!("an operation is already running in sandbox {sandbox}"),
+            });
+        }
+        drop(busy);
+        self.deliver(
+            person,
+            ToDevice::OperationProgress {
+                of: of.clone(),
+                operation: verb.clone(),
+                sandbox: sandbox.clone(),
+                message: operation.progress().to_owned(),
+            },
+        );
+        let hub = Arc::clone(self);
+        let person = person.to_owned();
+        let device = device.id.clone();
+        std::thread::spawn(move || {
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!("{verb} started"),
+                    Some(&sandbox),
+                );
+            }
+            let result = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .execute(&operation, &person);
+            let failed = result.as_ref().err().cloned();
+            let response = match result {
+                Ok(Completed::Created) => ToDevice::SandboxCreated {
+                    of,
+                    sandbox: sandbox.clone(),
+                },
+                Ok(Completed::Installed { runtime, login }) => ToDevice::RuntimeInstalled {
+                    of,
+                    sandbox: sandbox.clone(),
+                    runtime,
+                    login,
+                },
+                Err(message) => ToDevice::Error(ErrorBody {
+                    of: Some(of),
+                    code: ErrorCode::OperationFailed,
+                    message,
+                }),
+            };
+            // Release before completing: a next request may follow at once.
+            hub.provisioning_busy
+                .lock()
+                .expect("not poisoned")
+                .remove(&sandbox);
+            hub.deliver(&person, response);
+            if let Ok(sandboxes) = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .sandboxes()
+            {
+                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+            }
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!(
+                        "{verb} {}",
+                        if failed.is_some() {
+                            "failed"
+                        } else {
+                            "completed"
+                        }
+                    ),
+                    Some(&sandbox),
+                );
+            }
+        });
+        Ok(())
+    }
+
+    fn with_provisioning(self, host: Host) -> Hub {
+        Hub {
+            provisioning: Some(host),
+            ..self
+        }
+    }
+
     /// Returns once `agent` may have one more message stored ([`Pace`]):
     /// at once in a burst, else after a wait, in which its plugin's
     /// connection is not read.
@@ -255,6 +371,8 @@ impl Hub {
             layout,
             bridge_private,
             agents,
+            provisioning: None,
+            provisioning_busy: Mutex::new(HashSet::new()),
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
             opening,
@@ -971,6 +1089,7 @@ fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, Tool
 }
 
 /// Serves on `127.0.0.1:port` until the process ends.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     transport: Transport,
     port: u16,
@@ -979,6 +1098,7 @@ pub fn serve(
     bridge_private: Vec<u8>,
     approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
+    provisioning: Host,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     if let Ok(store) = Store::open(&store_path)
@@ -999,7 +1119,8 @@ pub fn serve(
             None,
             SILENCE,
         )
-        .with_approval_key(approval_key),
+        .with_approval_key(approval_key)
+        .with_provisioning(provisioning),
     );
     serve_on(listener, hub, RETRY);
     Ok(())
@@ -1393,6 +1514,15 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
+        capabilities: if hub
+            .provisioning
+            .as_ref()
+            .is_some_and(|h| h.is_owner(&person))
+        {
+            vec!["sandboxes".into()]
+        } else {
+            vec![]
+        },
     })?;
     // Authenticated: no longer among the callers that are few at once
     drop(waiting);
@@ -1722,6 +1852,78 @@ fn run_session(
                     }))?;
                 } else {
                     link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
+            FromDevice::Sandboxes
+            | FromDevice::Runtimes
+            | FromDevice::SandboxCreate { .. }
+            | FromDevice::RuntimeInstall { .. } => {
+                if !hub
+                    .provisioning
+                    .as_ref()
+                    .is_some_and(|h| h.is_owner(person))
+                    || !store
+                        .device(&device.id)
+                        .map_err(|e| e.to_string())?
+                        .is_some_and(|known| {
+                            known.noise_key == device.noise_key
+                                && known.person == person
+                                && known.node == device.node
+                        })
+                {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::NotAllowed,
+                        message: "only the host's user can manage sandboxes".to_owned(),
+                    }))?;
+                    continue;
+                }
+                let operation = match message.body {
+                    FromDevice::Sandboxes => {
+                        match hub
+                            .provisioning
+                            .as_ref()
+                            .expect("provisioning request checked")
+                            .sandboxes()
+                        {
+                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
+                            Err(why) => link.send(ToDevice::Error(ErrorBody {
+                                of: Some(message.id),
+                                code: ErrorCode::OperationFailed,
+                                message: why,
+                            }))?,
+                        }
+                        continue;
+                    }
+                    FromDevice::Runtimes => {
+                        link.send(ToDevice::RuntimesList {
+                            runtimes: hub
+                                .provisioning
+                                .as_ref()
+                                .expect("provisioning request checked")
+                                .runtimes(),
+                        })?;
+                        continue;
+                    }
+                    FromDevice::SandboxCreate { sandbox, template } => {
+                        Operation::create(&sandbox, &template)
+                    }
+                    FromDevice::RuntimeInstall { sandbox, runtime } => {
+                        Operation::install(&sandbox, &runtime)
+                    }
+                    _ => unreachable!("matched provisioning requests"),
+                };
+                match operation {
+                    Ok(operation) => {
+                        if let Err(error) = hub.begin(operation, message.id, device, person) {
+                            link.send(ToDevice::Error(error))?;
+                        }
+                    }
+                    Err(why) => link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::BadMessage,
+                        message: why,
+                    }))?,
                 }
             }
             FromDevice::Agents => {
@@ -2581,21 +2783,32 @@ mod connection_end_tests {
         });
         let socket = folder.join("main.sock");
         let store = folder.join("app.db");
-        let hub = Arc::new(Hub::new(
-            Transport::Tailscale,
-            whois,
-            store.clone(),
-            crate::layout::Layout::at(folder.join("enclos")),
-            keys.private.to_vec(),
-            vec![AgentEndpoint {
-                name: "lab/main".to_owned(),
-                runtime: "hermes".to_owned(),
-                socket: socket.clone(),
-                token: TOKEN.to_owned(),
-            }],
-            None,
-            silence,
-        ));
+        let hub = Arc::new(
+            Hub::new(
+                Transport::Tailscale,
+                whois,
+                store.clone(),
+                crate::layout::Layout::at(folder.join("enclos")),
+                keys.private.to_vec(),
+                vec![AgentEndpoint {
+                    name: "lab/main".to_owned(),
+                    runtime: "hermes".to_owned(),
+                    socket: socket.clone(),
+                    token: TOKEN.to_owned(),
+                }],
+                None,
+                silence,
+            )
+            .with_provisioning(Host::new(
+                crate::layout::Layout::at(folder),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+                None,
+            )),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
@@ -2795,6 +3008,37 @@ mod connection_end_tests {
             }
         });
         got
+    }
+
+    #[test]
+    fn provisioning_capability_follows_confirmed_host_and_transfer_on_existing_connection() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.set_host("another@example.com").unwrap();
+        let (_, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+        );
+        store.set_host(PERSON).unwrap();
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities == ["sandboxes"])
+        );
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(
+            matches!(device.receive(), Some(ToDevice::RuntimesList { runtimes }) if runtimes.iter().any(|r| r.runtime == "hermes"))
+        );
+        store.set_host("another@example.com").unwrap();
+        device.send("after-transfer", FromDevice::Runtimes);
+        assert!(
+            matches!(device.receive(), Some(ToDevice::Error(ErrorBody { code: ErrorCode::NotAllowed, of: Some(of), .. })) if of.as_str() == "after-transfer")
+        );
+        let (_, first) = connect(&bridge, &phone);
+        assert!(
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+        );
     }
 
     fn start_conversation(device: &mut PhoneLink) {

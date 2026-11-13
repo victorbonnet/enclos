@@ -326,6 +326,8 @@ pub enum ErrorCode {
     /// A request that may have reached the agent, whose outcome was not
     /// confirmed: unlike `agent_unavailable`, retrying is not known to be safe.
     Unconfirmed,
+    Busy,
+    OperationFailed,
     #[serde(other)]
     Unknown,
 }
