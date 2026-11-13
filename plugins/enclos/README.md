@@ -33,7 +33,7 @@ The plugin's command reference names the enclos version it describes. When the `
 ## Use
 
 - Ask about enclos, or for something enclos does ("sandbox my Hermes agent", "why can't my agent reach example.org?"): the `enclos` skill loads by itself.
-- `/enclos:setup` takes this host from nothing to a running agent, step by step, and picks up where it left off.
+- `/enclos:setup` in Claude Code (`$setup` in Codex) takes this host from nothing to a running agent, step by step, and picks up where it left off. It runs only when you ask for it.
 
 ## Allowing enclos commands
 
