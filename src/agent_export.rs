@@ -10,6 +10,8 @@ use crate::model::{agent::AgentName, runtime::RuntimeKind, sandbox::SandboxName}
 const MAGIC: &[u8] = b"ENCLOS_AGENT_EXPORT_V1\n";
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_STATE: u64 = 256 * 1024 * 1024;
+/// Maximum compressed runtime data, enforced before reading and while copying.
+pub const MAX_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 use crate::bridge::portable::HostState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,37 +29,23 @@ fn native_format() -> String {
 pub struct Presentation {
     pub display_name: Option<String>,
     /// Base64url JPEG or PNG; bounded like the mobile app's shared image.
-    pub avatar: Option<String>,
+    #[serde(alias = "avatar")]
+    pub photo: Option<String>,
 }
 
 impl Presentation {
     pub fn image(&self) -> io::Result<Option<Vec<u8>>> {
-        self.avatar
+        self.photo
             .as_ref()
             .map(|text| {
                 if text.len() > enclos_protocol::avatar::MAX_AVATAR_BYTES.div_ceil(3) * 4 {
                     return Err(invalid("the agent image is too large"));
                 }
-                let bytes = enclos_protocol::pairing::decode("avatar", text).map_err(invalid)?;
+                let bytes = enclos_protocol::pairing::decode("photo", text).map_err(invalid)?;
                 if bytes.is_empty() || bytes.len() > enclos_protocol::avatar::MAX_AVATAR_BYTES {
                     return Err(invalid("the agent image is empty or too large"));
                 }
-                let mut reader = image::ImageReader::new(io::Cursor::new(&bytes))
-                    .with_guessed_format()
-                    .map_err(invalid)?;
-                if !matches!(
-                    reader.format(),
-                    Some(image::ImageFormat::Jpeg | image::ImageFormat::Png)
-                ) {
-                    return Err(invalid("the agent image must be JPEG or PNG"));
-                }
-                let mut limits = image::Limits::default();
-                limits.max_image_width = Some(512);
-                limits.max_image_height = Some(512);
-                limits.max_alloc = Some(8 * 1024 * 1024);
-                reader.limits(limits);
-                reader.decode().map_err(invalid)?;
-                Ok(bytes)
+                crate::bridge::server::normalize_photo(&bytes).map_err(invalid)
             })
             .transpose()
     }
@@ -104,6 +92,7 @@ impl Manifest {
         sandbox.parse::<SandboxName>().map_err(invalid)?;
         agent.parse::<AgentName>().map_err(invalid)?;
         if self.payload_bytes == 0
+            || self.payload_bytes > MAX_PAYLOAD_BYTES
             || self.payload_sha256.len() != 64
             || !self
                 .payload_sha256
@@ -202,8 +191,18 @@ fn write_parts(
     format: &str,
     state: Option<&[u8]>,
 ) -> io::Result<Manifest> {
+    let size = payload.seek(SeekFrom::End(0))?;
+    if size == 0 || size > MAX_PAYLOAD_BYTES {
+        return Err(invalid(
+            "runtime data exceeds the 32 GiB export limit or is empty",
+        ));
+    }
     payload.seek(SeekFrom::Start(0))?;
-    let (payload_bytes, payload_sha256) = copy(payload, &mut io::sink())?;
+    let (payload_bytes, payload_sha256) =
+        copy(&mut payload.take(MAX_PAYLOAD_BYTES + 1), &mut io::sink())?;
+    if payload_bytes > MAX_PAYLOAD_BYTES {
+        return Err(invalid("runtime data exceeds the 32 GiB export limit"));
+    }
     let manifest = Manifest {
         schema_version: if state.is_some() { 2 } else { 1 },
         runtime: runtime.to_string(),
@@ -229,7 +228,7 @@ fn write_parts(
         output.write_all(state)?;
     }
     payload.seek(SeekFrom::Start(0))?;
-    let (size, digest) = copy(payload, output)?;
+    let (size, digest) = copy(&mut payload.take(manifest.payload_bytes + 1), output)?;
     if size != manifest.payload_bytes || digest != manifest.payload_sha256 {
         return Err(invalid("the runtime export changed while it was copied"));
     }
@@ -292,6 +291,45 @@ pub fn read_complete(
     Ok((manifest, state))
 }
 
+/// Computes an audit digest during the existing IO pass.
+pub(crate) struct Hashed<T> {
+    inner: T,
+    sha: Sha256,
+}
+impl<T> Hashed<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            sha: Sha256::new(),
+        }
+    }
+    pub fn sha256(&self) -> String {
+        self.sha
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+impl<T: Read> Read for Hashed<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(bytes)?;
+        self.sha.update(&bytes[..n]);
+        Ok(n)
+    }
+}
+impl<T: Write> Write for Hashed<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.sha.update(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn copy(input: &mut impl Read, output: &mut impl Write) -> io::Result<(u64, String)> {
     let mut sha = Sha256::new();
     let mut bytes = 0;
@@ -334,7 +372,7 @@ mod tests {
             "pi/comptoir-dev".into(),
             Presentation {
                 display_name: Some("Gégé Commit".into()),
-                avatar: Some(enclos_protocol::pairing::encode(&photo())),
+                photo: Some(enclos_protocol::pairing::encode(&photo())),
             },
         )
         .unwrap();
@@ -346,7 +384,10 @@ mod tests {
         let mut payload = Vec::new();
         assert_eq!(read(&mut bytes.as_slice(), &mut payload).unwrap(), manifest);
         assert_eq!(payload, vec![42; 200_000]);
-        assert_eq!(manifest.presentation.image().unwrap().unwrap(), photo());
+        assert_eq!(
+            manifest.presentation.image().unwrap().unwrap(),
+            crate::bridge::server::normalize_photo(&photo()).unwrap()
+        );
     }
     #[test]
     fn changed_truncated_and_appended_runtime_exports_are_refused() {
@@ -378,11 +419,11 @@ mod tests {
         for p in [
             Presentation {
                 display_name: Some("bad\nname".into()),
-                avatar: None,
+                photo: None,
             },
             Presentation {
                 display_name: None,
-                avatar: Some(enclos_protocol::pairing::encode(b"not a photo")),
+                photo: Some(enclos_protocol::pairing::encode(b"not a photo")),
             },
         ] {
             assert!(p.validate().is_err());
@@ -427,5 +468,86 @@ mod complete_tests {
             .unwrap();
         bytes[index] ^= 1;
         assert!(read_complete(&mut io::Cursor::new(&bytes), &mut Vec::new()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn review_imported_photos_drop_trailing_metadata_and_use_bridge_dimensions() {
+        let mut photo = io::Cursor::new(Vec::new());
+        image::RgbImage::new(512, 300)
+            .write_to(&mut photo, image::ImageFormat::Png)
+            .unwrap();
+        let mut bytes = photo.into_inner();
+        bytes.extend_from_slice(b"PRIVATE_PHOTO_TRAILER");
+        let p = Presentation {
+            display_name: None,
+            photo: Some(enclos_protocol::pairing::encode(&bytes)),
+        };
+        let clean = p.image().unwrap().unwrap();
+        let image = image::load_from_memory(&clean).unwrap();
+        assert_eq!((image.width(), image.height()), (256, 256));
+        assert!(clean.starts_with(&[0xff, 0xd8]));
+        assert!(!clean.windows(21).any(|w| w == b"PRIVATE_PHOTO_TRAILER"));
+    }
+    #[test]
+    fn review_oversized_payload_is_refused_before_any_read() {
+        struct Oversized;
+        impl Read for Oversized {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("oversized input must not be read")
+            }
+        }
+        impl Seek for Oversized {
+            fn seek(&mut self, seek: SeekFrom) -> io::Result<u64> {
+                Ok(if matches!(seek, SeekFrom::End(_)) {
+                    32 * 1024 * 1024 * 1024 + 1
+                } else {
+                    0
+                })
+            }
+        }
+        assert!(
+            write(
+                &mut Oversized,
+                &mut Vec::new(),
+                RuntimeKind::Hermes,
+                "old/main".into(),
+                Presentation::default()
+            )
+            .is_err()
+        );
+        let mut out = Vec::new();
+        let mut manifest = write(
+            &mut io::Cursor::new(b"small"),
+            &mut out,
+            RuntimeKind::Hermes,
+            "old/main".into(),
+            Presentation::default(),
+        )
+        .unwrap();
+        manifest.payload_bytes = 32 * 1024 * 1024 * 1024 + 1;
+        assert!(manifest.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_photo_tests {
+    use super::*;
+    #[test]
+    fn review_new_exports_use_photo_and_legacy_avatar_is_readable() {
+        let photo: Presentation =
+            serde_json::from_str(r#"{"display_name":null,"avatar":null}"#).unwrap();
+        let json = serde_json::to_value(&photo).unwrap();
+        assert!(json.get("photo").is_some());
+        assert!(json.get("avatar").is_none());
+        assert!(
+            serde_json::from_str::<Presentation>(
+                r#"{"display_name":null,"avatar":null,"photo":null}"#
+            )
+            .is_err()
+        );
     }
 }

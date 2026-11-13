@@ -117,19 +117,54 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 confirm,
             )? {
                 Planned::DryRun(plan) => output::show_plan(&plan),
-                Planned::Done(manifest) if output::json() => output::emit(&json!({
-                    "agent": format!("{sandbox}/{agent}"), "metadata_only": metadata_only,
-                    "display_name": manifest.presentation.display_name, "has_image": manifest.presentation.avatar.is_some(), "format_version": manifest.schema_version,
-                })),
-                Planned::Done(_) => println!(
-                    "Imported {}for {sandbox}/{agent} from {}.",
-                    if metadata_only {
-                        "name and image "
+                Planned::Done(imported) => {
+                    let manifest = &imported.manifest;
+                    let added = imported.added.as_ref();
+                    let (session, copy_left) = match added.map(|a| &a.how) {
+                        Some(Added::Imported { end, copy_left, .. }) => (
+                            Some(output::session(end)),
+                            copy_left.as_ref().map(ToString::to_string),
+                        ),
+                        _ => (None, None),
+                    };
+                    if output::json() {
+                        output::emit(&json!({
+                            "agent":format!("{sandbox}/{agent}"), "metadata_only":metadata_only,
+                            "display_name":manifest.presentation.display_name,"has_photo":manifest.presentation.photo.is_some(),"has_image":manifest.presentation.photo.is_some(),"format_version":manifest.schema_version,
+                            "session":session,"copy_left":copy_left,
+                            "archive":{"path":output::path(&imported.archive.path),"sha256":imported.archive.sha256},
+                            "talk":added.map(|a|format!("enclos connect {sandbox} -- {}",a.talk)),
+                            "choose_provider":added.and_then(|a|a.choose_provider.as_ref()).map(|c|format!("enclos connect {sandbox} -- {c}")),
+                        }));
                     } else {
-                        "agent data, credentials, presentation and app history "
-                    },
-                    from.display()
-                ),
+                        if let Some(added) = added {
+                            if let Added::Imported { end, .. } = &added.how {
+                                super::connect::report_end(&sandbox, end);
+                            }
+                            if let Some(left) = copy_left {
+                                eprintln!("enclos: {left}.");
+                            }
+                            println!(
+                                "Talk to the agent: enclos connect {sandbox} -- {}",
+                                added.talk
+                            );
+                            if let Some(choose) = &added.choose_provider {
+                                println!(
+                                    "Choose its provider and model: enclos connect {sandbox} -- {choose}"
+                                );
+                            }
+                        }
+                        println!(
+                            "Imported {}for {sandbox}/{agent} from {}.",
+                            if metadata_only {
+                                "name and photo "
+                            } else {
+                                "agent data, credentials, presentation and app history "
+                            },
+                            from.display()
+                        );
+                    }
+                }
             }
         }
         AgentVerb::Add { agent, from } => {

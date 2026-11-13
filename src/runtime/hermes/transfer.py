@@ -71,7 +71,16 @@ def add_file(archive, source, name):
             raise ValueError('agent data changed while being exported; stop interactive writers and retry')
 
 
-def export(home, name, output):
+class LimitedOutput:
+    def __init__(self, output, limit): self.output = output; self.limit = limit; self.size = 0
+    def write(self, data):
+        if self.size + len(data) > self.limit: raise ValueError('runtime data exceeds the export size limit')
+        n = self.output.write(data); self.size += n; return n
+    def flush(self): self.output.flush()
+    def tell(self): return self.size
+
+
+def export(home, name, output, max_bytes=32 * 1024 * 1024 * 1024):
     root = home / '.hermes'
     profile = root if name == 'default' else root / 'profiles' / name
     if profile.is_symlink() or not profile.is_dir():
@@ -104,7 +113,7 @@ def export(home, name, output):
     meta = json.dumps({'format': FORMAT, 'home': str(home), 'profile': str(profile), 'agent': name}).encode()
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(fd, 'wb') as raw, tarfile.open(fileobj=raw, mode='w:gz') as archive:
+        with os.fdopen(fd, 'wb') as raw, tarfile.open(fileobj=LimitedOutput(raw, max_bytes), mode='w:gz') as archive:
             info = tarfile.TarInfo('manifest.json'); info.size = len(meta); info.mode = 0o600
             archive.addfile(info, io.BytesIO(meta))
             for key, file in sorted(selected.items()):
@@ -261,7 +270,7 @@ if __name__ == '__main__':
         operation, name, path, context = sys.argv[1:]
         if not valid_name(name): raise ValueError('invalid agent name')
         home = Path.home().resolve()
-        if operation == 'export': export(home, name, Path(path))
+        if operation == 'export': export(home, name, Path(path), json.loads(context).get('max_bytes', 32 * 1024 * 1024 * 1024))
         elif operation == 'import': restore(home, name, Path(path), json.loads(context))
         else: raise ValueError('unknown transfer operation')
     except Exception as error:

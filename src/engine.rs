@@ -59,6 +59,7 @@ pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
+pub use portable::ImportedAgentExport;
 pub use probe::TestReport;
 pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};

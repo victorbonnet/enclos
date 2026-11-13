@@ -4,8 +4,8 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use super::import::{Source, opened_path};
-use super::{Archive, Engine};
+use super::import::{ImportArchive, Source, opened_path};
+use super::{Added, AgentAdded, Archive, Engine};
 use crate::agent_export::{self, Manifest, Presentation};
 use crate::bridge::{ids::new_id, store::Store};
 use crate::error::{Error, Result};
@@ -17,28 +17,43 @@ use crate::model::{
 };
 use crate::runtime::{RuntimeAgentName, adapter};
 
+/// What a portable import restored, including the runtime's session/cleanup report.
+#[derive(Debug, Clone)]
+pub struct ImportedAgentExport {
+    pub manifest: Manifest,
+    pub added: Option<AgentAdded>,
+    pub archive: Archive,
+}
+
 struct Temporary {
     path: PathBuf,
-    keep: bool,
+    armed: bool,
 }
 impl Temporary {
-    fn new(path: PathBuf) -> Self {
-        Self { path, keep: true }
-    }
-    fn create(&mut self) -> Result<File> {
+    fn created(path: PathBuf) -> Result<(Self, File)> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&self.path)
+            .open(&path)
             .map_err(failed)?;
-        self.keep = false;
-        Ok(file)
+        Ok((Self { path, armed: true }, file))
+    }
+    fn runtime_output(path: PathBuf) -> Result<Self> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Err(failed("runtime export output already exists")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(failed(e)),
+        }
+        Ok(Self { path, armed: true })
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 impl Drop for Temporary {
     fn drop(&mut self) {
-        if !self.keep
+        if self.armed
             && let Err(e) = std::fs::remove_file(&self.path)
             && e.kind() != io::ErrorKind::NotFound
         {
@@ -96,8 +111,7 @@ impl Engine {
         let paused = self.pause_runtime(by, name, "agent export")?;
         let result = (|| {
             let state = self.export_host_state(name, agent)?;
-            let mut _runtime_cleanup = Temporary::new(runtime_path.clone());
-            _runtime_cleanup.keep = false;
+            let _runtime_cleanup = Temporary::runtime_output(runtime_path.clone())?;
             let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
             if ended.exit != 0 {
                 return Err(failed(format!(
@@ -123,11 +137,7 @@ impl Engine {
             let presentation = self.export_presentation(&format!("{name}/{agent}"))?;
             let scratch =
                 to.with_file_name(format!(".enclos-export-{}.tmp", new_id().map_err(failed)?));
-            let mut output_cleanup = Temporary::new(scratch.clone());
-            // A failed create must never let cleanup delete an existing destination.
-            output_cleanup.keep = true;
-            let mut output = output_cleanup.create()?;
-            output_cleanup.keep = false;
+            let (_output_cleanup, mut output) = Temporary::created(scratch.clone())?;
             let exported = self.write(
                 by,
                 "agent export",
@@ -140,9 +150,10 @@ impl Engine {
                     )
                 },
                 |_| {
+                    let mut hashed = agent_export::Hashed::new(&mut output);
                     agent_export::write_complete(
                         &mut payload,
-                        &mut output,
+                        &mut hashed,
                         kind,
                         format!("{name}/{agent}"),
                         presentation,
@@ -150,8 +161,8 @@ impl Engine {
                         &state,
                     )
                     .map_err(failed)?;
+                    let hash = hashed.sha256();
                     output.sync_all().map_err(failed)?;
-                    let hash = Source::open(&self.layout, &scratch)?.hash()?.sha256;
                     // Publish a complete file without replacing a path created
                     // concurrently. Both names are on the same filesystem.
                     std::fs::hard_link(&scratch, &to).map_err(failed)?;
@@ -186,9 +197,12 @@ impl Engine {
         from: &Path,
         metadata_only: bool,
         confirm: Confirm,
-    ) -> Result<Planned<Manifest>> {
+    ) -> Result<Planned<ImportedAgentExport>> {
         let kind = self.runtime_of(name)?;
         let mut source = Source::open(&self.layout, from)?;
+        if !metadata_only {
+            self.preflight_host_import(name, &agent, None)?;
+        }
         // A dry run validates every byte but writes no temporary file or database.
         if confirm == Confirm::DryRun {
             let (manifest, state) =
@@ -208,6 +222,11 @@ impl Engine {
             if metadata_only {
                 self.portable_agent_exists(name, &agent)?;
             }
+            let services = if metadata_only {
+                Vec::new()
+            } else {
+                self.plan_restart(name)?.plan(&format!("{name}/{agent}"))
+            };
             return Ok(Planned::DryRun(Plan {
                 changes: vec![
                     format!(
@@ -221,44 +240,58 @@ impl Engine {
                     ),
                     "restore presentation and, for a complete import, agent credentials and app history; retain destination host policy and pairings"
                         .into(),
-                ],
+                ].into_iter().chain(services).collect(),
                 ..Plan::default()
             }));
         }
         if metadata_only {
             self.portable_agent_exists(name, &agent)?;
         }
-        let dir = self.layout.data().join("agent-transfers");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(failed)?;
         let id = new_id().map_err(failed)?;
-        let mut outer = Temporary::new(dir.join(format!("{id}.enclos")));
-        let archive = self.write(
+        let dir = self.layout.sandbox_installers(name.as_str());
+        let (mut payload, mut output) = if metadata_only {
+            (None, None)
+        } else {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(failed)?;
+            let (guard, file) =
+                Temporary::created(dir.join(format!("agent-{agent}.{id}.runtime")))?;
+            (Some(guard), Some(file))
+        };
+        let (manifest, state, archive) = self.write(
             by,
             "agent import export",
             Some(format!("{name}/{agent}")),
-            |a: &Archive| {
+            |data: &(
+                Manifest,
+                Option<crate::bridge::portable::HostState>,
+                Archive,
+            )| {
                 format!(
-                    "copied Enclos export {} (sha256 {})",
-                    a.path.display(),
-                    a.sha256
+                    "validated Enclos export {} (sha256 {}); runtime payload staged once",
+                    data.2.path.display(),
+                    data.2.sha256
                 )
             },
             |_| {
-                let copied = source.stage(&outer.path)?;
-                outer.keep = false;
-                Ok(copied)
+                let mut input = agent_export::Hashed::new(&mut source.file);
+                let (manifest, state) = if let Some(output) = &mut output {
+                    agent_export::read_complete(&mut input, output)
+                } else {
+                    agent_export::read_complete(&mut input, &mut io::sink())
+                }
+                .map_err(failed)?;
+                let archive = Archive {
+                    path: source.path.clone(),
+                    sha256: input.sha256(),
+                };
+                Ok((manifest, state, archive))
             },
         )?;
-        let mut payload = Temporary::new(dir.join(format!("{id}.runtime")));
-        let mut input = File::open(&outer.path).map_err(failed)?;
-        let (manifest, state) = {
-            let mut output = payload.create()?;
-            agent_export::read_complete(&mut input, &mut output).map_err(failed)?
-        };
+        drop(output);
         if manifest.runtime != kind.as_str() {
             return Err(failed(
                 "the export's runtime differs from the destination sandbox",
@@ -288,25 +321,46 @@ impl Engine {
         } else {
             None
         };
+        let mut added = None;
         if !metadata_only {
+            let runtime_archive = Archive {
+                path: payload.as_ref().expect("runtime payload").path.clone(),
+                sha256: manifest.payload_sha256.clone(),
+            };
             let imported = self.import_agent_data(
                 by,
                 name,
                 agent.clone(),
-                &payload.path,
+                ImportArchive::Staged(runtime_archive),
                 Some((&manifest.runtime_format, &context)),
                 Confirm::Yes,
             );
-            if let Err(error) = imported {
-                return Err(Error::WithContext {
-                    error: Box::new(error),
-                    what: format!(
-                        "import did not finish; sandbox {name}'s runtime remains stopped. Inspect the destination before restarting it"
-                    ),
-                });
-            }
+            added = match imported {
+                Ok(Planned::Done(added)) => {
+                    if matches!(
+                        &added.how,
+                        Added::Imported {
+                            copy_left: Some(_),
+                            ..
+                        }
+                    ) {
+                        payload.as_mut().expect("runtime payload").disarm();
+                    }
+                    Some(added)
+                }
+                Ok(Planned::DryRun(_)) => unreachable!("confirmed import"),
+                Err(error) => {
+                    let what = format!(
+                        "{error}; import did not finish; sandbox {name}'s runtime remains stopped. If the runtime agent was created, restore its name and photo with `agent import --metadata-only`; inspect the destination before restarting or retrying the full import"
+                    );
+                    return Err(Error::WithContext {
+                        error: Box::new(error),
+                        what,
+                    });
+                }
+            };
             if let Some(state) = &state {
-                self.restore_host_state(by, name, &agent, state, &conversations).map_err(|error| Error::FailedAfter { error: Box::new(error), done: format!("importing {name}/{agent}'s runtime data; its runtime remains stopped. Remove the imported agent and retry after fixing the cause") })?;
+                self.restore_host_state(by, name, &agent, state, &conversations).map_err(|error| with_import_copy(Error::FailedAfter { error: Box::new(error), done: format!("importing {name}/{agent}'s runtime data; its runtime remains stopped. Recover its name and photo with `agent import --metadata-only`, or remove the partial agent and retry the full import after fixing the cause") }, &added))?;
             }
         }
         let image = manifest.presentation.image().map_err(failed)?;
@@ -317,11 +371,20 @@ impl Engine {
                 store.import_presentation(&format!("{name}/{agent}"), manifest.presentation.display_name.as_deref(), image.as_deref()).map_err(failed)
             }).map_err(|error| if metadata_only { error } else { Error::FailedAfter {
                 error: Box::new(error), done: format!("importing {name}/{agent}; restore its name and image with agent import --metadata-only"),
-            }})?;
+            }}).map_err(|error| with_import_copy(error, &added))?;
         if let Some(paused) = paused {
-            self.resume_runtime(by, name, paused)?;
+            self.resume_runtime(by, name, paused)
+                .map_err(|error| Error::FailedAfter {
+                    error: Box::new(error),
+                    done: format!("restoring complete data and presentation for {name}/{agent}"),
+                })
+                .map_err(|error| with_import_copy(error, &added))?;
         }
-        Ok(Planned::Done(manifest))
+        Ok(Planned::Done(ImportedAgentExport {
+            manifest,
+            added,
+            archive,
+        }))
     }
 
     fn portable_agent_exists(&self, name: &SandboxName, agent: &AgentName) -> Result<()> {
@@ -350,7 +413,7 @@ impl Engine {
         let avatar = store.avatar(agent).map_err(failed)?;
         Ok(Presentation {
             display_name: name.display_name,
-            avatar: avatar
+            photo: avatar
                 .image
                 .as_deref()
                 .map(enclos_protocol::pairing::encode),
@@ -392,4 +455,47 @@ fn runtime_import_unsupported(
     adapter(kind)
         .import_export(agent, Path::new("/export/runtime"), format, "{}")
         .is_none()
+}
+
+fn with_import_copy(error: Error, added: &Option<AgentAdded>) -> Error {
+    if let Some(AgentAdded {
+        how: Added::Imported {
+            copy_left: Some(left),
+            ..
+        },
+        ..
+    }) = added
+    {
+        Error::CleanupFailed {
+            error: Box::new(error),
+            left: left.to_string(),
+        }
+    } else {
+        error
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn review_cleanup_owns_only_files_whose_creation_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing");
+        std::fs::write(&path, b"user data").unwrap();
+        assert!(Temporary::created(path.clone()).is_err());
+        assert!(Temporary::runtime_output(path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"user data");
+        let owned = dir.path().join("owned");
+        let (guard, file) = Temporary::created(owned.clone()).unwrap();
+        drop(file);
+        drop(guard);
+        assert!(!owned.exists());
+        let kept = dir.path().join("left-for-user");
+        let (mut guard, file) = Temporary::created(kept.clone()).unwrap();
+        drop(file);
+        guard.disarm();
+        drop(guard);
+        assert!(kept.exists());
+    }
 }

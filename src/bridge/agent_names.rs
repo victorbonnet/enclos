@@ -207,3 +207,45 @@ impl Hub {
         Ok(name_message(&edit.agent, saved, of))
     }
 }
+
+impl Hub {
+    /// CLI imports commit to the same store in another process. Deliver their
+    /// revisions without a device reconnect or an explicit agents.list request.
+    pub(super) fn broadcast_presentation_changes(&self, store: &Store) -> Result<(), String> {
+        let names = store.agent_name_metadata().map_err(|e| e.to_string())?;
+        let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
+        let paired = store.devices().map_err(|e| e.to_string())?;
+        let mut known = self.presentation_revisions.lock().expect("not poisoned");
+        for agent in &self.agents {
+            let name = names.get(&agent.name).cloned().unwrap_or_default();
+            let photo = photos.get(&agent.name).cloned().unwrap_or_default();
+            let previous = known.get(&agent.name).copied().unwrap_or_default();
+            let mut updates = Vec::new();
+            if name.revision != previous.0 {
+                updates.push(name_message(
+                    &agent.name,
+                    self.shown_name(&agent.name, name.clone()),
+                    String::new(),
+                ));
+            }
+            if photo.revision != previous.1 {
+                updates.push(super::avatars::photo_message(
+                    &agent.name,
+                    store.avatar(&agent.name).map_err(|e| e.to_string())?,
+                    String::new(),
+                ));
+            }
+            for (id, (person, sender, _)) in self.devices.lock().expect("not poisoned").iter() {
+                if self.sees_agent(person, &agent.name)
+                    && paired.iter().any(|d| &d.id == id && &d.person == person)
+                {
+                    for update in &updates {
+                        let _ = sender.send(update.clone());
+                    }
+                }
+            }
+            known.insert(agent.name.clone(), (name.revision, photo.revision));
+        }
+        Ok(())
+    }
+}

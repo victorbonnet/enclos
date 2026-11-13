@@ -550,6 +550,20 @@ impl Store {
         let image_revision = revision("agent_avatars")?;
         tx.execute("INSERT INTO agent_names(agent,revision,display_name) VALUES (?1,?2,?3) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,display_name=excluded.display_name", params![agent,name_revision,display_name])?;
         tx.execute("INSERT INTO agent_avatars(agent,revision,version,image) VALUES (?1,?2,?3,?4) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,version=excluded.version,image=excluded.image", params![agent,image_revision,image.map(crate::policy::sha256_hex),image])?;
+        for (event, revision) in [
+            ("agent.name.set", name_revision),
+            ("agent.avatar.set", image_revision),
+        ] {
+            tx.execute(
+                "INSERT INTO log(at,device,person,event,reason) VALUES (?1,NULL,NULL,?2,?3)",
+                params![
+                    now(),
+                    event,
+                    format!("{agent} revision {revision} imported by host")
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM log WHERE rowid NOT IN (SELECT rowid FROM log ORDER BY rowid DESC LIMIT ?1)",[LOG_KEPT])?;
         tx.commit()
     }
 

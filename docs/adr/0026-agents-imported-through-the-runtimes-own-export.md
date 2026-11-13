@@ -1,5 +1,5 @@
 ---
-status: superseded by 0061
+status: accepted
 ---
 
 # Agents come from the host only through the runtime's own export
@@ -9,6 +9,8 @@ People already run agents on their own computer and want to test them in a sandb
 So an agent comes in only from an export the user made with the runtime's own command (`hermes profile export`), named with `enclos agent add <sandbox>/<agent> --from <archive>`. enclos never runs the host's runtime or reads its files on its own. It copies the archive beside the sandbox home, where the sandbox reads and cannot write, audits the copy with its SHA-256, and runs the runtime's own import inside the sandbox, under its policy, so the runtime extracts it there and the host never does. What the export holds is the runtime's to decide; enclos copies no login and no secret in ([0022](0022-secrets-granted-per-sandbox.md)), and nothing in the archive widens the policy.
 
 This narrows [0001](0001-manage-only-created-sandboxes.md): enclos still never looks for agents on the host; it imports one only from an archive the user names.
+
+[Proposed ADR 0061](0061-agent-exports-include-enclos-presentation.md) proposes an extension for complete Enclos exports; this accepted decision remains in force for raw runtime imports until that proposal is accepted.
 
 ## Considered options
 

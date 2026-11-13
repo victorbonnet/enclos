@@ -101,4 +101,16 @@ class TransferTests(unittest.TestCase):
                 with self.assertRaises(ValueError): transfer.restore(self.dest,'new-agent',self.archive)
                 self.assertFalse((self.dest / '.hermes/profiles/new-agent').exists())
 
+
+class OutputLimitTests(unittest.TestCase):
+    def test_runtime_export_stops_at_the_write_limit_and_removes_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'home'; profile=home / '.hermes/profiles/main'; profile.mkdir(parents=True)
+            (profile / 'config.yaml').write_text('model: fixture')
+            (profile / 'data').write_bytes(os.urandom(4096))
+            archive=Path(tmp) / 'agent.tar.gz'
+            with self.assertRaisesRegex(ValueError,'export size limit'):
+                transfer.export(home,'main',archive,max_bytes=512)
+            self.assertFalse(archive.exists())
+
 if __name__ == '__main__': unittest.main()

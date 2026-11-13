@@ -4668,7 +4668,7 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             )
             .unwrap(),
     );
-    assert_eq!(manifest.source_agent, "home/source");
+    assert_eq!(manifest.manifest.source_agent, "home/source");
     assert_eq!(
         std::fs::read(
             lab.engine
@@ -4688,7 +4688,11 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     );
     assert_eq!(
         store.avatar("other/comptoir-dev").unwrap().image.as_deref(),
-        Some(photo.as_slice())
+        Some(
+            crate::bridge::server::normalize_photo(&photo)
+                .unwrap()
+                .as_slice()
+        )
     );
     let policy_after = lab.engine.policy(&other).unwrap().snapshot.policy;
     assert_eq!(policy_after.fs, policy_before.fs);
@@ -4718,14 +4722,30 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     );
     assert!(!lab.audit().contains("credential-survives-privately"));
     assert!(profile.is_dir());
-    assert_eq!(
-        std::fs::read_dir(lab.engine.layout.data().join("agent-transfers"))
-            .unwrap()
-            .count(),
-        0
+    assert!(
+        !lab.engine.layout.data().join("agent-transfers").exists(),
+        "the whole export must not be copied to another temporary file"
     );
+    assert!(
+        !std::fs::read_dir(lab.engine.layout.sandbox_installers(other.as_str()))
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|s| s == "runtime"))
+    );
+    assert_eq!(manifest.archive.sha256, exported.sha256);
+    assert!(matches!(
+        manifest.added.as_ref().map(|a| &a.how),
+        Some(Added::Imported {
+            copy_left: None,
+            ..
+        })
+    ));
     assert!(lab.audit().contains("agent export"));
     assert!(lab.audit().contains("agent import presentation"));
+    assert!(lab.audit().contains("without another copy"));
 }
 
 #[test]
@@ -4745,7 +4765,7 @@ fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
         "old/comptoir-dev".into(),
         crate::agent_export::Presentation {
             display_name: Some("Gégé Commit".into()),
-            avatar: None,
+            photo: None,
         },
     )
     .unwrap();
@@ -4812,4 +4832,199 @@ fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
             .is_err()
     );
     assert_eq!(store.agent_name("home/main").unwrap().revision, 1);
+}
+
+fn review_export_file(lab: &Lab) -> PathBuf {
+    let path = lab._dir.path().join("review.enclos");
+    let mut file = std::fs::File::create(&path).unwrap();
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"runtime export"),
+        &mut file,
+        RuntimeKind::Hermes,
+        "old/main".into(),
+        crate::agent_export::Presentation::default(),
+    )
+    .unwrap();
+    path
+}
+#[test]
+fn review_dry_run_refuses_conflicts_and_describes_service_pause_and_resume() {
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = review_export_file(&lab);
+    for name in ["tracked", "untracked"] {
+        let profile = lab.home.join(".hermes/profiles").join(name);
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("config.yaml"), "model: fixture").unwrap();
+    }
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("tracked"), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.audit(None).unwrap().len();
+    for name in ["default", "tracked", "untracked", "hermes"] {
+        assert!(
+            lab.engine
+                .import_agent_export(
+                    &alice(),
+                    &lab.name,
+                    agent(name),
+                    &path,
+                    false,
+                    Confirm::DryRun
+                )
+                .is_err(),
+            "{name}"
+        );
+    }
+    let gateway = lab
+        .engine
+        .label(
+            &lab.name,
+            Unit::Runtime(crate::runtime::ServiceName::new("gateway")),
+        )
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let Planned::DryRun(plan) = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::DryRun,
+        )
+        .unwrap()
+    else {
+        panic!("not a plan")
+    };
+    assert!(
+        plan.changes.iter().any(|s| s.contains("stop service")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.changes.iter().any(|s| s.contains("install service")),
+        "{plan:?}"
+    );
+    assert_eq!(lab.engine.audit(None).unwrap().len(), before);
+}
+#[test]
+fn review_partial_runtime_import_keeps_the_presentation_recovery_hint() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = review_export_file(&lab);
+    std::fs::write(lab.home.join("hermes-after-fails"), "").unwrap();
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("--metadata-only"), "{error}");
+}
+
+#[test]
+fn review_portable_import_preserves_a_staged_copy_cleanup_warning_in_its_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    let installer=INSTALLS.replace("exit 0\nSTUB","if [ \"$1 $2\" = \"profile import\" ]; then chmod 500 \"$HOME/../installers\"; fi\nexit 0\nSTUB");
+    done(lab.install(&installer, Confirm::Yes).unwrap());
+    let directory = lab.engine.layout.sandbox_installers(lab.name.as_str());
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = Writable(directory.clone());
+    let path = review_export_file(&lab);
+    let imported = done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                agent("fresh"),
+                &path,
+                false,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let Added::Imported {
+        end,
+        copy_left: Some(left),
+        ..
+    } = &imported.added.unwrap().how
+    else {
+        panic!("cleanup warning was discarded")
+    };
+    assert_eq!(end.exit, 0);
+    assert!(left.to_string().contains("remove it yourself"));
+    assert_eq!(std::fs::read(&left.path).unwrap(), b"runtime export");
+}
+#[test]
+fn review_resume_failure_reports_that_presentation_was_already_restored() {
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = lab._dir.path().join("resume.enclos");
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"runtime export"),
+        &mut std::fs::File::create(&path).unwrap(),
+        RuntimeKind::Hermes,
+        "old/main".into(),
+        crate::agent_export::Presentation {
+            display_name: Some("Recovered name".into()),
+            photo: None,
+        },
+    )
+    .unwrap();
+    let gateway = lab
+        .engine
+        .label(
+            &lab.name,
+            Unit::Runtime(crate::runtime::ServiceName::new("gateway")),
+        )
+        .unwrap();
+    fake.seed(gateway.as_str());
+    *fake.refuse.borrow_mut() = Some("gateway".into());
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("restoring complete data and presentation"),
+        "{error}"
+    );
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    assert_eq!(
+        store
+            .agent_name("home/fresh")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Recovered name")
+    );
 }

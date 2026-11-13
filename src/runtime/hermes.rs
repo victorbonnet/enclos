@@ -373,7 +373,13 @@ impl RuntimeAdapter for Hermes {
         let archive = prefix.with_extension("tar.gz");
         Some(super::RuntimeExport {
             format: "hermes-data-v1",
-            command: transfer("export", name, &archive, "{}"),
+            command: transfer(
+                "export",
+                name,
+                &archive,
+                &serde_json::json!({"max_bytes": crate::agent_export::MAX_PAYLOAD_BYTES})
+                    .to_string(),
+            ),
             archive,
         })
     }

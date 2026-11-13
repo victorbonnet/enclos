@@ -51,6 +51,12 @@ pub(super) struct Source {
     pub(super) file: File,
 }
 
+/// Only engine-owned, validated runtime payloads may bypass host-file staging.
+pub(super) enum ImportArchive<'a> {
+    Host(&'a Path),
+    Staged(Archive),
+}
+
 impl Engine {
     /// Adds an agent from the archive at `from`, an export the runtime's own
     /// command made on the host, such as `hermes profile export` (issue
@@ -71,7 +77,7 @@ impl Engine {
         from: &Path,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
-        self.import_agent_data(by, name, agent, from, None, confirm)
+        self.import_agent_data(by, name, agent, ImportArchive::Host(from), None, confirm)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -80,7 +86,7 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         agent: AgentName,
-        from: &Path,
+        from: ImportArchive<'_>,
         portable: Option<(&str, &str)>,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
@@ -92,7 +98,20 @@ impl Engine {
         let installers = self.layout.sandbox_installers(name.as_str());
         let suffix = if portable.is_some() { "data" } else { "tar.gz" };
         let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.{suffix}"));
-        let staged = copy_named(&std::process::id().to_string());
+        let supplied = match &from {
+            ImportArchive::Staged(archive) => Some(archive.clone()),
+            _ => None,
+        };
+        let staged = supplied
+            .as_ref()
+            .map(|a| a.path.clone())
+            .unwrap_or_else(|| copy_named(&std::process::id().to_string()));
+        if supplied.is_some() && staged.parent() != Some(installers.as_path()) {
+            return Err(failed(
+                "a validated runtime payload must be staged in this sandbox's installers folder"
+                    .into(),
+            ));
+        }
         let command_for = |path: &Path| match portable {
             Some((format, context)) => runtime.import_export(&agent, path, format, context),
             None => runtime.import_agent(&agent, path),
@@ -126,13 +145,19 @@ impl Engine {
                 path.display()
             )));
         }
-        let source = Source::open(&self.layout, from)?;
+        let source = match from {
+            ImportArchive::Host(path) => Some(Source::open(&self.layout, path)?),
+            ImportArchive::Staged(_) => None,
+        };
         // As for `agent add`: the runtime's services start again once the
         // imported agent exists.
         let restart = self.plan_restart(name)?;
         if confirm == Confirm::DryRun {
             let version = self.policy(name)?.version.version;
-            let Archive { path, sha256 } = source.hash()?;
+            let Archive { path, sha256 } = match source {
+                Some(source) => source.hash()?,
+                None => supplied.clone().expect("staged archive"),
+            };
             // The real run names its copy after its own process.
             let planned = copy_named("<pid>");
             let command = command_for(&planned).unwrap_or(command);
@@ -166,15 +191,26 @@ impl Engine {
             "agent import",
             Some(format!("{name}/{agent}")),
             |a: &Archive| {
-                format!(
-                    "copied {} (sha256 {}) to {}",
-                    a.path.display(),
-                    a.sha256,
-                    staged.display()
-                )
+                if supplied.is_some() {
+                    format!(
+                        "using validated runtime payload {} (sha256 {}) without another copy",
+                        a.path.display(),
+                        a.sha256
+                    )
+                } else {
+                    format!(
+                        "copied {} (sha256 {}) to {}",
+                        a.path.display(),
+                        a.sha256,
+                        staged.display()
+                    )
+                }
             },
             |_| {
-                let archive = source.stage(&staged)?;
+                let archive = match source {
+                    Some(source) => source.stage(&staged)?,
+                    None => supplied.clone().expect("staged archive"),
+                };
                 copied.set(true);
                 Ok(archive)
             },
@@ -351,6 +387,7 @@ impl Source {
         let mut target = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(staged)
             .map_err(|e| {
                 failed(format!(
