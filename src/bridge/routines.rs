@@ -185,15 +185,7 @@ impl Hub {
         person: &str,
         agent: &str,
     ) -> Result<(), (ErrorCode, String)> {
-        let host = store
-            .host_person()
-            .map_err(|_| (ErrorCode::Internal, NOT_READ_BEFORE.to_owned()))?;
-        if host.as_deref() != Some(person) {
-            return Err((
-                ErrorCode::NotAllowed,
-                "Only the host's person can manage routines.".into(),
-            ));
-        }
+        self.host_authority(store, device, person)?;
         // Each refusal with its own code: a database the bridge cannot
         // read is its fault, not the person's
         self.avatar_authority(store, device, person, agent, false)

@@ -73,6 +73,11 @@ pub enum FromDevice {
         revision: String,
         approve: bool,
     },
+    #[serde(rename = "audit")]
+    Audit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+    },
     #[serde(rename = "agents")]
     Agents,
     #[serde(rename = "conversation.new")]
@@ -152,6 +157,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "pair.request",
     "approval.decide",
     "agents",
+    "audit",
     "conversation.new",
     "group.new",
     "group.stop",
@@ -199,7 +205,17 @@ pub enum ToDevice {
     Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
     #[serde(rename = "authenticated")]
-    Authenticated { person: String },
+    Authenticated {
+        person: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
+    #[serde(rename = "audit.list")]
+    AuditList {
+        of: MessageId,
+        entries: Vec<AuditEntryInfo>,
+        next_before: Option<u64>,
+    },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
     #[serde(rename = "pair.refused")]
@@ -269,6 +285,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "sandbox.policy.preview",
     "approval",
     "authenticated",
+    "audit.list",
     "pair.accepted",
     "pair.refused",
     "agents.list",
@@ -348,6 +365,21 @@ pub fn commands_for_devices(commands: Vec<Command>) -> Vec<Command> {
 pub struct PushToken {
     pub kind: String,
     pub token: String,
+}
+
+/// A state-changing host command, for the audit view shown to the host's person. Times are Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntryInfo {
+    pub seq: u64,
+    pub time: i64,
+    pub user: String,
+    pub host: String,
+    pub command: String,
+    pub target: Option<String>,
+    /// `ok`, `failed`, or `unfinished` when no outcome was recorded.
+    pub result: String,
+    pub message: Option<String>,
+    pub finished: Option<i64>,
 }
 
 /// An agent a person may reach.
@@ -644,6 +676,8 @@ mod tests {
                 sig: "c2ln".into(),
             },
             FromDevice::Agents,
+            FromDevice::Audit { before: None },
+            FromDevice::Audit { before: Some(42) },
             FromDevice::MessageSend {
                 conversation: ConversationId::new("c-1").unwrap(),
                 text: "hi".into(),
@@ -856,6 +890,32 @@ mod tests {
         let response = br#"{"v":1,"id":"d2","type":"conversation.deleted","conversation":"c-1"}"#;
         assert!(
             matches!(decode_to_device(response).unwrap().body, ToDevice::ConversationDeleted { conversation } if conversation.as_str()=="c-1")
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_compatibility_tests {
+    use super::*;
+    #[test]
+    fn authenticated_capabilities_preserve_all_features_together() {
+        let body = ToDevice::Authenticated {
+            person: "alice".into(),
+            capabilities: vec!["approval.close".into(), "sandboxes".into(), "audit".into()],
+        };
+        let wire = encode_line(&Envelope::new(
+            MessageId::new("auth").unwrap(),
+            body.clone(),
+        ));
+        assert_eq!(decode_to_device(&wire).unwrap().body, body);
+    }
+
+    #[test]
+    fn older_authenticated_messages_have_no_audit_capability() {
+        let auth = decode_to_device(br#"{"v":1,"id":"m","type":"authenticated","person":"alice"}"#)
+            .unwrap();
+        assert!(
+            matches!(auth.body, ToDevice::Authenticated { capabilities, .. } if capabilities.is_empty())
         );
     }
 }

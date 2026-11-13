@@ -41,17 +41,8 @@ impl Hub {
         person: &str,
         sandbox: &str,
     ) -> Result<SandboxName, String> {
-        if self.known_host().as_deref() != Some(person) {
-            return Err("Only the host's person can manage sandbox policy.".into());
-        }
-        if !store
-            .devices()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|d| d.id == device.id && d.person == person)
-        {
-            return Err("This device is no longer paired.".into());
-        }
+        self.host_authority(store, device, person)
+            .map_err(|(_, message)| message)?;
         if !self
             .agents
             .iter()

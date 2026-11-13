@@ -141,11 +141,8 @@ impl Hub {
                 "This agent is not shared with you.".into(),
             ));
         }
-        if write && self.known_host().as_deref() != Some(person) {
-            return Err((
-                ErrorCode::NotAllowed,
-                "Only the host's person can change a shared agent name.".into(),
-            ));
+        if write {
+            self.host_authority(store, device, person)?;
         }
         Ok(())
     }
