@@ -359,7 +359,7 @@ pub struct PushToken {
     pub token: String,
 }
 
-/// A state-changing host command, for the owner's audit view. Times are Unix seconds.
+/// A state-changing host command, for the audit view shown to the host's person. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntryInfo {
     pub seq: u64,
@@ -877,6 +877,19 @@ mod tests {
 #[cfg(test)]
 mod audit_compatibility_tests {
     use super::*;
+    #[test]
+    fn authenticated_capabilities_preserve_all_features_together() {
+        let body = ToDevice::Authenticated {
+            person: "alice".into(),
+            capabilities: vec!["approval.close".into(), "sandboxes".into(), "audit".into()],
+        };
+        let wire = encode_line(&Envelope::new(
+            MessageId::new("auth").unwrap(),
+            body.clone(),
+        ));
+        assert_eq!(decode_to_device(&wire).unwrap().body, body);
+    }
+
     #[test]
     fn older_authenticated_messages_have_no_audit_capability() {
         let auth = decode_to_device(br#"{"v":1,"id":"m","type":"authenticated","person":"alice"}"#)

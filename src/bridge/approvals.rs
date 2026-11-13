@@ -397,18 +397,8 @@ impl Hub {
         revision: &str,
         approve: bool,
     ) -> Result<(), String> {
-        if self.known_host().as_deref() != Some(person) {
-            return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
-        }
-        // Recheck revocation immediately before the decision, not just at the handshake.
-        if !store
-            .devices()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|d| d.id == device.id && d.person == person)
-        {
-            return Err("This device is no longer paired.".into());
-        }
+        self.host_authority(store, device, person)
+            .map_err(|(_, message)| message)?;
         let mut a = store
             .approval(id)
             .map_err(|e| e.to_string())?

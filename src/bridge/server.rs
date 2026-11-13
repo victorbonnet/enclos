@@ -25,6 +25,8 @@ mod agent_names;
 mod approvals;
 #[path = "audit.rs"]
 mod audit;
+#[path = "authority.rs"]
+mod authority;
 #[path = "avatars.rs"]
 mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
@@ -1394,11 +1396,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
         }
     };
     link.send(ToDevice::Authenticated {
-        capabilities: if hub.known_host().as_deref() == Some(&person) {
-            vec!["audit".to_owned()]
-        } else {
-            vec![]
-        },
+        capabilities: hub.capabilities(&person),
         person: person.clone(),
     })?;
     // Authenticated: no longer among the callers that are few at once

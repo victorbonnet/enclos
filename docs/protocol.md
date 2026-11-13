@@ -235,7 +235,7 @@ Structured approval controls bypass a running group's queue of ordinary messages
 
 ### Host audit
 
-The bridge advertises `audit` only to the host's person, as recorded by pairing or `enclos app host`. Each request rereads that identity and the device's paired identity and keys; another person, unknown ownership or a revoked device receives `not_allowed`. A read failure returns a correlated `internal` error.
+The bridge advertises `audit` only to the host's person, as recorded by pairing or `enclos app host`. Each request rereads that identity and the device's paired identity and keys; another person, unknown ownership or a revoked device receives `not_allowed`. A read failure returns a correlated `internal` error with fixed guidance; database details and host paths are logged only on the host.
 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |

@@ -1,4 +1,4 @@
-//! Bounded pages of the host's audit log for its owner.
+//! Bounded pages of the host's audit log for the host's person.
 use enclos_protocol::MessageId;
 use enclos_protocol::device::{AuditEntryInfo, ToDevice};
 
@@ -21,31 +21,27 @@ impl Hub {
             code,
             message,
         };
-        let owner = store
-            .host_person()
-            .map_err(|e| error(ErrorCode::Internal, e.to_string()))?;
-        let paired = store
-            .device(&device.id)
-            .map_err(|e| error(ErrorCode::Internal, e.to_string()))?;
-        if owner.as_deref() != Some(person)
-            || paired.is_none_or(|d| {
-                d.person != person
-                    || d.noise_key != device.noise_key
-                    || d.device_key != device.device_key
-            })
-        {
-            return Err(error(
-                ErrorCode::NotAllowed,
-                "Only the host's person on a paired device can read the audit log.".to_owned(),
-            ));
-        }
+        self.host_authority(store, device, person)
+            .map_err(|(code, message)| {
+                if code == ErrorCode::Internal {
+                    error(code, NOT_READ.to_owned())
+                } else {
+                    error(code, message)
+                }
+            })?;
         let entries =
             crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
                 .audit(None)
-                .map_err(|e| error(ErrorCode::Internal, e.to_string()))?;
+                .map_err(|e| {
+                    eprintln!("enclos app: an audit read failed: {e}");
+                    error(ErrorCode::Internal, NOT_READ.to_owned())
+                })?;
         Ok(page(entries, of, before))
     }
 }
+
+const NOT_READ: &str =
+    "The host's audit could not be read. Try again, or run `enclos audit verify` on the host.";
 
 const PAGE_SIZE: usize = 25;
 // Leave room for the envelope and Noise's authentication tag (65,535 bytes).
@@ -72,6 +68,11 @@ pub(super) fn page(entries: Vec<AuditEntry>, of: MessageId, before: Option<u64>)
         bytes += size;
         page.push(info);
     }
+    // display() bounds every field so at least one entry fits in a page.
+    debug_assert!(
+        !page.is_empty() || candidates.peek().is_none(),
+        "an audit entry must fit in one page"
+    );
     let next_before = candidates.peek().and_then(|_| page.last().map(|e| e.seq));
     ToDevice::AuditList {
         of,
@@ -136,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn host_audit_rechecks_owner_pairing_and_keys_and_reads_the_engine_log() {
+    fn host_audit_rechecks_host_person_pairing_and_keys_and_reads_the_engine_log() {
         use crate::audit::jsonl::JsonlAuditLog;
         use crate::bridge::server::{Hub, SILENCE};
         use crate::bridge::transport::Transport;
@@ -191,6 +192,8 @@ mod tests {
             node: None,
         };
         store.add_device(&device).unwrap();
+        assert_eq!(hub.capabilities("alice"), vec!["audit"]);
+        assert!(hub.capabilities("guest").is_empty());
         let id = || MessageId::new("audit-request").unwrap();
         let reply = hub
             .host_audit(&store, &device, "alice", id(), None)
@@ -212,6 +215,23 @@ mod tests {
             ErrorCode::NotAllowed
         );
         device.device_key = vec![2; 32];
+        device.noise_key = vec![4; 32];
+        assert_eq!(
+            hub.host_audit(&store, &device, "alice", id(), None)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotAllowed
+        );
+        device.noise_key = vec![1; 32];
+        store.set_host("guest").unwrap();
+        assert_eq!(
+            hub.host_audit(&store, &device, "alice", id(), None)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotAllowed
+        );
+        assert!(hub.capabilities("alice").is_empty());
+        store.set_host("alice").unwrap();
         store.remove_device(&device.id).unwrap();
         assert_eq!(
             hub.host_audit(&store, &device, "alice", id(), None)
@@ -226,6 +246,36 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.of, Some(id()));
         assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, NOT_READ);
+        assert!(
+            !error
+                .message
+                .contains(&hub.layout.audit_log().display().to_string())
+        );
+        // Database read failures also return fixed copy before and after authority.
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute("DROP TABLE devices", [])
+            .unwrap();
+        let error = hub
+            .host_audit(&store, &device, "alice", id(), None)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, NOT_READ);
+        let error = hub
+            .host_audit(&store, &device, "guest", id(), None)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotAllowed);
+        assert!(!error.message.contains("devices"));
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute("DROP TABLE settings", [])
+            .unwrap();
+        let error = hub
+            .host_audit(&store, &device, "guest", id(), None)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, NOT_READ);
     }
 
     #[test]
