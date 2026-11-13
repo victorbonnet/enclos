@@ -16,6 +16,8 @@ Decision (proposed):
 - **Only paired devices.** A device pairs once per host by scanning a QR code that `enclos app pair` prints, and the user confirms it at the terminal. Its key stays in the phone's hardware. Every connection is a Noise handshake with the keys from pairing, and the bridge also checks with Tailscale that the caller is the device's own person and node. Pairing, unpairing and sharing are audit entries; connections and refusals go in the bridge's own log, as connections go in the network log.
 - **Push without the content.** The bridge sends notifications through FCM, from the host, with the preview encrypted for the device; the phone fetches the message over the tailnet.
 
+Proposed [0062](0062-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person.
+
 Reason: one listener per host is the least that reaches the phone, and dialing in keeps the sandbox's routes as they are. Every runtime then needs only its own plugin, and the app works with every agent.
 
 ## Considered options
@@ -31,4 +33,3 @@ Reason: one listener per host is the least that reaches the phone, and dialing i
 - The phone may read enclos's state (who has access, which devices are connected) but otherwise changes nothing in it. [ADR 0046](0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md), proposed, amends this for exact-scope sandbox policy requests approved by the host's person. Other remote control stays a non-goal (§2).
 - That a gateway can bind a socket in the sandbox home and the host can connect to it was shown on a Mac (`prototype/m4/README.md`); on Linux it is to verify (§14).
 
-Proposed [0062](0062-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person.
