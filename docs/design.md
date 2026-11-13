@@ -36,7 +36,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 
 - Agent-to-agent delegation, task routing, organizations, pull request workflows.
 - A collector, or discovery on the host of agents enclos did not create. Agents made inside an enclos sandbox are reported (§9).
-- Remote control over chat channels, except the proposed exact-scope sandbox policy requests and owner-only policy management from a paired phone ([ADR 0046](adr/0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md)).
+- Remote control over chat channels, except the proposed exact-scope sandbox policy requests ([ADR 0046](adr/0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md)) and owner-only policy management from a paired phone ([ADR 0047](adr/0047-the-hosts-person-manages-sandbox-policy-from-the-phone.md)).
 - Writing our own isolation primitives: backends wrap OS features and existing VMs.
 - Containing deliberately malicious code on the shared-kernel backends.
 - Running sandboxes while the user is logged out (for now). The one case where they do is a Linux host where the user turned lingering on (`loginctl enable-linger`): enclos never turns it on itself, and `doctor` says whether it is on and what follows from it (§10).
