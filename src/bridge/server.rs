@@ -116,6 +116,15 @@ struct PluginOut {
     sent: HashSet<String>,
 }
 
+/// The capabilities the bridge knows of: one it does not (`notify`, from
+/// an older plugin) is not shown to devices as `unknown`.
+fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    capabilities
+        .into_iter()
+        .filter(|c| *c != Capability::Unknown)
+        .collect()
+}
+
 /// What every connection shares.
 struct Hub {
     transport: Transport,
@@ -400,7 +409,7 @@ impl Hub {
             plugins.insert(
                 agent.to_owned(),
                 Plugin {
-                    capabilities: hello.capabilities,
+                    capabilities: known(hello.capabilities),
                     generation,
                     out: Arc::new(Mutex::new(PluginOut {
                         writer,
