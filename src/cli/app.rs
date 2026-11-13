@@ -146,6 +146,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         transport,
         port,
         engine.app_store_path(),
+        engine.app_layout(),
         key.private.to_vec(),
         agents,
     )

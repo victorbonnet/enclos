@@ -325,6 +325,14 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
              CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
         )?;
+        // A database whose devices were paired before the host's person
+        // was kept: the first of them names it, as it would have, so the
+        // next device paired, a guest's perhaps, does not (ADR 0044)
+        db.execute(
+            "INSERT OR IGNORE INTO settings (name, value)
+             SELECT ?1, person FROM devices ORDER BY paired, rowid LIMIT 1",
+            params![HOST_PERSON],
+        )?;
         Ok(Store { db })
     }
 
@@ -449,7 +457,12 @@ impl Store {
             return Ok(false);
         };
         let id = home_id(agent);
-        if self.conversation_of(&id)?.is_some() {
+        if let Some((s, a, _)) = self.conversation_of(&id)? {
+            // Not this agent's: a device chose the id, before the bridge
+            // kept `home.` for itself. It is not Home, and keeps its owner.
+            if (s.as_str(), a.as_str()) != (sandbox, name) {
+                return Ok(false);
+            }
             if owner.is_empty() {
                 return Ok(false);
             }
@@ -667,7 +680,8 @@ impl Store {
             params![HOST_PERSON, person],
         )?;
         transaction.execute(
-            "UPDATE conversations SET owner = ?1 WHERE id LIKE 'home.%'",
+            // Not `LIKE`, which ignores case: `Home.x` is a device's
+            "UPDATE conversations SET owner = ?1 WHERE substr(id, 1, 5) = 'home.'",
             params![person],
         )?;
         transaction.commit()
@@ -1366,5 +1380,74 @@ mod tests {
         ] {
             assert_eq!(store.owner(id).unwrap().as_deref(), Some(owner), "{id}");
         }
+    }
+
+    #[test]
+    fn a_device_chosen_id_is_never_a_home() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        // `LIKE` would take this one: it ignores case
+        store
+            .conversation("Home.lab.main", "lab", "main", "bob@example.com")
+            .unwrap();
+        // Made by a device before the bridge kept `home.`, for another agent
+        store
+            .conversation("home.lab.scout", "lab", "main", "bob@example.com")
+            .unwrap();
+        assert!(
+            !store
+                .ensure_home("lab/scout", "victor@example.com", true)
+                .unwrap()
+        );
+        store.set_host("victor@example.com").unwrap();
+        assert_eq!(
+            store.owner("Home.lab.main").unwrap().as_deref(),
+            Some("bob@example.com")
+        );
+        assert_eq!(
+            store
+                .conversation_of("home.lab.scout")
+                .unwrap()
+                .map(|c| c.0),
+            Some("lab".to_owned())
+        );
+    }
+
+    #[test]
+    fn devices_paired_before_the_host_was_kept_name_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        for (id, person, paired) in [
+            ("d-2", "alice@example.com", 20),
+            ("d-1", "victor@example.com", 10),
+        ] {
+            store
+                .add_device(&Device {
+                    id: id.to_owned(),
+                    name: "Pixel".to_owned(),
+                    person: person.to_owned(),
+                    noise_key: vec![paired as u8; 32],
+                    device_key: vec![2; 32],
+                    push_key: vec![3; 32],
+                    push_token: None,
+                    paired,
+                    seen: None,
+                    node: None,
+                })
+                .unwrap();
+        }
+        // As a database from before the setting
+        store
+            .db
+            .execute("DELETE FROM settings WHERE name = ?1", params![HOST_PERSON])
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.host_person().unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        // So the next device's person does not become it
+        assert!(!store.claim_host("bob@example.com").unwrap());
     }
 }
