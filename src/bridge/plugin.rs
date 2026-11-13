@@ -71,10 +71,12 @@ pub struct PluginReader {
 }
 
 /// Connects to the plugin at `socket` and opens the connection with
-/// `token`; the plugin answers with its own `hello`.
+/// `token` and the agent's `home` conversation; the plugin answers with its
+/// own `hello`.
 pub fn connect(
     socket: &Path,
     token: &str,
+    home: &str,
 ) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
@@ -90,6 +92,7 @@ pub fn connect(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
+        home: ConversationId::new(home).ok(),
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut reader = PluginReader {
@@ -302,7 +305,8 @@ mod tests {
             let mut lines = BufReader::new(stream);
             let mut line = Vec::new();
             lines.read_until(b'\n', &mut line).unwrap();
-            let FromBridge::Hello { token: given } = decode_from_bridge(&line).unwrap().body else {
+            let FromBridge::Hello { token: given, .. } = decode_from_bridge(&line).unwrap().body
+            else {
                 panic!("not a hello first");
             };
             if given != token {
@@ -357,7 +361,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
-        let (hello, mut reader, mut writer) = connect(&socket, "t0ken").unwrap();
+        let (hello, mut reader, mut writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert_eq!(hello.agent, "main");
         assert_eq!(hello.capabilities, [Capability::Notify]);
         let conversation = ConversationId::new("c-1").unwrap();
@@ -396,7 +400,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
-        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         // A clone keeps the descriptor open, as the reading thread's
         // acknowledgements do in `enclos app chat`
         let clone = writer.try_clone().unwrap();
@@ -485,7 +489,7 @@ mod tests {
         raw.extend(b"not json\n");
         raw.extend(out_line("p-3", "still here"));
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         let message = reader.receive().unwrap().unwrap();
         assert_eq!(message.id.as_str(), "p-3");
         let (unknown, bad, not_json) = (
@@ -511,7 +515,7 @@ mod tests {
         // No line break: a reader without a bound would keep growing
         let raw = vec![b'x'; MAX_MESSAGE_BYTES + 100];
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert!(matches!(reader.receive(), Err(PluginError::TooLong)));
         let error = answer(&lines_back);
         assert_eq!((error.code, error.of), (ErrorCode::BadMessage, None));
@@ -534,7 +538,7 @@ mod tests {
         let mut raw = br#"{"v":2,"type":"message.out","id":"p-1"}"#.to_vec();
         raw.push(b'\n');
         let lines_back = raw_plugin(UnixListener::bind(&socket).unwrap(), raw);
-        let (_, mut reader, _writer) = connect(&socket, "t0ken").unwrap();
+        let (_, mut reader, _writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert!(matches!(reader.receive(), Err(PluginError::Version(2))));
         let error = answer(&lines_back);
         assert_eq!(
@@ -552,7 +556,8 @@ mod tests {
         let plugin = echo_plugin(UnixListener::bind(real.join("main.sock")).unwrap(), "t0ken");
         let linked = folder.path().join(".enclos-app");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        let Err(PluginError::Connect { source, .. }) = connect(&linked.join("main.sock"), "t0ken")
+        let Err(PluginError::Connect { source, .. }) =
+            connect(&linked.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
         };
@@ -569,7 +574,8 @@ mod tests {
         let own = folder.path().join(".enclos-app");
         std::fs::create_dir(&own).unwrap();
         std::os::unix::fs::symlink(&elsewhere, own.join("main.sock")).unwrap();
-        let Err(PluginError::Connect { source, .. }) = connect(&own.join("main.sock"), "t0ken")
+        let Err(PluginError::Connect { source, .. }) =
+            connect(&own.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
         };
@@ -586,7 +592,7 @@ mod tests {
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
         assert!(matches!(
-            connect(&socket, "other"),
+            connect(&socket, "other", "home.lab.main"),
             Err(PluginError::Refused)
         ));
         plugin.join().unwrap();
@@ -596,7 +602,8 @@ mod tests {
     fn no_plugin_says_where_it_looked() {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
-        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken") else {
+        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken", "home.lab.main")
+        else {
             panic!("connected to nothing");
         };
         assert!(path.ends_with("main.sock"));
