@@ -533,6 +533,18 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         let waiting = Waiting(Arc::clone(&hub));
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
+            // The pairing page, for a browser; anything else is a device's
+            // WebSocket. A caller that sends nothing gives up the thread.
+            if stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .is_err()
+            {
+                return;
+            }
+            if super::page::requested(&stream) {
+                let _ = super::page::serve(stream);
+                return;
+            }
             match connection(&hub, stream, waiting) {
                 // The device hung up, or went away (a phone that locks, sleeps
                 // or changes network rarely says goodbye): how connections

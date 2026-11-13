@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Pair with enclos</title>
+<style>
+  :root { --bg: #f6f5f1; --text: #1b1f1c; --muted: #5d625e; --line: #d8d6cf; --accent: #3f6b2a; --button: #173d33; --button-text: #f6f5f1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121614; --text: #ecebe6; --muted: #a3a8a4; --line: #2c322e; --accent: #b8d98c; --button: #d6e7b0; --button-text: #12201a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 28rem; margin: 0 auto; padding: 3rem 1rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  .meta { font-family: ui-monospace, monospace; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+  p { color: var(--muted); }
+  a.open { display: block; margin: 1.5rem 0 .75rem; padding: .9rem; border-radius: 12px; text-align: center; font-weight: 600; text-decoration: none; background: var(--button); color: var(--button-text); }
+  a.open[aria-disabled="true"] { opacity: .4; pointer-events: none; }
+  button { font: inherit; background: none; border: 1px solid var(--line); border-radius: 12px; color: var(--accent); padding: .7rem; width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Pair with enclos</h1>
+  <div class="meta" id="meta"></div>
+  <p id="what">Opens the enclos app on this phone, which asks before pairing; then accept the phone in the terminal that ran <code>enclos app pair</code>.</p>
+  <a class="open" id="open" aria-disabled="true">Open in enclos</a>
+  <button id="copy" type="button">Copy the link</button>
+  <p id="note"></p>
+</main>
+<script>
+  // The link's parameters come after "#", which the browser never sends to
+  // the bridge: the one-time code stays on this phone.
+  const query = location.hash.slice(1);
+  const params = new URLSearchParams(query);
+  // The page vouches only for its own bridge: a link whose `url` is another
+  // bridge pairs with nothing here, and the host shown is the address the
+  // page came from, never the link's `host`, which anyone can write.
+  let ours = false;
+  try {
+    ours = new URL(params.get("url")).origin === location.origin;
+  } catch {
+    ours = false;
+  }
+  const host = location.hostname;
+  const expires = Number(params.get("exp"));
+  const link = "enclos://pair?" + query;
+  const open = document.getElementById("open");
+  const meta = document.getElementById("meta");
+  const note = document.getElementById("note");
+  if (!ours || !params.get("key") || !params.get("code") || !expires) {
+    document.getElementById("title").textContent = "Nothing to pair";
+    document.getElementById("what").textContent = "This page opens a pairing link from enclos app pair for this host; this one carries none, or one for another address. Run enclos app pair on the host and open the link it prints.";
+    open.hidden = true;
+    document.getElementById("copy").hidden = true;
+  } else {
+    document.getElementById("title").textContent = "Pair with " + host;
+    open.href = link;
+    open.setAttribute("aria-disabled", "false");
+    const tick = () => {
+      const left = expires - Math.floor(Date.now() / 1000);
+      if (left <= 0) {
+        meta.textContent = host + " · expired";
+        open.setAttribute("aria-disabled", "true");
+        open.removeAttribute("href");
+        note.textContent = "This link expired: run enclos app pair again.";
+        return;
+      }
+      meta.textContent = host + " · expires in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
+      setTimeout(tick, 1000);
+    };
+    tick();
+    document.getElementById("copy").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(link);
+        note.textContent = "Copied: paste it in the app, under Type the code instead.";
+      } catch {
+        note.textContent = link;
+      }
+    });
+  }
+</script>
+</body>
+</html>
