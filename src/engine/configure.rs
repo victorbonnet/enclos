@@ -451,7 +451,9 @@ impl Engine {
                 socket.display()
             )));
         }
-        let Some(app) = runtime.app_channel(agent, &socket) else {
+        // The agent's Home conversation, as the bridge names it (ADR 0044).
+        let home = crate::bridge::store::home_id(&format!("{name}/{agent}"));
+        let Some(app) = runtime.app_channel(agent, &socket, &home) else {
             return Err(session(format!(
                 "{shown} has no app channel enclos can set up"
             )));

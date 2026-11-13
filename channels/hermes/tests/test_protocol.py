@@ -23,7 +23,7 @@ def fixture(name: str) -> bytes:
 class FromTheBridge(unittest.TestCase):
     def test_every_fixture_the_bridge_sends_decodes(self):
         names = sorted(n for n in os.listdir(FIXTURES) if n.startswith("from_bridge_"))
-        self.assertEqual(len(names), 4)
+        self.assertEqual(len(names), 5)
         for name in names:
             with self.subTest(name):
                 self.assertEqual(protocol.decode_from_bridge(fixture(name)), json.loads(fixture(name)))
@@ -53,6 +53,42 @@ class FromTheBridge(unittest.TestCase):
         message = protocol.decode_from_bridge(b'{"v":1,"id":"m1","type":"ack","of":"m0","later":true}')
         self.assertEqual(message["of"], "m0")
 
+    def test_the_hello_names_the_agents_home_or_not(self):
+        self.assertEqual(protocol.decode_from_bridge(fixture("from_bridge_hello_home.json"))["home"], "home.lab.main")
+        self.assertNotIn("home", protocol.decode_from_bridge(fixture("from_bridge_hello.json")))
+        with self.assertRaises(protocol.DecodeError):
+            protocol.decode_from_bridge(b'{"v":1,"id":"m1","type":"hello","token":"t","home":""}')
+
+
+class Home(unittest.TestCase):
+    def test_hermes_notices_about_itself_are_told_apart(self):
+        notices = [
+            "♻️ Gateway online — Hermes is back and ready.",
+            "⚠️ Hermes is shutting down — your current task will be interrupted. When it is back online, "
+            "send any message and I'll try to pick up where we left off.",
+            "⚠️ Hermes is restarting — your current task will be interrupted.",
+            "📬 No home channel is set for Enclos. A home channel is where Hermes delivers cron job results.",
+        ]
+        for text in notices:
+            with self.subTest(text[:20]):
+                self.assertTrue(protocol.is_notice(text))
+        for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.", ""]:
+            with self.subTest(text[:20]):
+                self.assertFalse(protocol.is_notice(text))
+
+    def test_a_reply_that_starts_as_a_notice_reads_as_one(self):
+        # A notice is told by its first words only, as Hermes marks none: an
+        # agent's reply that starts with the same words is taken for one
+        # (a quiet line, and no title check). The choice, recorded.
+        self.assertTrue(protocol.is_notice(
+            "\u267b\ufe0f Gateway online \u2014 that is what the log said at 9:00."))
+
+    def test_sethome_is_caught_however_written(self):
+        for text in ["/sethome", "  /SetHome ", "/set-home now"]:
+            self.assertTrue(protocol.is_home_command(text), text)
+        for text in ["sethome", "/sethomes", "how do I /sethome?", ""]:
+            self.assertFalse(protocol.is_home_command(text), text)
+
 
 class ToTheBridge(unittest.TestCase):
     def assert_like_fixture(self, message, name):
@@ -69,7 +105,15 @@ class ToTheBridge(unittest.TestCase):
             protocol.message_out("c-42", "14 °C and cloudy.", reply_to), "from_plugin_message_out_reply.json")
         self.assert_like_fixture(
             protocol.message_out("c-42", "Good morning: 9 °C in Paris."), "from_plugin_message_out_notify.json")
+        self.assert_like_fixture(
+            protocol.message_out("home.lab.main", "Gateway online", kind="status"),
+            "from_plugin_message_out_status.json")
         self.assert_like_fixture(protocol.typing("c-42", True), "from_plugin_typing.json")
+        self.assert_like_fixture(protocol.commands([
+            ("new", "Start a new session (fresh session ID + history)", "[name]"),
+            ("model", "Switch model for this session", "[model] [--provider name] [--global]"),
+            ("stop", "Kill all running background processes", ""),
+        ]), "from_plugin_commands.json")
         self.assert_like_fixture(
             protocol.title("c-42", "Paris weather this week"), "from_plugin_conversation_title.json")
         self.assert_like_fixture(
@@ -173,6 +217,25 @@ class Files(unittest.TestCase):
                          "Here\n\n(A file could not be sent: a.pdf)")
         self.assertEqual(protocol.with_files_not_sent("", ["a.pdf", "b.png"]),
                          "(A file could not be sent: a.pdf)\n(A file could not be sent: b.png)")
+
+
+class CommandsTest(unittest.TestCase):
+    def test_each_once_without_slash_and_without_what_the_app_does_not_offer(self):
+        message = protocol.commands([
+            ("/new", "Start a new\n session", "[name]"),
+            ("new", "again", ""),
+            ("sethome", "Set the home channel", ""),
+            ("start", "Telegram's start", ""),
+            ("usage", "Show token usage", "  "),
+        ])
+        self.assertEqual(message["commands"], [
+            {"name": "new", "description": "Start a new session", "args": "[name]"},
+            {"name": "usage", "description": "Show token usage"},
+        ])
+
+    def test_hello_says_commands_only_when_listed(self):
+        self.assertNotIn("commands", protocol.hello("hermes", "main")["capabilities"])
+        self.assertIn("commands", protocol.hello("hermes", "main", ("commands",))["capabilities"])
 
 
 if __name__ == "__main__":
