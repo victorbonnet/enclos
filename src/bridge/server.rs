@@ -1,4 +1,4 @@
-//! The bridge's service (ADR 0042, proposed; `docs/protocol.md`, The
+//! The bridge's device leg (ADR 0042, proposed; `docs/protocol.md`, The
 //! device leg): a WebSocket listener on the host's loopback, which its
 //! transport puts on the person's network (`tailscale serve`, the only one
 //! for now). Each connection is a Noise session with a paired device, or
@@ -60,7 +60,7 @@ use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
 };
-use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
+use enclos_protocol::{ConversationId, DecodeError, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
@@ -184,6 +184,10 @@ struct Hub {
     /// How fast each agent may have its messages stored, kept across its
     /// plugin's connections.
     paces: Mutex<HashMap<String, Pace>>,
+    /// The agents whose plugin connection the bridge ended on a message it
+    /// could not store: how many times in a row, and when last. The
+    /// background pass opens theirs again only after [`reopen_after`].
+    unstored: Mutex<HashMap<String, (u32, std::time::Instant)>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -258,6 +262,7 @@ impl Hub {
             },
         );
         let hub = Arc::clone(self);
+        let by = authority::device_actor(person, &device.id, None);
         let person = person.to_owned();
         let device = device.id.clone();
         std::thread::spawn(move || {
@@ -273,7 +278,7 @@ impl Hub {
                 .provisioning
                 .as_ref()
                 .expect("provisioning request checked")
-                .execute(&operation, &person);
+                .execute(&operation, &by);
             let failed = result.as_ref().err().cloned();
             let response = match result {
                 Ok(Completed::Created) => ToDevice::SandboxCreated {
@@ -286,11 +291,7 @@ impl Hub {
                     runtime,
                     login,
                 },
-                Err(message) => ToDevice::Error(ErrorBody {
-                    of: Some(of),
-                    code: ErrorCode::OperationFailed,
-                    message,
-                }),
+                Err(message) => operation_failed(of, &message),
             };
             // Release before completing: a next request may follow at once.
             hub.provisioning_busy
@@ -304,7 +305,7 @@ impl Hub {
                 .expect("provisioning request checked")
                 .sandboxes()
             {
-                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+                hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
                 let _ = store.log(
@@ -395,6 +396,7 @@ impl Hub {
             questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
+            unstored: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             stops: Mutex::new(HashSet::new()),
             generations: AtomicU64::new(0),
@@ -734,16 +736,22 @@ impl Hub {
                         attachments,
                         reply_to,
                     } => {
+                        match store.deletion_started(conversation.as_str()) {
+                            Ok(false) => {}
+                            // Its conversation is going: dropped, and
+                            // acknowledged so the plugin does not send it again
+                            Ok(true) => {
+                                let _ = acks.ack(&message.id);
+                                continue;
+                            }
+                            Err(e) => {
+                                hub.kept_by_plugin(&agent, &acks, &e.to_string());
+                                break;
+                            }
+                        }
                         // Every runtime may send on its own: past a burst,
                         // at a pace, so that a loop fills neither the
                         // database nor the devices' queues.
-                        if store
-                            .deletion_started(conversation.as_str())
-                            .unwrap_or(true)
-                        {
-                            let _ = acks.ack(&message.id);
-                            continue;
-                        }
                         hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
@@ -756,16 +764,24 @@ impl Hub {
                             .split_once('/')
                             .map(|(_, n)| n.to_owned())
                             .unwrap_or_default();
-                        let group =
-                            group_of(&store, conversation.as_str()).filter(|(sandbox, handles)| {
+                        let group = match group_of(&store, conversation.as_str()) {
+                            Ok(group) => group.filter(|(sandbox, handles)| {
                                 agent.starts_with(&format!("{sandbox}/"))
                                     && handles.contains(&member)
-                            });
+                            }),
+                            // Not "no group": its turn would wait, and the
+                            // message would go to Home
+                            Err(e) => {
+                                hub.kept_by_plugin(&agent, &acks, &e.to_string());
+                                break;
+                            }
+                        };
                         let mut ends_turn = false;
-                        if group.is_some() {
-                            match hub.group_reply(
+                        if let Some((_, handles)) = &group {
+                            match hub.member_said(
                                 &store,
                                 conversation.as_str(),
+                                handles,
                                 &member,
                                 reply_to.as_ref().map(|r| r.as_str()),
                                 &text,
@@ -786,7 +802,13 @@ impl Hub {
                             Some(conversation)
                         } else {
                             let host = hub.known_host();
-                            destination(&store, host.as_deref(), &agent, conversation)
+                            match destination(&store, host.as_deref(), &agent, conversation) {
+                                Ok(conversation) => conversation,
+                                Err(e) => {
+                                    hub.kept_by_plugin(&agent, &acks, &e);
+                                    break;
+                                }
+                            }
                         };
                         let Some(conversation) = conversation else {
                             // Not stored, and acknowledged all the same: sent
@@ -819,21 +841,33 @@ impl Hub {
                             &home,
                             &from,
                         );
-                        match &stored {
-                            Ok(_) => {
-                                let _ = acks.ack(&message.id);
-                            }
-                            Err(e) => eprintln!("enclos app: {agent}: {e}"),
+                        if stored.is_ok() {
+                            let _ = acks.ack(&message.id);
                         }
                         // The member's reply ended its turn: the next turn
                         // starts. Its position stays at the last message it
                         // was given (a person's message sent while it worked
                         // is still to give it); its own reply is no news to
-                        // it (`Store::news_for`). The turn ended whatever the
-                        // store made of the reply (an id it had already, or a
-                        // failure): the discussion goes on all the same.
+                        // it (`Store::news_for`). The turn is replied once
+                        // the reply is stored (or was already); not stored,
+                        // it failed, so the reply the plugin sends again is
+                        // kept, as one to a failed turn. The discussion goes
+                        // on all the same.
                         if ends_turn {
+                            hub.turn_replied(
+                                &store,
+                                conversation.as_str(),
+                                &member,
+                                reply_to.as_ref().map(|r| r.as_str()),
+                                stored.is_ok(),
+                            );
                             hub.advance(&store, conversation.as_str());
+                        }
+                        // Not stored, so not acknowledged: the connection
+                        // ends, and the plugin sends it again within seconds.
+                        if let Err(e) = &stored {
+                            hub.kept_by_plugin(&agent, &acks, e);
+                            break;
                         }
                     }
                     FromPlugin::Ack { of } => {
@@ -975,24 +1009,54 @@ impl Hub {
         };
         let pieces = pieces(id, &measured)?;
         let conversation = whole.conversation.as_str();
-        let Some(seqs) = store
-            .add_pieces(&pieces, conversation, from, &whole.kind)
-            .map_err(|e| e.to_string())?
-        else {
+        // Sent again (its `ack` lost, or the bridge stopped before it): its
+        // files were stored with it, and the plugin's copies, if the bridge
+        // stopped before removing them, are removed now.
+        if store.has_message(id.as_str()).map_err(|e| e.to_string())? {
+            release_attachments(home, attachments);
             return Ok(None);
+        }
+        // Its files copied first, into the bridge's `.incoming` folder,
+        // then recorded with the message in one transaction, then moved
+        // into its media folder, and only then removed from the plugin's
+        // folder. A message the bridge cannot store, its database or its
+        // own copy failing, is not acknowledged: the plugin sends it again,
+        // with its files still there. Only a file the sandbox made unusable
+        // (`NotTaken::Refused`) is left out of a stored message.
+        let media = self.media();
+        let taken = take_attachments(home, &media, &whole.agent, conversation, attachments)?;
+        let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
+        let seqs = match store.add_pieces(&pieces, conversation, from, &whole.kind, &stored) {
+            Ok(Some(seqs)) => seqs,
+            // Stored meanwhile, with copies of its own: the plugin's are
+            // no longer needed either.
+            Ok(None) => {
+                for t in &taken {
+                    t.discard();
+                    t.release();
+                }
+                return Ok(None);
+            }
+            Err(e) => {
+                for t in &taken {
+                    t.discard();
+                }
+                return Err(e.to_string());
+            }
         };
+        for t in &taken {
+            // One not moved stays in `.incoming`, recorded: moved when the
+            // bridge starts again (`sweep_incoming`).
+            if let Err(e) = t.keep(&media) {
+                eprintln!(
+                    "enclos app: {}: a file stays in .incoming: {e}",
+                    whole.agent
+                );
+            }
+            t.release();
+        }
         let last = seqs.last().copied();
-        // A message stored once: its files taken once too, with its first
-        // piece, whose id is the plugin's
-        let mut files = take_attachments(
-            store,
-            home,
-            &self.media(),
-            &whole.agent,
-            conversation,
-            id.as_str(),
-            attachments,
-        );
+        let mut files: Vec<Attachment> = stored.into_iter().map(attachment_info).collect();
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
                 self.deliver(
@@ -1169,6 +1233,11 @@ pub fn serve(
 /// Tries every `retry` to give agents the messages pending for them, and
 /// serves `listener`'s connections; returns once the listener fails.
 fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
+    // Files copied for a message the bridge was storing when it stopped,
+    // before any plugin connection copies more.
+    if let Ok(store) = hub.store() {
+        sweep_incoming(&store, &hub.media());
+    }
     let retrying = Arc::clone(&hub);
     std::thread::spawn(move || {
         loop {
@@ -1225,7 +1294,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.
                 for agent in &hub.agents {
-                    let _ = hub.plugin(&agent.name);
+                    if hub.may_reopen(&agent.name) {
+                        let _ = hub.plugin(&agent.name);
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(3));
             }
@@ -1276,6 +1347,22 @@ const SILENT: &str = "silent for too long";
 /// The caller sent no first message within [`HANDSHAKE`].
 const TOO_SLOW: &str = "no first message in time";
 
+/// The answer to provisioning operation `of` that failed, in the engine's
+/// or the installer's words, cut so it fits one device-leg message: an
+/// installer's message is read from up to 64 KiB of its output, and one
+/// that could not be sealed would end the device's connection.
+fn operation_failed(of: MessageId, message: &str) -> ToDevice {
+    ToDevice::Error(ErrorBody {
+        of: Some(of),
+        code: ErrorCode::OperationFailed,
+        message: plain(
+            message,
+            2_000,
+            "the operation failed; check the sandbox on the host",
+        ),
+    })
+}
+
 /// Why reading or writing a device's connection failed: [`GONE`] when the
 /// device is simply no longer there, else the error itself.
 fn ended(e: tungstenite::Error) -> String {
@@ -1297,6 +1384,21 @@ fn ended(e: tungstenite::Error) -> String {
     }
 }
 
+/// Why [`Link::receive`] gave no message: one to answer, after which the
+/// connection goes on, or the end of the connection.
+#[derive(Debug)]
+enum Unread {
+    /// A message the bridge cannot use (`docs/protocol.md`, Messages): not
+    /// JSON, of an unknown `type`, a field missing or wrong, or in a text
+    /// frame. The caller sends this answer and reads on: one bad message
+    /// never ends the connection.
+    Refused(ErrorBody),
+    /// The connection ended: the device closed it or went away, a frame did
+    /// not decrypt, or it spoke a `v` this bridge does not (answered
+    /// `version` here, before closing).
+    Ended(String),
+}
+
 /// What a device's connection is once the handshake is done.
 struct Link {
     socket: WebSocket<TcpStream>,
@@ -1316,19 +1418,40 @@ impl Link {
     }
 
     /// The next message, `None` while nothing came in time.
-    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, String> {
+    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, Unread> {
         let read = self.socket.read();
         if read.is_ok() {
             self.heard = std::time::Instant::now();
         }
         match read {
             Ok(Message::Binary(bytes)) => {
-                let plain = self.session.decrypt(&bytes).map_err(|e| e.to_string())?;
-                decode_from_device(&plain)
-                    .map(Some)
-                    .map_err(|e| e.to_string())
+                let plain = self
+                    .session
+                    .decrypt(&bytes)
+                    .map_err(|e| Unread::Ended(e.to_string()))?;
+                match decode_from_device(&plain) {
+                    Ok(message) => Ok(Some(message)),
+                    Err(DecodeError::Version { id, v }) => {
+                        let _ = self.send(ToDevice::Error(ErrorBody {
+                            of: id.and_then(|id| MessageId::new(id).ok()),
+                            code: ErrorCode::Version,
+                            message: "this bridge speaks version 1".to_owned(),
+                        }));
+                        let _ = self.socket.close(None);
+                        let _ = self.socket.flush();
+                        Err(Unread::Ended(format!("version {v} is not spoken here")))
+                    }
+                    Err(e) => Err(Unread::Refused(unusable(e))),
+                }
             }
-            Ok(Message::Close(_)) => Err(CLOSED.to_owned()),
+            Ok(Message::Close(_)) => Err(Unread::Ended(CLOSED.to_owned())),
+            // One message per binary frame (`docs/protocol.md`, Messages)
+            Ok(Message::Text(_)) => Err(Unread::Refused(ErrorBody {
+                of: None,
+                code: ErrorCode::BadMessage,
+                message: "a message comes in a binary frame".to_owned(),
+            })),
+            // Pings and pongs, which tungstenite answers itself
             Ok(_) => Ok(None),
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -1338,8 +1461,36 @@ impl Link {
             {
                 Ok(None)
             }
-            Err(e) => Err(ended(e)),
+            Err(e) => Err(Unread::Ended(ended(e))),
         }
+    }
+}
+
+/// The answer to a message whose `field` does not hold what it must, such as
+/// base64 that does not decode.
+fn bad_field(of: &MessageId, e: impl std::fmt::Display) -> ErrorBody {
+    ErrorBody {
+        of: Some(of.clone()),
+        code: ErrorCode::BadMessage,
+        message: plain(&e.to_string(), 200, "bad message"),
+    }
+}
+
+/// The answer to a message the bridge cannot use, other than one of a `v`
+/// it does not speak: `unknown_type` or `bad_message`, naming the message
+/// when its id could be read.
+fn unusable(e: DecodeError) -> ErrorBody {
+    let (id, code) = match &e {
+        DecodeError::UnknownType { id, .. } => (id.clone(), ErrorCode::UnknownType),
+        DecodeError::Bad { id, .. } | DecodeError::Version { id, .. } => {
+            (id.clone(), ErrorCode::BadMessage)
+        }
+        DecodeError::NotJson(_) | DecodeError::TooBig => (None, ErrorCode::BadMessage),
+    };
+    ErrorBody {
+        of: id.and_then(|id| MessageId::new(id).ok()),
+        code,
+        message: plain(&e.to_string(), 200, "bad message"),
     }
 }
 
@@ -1471,17 +1622,31 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let known = store
         .device_by_noise_key(&noise_key)
         .map_err(|e| e.to_string())?;
+    // Before `authenticated` the device sends `auth` or `pair.request` and
+    // nothing else: one the bridge cannot use is answered, then refused
+    let unusable_first = |link: &mut Link, device: Option<&str>, error: ErrorBody| {
+        let why = format!(
+            "the first message is not one the bridge can use: {}",
+            error.message
+        );
+        let _ = link.send(ToDevice::Error(error));
+        refuse(device, Some(&person), &why)
+    };
     let first = loop {
         if std::time::Instant::now() > deadline {
             return Err(refuse(None, Some(&person), TOO_SLOW));
         }
-        if let Some(message) = link.receive()? {
-            break message;
+        match link.receive() {
+            Ok(Some(message)) => break message,
+            Ok(None) => {}
+            Err(Unread::Refused(error)) => return Err(unusable_first(&mut link, None, error)),
+            Err(Unread::Ended(why)) => return Err(why),
         }
     };
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
-            let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
+            let sig = decode("sig", &sig)
+                .map_err(|e| unusable_first(&mut link, Some(&known.id), bad_field(&first.id, e)))?;
             if check_signature(
                 &known.device_key,
                 Signed::Auth,
@@ -1538,6 +1703,10 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
             },
             None,
         ) => {
+            let decoded = decode("device_key", &device_key)
+                .and_then(|key| Ok((key, decode("proof", &proof)?, decode("sig", &sig)?)));
+            let (device_key, proof, sig) =
+                decoded.map_err(|e| unusable_first(&mut link, None, bad_field(&first.id, e)))?;
             let device = pair(
                 &store, &mut link, &caller, &noise_key, name, device_key, proof, sig, push,
             )?;
@@ -1596,9 +1765,9 @@ fn pair(
     caller: &Caller,
     noise_key: &[u8],
     name: String,
-    device_key: String,
-    proof: String,
-    sig: String,
+    device_key: Vec<u8>,
+    proof: Vec<u8>,
+    sig: Vec<u8>,
     push: Option<enclos_protocol::device::PushToken>,
 ) -> Result<Device, String> {
     let person = caller.login.as_str();
@@ -1611,8 +1780,6 @@ fn pair(
         let _ = store.log(None, Some(person), "refused", Some(why));
         why.to_owned()
     };
-    let proof = decode("proof", &proof).map_err(|e| e.to_string())?;
-    let device_key = decode("device_key", &device_key).map_err(|e| e.to_string())?;
     let codes = store.open_pairings().map_err(|e| e.to_string())?;
     let hash = link.session.handshake_hash().to_vec();
     let Some(code) = codes
@@ -1623,7 +1790,6 @@ fn pair(
     };
     // The device holds the key it asks to pair: checked before the code is
     // used, so a request that fails here leaves it for the real device
-    let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
     if check_signature(&device_key, Signed::Pair, &hash, &sig).is_err() {
         return Err(refused(link, "bad_signature"));
     }
@@ -1752,8 +1918,14 @@ fn run_session(
             return Err(UNPAIRED.to_owned());
         }
         drain(hub, store, link, person, outbox, &mut sent)?;
-        let Some(message) = link.receive()? else {
-            continue;
+        let message = match link.receive() {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
+            Err(Unread::Refused(error)) => {
+                link.send(ToDevice::Error(error))?;
+                continue;
+            }
+            Err(Unread::Ended(why)) => return Err(why),
         };
         match message.body {
             FromDevice::Audit { before } => {
@@ -1825,7 +1997,7 @@ fn run_session(
                 match result {
                     Ok(mut state) => {
                         state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
+                        link.send(policy::fitting(ToDevice::SandboxPolicy(state), &message.id))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1852,7 +2024,10 @@ fn run_session(
                 match result {
                     Ok(mut preview) => {
                         preview.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                        link.send(policy::fitting(
+                            ToDevice::SandboxPolicyPreview(preview),
+                            &message.id,
+                        ))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1864,17 +2039,17 @@ fn run_session(
             FromDevice::SandboxPolicyApply { sandbox, edit } => {
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
-                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
-                match result {
-                    Ok(mut state) => {
-                        state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
-                    }
-                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                        of: Some(message.id),
-                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                    .map_err(|e| ErrorBody {
+                        of: Some(message.id.clone()),
+                        code: ErrorCode::NotAllowed,
                         message: e,
-                    }))?,
+                    })
+                    .and_then(|name| {
+                        hub.apply_managed_policy(store, device, person, &name, &edit, &message.id)
+                    });
+                match result {
+                    Ok(state) => link.send(ToDevice::SandboxPolicy(state))?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
                 }
             }
             FromDevice::ApprovalDecide {
@@ -1921,12 +2096,11 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
-                            Err(why) => link.send(ToDevice::Error(ErrorBody {
-                                of: Some(message.id),
-                                code: ErrorCode::OperationFailed,
-                                message: why,
-                            }))?,
+                            Ok(sandboxes) => link.send(policy::fitting(
+                                ToDevice::SandboxesList { sandboxes },
+                                &message.id,
+                            ))?,
+                            Err(why) => link.send(operation_failed(message.id, &why))?,
                         }
                         continue;
                     }
@@ -2226,16 +2400,18 @@ fn send_history(
 /// written, the device stays paired and the request fails.
 fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(), String> {
     let engine = crate::engine::Engine::open(hub.layout.clone(), crate::state::Wait::Background);
-    let by = crate::model::audit::Actor {
-        user: person.to_owned(),
-        host: device.name.clone(),
-    };
+    let by = authority::device_actor(person, &device.id, None);
     engine
         .app_access(
             &by,
             "app forget",
             device.id.clone(),
-            |_| "forgotten on the device: it can no longer connect".to_owned(),
+            |_| {
+                format!(
+                    "forgotten on the device, {}: it can no longer connect",
+                    device.name
+                )
+            },
             || {
                 store.remove_device(&device.id).map(|_| ()).map_err(|e| {
                     crate::error::Error::Session {
@@ -2259,6 +2435,10 @@ const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
 /// The most files the bridge takes from one message.
 const MAX_ATTACHMENTS: usize = 10;
+
+/// Where, in the bridge's media folder, it copies a message's files before
+/// the message is stored with them ([`sweep_incoming`]).
+const INCOMING: &str = ".incoming";
 
 /// Where the plugin puts the files the agent sends, under the sandbox
 /// home: `.enclos-app/media`, beside its socket
@@ -2292,66 +2472,192 @@ fn open_inbox(home: &Path) -> Result<OwnedFd, String> {
     Ok(dir)
 }
 
-/// The files of an agent's message, once it is stored: each taken from the
-/// plugin's `media` folder under `home` ([`take_attachment`]) and recorded
-/// with the message, at most [`MAX_ATTACHMENTS`]. One that cannot be is
-/// left out, said on stderr, and leaves no file in `media`.
+/// The files of an agent's message, before it is stored: each copied from
+/// the plugin's `media` folder under `home` ([`take_attachment`]), at most
+/// [`MAX_ATTACHMENTS`]. One the sandbox made unusable is left out, said on
+/// stderr. An error, with no copy left, when the bridge's own side fails:
+/// the message is then not stored.
 fn take_attachments(
-    store: &Store,
     home: &Path,
     media: &Path,
     agent: &str,
     conversation: &str,
-    message: &str,
     attachments: &[OutAttachment],
-) -> Vec<Attachment> {
+) -> Result<Vec<Taken>, String> {
     if attachments.len() > MAX_ATTACHMENTS {
         eprintln!(
             "enclos app: {agent}: a message carries {} files, the first {MAX_ATTACHMENTS} are taken",
             attachments.len()
         );
     }
-    attachments
-        .iter()
-        .take(MAX_ATTACHMENTS)
-        .filter_map(|a| {
-            let taken = take_attachment(home, media, conversation, a)
-                .inspect_err(|e| eprintln!("enclos app: {agent}: an attachment is left out: {e}"))
-                .ok()?;
-            if let Err(e) = store.add_attachment(&taken, message) {
-                eprintln!("enclos app: {agent}: an attachment is left out: cannot record it: {e}");
-                let _ = std::fs::remove_file(media.join(&taken.id));
-                return None;
+    let mut taken: Vec<Taken> = Vec::new();
+    for a in attachments.iter().take(MAX_ATTACHMENTS) {
+        match take_attachment(home, media, conversation, a) {
+            Ok(t) => taken.push(t),
+            Err(NotTaken::Refused(why)) => {
+                eprintln!("enclos app: {agent}: an attachment is left out: {why}");
             }
-            Some(attachment_info(taken))
-        })
-        .collect()
+            Err(NotTaken::Failed(why)) => {
+                for t in &taken {
+                    t.discard();
+                }
+                return Err(format!("cannot take a file of the message: {why}"));
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// The bridge's copies of files whose message it was storing when it
+/// stopped, left in its media folder's `.incoming`: each moved into the
+/// media folder when the message was stored with it, else removed (the
+/// plugin sends that message again, with its files). Run as the bridge
+/// starts, before any plugin connection.
+fn sweep_incoming(store: &Store, media: &Path) {
+    let Ok(entries) = std::fs::read_dir(media.join(INCOMING)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let recorded = match entry.file_name().to_str() {
+            Some(id) => store
+                .has_attachment(id)
+                .map(|has| has.then(|| media.join(id))),
+            None => Ok(None),
+        };
+        let done = match recorded {
+            Ok(Some(kept)) => std::fs::rename(&path, kept),
+            Ok(None) => std::fs::remove_file(&path),
+            // Left for the next start
+            Err(e) => Err(std::io::Error::other(e)),
+        };
+        if let Err(e) = done {
+            eprintln!("enclos app: {}: {e}", path.display());
+        }
+    }
+}
+
+/// Why a file of an agent's message was not taken.
+#[derive(Debug, PartialEq, Eq)]
+enum NotTaken {
+    /// The sandbox's doing: a name that is not plain, no such file, a link,
+    /// not a regular file, another link to it, more than 25 MiB, a read
+    /// that fails. The file is left out, and the message stored without
+    /// it: sent again, it would carry the same file.
+    Refused(String),
+    /// The bridge's own side failed: its media folder, its disk, a new id.
+    /// The message is not stored, and the plugin sends it again.
+    Failed(String),
+}
+
+impl NotTaken {
+    /// The same, said of `what`.
+    fn of(self, what: &str) -> NotTaken {
+        match self {
+            NotTaken::Refused(why) => NotTaken::Refused(format!("{what}: {why}")),
+            NotTaken::Failed(why) => NotTaken::Failed(format!("{what}: {why}")),
+        }
+    }
+}
+
+/// Removes the plugin's copies of a stored message's files, which it sent
+/// again: the bridge stored them with it before, and may have stopped
+/// before removing these. A name that is not a plain one of the folder is
+/// left alone, as [`take_attachment`] leaves it.
+fn release_attachments(home: &Path, attachments: &[OutAttachment]) {
+    let Ok(inbox) = open_inbox(home) else { return };
+    for a in attachments.iter().take(MAX_ATTACHMENTS) {
+        if plain_file_name(&a.file) {
+            let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
+/// A file of an agent's message copied into the bridge's `.incoming`
+/// folder: moved into its media folder once the message is stored with it
+/// ([`Taken::keep`]), else removed ([`Taken::discard`]). The plugin's copy
+/// stays until the message is stored with it: [`Taken::release`].
+struct Taken {
+    stored: StoredAttachment,
+    /// The bridge's copy, in `.incoming`.
+    copy: PathBuf,
+    /// The plugin's `media` folder, as it was opened.
+    inbox: OwnedFd,
+    /// The file's name there, and what it was when read.
+    file: String,
+    read: rustix::fs::Stat,
+}
+
+impl Taken {
+    /// Moves the bridge's copy into `media`, its message stored with it.
+    fn keep(&self, media: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.copy, media.join(&self.stored.id))
+    }
+
+    /// Removes the bridge's copy, its message not stored with it.
+    fn discard(&self) {
+        let _ = std::fs::remove_file(&self.copy);
+    }
+
+    /// Removes the plugin's copy, through the folder it was read from, and
+    /// only while its name is still the file that was read.
+    fn release(&self) {
+        use rustix::fs::AtFlags;
+        if let Ok(now) =
+            rustix::fs::statat(&self.inbox, self.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            && (now.st_dev, now.st_ino) == (self.read.st_dev, self.read.st_ino)
+        {
+            let _ = rustix::fs::unlinkat(&self.inbox, self.file.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+/// Whether `file` is a plain name of the plugin's `media` folder: no
+/// folder, no leading dot, only ASCII letters, digits, `.`, `-` and `_`.
+fn plain_file_name(file: &str) -> bool {
+    !file.is_empty()
+        && file.len() <= 200
+        && !file.starts_with('.')
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Copies `source` into the new file `to`, and its size: no more than `max`
-/// bytes are copied, and a source found longer leaves no file and is an
-/// error, as is any failure.
-fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, String> {
+/// bytes are copied, and a source found longer leaves no file and is
+/// refused, as is a source that cannot be read; writing failing is the
+/// bridge's own failure. Either leaves no file.
+fn copy_at_most(mut source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, NotTaken> {
+    use std::io::{ErrorKind, Write};
     use std::os::unix::fs::OpenOptionsExt;
     let mut target = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(to)
-        .map_err(|e| e.to_string())?;
-    let copied = std::io::copy(&mut source.take(max + 1), &mut target);
+        .map_err(|e| NotTaken::Failed(e.to_string()))?;
+    let mut buffer = vec![0; 64 * 1024];
+    let mut size = 0u64;
+    let copied = loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break Ok(size),
+            Ok(read) => read,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(NotTaken::Refused(e.to_string())),
+        };
+        size += read as u64;
+        if size > max {
+            break Err(NotTaken::Refused(format!("longer than {max} bytes")));
+        }
+        if let Err(e) = target.write_all(&buffer[..read]) {
+            break Err(NotTaken::Failed(e.to_string()));
+        }
+    };
     drop(target);
-    match copied {
-        Ok(size) if size <= max => Ok(size),
-        Ok(_) => {
-            let _ = std::fs::remove_file(to);
-            Err(format!("longer than {max} bytes"))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(to);
-            Err(e.to_string())
-        }
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
     }
+    copied
 }
 
 /// Moves a file the agent sends from the plugin's `media` folder (in the
@@ -2361,28 +2667,25 @@ fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, 
 /// following a link and without waiting (a named pipe would block), and
 /// only a regular file with no other link to it, of at most
 /// [`MAX_ATTACHMENT_BYTES`], copied no further than that limit even while
-/// it grows. The plugin's copy is then removed through the same folder.
+/// it grows. It is copied into `media`'s `.incoming`, and the plugin's
+/// copy stays until [`Taken::release`], once the message is stored with
+/// the file. What the sandbox did is [`NotTaken::Refused`], what failed on
+/// the bridge's side [`NotTaken::Failed`].
 fn take_attachment(
     home: &Path,
     media: &Path,
     conversation: &str,
     a: &OutAttachment,
-) -> Result<StoredAttachment, String> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+) -> Result<Taken, NotTaken> {
+    use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::DirBuilderExt;
-    let plain = !a.file.is_empty()
-        && a.file.len() <= 200
-        && !a.file.starts_with('.')
-        && a.file
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if !plain {
-        return Err(format!(
+    if !plain_file_name(&a.file) {
+        return Err(NotTaken::Refused(format!(
             "{:?} is not a file name of the media folder",
             a.file
-        ));
+        )));
     }
-    let inbox = open_inbox(home)?;
+    let inbox = open_inbox(home).map_err(NotTaken::Refused)?;
     let from = format!("~/{}/{}", INBOX.join("/"), a.file);
     let fd = rustix::fs::openat(
         &inbox,
@@ -2390,35 +2693,29 @@ fn take_attachment(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| format!("{from}: {e}"))?;
-    let opened = rustix::fs::fstat(&fd).map_err(|e| format!("{from}: {e}"))?;
+    .map_err(|e| NotTaken::Refused(format!("{from}: {e}")))?;
+    let opened = rustix::fs::fstat(&fd).map_err(|e| NotTaken::Refused(format!("{from}: {e}")))?;
     if !rustix::fs::FileType::from_raw_mode(opened.st_mode).is_file() {
-        return Err(format!("{from} is not a file"));
+        return Err(NotTaken::Refused(format!("{from} is not a file")));
     }
     // A second link may be one to a host file the sandbox could not read.
     if opened.st_nlink != 1 {
-        return Err(format!("{from} has other links to it"));
+        return Err(NotTaken::Refused(format!("{from} has other links to it")));
     }
     if opened.st_size < 0 || opened.st_size as u64 > MAX_ATTACHMENT_BYTES {
-        return Err(format!("{from} is larger than 25 MiB"));
+        return Err(NotTaken::Refused(format!("{from} is larger than 25 MiB")));
     }
     let source = std::fs::File::from(fd);
-    let id = new_id().map_err(|e| e.to_string())?;
+    let id = new_id().map_err(|e| NotTaken::Failed(e.to_string()))?;
+    let incoming = media.join(INCOMING);
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(media)
-        .map_err(|e| e.to_string())?;
+        .create(&incoming)
+        .map_err(|e| NotTaken::Failed(format!("{}: {e}", incoming.display())))?;
+    let copy = incoming.join(&id);
     // The sandbox may write on while the bridge reads.
-    let size = copy_at_most(source, &media.join(&id), MAX_ATTACHMENT_BYTES)
-        .map_err(|e| format!("{from}: {e}"))?;
-    // The plugin's copy, through the same folder, and only while its name
-    // is still the file that was read.
-    if let Ok(now) = rustix::fs::statat(&inbox, a.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-        && (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino)
-    {
-        let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
-    }
+    let size = copy_at_most(source, &copy, MAX_ATTACHMENT_BYTES).map_err(|e| e.of(&from))?;
     let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
         !t.is_empty()
             && !s.is_empty()
@@ -2434,7 +2731,7 @@ fn take_attachment(
         false,
     );
     let name = name.trim();
-    Ok(StoredAttachment {
+    let stored = StoredAttachment {
         id,
         conversation: conversation.to_owned(),
         mime: if typed {
@@ -2448,6 +2745,13 @@ fn take_attachment(
             name.chars().take(120).collect()
         },
         size: size as i64,
+    };
+    Ok(Taken {
+        stored,
+        copy,
+        inbox,
+        file: a.file.clone(),
+        read: opened,
     })
 }
 
@@ -2528,39 +2832,98 @@ fn read(
     Ok(())
 }
 
+/// How long the background pass waits before it opens again an agent's
+/// plugin connection that ended `failures` times in a row on a message the
+/// bridge could not store: not at all the first time, so the message comes
+/// again within seconds, then 3 seconds, doubled each time, up to a minute.
+/// While the database keeps failing (a full disk), each connection would
+/// end within seconds, and each `hello` sends the agent's commands to
+/// every device again.
+fn reopen_after(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::ZERO,
+        n => (Duration::from_secs(3) * (1 << (n - 2).min(5))).min(Duration::from_secs(60)),
+    }
+}
+
+impl Hub {
+    /// Ends `agent`'s plugin connection, through `acks` so that it ends
+    /// for every clone of it, on a message of its the bridge could not
+    /// store (`why`: its database failed). Unacknowledged, the plugin keeps
+    /// the message and sends it again after the `hello` of the next
+    /// connection, which the background pass opens within seconds, or
+    /// later when this happened just before ([`reopen_after`]).
+    fn kept_by_plugin(&self, agent: &str, acks: &PluginWriter, why: &str) {
+        eprintln!(
+            "enclos app: {agent}: a message could not be stored ({why}); its app channel is closed, so the message comes again when it is opened"
+        );
+        self.ended_unstored(agent);
+        acks.shutdown();
+    }
+
+    /// Counts one more connection of `agent`'s ended on a message the
+    /// bridge could not store.
+    fn ended_unstored(&self, agent: &str) {
+        let now = std::time::Instant::now();
+        let mut unstored = self.unstored.lock().expect("not poisoned");
+        let failures = match unstored.get(agent) {
+            // In a row: within the longest wait, and the pass after it
+            Some((n, at)) if now.duration_since(*at) <= Duration::from_secs(120) => n + 1,
+            _ => 1,
+        };
+        unstored.insert(agent.to_owned(), (failures, now));
+    }
+
+    /// Whether the background pass may open `agent`'s plugin connection
+    /// again ([`reopen_after`]).
+    fn may_reopen(&self, agent: &str) -> bool {
+        self.unstored
+            .lock()
+            .expect("not poisoned")
+            .get(agent)
+            .is_none_or(|(n, at)| at.elapsed() >= reopen_after(*n))
+    }
+}
+
 /// Where `agent`'s message for `conversation` is kept: there, when it is
 /// one of `agent`'s own; else (a conversation the bridge does not know, or
 /// another agent's: the runtime's home channel as it was, or a chat gone)
-/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None`, said on
-/// stderr, when Home's id is not one the protocol takes.
+/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None` when the
+/// conversation is being deleted, or, said on stderr, when Home's id is not
+/// one the protocol takes. An error when the store cannot say which: the
+/// message is then not acknowledged, and its plugin sends it again.
 fn destination(
     store: &Store,
     host: Option<&str>,
     agent: &str,
     conversation: ConversationId,
-) -> Option<ConversationId> {
+) -> Result<Option<ConversationId>, String> {
     if store
         .deletion_started(conversation.as_str())
-        .unwrap_or(true)
+        .map_err(|e| e.to_string())?
     {
-        return None;
+        return Ok(None);
     }
     let own = matches!(
-        store.conversation_of(conversation.as_str()),
-        Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+        store.conversation_of(conversation.as_str()).map_err(|e| e.to_string())?,
+        Some((sandbox, name, _)) if format!("{sandbox}/{name}") == agent
     );
     if own {
-        return Some(conversation);
+        return Ok(Some(conversation));
     }
-    let home = ConversationId::new(home_id(agent))
-        .inspect_err(|e| {
-            eprintln!(
-                "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
-            );
-        })
-        .ok()?;
-    let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
-    Some(home)
+    let Ok(home) = ConversationId::new(home_id(agent)).inspect_err(|e| {
+        eprintln!(
+            "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
+        );
+    }) else {
+        return Ok(None);
+    };
+    // A Home not made would hide the message from every device
+    // (`Store::since` reads it through its conversation).
+    store
+        .ensure_home(agent, host.unwrap_or(""), host.is_some())
+        .map_err(|e| e.to_string())?;
+    Ok(Some(home))
 }
 
 /// A conversation for a device: `None` for an id the protocol refuses.
@@ -2657,14 +3020,19 @@ fn archive_conversation(
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a
-/// conversation that is not a group.
-fn group_of(store: &Store, id: &str) -> Option<(String, Vec<String>)> {
-    let members = store.members(id).ok()?;
+/// conversation that is not a group; an error when the store cannot say.
+fn group_of(store: &Store, id: &str) -> rusqlite::Result<Option<(String, Vec<String>)>> {
+    let members = store.members(id)?;
     if members.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (sandbox, _, _) = store.conversation_of(id).ok()??;
-    Some((sandbox, members.into_iter().map(|(a, _)| a).collect()))
+    let Some((sandbox, _, _)) = store.conversation_of(id)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        sandbox,
+        members.into_iter().map(|(a, _)| a).collect(),
+    )))
 }
 
 /// A message's `agent` for a device: the conversation's agent, a group
@@ -2782,7 +3150,9 @@ fn send(
                 .into(),
         })));
     }
-    let group = group_of(store, conversation.as_str()).is_some();
+    let group = group_of(store, conversation.as_str())
+        .map_err(|e| e.to_string())?
+        .is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
         question: None,
@@ -2897,10 +3267,6 @@ mod connection_end_tests {
             silence,
             Host::new(
                 crate::layout::Layout::at(folder.join("enclos")),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
                 "/unused/enclos".into(),
             ),
         )
@@ -2999,6 +3365,13 @@ mod connection_end_tests {
         fn send(&mut self, id: &str, body: FromDevice) {
             let plain = encode_line(&Envelope::new(MessageId::new(id).unwrap(), body));
             let sealed = self.session.encrypt(&plain).unwrap();
+            self.socket.send(Message::Binary(sealed.into())).unwrap();
+        }
+
+        /// `bytes`, sealed as they are: a message the bridge may not be
+        /// able to read.
+        fn send_raw(&mut self, bytes: &[u8]) {
+            let sealed = self.session.encrypt(bytes).unwrap();
             self.socket.send(Message::Binary(sealed.into())).unwrap();
         }
 
@@ -3171,16 +3544,13 @@ mod connection_end_tests {
         );
     }
 
-    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+    /// An engine on `layout` with a stand-in Seatbelt backend.
+    fn fake_engine(layout: &crate::layout::Layout) -> crate::engine::Engine {
         use crate::{
-            audit::jsonl::JsonlAuditLog,
-            backend::fake::FakeBackend,
-            engine::{Engine, SandboxSpec},
-            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
-            state::sqlite::SqliteStateStore,
+            audit::jsonl::JsonlAuditLog, backend::fake::FakeBackend, engine::Engine,
+            model::sandbox::BackendKind, state::sqlite::SqliteStateStore,
         };
-        let layout = crate::layout::Layout::at(folder.join("enclos"));
-        let engine = Engine::new(
+        Engine::new(
             layout.clone(),
             Box::new(SqliteStateStore::new(
                 layout.state_db(),
@@ -3189,7 +3559,16 @@ mod connection_end_tests {
             )),
             Box::new(JsonlAuditLog::new(layout.audit_log())),
             vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
-        );
+        )
+    }
+
+    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+        use crate::{
+            engine::SandboxSpec,
+            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+        };
+        let layout = crate::layout::Layout::at(folder.join("enclos"));
+        let engine = fake_engine(&layout);
         let actor = Actor {
             user: PERSON.into(),
             host: "test".into(),
@@ -3209,6 +3588,129 @@ mod connection_end_tests {
         layout
     }
 
+    /// Sandbox `lab`'s policy with `destinations` more allowed
+    /// destinations, of `bytes` bytes each, through the host's own edit.
+    fn allow_many(layout: &crate::layout::Layout, destinations: usize, bytes: usize) {
+        use crate::model::{audit::Actor, plan::Confirm};
+        let engine = fake_engine(layout);
+        let before = layout.read_policy("lab").unwrap();
+        let list: Vec<String> = (0..destinations)
+            .map(|n| format!("\"{n:05}{}.example.com\"", "a".repeat(bytes - 17)))
+            .collect();
+        let after = before.replace(
+            "allow_add = []",
+            &format!("allow_add = [{}]", list.join(", ")),
+        );
+        assert_ne!(before, after);
+        let actor = Actor {
+            user: PERSON.into(),
+            host: "test".into(),
+        };
+        engine
+            .policy_edit(
+                &actor,
+                &"lab".parse().unwrap(),
+                &before,
+                &after,
+                Confirm::Yes,
+            )
+            .unwrap();
+    }
+
+    /// A bridge serving `layout`'s sandboxes to the host's person, and that
+    /// person's device, connected.
+    fn host_device(folder: &Path, layout: &crate::layout::Layout) -> (Bridge, PhoneLink) {
+        let bridge = bridge_serving(
+            folder,
+            SILENCE,
+            Host::new(layout.clone(), "/unused/enclos".into()),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        (bridge, device)
+    }
+
+    /// The device's connection still answers: a `runtimes` round trip.
+    fn still_answers(device: &mut PhoneLink) {
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+    }
+
+    #[test]
+    fn a_policy_too_large_for_one_message_is_answered_left_unchanged_and_the_connection_goes_on() {
+        use enclos_protocol::policy::{PolicyApply, PolicyChange};
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        allow_many(&layout, 1_500, 60);
+        let (_bridge, mut device) = host_device(folder.path(), &layout);
+        // An edit, reviewed on a policy the phone kept from before: refused
+        // before it is applied, since the policy it makes could not be sent
+        let engine = fake_engine(&layout);
+        let name = "lab".parse().unwrap();
+        let base = engine.mobile_policy(&name).unwrap().base;
+        let change = PolicyChange {
+            field: "allow".into(),
+            before: None,
+            after: Some("one-more.example.com".into()),
+        };
+        let revision = engine
+            .mobile_policy_preview(&name, &base, &change)
+            .unwrap()
+            .revision;
+        let before = layout.read_policy("lab").unwrap();
+        device.send(
+            "apply-1",
+            FromDevice::SandboxPolicyApply {
+                sandbox: "lab".into(),
+                edit: PolicyApply {
+                    base,
+                    revision,
+                    change,
+                },
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "apply-1");
+                assert!(message.contains("enclos policy edit lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        // `unsupported`: nothing was changed
+        assert_eq!(layout.read_policy("lab").unwrap(), before);
+        still_answers(&mut device);
+        device.send(
+            "get-1",
+            FromDevice::SandboxPolicyGet {
+                sandbox: "lab".into(),
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "get-1");
+                assert!(message.contains("enclos policy show lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        still_answers(&mut device);
+    }
+
     #[test]
     fn provisioning_install_busy_and_failures_keep_request_ids_over_the_device_connection() {
         use std::os::unix::fs::PermissionsExt;
@@ -3216,6 +3718,7 @@ mod connection_end_tests {
         let layout = provisioning_state(folder.path());
         let executable = folder.path().join("fake-enclos");
         std::fs::write(&executable, r#"#!/bin/sh
+printf '%s' "${7#--requested-by=}" > "$ENCLOS_HOME/requested-by"
 while [ ! -f "$ENCLOS_HOME/release" ]; do sleep 0.01; done
 if [ -f "$ENCLOS_HOME/fail" ]; then
   printf '%s\n' '{"error":{"message":"installer refused the operation"}}'
@@ -3227,14 +3730,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let bridge = bridge_serving(
             folder.path(),
             SILENCE,
-            Host::new(
-                layout.clone(),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
-                executable,
-            ),
+            Host::new(layout.clone(), executable),
         );
         let phone = paired(&bridge, "n-pixel");
         Store::open(&bridge.store)
@@ -3257,6 +3753,11 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         std::fs::write(layout.data().join("release"), "").unwrap();
         assert!(
             matches!(device.receive(), Some(ToDevice::RuntimeInstalled { of, sandbox, runtime, login }) if of.as_str() == "install-one" && sandbox == "lab" && runtime == "hermes" && login.contains("hermes setup"))
+        );
+        // The install's audit entry names the person and device that asked
+        assert_eq!(
+            std::fs::read_to_string(layout.data().join("requested-by")).unwrap(),
+            format!("{PERSON} (device {})", phone.id)
         );
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "lab"))
@@ -3300,14 +3801,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let bridge = bridge_serving(
             folder.path(),
             SILENCE,
-            Host::new(
-                layout.clone(),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
-                "/unused/enclos".into(),
-            ),
+            Host::new(layout.clone(), "/unused/enclos".into()),
         );
         let phone = paired(&bridge, "n-pixel");
         Store::open(&bridge.store)
@@ -3330,6 +3824,12 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         );
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
+        );
+        let audit = std::fs::read_to_string(layout.audit_log()).unwrap();
+        assert!(
+            audit.lines().any(|line| line.contains("sandbox create")
+                && line.contains(&format!("{PERSON} (device {})", phone.id))),
+            "{audit}"
         );
     }
 
@@ -3811,6 +4311,63 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
     }
 
     #[test]
+    fn a_message_the_bridge_could_not_store_comes_again_within_seconds() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        // The database refuses it, as a full disk would.
+        let database = rusqlite::Connection::open(&bridge.store).unwrap();
+        database
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON messages WHEN NEW.id = 'o-1'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let (told, heard) = std::sync::mpsc::channel();
+        plugin_that(&bridge.socket, move |mut lines, mut out| {
+            // What its outbox holds, sent after each hello.
+            let said = FromPlugin::MessageOut {
+                conversation: ConversationId::new("c-1").unwrap(),
+                text: "the answer".into(),
+                kind: OutKind::Reply,
+                reply_to: None,
+                attachments: vec![],
+            };
+            out.write_all(&encode_line(&Envelope::new(
+                MessageId::new("o-1").unwrap(),
+                said,
+            )))
+            .unwrap();
+            let mut line = Vec::new();
+            let mut acked = false;
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                if let Ok(message) = decode_from_bridge(&line)
+                    && let FromBridge::Ack { of } = message.body
+                    && of.as_str() == "o-1"
+                {
+                    acked = true;
+                    break;
+                }
+                line.clear();
+            }
+            let _ = told.send(acked);
+        });
+        // Not stored, not acknowledged, and the connection ends.
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)), Ok(false));
+        database.execute_batch("DROP TRIGGER refuse").unwrap();
+        // The bridge opens it again, and the plugin sends it again.
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)), Ok(true));
+        let stored = store.since(PERSON, 0).unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|m| m.id == "o-1" && m.text == "the answer"),
+            "{stored:?}"
+        );
+    }
+
+    #[test]
     fn a_plugin_that_never_reads_holds_no_other_device() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
@@ -4185,6 +4742,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert!(audit.contains("app forget"), "{audit}");
         assert!(audit.contains(&phone.id), "{audit}");
         assert!(audit.contains(PERSON), "{audit}");
+        // And the device's name, which the actor no longer carries
+        assert!(audit.contains("Pixel"), "{audit}");
     }
 
     #[test]
@@ -4320,6 +4879,133 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_ne!(other, GONE);
         assert_ne!(other, CLOSED);
     }
+    /// The code and `of` of an `error`, or a panic naming what came.
+    fn error_of(message: Option<ToDevice>) -> (ErrorCode, Option<String>) {
+        match message {
+            Some(ToDevice::Error(error)) => (error.code, error.of.map(|of| of.as_str().to_owned())),
+            other => panic!("not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_the_bridge_cannot_use_is_answered_and_the_connection_goes_on() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        // A type of a newer app: answered, and otherwise ignored
+        device.send_raw(br#"{"v":1,"type":"something.newer","id":"newer-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::UnknownType, Some("newer-1".to_owned()))
+        );
+        // A known type with a field missing
+        device.send_raw(br#"{"v":1,"type":"message.send","id":"bad-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("bad-1".to_owned()))
+        );
+        // Not JSON: no id to name
+        device.send_raw(b"not json");
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // A text frame: a message comes in a binary frame
+        device
+            .socket
+            .send(Message::Text(
+                r#"{"v":1,"type":"runtimes","id":"text-1"}"#.into(),
+            ))
+            .unwrap();
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // The connection goes on
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+        // A version the bridge does not speak is answered, then ends it
+        device.send_raw(br#"{"v":2,"type":"auth","id":"v-2"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::Version, Some("v-2".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+    }
+
+    #[test]
+    fn a_first_message_the_bridge_cannot_use_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send_raw(br#"{"v":1,"type":"auth","id":"auth-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        assert!(
+            refusal(&bridge).starts_with("the first message is not one the bridge can use"),
+            "{}",
+            refusal(&bridge)
+        );
+    }
+
+    #[test]
+    fn a_first_message_with_a_key_or_signature_that_is_not_base64_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // An `auth` from a known device, its `sig` not base64
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send(
+            "auth-1",
+            FromDevice::Auth {
+                device: phone.id.clone(),
+                sig: "not base64!".to_owned(),
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(
+            why.starts_with("the first message is not one the bridge can use"),
+            "{why}"
+        );
+        assert!(why.contains("sig"), "{why}");
+        // A `pair.request`, its `proof` not base64
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let noise = generate_keypair().unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).expect("no handshake");
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(b"key"),
+                proof: "not base64!".to_owned(),
+                sig: encode(b"sig"),
+                push: None,
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("pair-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(why.contains("proof"), "{why}");
+        // The code is still there for its device
+        assert_eq!(store.open_pairings().unwrap(), [b"code-1".to_vec()]);
+    }
+
     #[test]
     fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
         let folder = tempfile::tempdir().unwrap();

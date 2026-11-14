@@ -29,17 +29,50 @@ fn the_sandbox_home_is_two_folders_above_the_app_socket() {
     );
 }
 
+/// The bridge's copies of files: in its media folder, and in `.incoming`.
+fn copies(media: &Path) -> usize {
+    let files = |folder: &Path| {
+        std::fs::read_dir(folder).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .count()
+        })
+    };
+    files(media) + files(&media.join(".incoming"))
+}
+
 #[test]
 fn a_file_of_the_media_folder_is_moved_into_the_bridges() {
     let (_dir, home, inbox, media) = folders();
     std::fs::write(inbox.join("a1.png"), b"\x89PNG").unwrap();
     let taken = take_attachment(&home, &media, "c-1", &out("a1.png")).unwrap();
+    let stored = &taken.stored;
     assert_eq!(
-        (taken.size, taken.name.as_str(), taken.mime.as_str()),
+        (stored.size, stored.name.as_str(), stored.mime.as_str()),
         (4, "unicorn.png", "image/png")
     );
-    assert_eq!(std::fs::read(media.join(&taken.id)).unwrap(), b"\x89PNG");
+    // Copied aside until its message is stored, then kept.
+    assert!(!media.join(&stored.id).exists());
+    taken.keep(&media).unwrap();
+    assert_eq!(std::fs::read(media.join(&stored.id)).unwrap(), b"\x89PNG");
+    assert_eq!(copies(&media), 1);
+    // The plugin's copy stays until the message is stored with it.
+    assert!(inbox.join("a1.png").exists());
+    taken.release();
     assert!(!inbox.join("a1.png").exists(), "moved, not copied");
+}
+
+#[test]
+fn a_file_replaced_since_it_was_read_is_not_removed() {
+    let (_dir, home, inbox, media) = folders();
+    std::fs::write(inbox.join("a1.png"), b"\x89PNG").unwrap();
+    let taken = take_attachment(&home, &media, "c-1", &out("a1.png")).unwrap();
+    // Moved aside, not removed: Linux would give a new file its inode.
+    std::fs::rename(inbox.join("a1.png"), inbox.join("read.png")).unwrap();
+    std::fs::write(inbox.join("a1.png"), b"another").unwrap();
+    taken.release();
+    assert_eq!(std::fs::read(inbox.join("a1.png")).unwrap(), b"another");
 }
 
 #[test]
@@ -54,6 +87,8 @@ fn an_html_artefact_keeps_its_bytes_and_type_as_an_attachment() {
         size: html.len() as u64,
     };
     let taken = take_attachment(&home, &media, "c-1", &a).unwrap();
+    taken.keep(&media).unwrap();
+    let taken = taken.stored;
     assert_eq!(std::fs::read(media.join(&taken.id)).unwrap(), html);
     assert_eq!(taken.conversation, "c-1");
     let info = attachment_info(taken);
@@ -167,7 +202,10 @@ fn a_file_name_loses_its_hidden_characters() {
     let mut a = out("a5.pdf");
     a.name = "report\u{202E}fdp.exe\u{200B}".to_owned();
     assert_eq!(
-        take_attachment(&home, &media, "c-1", &a).unwrap().name,
+        take_attachment(&home, &media, "c-1", &a)
+            .unwrap()
+            .stored
+            .name,
         "reportfdp.exe"
     );
 }
@@ -179,7 +217,10 @@ fn a_strange_media_type_is_a_plain_file() {
     let mut a = out("a2.bin");
     a.mime = "text/html; <script>".to_owned();
     assert_eq!(
-        take_attachment(&home, &media, "c-1", &a).unwrap().mime,
+        take_attachment(&home, &media, "c-1", &a)
+            .unwrap()
+            .stored
+            .mime,
         "application/octet-stream"
     );
 }
@@ -192,7 +233,10 @@ fn an_attachment_name_loses_its_hidden_characters() {
     a.mime = "text/html".to_owned();
     a.name = "report\u{202E}lmth.txt\nsecond line".to_owned();
     assert_eq!(
-        take_attachment(&home, &media, "c-1", &a).unwrap().name,
+        take_attachment(&home, &media, "c-1", &a)
+            .unwrap()
+            .stored
+            .name,
         "reportlmth.txtsecond line"
     );
 }
@@ -258,6 +302,30 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
     store.recover_approvals().unwrap();
     assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
     assert!(!store.claim_approval("r1").unwrap());
+}
+
+#[test]
+fn a_connection_ended_on_an_unstored_message_is_opened_again_later_each_time_in_a_row() {
+    let waits: Vec<u64> = (1..=8).map(|n| reopen_after(n).as_secs()).collect();
+    assert_eq!(waits, [0, 3, 6, 12, 24, 48, 60, 60]);
+    let folder = tempfile::tempdir().unwrap();
+    let hub = Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        folder.path().join("app.db"),
+        crate::layout::Layout::at(folder.path().join("enclos")),
+        vec![],
+        vec![],
+        None,
+        SILENCE,
+    );
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    // The first time: at once, so the message comes again within seconds.
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    assert!(!hub.may_reopen("lab/main"));
+    assert!(hub.may_reopen("lab/other"));
 }
 
 #[test]
@@ -531,7 +599,7 @@ fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
         .add("asks-1", "c-asks", &From::Agent, "still working", "reply")
         .unwrap();
     assert!(store.conversation_info("c-asks").unwrap().unwrap().archived);
-    // A question or a command approval brings it back, on every device.
+    // A question or a runtime approval brings it back, on every device.
     assert!(hub.unarchive_for_request(&store, "c-asks").unwrap());
     let ToDevice::Conversation(info) = phone_rx.try_recv().unwrap() else {
         panic!("expected conversation metadata");
@@ -2386,14 +2454,14 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     let id = |s: &str| ConversationId::new(s).unwrap();
     assert_eq!(
         destination(&store, host, "lab/a", id("c-a")),
-        Some(id("c-a"))
+        Ok(Some(id("c-a")))
     );
     // Another agent's conversation, or one the bridge does not know: Home,
     // the host's person's.
     for other in ["c-b", "c-unknown"] {
         assert_eq!(
             destination(&store, host, "lab/a", id(other)),
-            Some(id("home.lab.a"))
+            Ok(Some(id("home.lab.a")))
         );
     }
     assert_eq!(
@@ -2403,7 +2471,7 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     // An agent whose Home's id the protocol refuses (longer than an id may
     // be): nothing, which the caller acknowledges.
     let long = format!("lab/{}", "a".repeat(130));
-    assert_eq!(destination(&store, host, &long, id("c-unknown")), None);
+    assert_eq!(destination(&store, host, &long, id("c-unknown")), Ok(None));
     assert_eq!(store.conversation_info(&home_id(&long)).unwrap(), None);
 }
 
@@ -2450,15 +2518,28 @@ fn a_forgotten_device_is_unpaired_and_logged() {
     );
 }
 
+/// An agent's message in `c-1` of `lab/main`, as the plugin leg gives it.
+fn agent_says(text: &str) -> ConversationMessage {
+    ConversationMessage {
+        question: None,
+        conversation: ConversationId::new("c-1").unwrap(),
+        agent: "lab/main".to_owned(),
+        from: "agent".to_owned(),
+        text: text.to_owned(),
+        kind: "reply".to_owned(),
+        time: 0,
+        seq: 0,
+        attachments: Vec::new(),
+    }
+}
+
 #[test]
 fn a_message_takes_at_most_ten_files() {
-    let (dir, home, inbox, media) = folders();
-    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let (dir, home, inbox, _media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
     store
         .conversation("c-1", "lab", "main", "alice@example.com")
-        .unwrap();
-    store
-        .add("m-1", "c-1", &From::Agent, "files", "reply")
         .unwrap();
     let files: Vec<OutAttachment> = (0..12)
         .map(|i| {
@@ -2467,36 +2548,81 @@ fn a_message_takes_at_most_ten_files() {
             out(&file)
         })
         .collect();
-    let taken = take_attachments(&store, &home, &media, "lab/main", "c-1", "m-1", &files);
-    assert_eq!(taken.len(), MAX_ATTACHMENTS);
+    let id = MessageId::new("m-1").unwrap();
+    hub.store_agent_text(
+        &store,
+        &id,
+        agent_says("files"),
+        &files,
+        &home,
+        &From::Agent,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(store.attachments_of("m-1").unwrap().len(), MAX_ATTACHMENTS);
+    assert!(!inbox.join("f0.png").exists(), "taken");
     assert!(inbox.join("f11.png").exists(), "not taken");
 }
 
 #[test]
-fn a_file_that_cannot_be_recorded_leaves_none_behind() {
+fn a_message_whose_files_cannot_be_recorded_is_not_stored_and_keeps_them() {
     let (dir, home, inbox, media) = folders();
-    let path = dir.path().join("app.db");
-    let store = Store::open(&path).unwrap();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
     store
         .conversation("c-1", "lab", "main", "alice@example.com")
         .unwrap();
-    rusqlite::Connection::open(&path)
+    rusqlite::Connection::open(&hub.store_path)
         .unwrap()
         .execute_batch("DROP TABLE attachments")
         .unwrap();
     std::fs::write(inbox.join("a6.png"), b"x").unwrap();
-    let taken = take_attachments(
+    let id = MessageId::new("m-1").unwrap();
+    let stored = hub.store_agent_text(
         &store,
-        &home,
-        &media,
-        "lab/main",
-        "c-1",
-        "m-1",
+        &id,
+        agent_says("a file"),
         &[out("a6.png")],
+        &home,
+        &From::Agent,
     );
-    assert!(taken.is_empty());
-    assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
+    // Not stored, so not acknowledged: the plugin sends it again, and its
+    // file is still there for it.
+    assert!(stored.is_err());
+    assert!(!store.has_message("m-1").unwrap());
+    assert!(inbox.join("a6.png").exists());
+    assert_eq!(copies(&media), 0, "no orphan");
+}
+
+#[test]
+fn a_message_sent_again_is_stored_once_and_its_files_left_behind_are_removed() {
+    let (dir, home, inbox, media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    std::fs::write(inbox.join("a7.png"), b"x").unwrap();
+    let id = MessageId::new("m-1").unwrap();
+    let say = || {
+        hub.store_agent_text(
+            &store,
+            &id,
+            agent_says("a file"),
+            &[out("a7.png")],
+            &home,
+            &From::Agent,
+        )
+    };
+    assert!(say().unwrap().is_some());
+    assert_eq!(store.attachments_of("m-1").unwrap().len(), 1);
+    // The bridge stopped after storing it, before removing the plugin's
+    // copy, and before its `ack`: the plugin sends it again.
+    std::fs::write(inbox.join("a7.png"), b"x").unwrap();
+    assert_eq!(say().unwrap(), None);
+    assert!(!inbox.join("a7.png").exists());
+    assert_eq!(store.attachments_of("m-1").unwrap().len(), 1);
+    assert_eq!(copies(&media), 1);
 }
 
 #[test]
@@ -2657,4 +2783,219 @@ fn review_imported_presentation_reaches_connected_paired_devices_without_relisti
         panic!("missing clear")
     };
     assert!(photo.image.is_none());
+}
+
+#[test]
+fn a_file_the_bridge_cannot_copy_fails_its_message_and_one_the_sandbox_spoiled_is_left_out() {
+    let (dir, home, inbox, media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    std::fs::write(inbox.join("a8.png"), b"x").unwrap();
+    std::fs::write(inbox.join("a9.png"), b"y").unwrap();
+    // The bridge's media folder cannot be made, as on a full disk.
+    std::fs::write(&media, b"not a folder").unwrap();
+    let say = |id: &str, files: &[OutAttachment]| {
+        hub.store_agent_text(
+            &store,
+            &MessageId::new(id).unwrap(),
+            agent_says("a chart"),
+            files,
+            &home,
+            &From::Agent,
+        )
+    };
+    // Not stored, so not acknowledged: the plugin sends it again, its
+    // files still there.
+    assert!(say("m-1", &[out("a8.png"), out("a9.png")]).is_err());
+    assert!(!store.has_message("m-1").unwrap());
+    assert!(inbox.join("a8.png").exists() && inbox.join("a9.png").exists());
+    // Room again: stored with both.
+    std::fs::remove_file(&media).unwrap();
+    assert!(
+        say("m-1", &[out("a8.png"), out("a9.png")])
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.attachments_of("m-1").unwrap().len(), 2);
+    assert_eq!(copies(&media), 2);
+    assert!(!inbox.join("a8.png").exists());
+    // A file the sandbox spoiled (here a link) is left out, and the
+    // message stored without it: sent again, it would carry it again.
+    std::os::unix::fs::symlink(dir.path().join("secret"), inbox.join("link.png")).unwrap();
+    assert!(say("m-2", &[out("link.png")]).unwrap().is_some());
+    assert!(store.attachments_of("m-2").unwrap().is_empty());
+}
+
+#[test]
+fn files_copied_for_a_message_the_bridge_had_not_stored_when_it_stopped_are_removed_at_start() {
+    let (dir, home, inbox, media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    std::fs::write(inbox.join("b1.png"), b"x").unwrap();
+    std::fs::write(inbox.join("b2.png"), b"y").unwrap();
+    // The bridge stopped after copying b1, before storing its message.
+    let lost = take_attachment(&home, &media, "c-1", &out("b1.png")).unwrap();
+    // And after storing b2's, before moving its copy into place.
+    let kept = take_attachment(&home, &media, "c-1", &out("b2.png")).unwrap();
+    let pieces = [("m-2".to_owned(), "a chart".to_owned())];
+    store
+        .add_pieces(
+            &pieces,
+            "c-1",
+            &From::Agent,
+            "reply",
+            std::slice::from_ref(&kept.stored),
+        )
+        .unwrap()
+        .unwrap();
+    sweep_incoming(&store, &media);
+    assert!(!lost.copy.exists());
+    assert!(!media.join(&lost.stored.id).exists());
+    assert_eq!(std::fs::read(media.join(&kept.stored.id)).unwrap(), b"y");
+    assert_eq!(copies(&media), 1);
+}
+
+#[test]
+fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
+    use enclos_protocol::device::SandboxInfo;
+    use enclos_protocol::plugin::ErrorCode;
+    use enclos_protocol::policy::PolicyState;
+    let policy = |reason: usize| {
+        ToDevice::SandboxPolicy(PolicyState {
+            sandbox: "lab".into(),
+            version: 1,
+            base: "b".into(),
+            editable: true,
+            reason: Some("x".repeat(reason)),
+            fields: Vec::new(),
+            of: "get-1".into(),
+        })
+    };
+    let of = MessageId::new("get-1").unwrap();
+    assert_eq!(policy::fitting(policy(10), &of), policy(10));
+    let ToDevice::Error(error) = policy::fitting(policy(70_000), &of) else {
+        panic!("sent as it is");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::Unsupported);
+    assert!(
+        error.message.contains("enclos policy show lab"),
+        "{}",
+        error.message
+    );
+    let sandboxes = (0..3_000)
+        .map(|n| SandboxInfo {
+            sandbox: format!("sandbox-{n}"),
+            runtime: Some("hermes".into()),
+            state: "running".into(),
+        })
+        .collect();
+    assert!(matches!(
+        policy::fitting(ToDevice::SandboxesList { sandboxes }, &of),
+        ToDevice::Error(_)
+    ));
+    // Not broadcast at all: sealed, it would end the device's connection.
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, received) = hub_with(dir.path(), &["alice@example.com"]);
+    hub.deliver_fitting("alice@example.com", policy(70_000));
+    hub.deliver_fitting("alice@example.com", policy(10));
+    assert_eq!(received[0].try_recv().ok(), Some(policy(10)));
+    assert!(received[0].try_recv().is_err());
+}
+
+#[test]
+fn a_long_provisioning_failure_still_fits_one_message() {
+    let of = MessageId::new("install-1").unwrap();
+    let long = format!("installer refused: {}", "line of output\n".repeat(5_000));
+    let failed = operation_failed(of.clone(), &long);
+    assert!(agent_names::agent_message_fits(&failed).unwrap());
+    let ToDevice::Error(error) = failed else {
+        panic!("not an error");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::OperationFailed);
+    assert!(
+        error
+            .message
+            .starts_with("installer refused: line of output line")
+    );
+    // A short one goes as it is
+    let ToDevice::Error(error) = operation_failed(of, "installer refused the operation") else {
+        panic!("not an error");
+    };
+    assert_eq!(error.message, "installer refused the operation");
+}
+
+#[test]
+fn an_edit_is_measured_against_the_policy_it_would_make() {
+    use enclos_protocol::policy::{PolicyChange, PolicyField, PolicyState, PolicyValue};
+    let of = MessageId::new("apply-1").unwrap();
+    let state = |reason: usize| PolicyState {
+        sandbox: "lab".into(),
+        version: 1,
+        base: "b".into(),
+        editable: true,
+        reason: Some("x".repeat(reason)),
+        fields: vec![PolicyField {
+            key: "allow".into(),
+            label: "Allowed destinations".into(),
+            multiple: true,
+            editable: true,
+            choices: Vec::new(),
+            values: vec![PolicyValue {
+                value: "example.com".into(),
+                source: "Sandbox".into(),
+                locked: false,
+            }],
+        }],
+        of: String::new(),
+    };
+    let fits = |reason: usize| {
+        let mut s = state(reason);
+        s.of = of.to_string();
+        agent_names::agent_message_fits(&ToDevice::SandboxPolicy(s)).unwrap()
+    };
+    // The longest reason that still lets the policy reach the phone
+    let (mut low, mut high) = (0, 70_000);
+    while low + 1 < high {
+        let middle = (low + high) / 2;
+        if fits(middle) {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    let change = |after: Option<usize>| PolicyChange {
+        field: "allow".into(),
+        before: None,
+        after: after.map(|n| format!("{}.example.com", "a".repeat(n))),
+    };
+    // At the limit, an added entry would not reach it
+    assert!(!policy::fits_once_applied(
+        &state(low),
+        &change(Some(1)),
+        &of
+    ));
+    // With room, it would; a removal never grows it
+    assert!(policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(200)),
+        &of
+    ));
+    assert!(!policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(2_000)),
+        &of
+    ));
+    assert!(policy::fits_once_applied(
+        &state(low - 1_000),
+        &change(None),
+        &of
+    ));
 }

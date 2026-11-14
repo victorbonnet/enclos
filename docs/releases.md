@@ -21,7 +21,9 @@ The Linux binaries are static, linked against musl rather than the host's glibc,
 3. Push a tag named `v` and that version, such as `v0.1.0` for `0.1.0`, on that commit.
 4. Once it is published, put its notes on the release: `gh release edit v0.1.0 --notes-file docs/release-notes/0.1.0.md`. The workflow only generates a list of changes.
 
-The tag runs [`release.yml`](../.github/workflows/release.yml) in three jobs. **build**, once for each archive, with read access only, so dependency build scripts never see a token that can publish:
+The tag runs [`release.yml`](../.github/workflows/release.yml) in four jobs. **ci-passed** first: the `ci` workflow must have passed on the tagged commit on `main`. It waits for a run still going, and for ten minutes for a run not yet listed (a tag pushed together with its commit can be checked before that run exists). It refuses the tag when the run failed or was cancelled, or when there is still none; rerun `ci` on that commit, then rerun the release. A run on `main` is never cancelled by a later push.
+
+**build**, once for each archive, with read access only, so dependency build scripts never see a token that can publish:
 
 - refuses a tag that does not match the version in `Cargo.toml`;
 - builds with the lockfile and the toolchain pinned in `rust-toolchain.toml`, natively on each architecture: on a macOS 26 runner with deployment target 15.0 (so the binary runs on macOS 15 and later), and checks that the binary is arm64; on GitHub's `ubuntu-24.04` and `ubuntu-24.04-arm` runners for the musl targets, with `musl-gcc` for the bundled SQLite, and checks that the binary is static (no program interpreter, no shared library) and for its architecture; and checks that each prints `enclos <version>`;
@@ -37,7 +39,7 @@ The tag runs [`release.yml`](../.github/workflows/release.yml) in three jobs. **
 
 A version with a suffix, such as `0.2.0-rc.1`, is published as a prerelease and never becomes the latest. A stable version becomes the latest, so publish stable versions in increasing order. If a step fails, the release stays a draft and rerunning the workflow replaces that draft's assets; it refuses to touch a published release.
 
-A pull request that changes `release.yml`, the packaging script, the toolchain or the dependencies runs build and try as a dry run, and so can a manual run of the workflow: nothing is published. CI's `musl` job runs the test suite against the musl build on both architectures on every change.
+A pull request that changes `release.yml`, the packaging script, the toolchain or the dependencies runs build and try as a dry run, and so can a manual run of the workflow: ci-passed checks nothing and nothing is published. CI's `musl` job runs the test suite against the musl build on both architectures on every change.
 
 ## Checking one
 

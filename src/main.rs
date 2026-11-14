@@ -407,7 +407,7 @@ fn writes_wait(command: &Command) -> Wait {
         Command::Launch(_) | Command::Proxy(_) | Command::Holder(_) | Command::Relay(_) => {
             Wait::Background
         }
-        // The bridge, which the service manager runs
+        // The long-running bridge, whose writes no person waits on
         Command::App(args) if args.is_service() => Wait::Background,
         Command::Init
         | Command::Doctor
@@ -491,13 +491,7 @@ fn verify_json(report: &VerifyReport) -> serde_json::Value {
 
 /// The user and host recorded in audit entries.
 fn current_actor() -> Actor {
-    let or_unknown = |value: std::result::Result<String, _>| {
-        value.unwrap_or_else(|_: whoami::Error| "unknown".to_owned())
-    };
-    Actor {
-        user: or_unknown(whoami::username()),
-        host: or_unknown(whoami::hostname()),
-    }
+    Actor::on_this_host(whoami::username().unwrap_or_else(|_| "unknown".to_owned()))
 }
 
 fn print_init(planned: Planned<InitReport>) {
