@@ -261,6 +261,30 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
 }
 
 #[test]
+fn a_connection_ended_on_an_unstored_message_is_opened_again_later_each_time_in_a_row() {
+    let waits: Vec<u64> = (1..=8).map(|n| reopen_after(n).as_secs()).collect();
+    assert_eq!(waits, [0, 3, 6, 12, 24, 48, 60, 60]);
+    let folder = tempfile::tempdir().unwrap();
+    let hub = Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        folder.path().join("app.db"),
+        crate::layout::Layout::at(folder.path().join("enclos")),
+        vec![],
+        vec![],
+        None,
+        SILENCE,
+    );
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    // The first time: at once, so the message comes again within seconds.
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    assert!(!hub.may_reopen("lab/main"));
+    assert!(hub.may_reopen("lab/other"));
+}
+
+#[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
     let mut hub = Arc::new(Hub::new(
@@ -531,7 +555,7 @@ fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
         .add("asks-1", "c-asks", &From::Agent, "still working", "reply")
         .unwrap();
     assert!(store.conversation_info("c-asks").unwrap().unwrap().archived);
-    // A question or a command approval brings it back, on every device.
+    // A question or a runtime approval brings it back, on every device.
     assert!(hub.unarchive_for_request(&store, "c-asks").unwrap());
     let ToDevice::Conversation(info) = phone_rx.try_recv().unwrap() else {
         panic!("expected conversation metadata");
@@ -2386,14 +2410,14 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     let id = |s: &str| ConversationId::new(s).unwrap();
     assert_eq!(
         destination(&store, host, "lab/a", id("c-a")),
-        Some(id("c-a"))
+        Ok(Some(id("c-a")))
     );
     // Another agent's conversation, or one the bridge does not know: Home,
     // the host's person's.
     for other in ["c-b", "c-unknown"] {
         assert_eq!(
             destination(&store, host, "lab/a", id(other)),
-            Some(id("home.lab.a"))
+            Ok(Some(id("home.lab.a")))
         );
     }
     assert_eq!(
@@ -2403,7 +2427,7 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     // An agent whose Home's id the protocol refuses (longer than an id may
     // be): nothing, which the caller acknowledges.
     let long = format!("lab/{}", "a".repeat(130));
-    assert_eq!(destination(&store, host, &long, id("c-unknown")), None);
+    assert_eq!(destination(&store, host, &long, id("c-unknown")), Ok(None));
     assert_eq!(store.conversation_info(&home_id(&long)).unwrap(), None);
 }
 
@@ -2657,4 +2681,143 @@ fn review_imported_presentation_reaches_connected_paired_devices_without_relisti
         panic!("missing clear")
     };
     assert!(photo.image.is_none());
+}
+
+#[test]
+fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
+    use enclos_protocol::device::SandboxInfo;
+    use enclos_protocol::plugin::ErrorCode;
+    use enclos_protocol::policy::PolicyState;
+    let policy = |reason: usize| {
+        ToDevice::SandboxPolicy(PolicyState {
+            sandbox: "lab".into(),
+            version: 1,
+            base: "b".into(),
+            editable: true,
+            reason: Some("x".repeat(reason)),
+            fields: Vec::new(),
+            of: "get-1".into(),
+        })
+    };
+    let of = MessageId::new("get-1").unwrap();
+    assert_eq!(policy::fitting(policy(10), &of), policy(10));
+    let ToDevice::Error(error) = policy::fitting(policy(70_000), &of) else {
+        panic!("sent as it is");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::Unsupported);
+    assert!(
+        error.message.contains("enclos policy show lab"),
+        "{}",
+        error.message
+    );
+    let sandboxes = (0..3_000)
+        .map(|n| SandboxInfo {
+            sandbox: format!("sandbox-{n}"),
+            runtime: Some("hermes".into()),
+            state: "running".into(),
+        })
+        .collect();
+    assert!(matches!(
+        policy::fitting(ToDevice::SandboxesList { sandboxes }, &of),
+        ToDevice::Error(_)
+    ));
+    // Not broadcast at all: sealed, it would end the device's connection.
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, received) = hub_with(dir.path(), &["alice@example.com"]);
+    hub.deliver_fitting("alice@example.com", policy(70_000));
+    hub.deliver_fitting("alice@example.com", policy(10));
+    assert_eq!(received[0].try_recv().ok(), Some(policy(10)));
+    assert!(received[0].try_recv().is_err());
+}
+
+#[test]
+fn a_long_provisioning_failure_still_fits_one_message() {
+    let of = MessageId::new("install-1").unwrap();
+    let long = format!("installer refused: {}", "line of output\n".repeat(5_000));
+    let failed = operation_failed(of.clone(), &long);
+    assert!(agent_names::agent_message_fits(&failed).unwrap());
+    let ToDevice::Error(error) = failed else {
+        panic!("not an error");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::OperationFailed);
+    assert!(
+        error
+            .message
+            .starts_with("installer refused: line of output line")
+    );
+    // A short one goes as it is
+    let ToDevice::Error(error) = operation_failed(of, "installer refused the operation") else {
+        panic!("not an error");
+    };
+    assert_eq!(error.message, "installer refused the operation");
+}
+
+#[test]
+fn an_edit_is_measured_against_the_policy_it_would_make() {
+    use enclos_protocol::policy::{PolicyChange, PolicyField, PolicyState, PolicyValue};
+    let of = MessageId::new("apply-1").unwrap();
+    let state = |reason: usize| PolicyState {
+        sandbox: "lab".into(),
+        version: 1,
+        base: "b".into(),
+        editable: true,
+        reason: Some("x".repeat(reason)),
+        fields: vec![PolicyField {
+            key: "allow".into(),
+            label: "Allowed destinations".into(),
+            multiple: true,
+            editable: true,
+            choices: Vec::new(),
+            values: vec![PolicyValue {
+                value: "example.com".into(),
+                source: "Sandbox".into(),
+                locked: false,
+            }],
+        }],
+        of: String::new(),
+    };
+    let fits = |reason: usize| {
+        let mut s = state(reason);
+        s.of = of.to_string();
+        agent_names::agent_message_fits(&ToDevice::SandboxPolicy(s)).unwrap()
+    };
+    // The longest reason that still lets the policy reach the phone
+    let (mut low, mut high) = (0, 70_000);
+    while low + 1 < high {
+        let middle = (low + high) / 2;
+        if fits(middle) {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    let change = |after: Option<usize>| PolicyChange {
+        field: "allow".into(),
+        before: None,
+        after: after.map(|n| format!("{}.example.com", "a".repeat(n))),
+    };
+    // At the limit, an added entry would not reach it
+    assert!(!policy::fits_once_applied(
+        &state(low),
+        &change(Some(1)),
+        &of
+    ));
+    // With room, it would; a removal never grows it
+    assert!(policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(200)),
+        &of
+    ));
+    assert!(!policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(2_000)),
+        &of
+    ));
+    assert!(policy::fits_once_applied(
+        &state(low - 1_000),
+        &change(None),
+        &of
+    ));
 }

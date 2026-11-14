@@ -18,7 +18,7 @@ Reason: one well-known place for what belongs to no conversation, made by enclos
 
 ## Consequences
 
-- Who the host's person is never follows from a connection or from the transport, so a guest gets Home neither by connecting first nor by pairing after the host unpaired their last phone. The cost: a host's person who leaves for good hands Home on with `enclos app host`.
+- Who the host's person is never follows from a connection or from the transport, so another person gets Home neither by connecting first nor by pairing after the host unpaired their last phone. The cost: a host's person who leaves for good hands Home on with `enclos app host`.
 - Home is shown first and never hidden as empty; the person may also talk to the agent there. It cannot be archived under [0049](0049-conversation-archives-belong-to-the-bridge.md), so its notices keep a permanent destination in the active Inbox.
-- With sharing ([0043](0043-sharing-an-agent-is-not-hosting-it.md), proposed), Home stays the host's person's: a guest's cron jobs answer in the guest's own conversations.
+- With sharing ([0043](0043-sharing-an-agent-is-not-hosting-it.md), proposed), Home stays the host's person's: the cron jobs another person starts answer in that person's own conversations.
 - Which of the runtime's messages are notices is the plugin's call: Hermes marks none, so its plugin recognises them (to verify against each Hermes release, design §14).

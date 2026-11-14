@@ -5,7 +5,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{Backend, Launch, SandboxContext};
 use super::Baseline;
@@ -165,7 +165,7 @@ fn world() -> World {
 /// inherited private socket, cannot open that path, and cannot bind TCP.
 #[test]
 fn a_private_dashboard_inherits_its_listener_and_cannot_bind_or_dial_its_path() {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     let dir = tempfile::tempdir_in("/tmp").unwrap();
@@ -214,11 +214,15 @@ client.close()
         limits: Default::default(),
         reads: vec![],
     };
-    for text in [text.clone(), on_allow_default(&text)] {
+    for (baseline, text) in [
+        ("deny default", text.clone()),
+        ("allow default", on_allow_default(&text)),
+    ] {
         std::fs::write(&compiled, text).unwrap();
         let mut command = Seatbelt::default().wrap(&compiled, &ctx, &launch).unwrap();
         command.stdout(Stdio::null()).stderr(Stdio::piped());
         let marker_dir = layout.sandbox_dir("home").join("members");
+        let started = Instant::now();
         let (child, _marker) = crate::lifecycle::marker::Marker::new(&marker_dir)
             .unwrap()
             .spawn_with(
@@ -227,11 +231,21 @@ client.close()
             )
             .unwrap();
         let mut client = UnixStream::connect(&socket).unwrap();
+        // Only a guard against a dashboard that never answers (the test holds
+        // the listener, so the read would wait forever). A cold Python under
+        // sandbox-exec on a CI runner has taken over 5 s to answer.
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut answer = String::new();
         let read = client.read_to_string(&mut answer);
+        // Straight to the job's log, which keeps no output of a test that
+        // passes: a start slowing towards the guard shows there.
+        let _ = writeln!(
+            std::io::stderr(),
+            "private dashboard on {baseline}: answered after {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),

@@ -35,8 +35,8 @@ pub struct AppArgs {
 }
 
 impl AppArgs {
-    /// Whether this is `app serve`, the bridge the service manager runs
-    /// rather than a person.
+    /// Whether this is `app serve`, the long-running bridge, whose writes
+    /// no person waits on.
     pub fn is_service(&self) -> bool {
         matches!(self.verb, AppVerb::Serve { .. })
     }
@@ -102,7 +102,7 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             target,
             conversation,
         } => chat(engine, by, target, conversation),
-        AppVerb::Serve { port, transport } => serve(engine, by, port, transport),
+        AppVerb::Serve { port, transport } => serve(engine, port, transport),
         AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
         AppVerb::Unpair { device } => unpair(engine, by, &device),
@@ -120,7 +120,7 @@ fn open_store(engine: &Engine) -> Result<Store> {
         .map_err(|e| failed(format!("cannot open the bridge's database: {e}")))
 }
 
-fn serve(engine: &Engine, by: &Actor, port: u16, transport: Transport) -> Result<u8> {
+fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
     let approvals = approval_key(&engine.app_approval_key_path()).map_err(|e| {
@@ -161,7 +161,7 @@ fn serve(engine: &Engine, by: &Actor, port: u16, transport: Transport) -> Result
         key.private.to_vec(),
         approvals,
         agents,
-        Host::new(engine.app_layout(), by.clone(), executable),
+        Host::new(engine.app_layout(), executable),
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
     Ok(exit::OK)

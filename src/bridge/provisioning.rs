@@ -15,7 +15,7 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Planned};
 use crate::model::policy::TemplateName;
 use crate::model::runtime::RuntimeKind;
-use crate::model::sandbox::{BackendKind, SandboxName, SandboxState};
+use crate::model::sandbox::{SandboxName, SandboxState};
 
 /// All inputs have been checked before a worker is started.
 pub enum Operation {
@@ -80,21 +80,16 @@ pub enum Completed {
     Installed { runtime: String, login: String },
 }
 
-/// Data a worker needs to open its own engine and to identify its caller in
-/// the audit log. It contains no connection, database or device keys.
+/// Data a worker needs to open its own engine and to run enclos. It
+/// contains no connection, database or device keys.
 pub struct Host {
     layout: Layout,
-    actor: Actor,
     executable: PathBuf,
 }
 
 impl Host {
-    pub fn new(layout: Layout, actor: Actor, executable: PathBuf) -> Self {
-        Self {
-            layout,
-            actor,
-            executable,
-        }
+    pub fn new(layout: Layout, executable: PathBuf) -> Self {
+        Self { layout, executable }
     }
 
     pub fn sandboxes(&self) -> Result<Vec<SandboxInfo>, String> {
@@ -114,30 +109,25 @@ impl Host {
         }).collect()
     }
 
-    pub fn execute(&self, operation: &Operation, person: &str) -> Result<Completed, String> {
-        // The authenticated transport login identifies who requested the
-        // change; the host is the one executing it.
-        let actor = Actor {
-            user: person.to_owned(),
-            host: self.actor.host.clone(),
-        };
+    /// Runs `operation` for `by`, the authenticated person and device that
+    /// asked for it, whom the audit log names.
+    pub fn execute(&self, operation: &Operation, by: &Actor) -> Result<Completed, String> {
         match operation {
             Operation::Create { name, template } => {
                 let engine = Engine::open(self.layout.clone(), crate::state::Wait::Command);
-                create(
-                    &engine,
-                    &actor,
-                    &self.layout,
-                    name.clone(),
-                    template.clone(),
-                )?;
+                create(&engine, by, name.clone(), template.clone())?;
                 Ok(Completed::Created)
             }
-            Operation::Install { name, runtime } => self.install(name, *runtime),
+            Operation::Install { name, runtime } => self.install(name, *runtime, by),
         }
     }
 
-    fn install(&self, name: &SandboxName, runtime: RuntimeKind) -> Result<Completed, String> {
+    fn install(
+        &self,
+        name: &SandboxName,
+        runtime: RuntimeKind,
+        by: &Actor,
+    ) -> Result<Completed, String> {
         // A session installs signal handlers and inherits standard streams.
         // Give it a process of its own, no terminal and no stdin, instead of
         // changing the bridge process's signals or reading its terminal.
@@ -150,6 +140,10 @@ impl Host {
                 runtime.as_str(),
                 "--sandbox",
                 name.as_str(),
+                // Its audit entry names the person and device, not the
+                // host's user who runs the bridge; joined by `=`, so a
+                // value starting with `-` is not taken for an option
+                &format!("--requested-by={}", by.user),
                 // The CLI stops the installer and all it started, records
                 // that and undoes the install: it knows the session.
                 &format!("--time-limit={}", INSTALL_TIMEOUT.as_secs()),
@@ -290,21 +284,15 @@ fn sandbox_list(engine: &Engine) -> Result<Vec<SandboxInfo>, String> {
         })
 }
 
+/// Creates sandbox `name` with the backend `sandbox create` takes when it
+/// names none: the configured default, else the first available.
 fn create(
     engine: &Engine,
     actor: &Actor,
-    layout: &Layout,
     name: SandboxName,
     template: TemplateName,
 ) -> Result<(), String> {
-    let text = layout.read_config().map_err(|e| e.to_string())?;
-    let config: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
-    let backend = config
-        .get("default_backend")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| "the host has no default backend; run enclos init on the host".to_owned())?
-        .parse::<BackendKind>()
-        .map_err(|e| e.to_string())?;
+    let backend = engine.default_backend().map_err(|e| e.to_string())?;
     match engine
         .create_sandbox(
             actor,
@@ -325,6 +313,7 @@ fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::sandbox::BackendKind;
     use std::os::unix::fs::PermissionsExt;
 
     fn actor() -> Actor {
@@ -334,12 +323,19 @@ mod tests {
         }
     }
 
+    fn device_actor() -> Actor {
+        Actor {
+            user: "owner@example.org (device phone-1)".into(),
+            host: "mac".into(),
+        }
+    }
+
     fn fake_host(body: &str) -> (tempfile::TempDir, Host) {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("enclos");
         std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let host = Host::new(Layout::at(dir.path().join("data")), actor(), executable);
+        let host = Host::new(Layout::at(dir.path().join("data")), executable);
         (dir, host)
     }
 
@@ -466,7 +462,6 @@ mod tests {
         create(
             &engine,
             &actor(),
-            &layout,
             "lab".parse().unwrap(),
             "minimal".parse().unwrap(),
         )
@@ -494,7 +489,6 @@ mod tests {
             create(
                 &engine,
                 &actor(),
-                &layout,
                 "lab".parse().unwrap(),
                 "minimal".parse().unwrap()
             )
@@ -504,10 +498,64 @@ mod tests {
     }
 
     #[test]
+    fn creates_with_the_backend_sandbox_create_takes_when_the_config_names_none() {
+        use crate::audit::jsonl::JsonlAuditLog;
+        use crate::backend::fake::FakeBackend;
+        use crate::state::sqlite::SqliteStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path().join("data"));
+        let engine = Engine::new(
+            layout.clone(),
+            Box::new(SqliteStateStore::new(
+                layout.state_db(),
+                layout.state_lock(),
+                crate::state::Wait::Command,
+            )),
+            Box::new(JsonlAuditLog::new(layout.audit_log())),
+            vec![
+                Box::new(FakeBackend::unavailable(BackendKind::Seatbelt, "not here")),
+                Box::new(FakeBackend::available(BackendKind::Bubblewrap)),
+            ],
+        );
+        engine.init(&actor(), Confirm::Yes).unwrap();
+        // A config.toml that names no default backend, as `sandbox create`
+        // reads one: the first backend available here
+        let config = std::fs::read_to_string(layout.config_file()).unwrap();
+        let without: String = config
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("default_backend"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(layout.config_file(), without).unwrap();
+        create(
+            &engine,
+            &actor(),
+            "lab".parse().unwrap(),
+            "minimal".parse().unwrap(),
+        )
+        .unwrap();
+        let view = engine.show_sandbox(&"lab".parse().unwrap()).unwrap();
+        assert_eq!(view.record.backend, BackendKind::Bubblewrap);
+        // One that names something else than a backend is refused, as by
+        // `sandbox create`
+        std::fs::write(layout.config_file(), "default_backend = \"docker\"\n").unwrap();
+        assert!(
+            create(
+                &engine,
+                &actor(),
+                "lab2".parse().unwrap(),
+                "minimal".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn installs_in_a_child_with_exact_arguments_layout_no_input_and_no_yes() {
         let (_dir, host) = fake_host(
             r#"
-test "$#" = 7 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = --time-limit=3600 || exit 10
+test "$#" = 8 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = "--requested-by=owner@example.org (device phone-1)" && test "$8" = --time-limit=3600 || exit 10
 test -n "$ENCLOS_HOME" || exit 11
 if read -r ignored; then exit 12; fi
 printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enclos connect lab -- hermes setup"}'
@@ -516,7 +564,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let done = host
             .execute(
                 &Operation::install("lab", "hermes").unwrap(),
-                "owner@example.org",
+                &device_actor(),
             )
             .unwrap();
         assert!(
@@ -549,7 +597,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             let why = host
                 .execute(
                     &Operation::install("lab", "hermes").unwrap(),
-                    "owner@example.org",
+                    &device_actor(),
                 )
                 .unwrap_err();
             assert!(why.contains(expected), "{why}");
@@ -567,7 +615,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let start = std::time::Instant::now();
         host.execute(
             &Operation::install("lab", "hermes").unwrap(),
-            "owner@example.org",
+            &device_actor(),
         )
         .unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
