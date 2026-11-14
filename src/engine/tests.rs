@@ -46,15 +46,19 @@ impl Root {
 fn engine_under(backends: Vec<Box<dyn Backend>>, root: &Root) -> (TempDir, Engine) {
     let dir = tempfile::tempdir_in(&root.parent).unwrap();
     let layout = Layout::at(dir.path().join(&root.leaf));
+    (dir, engine_on(backends, layout))
+}
+
+/// An engine on `layout`, wherever it puts enclos's folder and `~`.
+fn engine_on(backends: Vec<Box<dyn Backend>>, layout: Layout) -> Engine {
     let state = SqliteStateStore::new(
         layout.state_db(),
         layout.state_lock(),
         crate::state::Wait::Command,
     );
     let audit = JsonlAuditLog::new(layout.audit_log());
-    let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
-        .with_downloader(Box::new(LocalFiles));
-    (dir, engine)
+    Engine::new(layout, Box::new(state), Box::new(audit), backends)
+        .with_downloader(Box::new(LocalFiles))
 }
 
 /// Copies a test's `file://` installer, which curl refuses, and leaves any

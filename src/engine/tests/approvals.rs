@@ -17,96 +17,190 @@ fn write(target: impl AsRef<std::path::Path>) -> Access {
 }
 
 #[test]
-fn access_approval_refuses_absolute_paths_that_run_code_outside_the_sandbox() {
+fn access_approval_can_grant_the_hosts_gradle_cache_after_review() {
     let (dir, e, name) = with_sandbox();
-    // The fixture's home is the temporary folder: these are absolute paths in it.
+    let target = dir.path().join(".gradle");
+    std::fs::create_dir(&target).unwrap();
+    let a = write(&target);
+    let before = e.policy(&name).unwrap().snapshot.policy;
+    let state = e.mobile_policy(&name).unwrap();
+    // The owner can already add this path in the app's policy editor.
+    let edit = enclos_protocol::policy::PolicyChange {
+        field: "write".into(),
+        before: None,
+        after: Some(a.target.clone()),
+    };
+    e.mobile_policy_preview(&name, &state.base, &edit).unwrap();
+
+    let plan = e.access_plan(&name, &a).unwrap();
+    let resolved = crate::policy::paths::real_path(&target)
+        .display()
+        .to_string();
+    assert_eq!(plan.scope, resolved);
+    // Gradle runs init scripts from it on the host: the preview leads with that.
+    assert!(
+        plan.change.starts_with("Warning:") && plan.change.contains("hidden"),
+        "{}",
+        plan.change
+    );
+    assert!(plan.change.contains("every agent"));
+    assert!(plan.change.contains("outside the sandbox"));
+    assert!(plan.change.contains("Future writes"));
+    assert_eq!(e.policy(&name).unwrap().snapshot.policy, before);
+
+    e.approve_access(&alice(), &name, &a, &plan.revision)
+        .unwrap();
+    let mut expected = before;
+    expected.fs.write.push(resolved);
+    expected.fs.write.sort();
+    assert_eq!(e.policy(&name).unwrap().snapshot.policy, expected);
+    assert!(e.verify_audit().unwrap().intact());
+}
+
+#[test]
+fn access_approval_write_paths_use_the_same_validation_as_the_policy_editor() {
+    let (dir, e, name) = with_sandbox();
+    let outside = tempfile::tempdir().unwrap();
     let home = dir.path();
     std::fs::create_dir_all(home.join("project/.git/hooks")).unwrap();
-    for target in [
+    let state = e.mobile_policy(&name).unwrap();
+    // Not `LaunchAgents`, which the deny list hides, so the editor refuses it.
+    let mut library = home.join("Library/Developer");
+    if cfg!(target_os = "macos") {
+        // Not there yet, so it keeps the agent's case; macOS's usual file
+        // system does not tell it from `Library`.
+        library = home.join("library/Developer");
+    }
+    // Places the host runs programs or settings from, then ordinary folders.
+    let risky = [
         home.join(".zshrc"),
-        home.join(".bashrc"),
         home.join(".gitconfig"),
         home.join(".config/git"),
         home.join(".local/bin"),
-        home.join(".ssh"),
         home.join(".vscode/extensions"),
         home.join("Library/Application Support/Code/User"),
-        home.join("Library/LaunchAgents"),
+        library,
         home.join("bin"),
         home.join("go/bin"),
-        // Holds ~/go/bin, which a service's PATH does not name.
+        // Holds ~/go/bin.
         home.join("go"),
         home.join("project/.git/hooks"),
-        // enclos's own files, inside the home too: refused by validation.
+    ];
+    let ordinary = [
+        home.join("project"),
+        // A grant is not restricted to the host user's home or external volumes.
+        outside.path().join("tools/bin"),
+    ];
+    for (target, warned) in risky
+        .iter()
+        .map(|t| (t, true))
+        .chain(ordinary.iter().map(|t| (t, false)))
+    {
+        let a = write(target);
+        let edit = enclos_protocol::policy::PolicyChange {
+            field: "write".into(),
+            before: None,
+            after: Some(a.target.clone()),
+        };
+        e.mobile_policy_preview(&name, &state.base, &edit)
+            .unwrap_or_else(|err| panic!("policy editor {}: {err}", target.display()));
+        let plan = e
+            .access_plan(&name, &a)
+            .unwrap_or_else(|err| panic!("approval {}: {err}", target.display()));
+        assert_eq!(
+            plan.change.starts_with("Warning:"),
+            warned,
+            "{}: {}",
+            target.display(),
+            plan.change
+        );
+    }
+    // Preparing the previews grants nothing.
+    assert_eq!(e.policy(&name).unwrap().version.version, 1);
+}
+
+#[test]
+fn access_approval_still_refuses_sensitive_and_enclos_paths_including_symlinks() {
+    let (dir, e, name) = with_sandbox();
+    let home = dir.path();
+    let sensitive = home.join(".ssh");
+    std::fs::create_dir(&sensitive).unwrap();
+    let alias = home.join("ssh-alias");
+    std::os::unix::fs::symlink(&sensitive, &alias).unwrap();
+    let state = e.mobile_policy(&name).unwrap();
+    for target in [
+        sensitive,
+        home.join(".config/gh"),
+        home.join(".config/systemd/user"),
         dir.path().join("enclos"),
         dir.path().join("enclos/sandboxes"),
-        std::path::PathBuf::from("/opt/homebrew/bin"),
-        std::path::PathBuf::from("/usr/local/bin"),
-        std::path::PathBuf::from("/etc"),
-        std::path::PathBuf::from("/Volumes/Disk"),
+        alias,
     ] {
         assert!(
             e.access_plan(&name, &write(&target)).is_err(),
-            "{}",
+            "approval {}",
             target.display()
         );
+        // The policy editor refuses them too: the two surfaces share these limits.
+        let edit = enclos_protocol::policy::PolicyChange {
+            field: "write".into(),
+            before: None,
+            after: Some(target.display().to_string()),
+        };
+        assert!(
+            e.mobile_policy_preview(&name, &state.base, &edit).is_err(),
+            "policy editor {}",
+            target.display()
+        );
+    }
+    assert_eq!(e.policy(&name).unwrap().version.version, 1);
+}
+
+#[test]
+fn access_approval_refuses_the_home_folder_and_the_folders_holding_it() {
+    // enclos's folder outside the home, so nothing of enclos's own inside
+    // it refuses a grant over the whole home.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("users/alice");
+    std::fs::create_dir_all(home.join("project")).unwrap();
+    let e = engine_on(
+        vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+        Layout::at(dir.path().join("srv/enclos")).with_user_home(&home),
+    );
+    let name = super::policy::home_sandbox(&e);
+    for target in [home.clone(), dir.path().join("users")] {
+        let err = e
+            .access_plan(&name, &write(&target))
+            .err()
+            .unwrap_or_else(|| panic!("{} was approvable", target.display()));
+        assert!(err.to_string().contains("home folder"), "{err}");
     }
     assert!(e.access_plan(&name, &write(home.join("project"))).is_ok());
     assert_eq!(e.policy(&name).unwrap().version.version, 1);
 }
 
 #[test]
-fn access_approval_write_narrowing_holds_path_folders_and_external_volumes() {
-    use crate::engine::approvals::phone_write_refusal;
+fn access_approval_warns_of_folders_on_the_hosts_path() {
+    use crate::engine::approvals::write_risk;
     use std::path::{Path, PathBuf};
     let home = Path::new("/Users/alice");
     let path = [
+        PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/Users/alice/tools/bin"),
-        PathBuf::from("/usr/bin"),
     ];
-    for refused in [
-        "/Users/alice/tools/bin",
-        "/Users/alice/tools/bin/new",
+    for warned in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/bin/new",
         // Holds a PATH folder: its programs could be replaced.
+        "/opt/homebrew",
         "/Users/alice/tools",
-        "/Users/alice",
-        // Holds a refused home folder, whether or not it is on PATH.
-        "/Users/alice/go",
-        "/Users/alice/Library/LaunchAgents",
-        "/Users/alice/bin/tool",
-        "/Users/other/work",
-        "/Volumes/Disk",
-        "/Volumes/Disk/.Trashes",
-        "/mnt/disk",
-        "/media/me/disk",
     ] {
-        assert!(
-            phone_write_refusal(Path::new(refused), home, &path).is_some(),
-            "{refused}"
-        );
+        let why = write_risk(Path::new(warned), home, &path)
+            .unwrap_or_else(|| panic!("{warned} has no warning"));
+        assert!(why.contains("PATH"), "{why}");
     }
-    for allowed in [
-        "/Users/alice/work",
-        "/Users/alice/Documents/report",
-        "/Volumes/Disk/projects",
-        "/mnt/disk/projects",
-        "/media/me/disk/projects",
-    ] {
-        assert_eq!(phone_write_refusal(Path::new(allowed), home, &path), None);
-    }
-    // A folder that does not exist yet keeps the agent's case; macOS's
-    // usual file system does not tell it from the refused one.
-    if cfg!(target_os = "macos") {
-        for refused in [
-            "/Users/alice/library/LaunchAgents",
-            "/Users/alice/GO",
-            "/Users/alice/Tools/Bin",
-        ] {
-            assert!(
-                phone_write_refusal(Path::new(refused), home, &path).is_some(),
-                "{refused}"
-            );
-        }
+    for plain in ["/Users/alice/work", "/Volumes/Disk/projects", "/srv/data"] {
+        assert_eq!(write_risk(Path::new(plain), home, &path), None, "{plain}");
     }
 }
 
@@ -150,8 +244,7 @@ fn access_approval_shows_the_scope_it_writes() {
         plan.scope,
         crate::policy::paths::real_path(&real).display().to_string()
     );
-    // The narrowing refuses a hidden folder as the target, not the hidden
-    // entries beneath an approved one: the preview says so.
+    // The reviewed scope includes hidden entries beneath the granted folder.
     assert!(
         plan.change.contains("hidden files and folders included"),
         "{}",

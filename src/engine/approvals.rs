@@ -52,7 +52,7 @@ const LOCAL_NAME_SUFFIXES: &[&str] = &[".local", ".home.arpa", ".internal", ".la
 /// Folders under the user's home that hold code or settings the host runs
 /// outside any sandbox: macOS's `Library` (launch agents, editor and IDE
 /// settings), apps, and the usual personal `bin` folders.
-const HOME_REFUSED: &[&str] = &["Library", "Applications", "bin", "go/bin"];
+const HOME_RUN_FOLDERS: &[&str] = &["Library", "Applications", "bin", "go/bin"];
 
 /// Whether `a` is, or is inside, `b`. On macOS without case: its usual file
 /// system does not tell `~/library` from `~/Library`, and a folder that does
@@ -67,61 +67,46 @@ fn within(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
-/// Why an agent-proposed write scope cannot be approved from the phone, if
-/// it cannot (ADR 0046). `target` and `home` are real paths; `path` is the
-/// host's `PATH`. The host's own `enclos policy edit` is not narrowed: there
-/// the person writes the path, here the agent does.
-pub(crate) fn phone_write_refusal(
+/// Why a writable path an agent asks for lets the agent run code on the
+/// host, if it does: the path is, holds or is inside a place the host reads
+/// settings or programs from (ADR 0046). The preview leads with it, so this
+/// grant does not read like an ordinary project folder's. Approval does not
+/// refuse it: the host's person decides, as in the policy editor. `target`
+/// and `home` are real paths; `path` is the host's `PATH`.
+pub(crate) fn write_risk(
     target: &std::path::Path,
     home: &std::path::Path,
     path: &[std::path::PathBuf],
 ) -> Option<String> {
     use std::path::{Component, Path};
-    let on_host = "; grant it on the host with `enclos policy edit` if you mean it";
-    let below = |root: &Path, depth: usize| {
-        target
-            .strip_prefix(root)
-            .ok()
-            .filter(|rest| rest.components().count() >= depth)
-            .map(Path::to_owned)
-    };
-    // A folder inside the home, or on an external volume: never the system's.
-    let Some(rest) = below(home, 1)
-        .or_else(|| below(Path::new("/Volumes"), 2))
-        .or_else(|| below(Path::new("/mnt"), 2))
-        .or_else(|| below(Path::new("/media"), 3))
-    else {
-        return Some(format!(
-            "{} is outside your home folder and external volumes{on_host}",
-            target.display()
-        ));
-    };
-    if rest.components().any(|c| match c {
-        Component::Normal(part) => part.to_string_lossy().starts_with('.'),
-        _ => false,
-    }) {
-        return Some(format!(
-            "{} is or is inside a hidden file or folder, where shell startup files, git, editor and tool settings live and run outside the sandbox{on_host}",
-            target.display()
-        ));
-    }
-    // Both ways: a grant on `~/go` covers `~/go/bin`.
-    if target.starts_with(home)
-        && let Some(folder) = HOME_REFUSED
+    let runs = "what an agent writes there can run as you, outside the sandbox";
+    if let Ok(rest) = target.strip_prefix(home) {
+        if rest.components().any(|c| match c {
+            Component::Normal(part) => part.to_string_lossy().starts_with('.'),
+            _ => false,
+        }) {
+            return Some(format!(
+                "{} is or is inside a hidden file or folder, where shell startup files and git, editor and tool settings live: {runs}.",
+                target.display()
+            ));
+        }
+        // Both ways: a grant on `~/go` covers `~/go/bin`.
+        if let Some(folder) = HOME_RUN_FOLDERS
             .iter()
-            .find(|f| within(&rest, Path::new(f)) || within(Path::new(f), &rest))
-    {
-        return Some(format!(
-            "{} is, holds or is inside ~/{folder}, which holds programs or settings the host runs outside the sandbox{on_host}",
-            target.display()
-        ));
+            .find(|f| within(rest, Path::new(f)) || within(Path::new(f), rest))
+        {
+            return Some(format!(
+                "{} is, holds or is inside ~/{folder}, which holds programs or settings the host runs: {runs}.",
+                target.display()
+            ));
+        }
     }
     if let Some(folder) = path
         .iter()
         .find(|p| p.is_absolute() && (within(target, p) || within(p, target)))
     {
         return Some(format!(
-            "{} is, holds or is inside {}, a folder on the host's PATH, whose programs run outside the sandbox{on_host}",
+            "{} is, holds or is inside {}, a folder on the host's PATH: an agent could replace programs the host runs, outside the sandbox.",
             target.display(),
             folder.display()
         ));
@@ -193,7 +178,7 @@ impl Engine {
                 };
                 if access.private && local_name == Some(false) {
                     return Err(refused(format!(
-                        "From the phone, private addresses can be approved for an IP address or a local name ({}). {} is a public name its owner could point at your network later; grant it on the host with `enclos policy edit` if you mean it.",
+                        "From the phone, private addresses can be approved for an IP address or a local name ({}). {} is a public name its owner could point at your network later; add it in the app's policy editor or with `enclos policy edit` on the host if you mean it.",
                         LOCAL_NAME_SUFFIXES.join(", "),
                         entry.host_text()
                     )));
@@ -247,10 +232,20 @@ impl Engine {
                 // Store the resolved destination: changing a symlink after approval cannot
                 // redirect the persistent grant to another host folder.
                 let real = crate::policy::paths::real_path(path);
+                // The host's person reviews the grant, as in the app's policy
+                // editor, and the shared validator below holds the protected
+                // paths and backend restrictions. One narrowing is the
+                // agent's alone: the home folder, or a folder holding it,
+                // would let it change everything there in one approval, and
+                // only enclos's own folders inside it would otherwise stop it.
                 let home = crate::policy::paths::real_path(self.layout.user_home());
-                if let Some(why) = phone_write_refusal(&real, &home, &host_path()) {
-                    return Err(refused(format!("{why}.")));
+                if within(&home, &real) {
+                    return Err(refused(format!(
+                        "{} is your home folder or holds it, so approving it would let every agent change everything in your home folder. Only a folder inside it can be approved here.",
+                        real.display()
+                    )));
                 }
+                let risk = write_risk(&real, &home, &host_path());
                 let target = real.display().to_string();
                 scope = target.clone();
                 if !expected.fs.write.contains(&target) {
@@ -258,7 +253,8 @@ impl Engine {
                     expected.fs.write.push(target.clone());
                 }
                 format!(
-                    "Allow every agent in {name} to write {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
+                    "{}Allow every agent in {name} to create, change or delete files at {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval.",
+                    risk.map(|r| format!("Warning: {r} ")).unwrap_or_default()
                 )
             }
             AccessKind::Read => {
