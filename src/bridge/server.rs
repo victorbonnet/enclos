@@ -286,11 +286,7 @@ impl Hub {
                     runtime,
                     login,
                 },
-                Err(message) => ToDevice::Error(ErrorBody {
-                    of: Some(of),
-                    code: ErrorCode::OperationFailed,
-                    message,
-                }),
+                Err(message) => operation_failed(of, &message),
             };
             // Release before completing: a next request may follow at once.
             hub.provisioning_busy
@@ -304,7 +300,7 @@ impl Hub {
                 .expect("provisioning request checked")
                 .sandboxes()
             {
-                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+                hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
                 let _ = store.log(
@@ -1276,6 +1272,22 @@ const SILENT: &str = "silent for too long";
 /// The caller sent no first message within [`HANDSHAKE`].
 const TOO_SLOW: &str = "no first message in time";
 
+/// The answer to provisioning operation `of` that failed, in the engine's
+/// or the installer's words, cut so it fits one device-leg message: an
+/// installer's message is read from up to 64 KiB of its output, and one
+/// that could not be sealed would end the device's connection.
+fn operation_failed(of: MessageId, message: &str) -> ToDevice {
+    ToDevice::Error(ErrorBody {
+        of: Some(of),
+        code: ErrorCode::OperationFailed,
+        message: plain(
+            message,
+            2_000,
+            "the operation failed; check the sandbox on the host",
+        ),
+    })
+}
+
 /// Why reading or writing a device's connection failed: [`GONE`] when the
 /// device is simply no longer there, else the error itself.
 fn ended(e: tungstenite::Error) -> String {
@@ -1909,7 +1921,7 @@ fn run_session(
                 match result {
                     Ok(mut state) => {
                         state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
+                        link.send(policy::fitting(ToDevice::SandboxPolicy(state), &message.id))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1936,7 +1948,10 @@ fn run_session(
                 match result {
                     Ok(mut preview) => {
                         preview.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                        link.send(policy::fitting(
+                            ToDevice::SandboxPolicyPreview(preview),
+                            &message.id,
+                        ))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1948,17 +1963,17 @@ fn run_session(
             FromDevice::SandboxPolicyApply { sandbox, edit } => {
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
-                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
-                match result {
-                    Ok(mut state) => {
-                        state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
-                    }
-                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                        of: Some(message.id),
-                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                    .map_err(|e| ErrorBody {
+                        of: Some(message.id.clone()),
+                        code: ErrorCode::NotAllowed,
                         message: e,
-                    }))?,
+                    })
+                    .and_then(|name| {
+                        hub.apply_managed_policy(store, device, person, &name, &edit, &message.id)
+                    });
+                match result {
+                    Ok(state) => link.send(ToDevice::SandboxPolicy(state))?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
                 }
             }
             FromDevice::ApprovalDecide {
@@ -2005,12 +2020,11 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
-                            Err(why) => link.send(ToDevice::Error(ErrorBody {
-                                of: Some(message.id),
-                                code: ErrorCode::OperationFailed,
-                                message: why,
-                            }))?,
+                            Ok(sandboxes) => link.send(policy::fitting(
+                                ToDevice::SandboxesList { sandboxes },
+                                &message.id,
+                            ))?,
+                            Err(why) => link.send(operation_failed(message.id, &why))?,
                         }
                         continue;
                     }
@@ -3207,16 +3221,13 @@ mod connection_end_tests {
         );
     }
 
-    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+    /// An engine on `layout` with a stand-in Seatbelt backend.
+    fn fake_engine(layout: &crate::layout::Layout) -> crate::engine::Engine {
         use crate::{
-            audit::jsonl::JsonlAuditLog,
-            backend::fake::FakeBackend,
-            engine::{Engine, SandboxSpec},
-            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
-            state::sqlite::SqliteStateStore,
+            audit::jsonl::JsonlAuditLog, backend::fake::FakeBackend, engine::Engine,
+            model::sandbox::BackendKind, state::sqlite::SqliteStateStore,
         };
-        let layout = crate::layout::Layout::at(folder.join("enclos"));
-        let engine = Engine::new(
+        Engine::new(
             layout.clone(),
             Box::new(SqliteStateStore::new(
                 layout.state_db(),
@@ -3225,7 +3236,16 @@ mod connection_end_tests {
             )),
             Box::new(JsonlAuditLog::new(layout.audit_log())),
             vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
-        );
+        )
+    }
+
+    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+        use crate::{
+            engine::SandboxSpec,
+            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+        };
+        let layout = crate::layout::Layout::at(folder.join("enclos"));
+        let engine = fake_engine(&layout);
         let actor = Actor {
             user: PERSON.into(),
             host: "test".into(),
@@ -3243,6 +3263,136 @@ mod connection_end_tests {
             )
             .unwrap();
         layout
+    }
+
+    /// Sandbox `lab`'s policy with `destinations` more allowed
+    /// destinations, of `bytes` bytes each, through the host's own edit.
+    fn allow_many(layout: &crate::layout::Layout, destinations: usize, bytes: usize) {
+        use crate::model::{audit::Actor, plan::Confirm};
+        let engine = fake_engine(layout);
+        let before = layout.read_policy("lab").unwrap();
+        let list: Vec<String> = (0..destinations)
+            .map(|n| format!("\"{n:05}{}.example.com\"", "a".repeat(bytes - 17)))
+            .collect();
+        let after = before.replace(
+            "allow_add = []",
+            &format!("allow_add = [{}]", list.join(", ")),
+        );
+        assert_ne!(before, after);
+        let actor = Actor {
+            user: PERSON.into(),
+            host: "test".into(),
+        };
+        engine
+            .policy_edit(
+                &actor,
+                &"lab".parse().unwrap(),
+                &before,
+                &after,
+                Confirm::Yes,
+            )
+            .unwrap();
+    }
+
+    /// A bridge serving `layout`'s sandboxes to the host's person, and that
+    /// person's device, connected.
+    fn host_device(folder: &Path, layout: &crate::layout::Layout) -> (Bridge, PhoneLink) {
+        let bridge = bridge_serving(
+            folder,
+            SILENCE,
+            Host::new(
+                layout.clone(),
+                crate::model::audit::Actor {
+                    user: "host".into(),
+                    host: "test".into(),
+                },
+                "/unused/enclos".into(),
+            ),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        (bridge, device)
+    }
+
+    /// The device's connection still answers: a `runtimes` round trip.
+    fn still_answers(device: &mut PhoneLink) {
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+    }
+
+    #[test]
+    fn a_policy_too_large_for_one_message_is_answered_left_unchanged_and_the_connection_goes_on() {
+        use enclos_protocol::policy::{PolicyApply, PolicyChange};
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        allow_many(&layout, 1_500, 60);
+        let (_bridge, mut device) = host_device(folder.path(), &layout);
+        // An edit, reviewed on a policy the phone kept from before: refused
+        // before it is applied, since the policy it makes could not be sent
+        let engine = fake_engine(&layout);
+        let name = "lab".parse().unwrap();
+        let base = engine.mobile_policy(&name).unwrap().base;
+        let change = PolicyChange {
+            field: "allow".into(),
+            before: None,
+            after: Some("one-more.example.com".into()),
+        };
+        let revision = engine
+            .mobile_policy_preview(&name, &base, &change)
+            .unwrap()
+            .revision;
+        let before = layout.read_policy("lab").unwrap();
+        device.send(
+            "apply-1",
+            FromDevice::SandboxPolicyApply {
+                sandbox: "lab".into(),
+                edit: PolicyApply {
+                    base,
+                    revision,
+                    change,
+                },
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "apply-1");
+                assert!(message.contains("enclos policy edit lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        // `unsupported`: nothing was changed
+        assert_eq!(layout.read_policy("lab").unwrap(), before);
+        still_answers(&mut device);
+        device.send(
+            "get-1",
+            FromDevice::SandboxPolicyGet {
+                sandbox: "lab".into(),
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "get-1");
+                assert!(message.contains("enclos policy show lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        still_answers(&mut device);
     }
 
     #[test]
