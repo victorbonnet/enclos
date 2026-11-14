@@ -227,8 +227,11 @@ client.close()
             )
             .unwrap();
         let mut client = UnixStream::connect(&socket).unwrap();
+        // Only a guard against a dashboard that never answers (the test holds
+        // the listener, so the read would wait forever). A cold Python under
+        // sandbox-exec on a CI runner has taken over 5 s to answer.
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut answer = String::new();
         let read = client.read_to_string(&mut answer);
