@@ -74,7 +74,7 @@ use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
 use super::store::{
-    Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
+    Acked, Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
     PairingRequest, Store, StoredAttachment, attachment_mime, attachment_name, conversation_title,
     home_id, is_home, now,
 };
@@ -89,8 +89,9 @@ const PAIRING_WAIT: Duration = Duration::from_secs(120);
 const RETRY: Duration = Duration::from_secs(10);
 
 /// How long a caller has, from connecting, to send its first message
-/// (`auth` or `pair.request`). Shorter in tests, which wait it out.
-const HANDSHAKE: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 30 });
+/// (`auth` or `pair.request`). Shorter in tests, which wait it out, but
+/// long enough that a slow machine sets up its 16 waiting callers within it.
+const HANDSHAKE: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 30 });
 
 /// How long a write to a device may make no progress (`SO_SNDTIMEO`, which
 /// times each system call, not each message) before its session ends
@@ -860,7 +861,20 @@ impl Hub {
                         if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
                             continue;
                         }
-                        let _ = store.delivered(of.as_str(), &agent);
+                        match store.delivered(of.as_str(), &agent) {
+                            Ok(Acked::Delivered | Acked::Nothing) => {}
+                            Ok(Acked::NotItsOwn) => {
+                                let why = format!(
+                                    "{agent}'s plugin acknowledged message {}, not one of its own",
+                                    of.as_str()
+                                );
+                                eprintln!("enclos app: {why}");
+                                if let Err(e) = store.log(None, None, "refused", Some(&why)) {
+                                    eprintln!("enclos app: cannot log that: {e}");
+                                }
+                            }
+                            Err(e) => eprintln!("enclos app: {agent}: cannot record an ack: {e}"),
+                        }
                     }
                     FromPlugin::Typing { conversation, on } => {
                         // Only in this agent's own conversations
@@ -1486,15 +1500,21 @@ fn binary(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(e) => return Err(past(deadline).unwrap_or_else(|| ended(e))),
+            Err(e) => return Err(past(deadline, ended(e))),
         }
     }
 }
 
-/// [`TOO_SLOW`] once `deadline` has passed: a connection [`close_at`] shut
-/// then ends with an error of its own, which this names for what it is.
-fn past(deadline: std::time::Instant) -> Option<String> {
-    (std::time::Instant::now() > deadline).then(|| TOO_SLOW.to_owned())
+/// `why` a connection ended, or [`TOO_SLOW`] when it went away ([`GONE`])
+/// once `deadline` had passed: a connection [`close_at`] shut ends as one
+/// that went away, which this names for what it is. Any other reason, an
+/// undecryptable frame say, is kept.
+fn past(deadline: std::time::Instant, why: String) -> String {
+    if why == GONE && std::time::Instant::now() > deadline {
+        TOO_SLOW.to_owned()
+    } else {
+        why
+    }
 }
 
 /// Shuts `stream` down at `deadline` unless the guard it returns is dropped
@@ -1646,7 +1666,7 @@ fn connection(
         match link.receive() {
             Ok(Some(message)) => break message,
             Ok(None) => {}
-            Err(_) if past(deadline).is_some() => {
+            Err(e) if past(deadline, e.clone()) == TOO_SLOW => {
                 return Err(refuse(None, Some(&person), TOO_SLOW));
             }
             Err(e) => return Err(e),

@@ -392,6 +392,8 @@ impl Layout {
             // The key the bridge signs runtime-approval decisions with: a
             // sandbox that read it could sign its own (ADR 0060).
             self.app_approval_key(),
+            // Which `policy test` runs are under way and their run tags
+            // (ADR 0059): every sandbox's, which no sandbox may read.
             self.probe_sources(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the

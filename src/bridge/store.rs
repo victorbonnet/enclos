@@ -499,6 +499,18 @@ pub enum Added {
     Again,
 }
 
+/// What a plugin's `ack` did ([`Store::delivered`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acked {
+    /// A message of the agent's own, now the runtime's.
+    Delivered,
+    /// Nothing pending under that id: an ack of something else, such as a
+    /// rename, or one given again.
+    Nothing,
+    /// A message still pending for another agent, which it left as it was.
+    NotItsOwn,
+}
+
 /// A person's message still to give the agent's plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -1313,16 +1325,34 @@ impl Store {
     /// The plugin of `agent` (`<sandbox>/<agent>`) acknowledged message
     /// `id`: it is the runtime's now. Only a message of one of that agent's
     /// own conversations: another agent's plugin cannot mark it delivered.
-    pub fn delivered(&self, id: &str, agent: &str) -> rusqlite::Result<()> {
-        let Some((sandbox, agent)) = agent.split_once('/') else {
-            return Ok(());
+    pub fn delivered(&self, id: &str, agent: &str) -> rusqlite::Result<Acked> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "{agent} is not <sandbox>/<agent>"
+            )));
         };
-        self.db.execute(
-            "UPDATE messages SET pending = 0 WHERE id = ?1 AND conversation IN
+        let marked = self.db.execute(
+            "UPDATE messages SET pending = 0 WHERE id = ?1 AND pending = 1 AND conversation IN
              (SELECT id FROM conversations WHERE sandbox = ?2 AND agent = ?3)",
-            params![id, sandbox, agent],
+            params![id, sandbox, name],
         )?;
-        Ok(())
+        if marked > 0 {
+            return Ok(Acked::Delivered);
+        }
+        let others = self
+            .db
+            .query_row(
+                "SELECT 1 FROM messages WHERE id = ?1 AND pending = 1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(if others {
+            Acked::NotItsOwn
+        } else {
+            Acked::Nothing
+        })
     }
 
     /// The messages of `owner`'s conversations after `since`, in order.
@@ -2474,10 +2504,19 @@ mod tests {
             "both agents wait"
         );
         // Another agent's plugin cannot mark it delivered
-        store.delivered("b-1", "lab/scout").unwrap();
+        assert_eq!(
+            store.delivered("b-1", "lab/scout").unwrap(),
+            Acked::NotItsOwn
+        );
         assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
-        store.delivered("b-1", "lab/main").unwrap();
+        assert_eq!(
+            store.delivered("b-1", "lab/main").unwrap(),
+            Acked::Delivered
+        );
         assert!(store.pending("lab", "main").unwrap().is_empty());
+        // Given again, or of something that was never pending
+        assert_eq!(store.delivered("b-1", "lab/main").unwrap(), Acked::Nothing);
+        assert!(store.delivered("b-1", "no-slash").is_err());
         assert_eq!(
             store.agents_with_pending().unwrap(),
             [("lab".to_owned(), "scout".to_owned())]
