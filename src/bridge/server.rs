@@ -88,8 +88,12 @@ const PAIRING_WAIT: Duration = Duration::from_secs(120);
 const RETRY: Duration = Duration::from_secs(10);
 
 /// How long a caller has, from connecting, to send its first message
-/// (`auth` or `pair.request`).
-const HANDSHAKE: Duration = Duration::from_secs(30);
+/// (`auth` or `pair.request`). Shorter in tests, which wait it out.
+const HANDSHAKE: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 30 });
+
+/// How long a write to a device may wait: one that stopped reading would
+/// otherwise hold its session's thread, and its queue would grow.
+const WRITE_WAIT: Duration = Duration::from_secs(30);
 
 /// Connections not yet authenticated at once: any login of the tailnet
 /// gets that far, so they are few, and a caller past them is closed.
@@ -1387,9 +1391,31 @@ fn binary(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(e) => return Err(ended(e)),
+            Err(e) => return Err(past(deadline).unwrap_or_else(|| ended(e))),
         }
     }
+}
+
+/// [`TOO_SLOW`] once `deadline` has passed: a connection [`close_at`] shut
+/// then ends with an error of its own, which this names for what it is.
+fn past(deadline: std::time::Instant) -> Option<String> {
+    (std::time::Instant::now() > deadline).then(|| TOO_SLOW.to_owned())
+}
+
+/// Shuts `stream` down at `deadline` unless the guard it returns is dropped
+/// first. A read timeout cannot hold a deadline alone: tungstenite reads a
+/// frame to its end, so a caller that sends a byte every few seconds would
+/// keep one read going, and its place among the [`MAX_WAITING`], for days.
+fn close_at(stream: &TcpStream, deadline: std::time::Instant) -> Result<Sender<()>, String> {
+    let watched = stream.try_clone().map_err(|e| e.to_string())?;
+    let (guard, dropped) = channel::<()>();
+    std::thread::spawn(move || {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if dropped.recv_timeout(left) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = watched.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    Ok(guard)
 }
 
 impl Hub {
@@ -1429,10 +1455,15 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let store = hub.store()?;
     let mut login: Option<String> = None;
     let mut address: Option<String> = None;
-    // Each read waits at most this long, so the deadline is looked at
+    // Each read waits at most this long, so the deadline is looked at; and
+    // past it, the connection is shut whatever a read is doing
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(WRITE_WAIT))
+        .map_err(|e| e.to_string())?;
+    let first_message_due = close_at(&stream, deadline)?;
     // No device-leg message is larger than one Noise message
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_NOISE_MESSAGE))
@@ -1501,10 +1532,17 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
         if std::time::Instant::now() > deadline {
             return Err(refuse(None, Some(&person), TOO_SLOW));
         }
-        if let Some(message) = link.receive()? {
-            break message;
+        match link.receive() {
+            Ok(Some(message)) => break message,
+            Ok(None) => {}
+            Err(_) if past(deadline).is_some() => {
+                return Err(refuse(None, Some(&person), TOO_SLOW));
+            }
+            Err(e) => return Err(e),
         }
     };
+    // In time: what follows (a pairing the person confirms) has no deadline
+    drop(first_message_due);
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
             let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
@@ -3661,6 +3699,67 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert!(
             (REFUSALS_PER_MINUTE as usize..=REFUSALS_PER_MINUTE as usize * 2).contains(&refused),
             "{refused}"
+        );
+    }
+
+    /// A caller that sends its first frame a byte at a time, each within a
+    /// read's wait, is still closed at the deadline: tungstenite reads a
+    /// frame to its end, so the deadline was once never looked at and one
+    /// caller could hold a place among the few for days.
+    #[test]
+    fn a_caller_that_trickles_its_first_frame_is_closed_at_the_deadline() {
+        use std::io::{Read, Write};
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let started = std::time::Instant::now();
+        let mut socket = websocket(&bridge, PERSON);
+        let stream = socket.get_mut();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        // A masked binary frame said to hold 60,000 bytes
+        stream
+            .write_all(&[0x82, 0xFE, 0xEA, 0x60, 1, 2, 3, 4])
+            .unwrap();
+        let mut closed = false;
+        while started.elapsed() < HANDSHAKE + Duration::from_secs(5) {
+            if stream.write_all(&[0]).is_err() {
+                closed = true;
+                break;
+            }
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                _ => {
+                    closed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            closed,
+            "still open {:?} after connecting",
+            started.elapsed()
+        );
+        assert!(started.elapsed() >= HANDSHAKE, "closed before the deadline");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            Store::open(&bridge.store)
+                .unwrap()
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .any(|l| l.event == "refused" && l.reason.as_deref() == Some(TOO_SLOW)),
+            "the refusal is logged as too slow"
         );
     }
 
