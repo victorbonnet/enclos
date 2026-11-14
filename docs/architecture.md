@@ -1,12 +1,12 @@
 # Architecture
 
-How enclos is put together, on a Mac with the Seatbelt backend. The [design](design.md) says what enclos is meant to be and why; the [ADRs](adr/) record each decision. Words such as sandbox, runtime, agent and policy are defined in the [glossary](../GLOSSARY.md).
+How enclos is put together, shown on a Mac with the Seatbelt backend; on Linux, bubblewrap takes Seatbelt's place and systemd user units launchd's ([design §5](design.md#5-isolation-backends)). The [design](design.md) says what enclos is meant to be and why; the [ADRs](adr/) record each decision. Words such as sandbox, runtime, agent and policy are defined in the [glossary](../GLOSSARY.md).
 
 ## The big picture
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="diagrams/architecture-dark.svg">
-  <img alt="Clients (the enclos CLI, which host assistants such as Claude Code and Codex also run, through the enclos plugin; a web UI later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="diagrams/architecture-light.svg">
+  <img alt="Clients (the enclos CLI, which host assistants such as Claude Code and Codex also run, through the enclos plugin; a web UI later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS and bubblewrap on Linux now; OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services on macOS and systemd user units on Linux." src="diagrams/architecture-light.svg">
 </picture>
 
 The drawing is made by [`diagrams/architecture.py`](diagrams/architecture.py): edit its boxes and run `uv run --no-project python docs/diagrams/architecture.py` to redraw both themes.
@@ -63,14 +63,18 @@ flowchart TB
   main["main.rs, cli/<br/>commands, arguments, output"] --> engine["engine/<br/>the one place components meet:<br/>lock, audit, then the work"]
 
   engine --> policy["policy/<br/>layers, snapshots, validation"]
-  engine --> backend["backend/seatbelt/<br/>compile a policy, wrap a command"]
+  engine --> backend["backend/seatbelt/, backend/bubblewrap/<br/>compile a policy, wrap a command"]
   engine --> runtime["runtime/<br/>adapters: Hermes"]
-  engine --> service["service/<br/>service manager: launchd"]
+  engine --> service["service/<br/>service manager: launchd, systemd"]
   engine --> lifecycle["lifecycle/<br/>session members, safe stop"]
   engine --> probes["probes/<br/>escape probes for policy test"]
   engine --> proxy["proxy/<br/>the egress proxy"]
   engine --> state["state/<br/>state.db"]
   engine --> audit["audit/<br/>audit.jsonl"]
+
+  main -->|"enclos app serve"| bridge["bridge/<br/>the mobile app's bridge"]
+  bridge --> engine
+  bridge --> protocol["crates/enclos-protocol<br/>the app's protocol, no I/O"]
 
   policy --> netmod["net/<br/>allowlist entries, address classes"]
   proxy --> netmod
@@ -79,7 +83,11 @@ flowchart TB
 
 Every client calls the `Engine` in `src/engine.rs`. A command that changes anything takes the state lock, opens an audit entry, does the work, saves the state and closes the entry, also on failure. Removing a sandbox's services is done outside the lock, which a runtime service told to end needs, with an audit entry before and one after ([design §4](design.md#4-architecture)). Each component sits behind one interface (`Backend`, `RuntimeAdapter`, `ServiceManager`, `StateStore`, `AuditLog`), so a new backend or runtime is one new implementation. Typed records shared between components live in `model/`. A runtime adapter also lists the agents its runtime has in a sandbox, read on the host without following links, so enclos can report agents made inside the sandbox and adopt them with `enclos agent add` ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). It also names the runtime's own import command, so `enclos agent add --from` can bring in an export the runtime made on the host: the runtime extracts it inside the sandbox, and enclos only copies the archive beside the home and records the agent.
 
-A sandbox's policy is resolved from four layers: built-in defaults, a template (`minimal`, `assistant`, or the proposed `autonomous`), the runtime adapter's endpoints, and the sandbox's own `policy.toml`. The result is an immutable snapshot identified by its hash ([ADR 0018](adr/0018-immutable-policy-snapshots.md)), and the backend compiles it into a `.sb` file under `sandboxes/<name>/compiled/`. [Policy compilation](policy-compilation.md) follows a policy through each step.
+`enclos dashboard <sandbox>` (`engine/dashboard.rs`) opens a runtime's own dashboard to the user who runs it, until Ctrl-C, as a recorded session under the sandbox's policy: through the namespace relay on Linux ([ADR 0040](adr/0040-on-linux-enclos-dashboard-opens-a-sandboxs-service-to-its-user.md)), through a private inherited socket on macOS ([ADR 0063](adr/0063-a-dashboard-on-macos-uses-a-private-inherited-socket.md), proposed).
+
+**The bridge** (`src/bridge/`, [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md), proposed) serves the mobile app. `enclos app serve` runs it in the foreground; it is not installed as a service yet. It listens on the host's loopback, which `tailscale serve` puts on the tailnet, and dials each agent's channel plugin (`channels/hermes/enclos/`) on a Unix socket in the sandbox home, so no sandbox gets a new way out. Its messages are those of the `enclos-protocol` crate (`crates/enclos-protocol/`, [the protocol](protocol.md)), which the app shares. It keeps conversations in its own database, `app.db`, and goes through the `Engine` for anything that changes enclos's state, such as a policy edit by the host's person ([design §9](design.md#9-component-apis)).
+
+A sandbox's policy is resolved from four layers: built-in defaults, a template (`minimal`, `assistant`, or the proposed `autonomous`), the runtime adapter's endpoints, and the sandbox's own `policy.toml`. The result is an immutable snapshot identified by its hash ([ADR 0018](adr/0018-immutable-policy-snapshots.md)), and the backend compiles it into a file under `sandboxes/<name>/compiled/`: a `.sb` file on Seatbelt, a `.json` one on bubblewrap. [Policy compilation](policy-compilation.md) follows a policy through each step.
 
 ## A session, step by step
 

@@ -4,7 +4,7 @@ status: proposed
 
 # Runtime approvals use exact native requests and explicit scopes
 
-Hermes's command guard already waits for Allow once, Allow for session, Always allow or Deny. Typing `/approve` addresses native pending work, while a stale app button must never resolve a later request. Treating a command approval as an ordinary information question would also invent Other/Skip or lose the meaning of persistent consent.
+Hermes's command guard already waits for Allow once, Allow for session, Always allow or Deny. Typing `/approve` addresses native pending work, while a stale app button must never resolve a later request. Treating a runtime approval as an ordinary information question would also invent Other/Skip or lose the meaning of persistent consent.
 
 Decision (proposed): extend [0052](0052-questions-keep-their-runtime-waiter-and-structured-app-controls.md)'s durable control transport with explicitly typed runtime-approval metadata and actions, a separate capability and a distinct history kind. The runtime supplies the full redacted display command, reason and permitted scopes; a card is made only when that display command is the very command of its pending native request, and otherwise the request is denied and shown as text, so no one approves a command redaction changed. The bridge requires both the current conversation owner and the host's own person on a paired device. Its adapter resolves only the exact native request; it neither sends a chat command nor executes a host shell command. The native guard continues under the unchanged sandbox policy, and retains responsibility for pattern grants and execution. Existing revision, receipt, reconnect and no-automatic-retry rules apply, including Deny.
 

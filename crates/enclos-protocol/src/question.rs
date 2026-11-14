@@ -820,7 +820,7 @@ mod tests {
     fn approval_definition() -> QuestionDefinition {
         QuestionDefinition {
             id: QuestionId::new("approval-1").unwrap(),
-            text: "Command approval".into(),
+            text: "Runtime approval".into(),
             choices: vec![],
             multiple: false,
             approval: Some(RuntimeApprovalDefinition {

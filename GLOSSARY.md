@@ -29,11 +29,11 @@ What a sandbox may do with files, programs, network, resources and secrets. Buil
 _Avoid_: rules, permissions, config
 
 **Policy request**:
-A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
-_Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision)
+A proposed grant of access for a sandbox, such as one destination or one writable path, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+_Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision), scope (a session's systemd unit)
 
 **Runtime approval**:
-A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
+A runtime's request for a person's decision before an operation continues, with the operation and the consents it allows, such as once, for the session or always, supplied by that runtime. It changes no sandbox policy.
 _Avoid_: policy request, question (a request for information), command approval
 
 **Signed decision**:
@@ -124,7 +124,7 @@ The account on a channel through which the sandbox's runtime answers people, suc
 _Avoid_: agent (an agent is the runtime's identity, not the account)
 
 **Bridge**:
-The service of an install that the mobile app reaches through its transport, and that talks to each agent's channel plugin inside its sandbox.
+The part of an install that the mobile app reaches through its transport, and that talks to each agent's channel plugin inside its sandbox.
 _Avoid_: daemon, server, gateway (the runtime's word), relay (the proxy's)
 
 **Transport**:
@@ -202,6 +202,7 @@ A file enclos gives a program as a session starts, which the program and everyth
 
 **Scope**:
 On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
+_Avoid_: scope for what a policy request asks (a grant) or a runtime approval allows (a consent)
 
 **Slice**:
 On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
