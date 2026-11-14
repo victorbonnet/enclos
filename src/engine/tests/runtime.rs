@@ -594,7 +594,7 @@ fn an_installer_past_its_time_limit_is_stopped_with_all_it_started_and_undone() 
     );
     assert!(
         lab.summary("session end")
-            .contains("stopped at its time limit of 3 seconds"),
+            .contains("stopped at its time limit"),
         "{}",
         lab.audit()
     );

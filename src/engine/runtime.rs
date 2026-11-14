@@ -4,7 +4,7 @@
 //! the runtime's own command, through `enclos connect` (ADR 0024).
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
@@ -124,8 +124,8 @@ impl Engine {
     }
 
     /// [`Engine::install_runtime`], for a caller nobody watches, such as
-    /// the mobile app's bridge: an installer still running after `limit`
-    /// is stopped, with every process it started whatever its process
+    /// the mobile app's bridge: an installer still running `limit` after
+    /// the install began, its download included, is stopped, with every process it started whatever its process
     /// group, its session's end is recorded, and the install fails, undone
     /// as when the installer exits non-zero. This takes up to
     /// [`INSTALL_STOP_TIME`] more.
@@ -153,7 +153,7 @@ impl Engine {
         self.install_runtime_limited(by, name, runtime, confirm, None)
     }
 
-    /// `install_runtime_with`, stopping the installer after `limit`.
+    /// `install_runtime_with`, stopping the installer `limit` after now.
     pub(crate) fn install_runtime_limited(
         &self,
         by: &Actor,
@@ -162,6 +162,7 @@ impl Engine {
         confirm: Confirm,
         limit: Option<Duration>,
     ) -> Result<Planned<InstallEnd>> {
+        let deadline = limit.map(|limit| Instant::now() + limit);
         let kind = runtime.kind();
         let plan = self.plan_install(name, runtime)?;
         match confirm {
@@ -189,12 +190,12 @@ impl Engine {
                 self.save_policy_for_runtime(lock, by, name, &plan.overrides, Some(kind))
             },
         )?;
-        let ran = match limit {
+        let ran = match deadline {
             None => self
                 .run_in_sandbox(by, name, command, "runtime installer")
                 .map(|end| (end, false)),
-            Some(limit) => {
-                self.run_in_sandbox_within(by, name, command, "runtime installer", limit)
+            Some(deadline) => {
+                self.run_in_sandbox_within(by, name, command, "runtime installer", deadline)
             }
         };
         let (end, timed_out) = match ran {
