@@ -1,0 +1,9 @@
+---
+status: proposed
+---
+
+# The host's person can provision sandboxes from a paired phone
+
+Amends [0042](0042-a-bridge-on-each-host-serves-the-mobile-app.md)'s original read-only sandbox boundary and §2's remote-control non-goal, alongside policy management in [0047](0047-the-hosts-person-manages-sandbox-policy-from-the-phone.md). The host's person wants to create a sandbox and install its runtime while using the mobile app, including on a host that has no agents yet. The bridge offers these changes only to the host's person, using the same stored identity as the other host controls. The first pairing explicitly accepted at the host's terminal establishes that identity; `enclos app host` changes it. Authenticated devices still pass the current signature, Tailscale node and pairing checks. The host's person is read for every request, so a change of person takes effect without restarting the bridge. If the host has no confirmed person, provisioning is unavailable. The bridge advertises `sandboxes` to that person's devices so older bridges remain compatible.
+
+Creation uses an explicitly selected built-in policy template and the host's configured default backend. Installation uses the runtime's existing engine and audit behavior, in a separate enclos process with no terminal input, so a long install does not occupy the device connection or take the bridge's terminal. An install refuses unrelated policy edits that need confirmation, as the CLI does without `--yes`. The bridge logs the requesting device and person; the engine audit records sandbox creation by that person and installation by the host's user, who executes its CLI process. Login, app channel configuration, service startup and removal remain host operations. Existing policy management from the phone remains available. This keeps one small provisioning surface while preserving the sandbox's existing policy and lifecycle boundaries.

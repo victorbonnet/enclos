@@ -855,7 +855,7 @@ impl Store {
         )?;
         // A database whose devices were paired before the host's person
         // was kept: the first of them names it, as it would have, so the
-        // next device paired, a guest's perhaps, does not (ADR 0044)
+        // next device paired, another person's perhaps, does not (ADR 0044)
         db.execute(
             "INSERT OR IGNORE INTO settings (name, value)
              SELECT ?1, person FROM devices ORDER BY paired, rowid LIMIT 1",

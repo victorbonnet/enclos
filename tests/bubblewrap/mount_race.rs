@@ -20,20 +20,37 @@ const MOUNT_CHANGED: &str = "Unable to apply mount flags: remount";
 
 /// As root: mounts a tmpfs at the folder named first, holds it `on`
 /// seconds, takes it away, waits `off` seconds, and again, as long as the
-/// file named second is there; then removes the folder.
+/// file named second is there; then removes the folder. Taking it away
+/// fails with `EBUSY` while something briefly holds the mount, as it did in
+/// about one run in twenty with sessions starting: that is tried again for
+/// up to five seconds. On the way out it writes how many unmounts were busy
+/// and the longest wait, so that a drift from rare and brief shows in the
+/// job's log.
 const CHURN: &str = r#"
-import ctypes, os, sys, time
+import ctypes, errno, os, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
 path, flag, on, off = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
 os.makedirs(path, exist_ok=True)
+cycles, busy, longest = 0, 0, 0.0
 while os.path.exists(flag):
     if libc.mount(b"enclos-churn", path.encode(), b"tmpfs", 0, None) != 0:
         sys.exit("mount: " + os.strerror(ctypes.get_errno()))
     time.sleep(on)
-    if libc.umount2(path.encode(), 0) != 0:
-        sys.exit("umount: " + os.strerror(ctypes.get_errno()))
+    cycles += 1
+    start = time.monotonic()
+    waited = False
+    while libc.umount2(path.encode(), 0) != 0:
+        error = ctypes.get_errno()
+        if error != errno.EBUSY or time.monotonic() > start + 5:
+            sys.exit("umount: " + os.strerror(error))
+        waited = True
+        time.sleep(0.001)
+    if waited:
+        busy += 1
+        longest = max(longest, time.monotonic() - start)
     time.sleep(off)
 os.rmdir(path)
+sys.stderr.write(f"{busy} of {cycles} unmounts busy, the longest for {longest * 1000:.0f} ms")
 "#;
 
 /// A tmpfs mounted and taken away at `CHURNED` until stopped or dropped.
@@ -68,8 +85,9 @@ impl Churn {
         churn
     }
 
-    /// Stops the loop, and says why if it had stopped before.
-    fn stop(mut self) {
+    /// Stops the loop, and says why if it had stopped before. Returns what
+    /// it wrote on the way out: how many unmounts were busy.
+    fn stop(mut self) -> String {
         let mut child = self.child.take().unwrap();
         let early = child.try_wait().unwrap();
         let _ = std::fs::remove_file(&self.flag);
@@ -79,6 +97,7 @@ impl Churn {
             "the churn stopped early: {out:?}"
         );
         assert!(!mounted(), "the churn left its mount");
+        text(&out.stderr)
     }
 }
 
@@ -156,13 +175,13 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
         assert_eq!(text(&out.stdout), "ran", "session {sessions}: {out:?}");
         again += usize::from(text(&out.stderr).contains(AGAIN));
     }
-    churn.stop();
+    let busy = churn.stop();
     let runs = std::fs::read_to_string(lab.sandbox_home().join("runs")).unwrap();
     // Straight to the job's log, which keeps no output of a test that passes.
     use std::io::Write;
     let _ = writeln!(
         std::io::stderr(),
-        "mount race: bubblewrap alone failed {failed} of {alone} starts, last with `{said}`; {sessions} sessions all started, {again} of them started again"
+        "mount race: bubblewrap alone failed {failed} of {alone} starts, last with `{said}`; {sessions} sessions all started, {again} of them started again; churn: {busy}"
     );
     assert!(
         failed > 0,

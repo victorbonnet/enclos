@@ -35,8 +35,8 @@ pub struct AppArgs {
 }
 
 impl AppArgs {
-    /// Whether this is `app serve`, the bridge the service manager runs
-    /// rather than a person.
+    /// Whether this is `app serve`, the long-running bridge, whose writes
+    /// no person waits on.
     pub fn is_service(&self) -> bool {
         matches!(self.verb, AppVerb::Serve { .. })
     }
