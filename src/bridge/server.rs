@@ -184,6 +184,10 @@ struct Hub {
     /// How fast each agent may have its messages stored, kept across its
     /// plugin's connections.
     paces: Mutex<HashMap<String, Pace>>,
+    /// The agents whose plugin connection the bridge ended on a message it
+    /// could not store: how many times in a row, and when last. The
+    /// background pass opens theirs again only after [`reopen_after`].
+    unstored: Mutex<HashMap<String, (u32, std::time::Instant)>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -395,6 +399,7 @@ impl Hub {
             questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
+            unstored: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             stops: Mutex::new(HashSet::new()),
             generations: AtomicU64::new(0),
@@ -819,30 +824,32 @@ impl Hub {
                             &home,
                             &from,
                         );
-                        match &stored {
-                            Ok(_) => {
-                                let _ = acks.ack(&message.id);
-                            }
-                            Err(e) => eprintln!(
-                                "enclos app: {agent}: {e}; its app channel is closed, so the message comes again when it is opened"
-                            ),
+                        if stored.is_ok() {
+                            let _ = acks.ack(&message.id);
                         }
                         // The member's reply ended its turn: the next turn
                         // starts. Its position stays at the last message it
                         // was given (a person's message sent while it worked
                         // is still to give it); its own reply is no news to
-                        // it (`Store::news_for`). The turn ended whatever the
-                        // store made of the reply (an id it had already, or a
-                        // failure): the discussion goes on all the same.
+                        // it (`Store::news_for`). The turn is replied once
+                        // the reply is stored (or was already); not stored,
+                        // it failed, so the reply the plugin sends again is
+                        // kept, as one to a failed turn. The discussion goes
+                        // on all the same.
                         if ends_turn {
+                            hub.turn_replied(
+                                &store,
+                                conversation.as_str(),
+                                &member,
+                                reply_to.as_ref().map(|r| r.as_str()),
+                                stored.is_ok(),
+                            );
                             hub.advance(&store, conversation.as_str());
                         }
-                        // Not stored, so not acknowledged: the plugin sends it
-                        // again after its next `hello`. The connection ends
-                        // so that this comes within seconds, as the bridge
-                        // opens it again on its next round, and not whenever
-                        // the connection would end otherwise.
-                        if stored.is_err() {
+                        // Not stored, so not acknowledged: the connection
+                        // ends, and the plugin sends it again within seconds.
+                        if let Err(e) = &stored {
+                            hub.kept_by_plugin(&agent, &acks, e);
                             break;
                         }
                     }
@@ -1235,7 +1242,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.
                 for agent in &hub.agents {
-                    let _ = hub.plugin(&agent.name);
+                    if hub.may_reopen(&agent.name) {
+                        let _ = hub.plugin(&agent.name);
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(3));
             }
@@ -2480,6 +2489,59 @@ fn read(
         hub.deliver_conversation(store, person, id);
     }
     Ok(())
+}
+
+/// How long the background pass waits before it opens again an agent's
+/// plugin connection that ended `failures` times in a row on a message the
+/// bridge could not store: not at all the first time, so the message comes
+/// again within seconds, then 3 seconds, doubled each time, up to a minute.
+/// While the database keeps failing (a full disk), each connection would
+/// end within seconds, and each `hello` sends the agent's commands to
+/// every device again.
+fn reopen_after(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::ZERO,
+        n => (Duration::from_secs(3) * (1 << (n - 2).min(5))).min(Duration::from_secs(60)),
+    }
+}
+
+impl Hub {
+    /// Ends `agent`'s plugin connection, through `acks` so that it ends
+    /// for every clone of it, on a message of its the bridge could not
+    /// store (`why`: its database failed). Unacknowledged, the plugin keeps
+    /// the message and sends it again after the `hello` of the next
+    /// connection, which the background pass opens within seconds, or
+    /// later when this happened just before ([`reopen_after`]).
+    fn kept_by_plugin(&self, agent: &str, acks: &PluginWriter, why: &str) {
+        eprintln!(
+            "enclos app: {agent}: a message could not be stored ({why}); its app channel is closed, so the message comes again when it is opened"
+        );
+        self.ended_unstored(agent);
+        acks.shutdown();
+    }
+
+    /// Counts one more connection of `agent`'s ended on a message the
+    /// bridge could not store.
+    fn ended_unstored(&self, agent: &str) {
+        let now = std::time::Instant::now();
+        let mut unstored = self.unstored.lock().expect("not poisoned");
+        let failures = match unstored.get(agent) {
+            // In a row: within the longest wait, and the pass after it
+            Some((n, at)) if now.duration_since(*at) <= Duration::from_secs(120) => n + 1,
+            _ => 1,
+        };
+        unstored.insert(agent.to_owned(), (failures, now));
+    }
+
+    /// Whether the background pass may open `agent`'s plugin connection
+    /// again ([`reopen_after`]).
+    fn may_reopen(&self, agent: &str) -> bool {
+        self.unstored
+            .lock()
+            .expect("not poisoned")
+            .get(agent)
+            .is_none_or(|(n, at)| at.elapsed() >= reopen_after(*n))
+    }
 }
 
 /// Where `agent`'s message for `conversation` is kept: there, when it is

@@ -342,8 +342,11 @@ fn a_reply_that_is_only_a_file_ends_its_turn_and_is_kept() {
         hub.group_reply(&store, "g-1", "main", Some("s-1"), "", true, "reply"),
         Some(true)
     );
-    let turn = store.turn_sent("s-1", "g-1", "main").unwrap().unwrap();
-    assert_eq!(turn.1, "replied");
+    let status = |store: &Store| store.turn_sent("s-1", "g-1", "main").unwrap().unwrap().1;
+    // Replied once the reply is stored, not before.
+    assert_eq!(status(&store), "running");
+    hub.turn_replied(&store, "g-1", "main", Some("s-1"), true);
+    assert_eq!(status(&store), "replied");
     // No text and no file is a pass, dropped.
     running(&hub, &store);
     assert_eq!(
@@ -545,4 +548,147 @@ fn a_second_advance_while_a_turn_is_sent_sends_no_turn_of_its_own() {
         turn_of(&hub, &store, "g-1", "coder").as_deref(),
         Some("queued")
     );
+}
+
+#[test]
+fn a_reply_that_could_not_be_stored_fails_its_turn_and_is_kept_when_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    running(&hub, &store);
+    let status = |store: &Store| store.turn_sent("s-1", "g-1", "main").unwrap().unwrap().1;
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", false, "reply"),
+        Some(true)
+    );
+    // Its store failed: the turn failed, as if no reply came.
+    hub.turn_replied(&store, "g-1", "main", Some("s-1"), false);
+    assert_eq!(status(&store), "failed");
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("failed")
+    );
+    // The plugin sends it again: kept, and the turn replied.
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", false, "reply"),
+        Some(false)
+    );
+    assert_eq!(status(&store), "replied");
+}
+
+/// A stand-in plugin for `lab/<name>` with an outbox, as Hermes's has:
+/// what `answer` returns for a `message.in` is kept until the bridge's
+/// `ack`, and sent again after each `hello`.
+fn outbox_member(
+    dir: &Path,
+    name: &str,
+    answer: impl Fn(&MessageId) -> Vec<(String, FromPlugin)> + Send + 'static,
+) {
+    let listener = UnixListener::bind(dir.join(format!("{name}.sock"))).unwrap();
+    std::thread::spawn(move || {
+        let mut outbox: Vec<(String, FromPlugin)> = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            if lines.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            send(
+                &mut out,
+                &new_id().unwrap(),
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "x".into(),
+                    capabilities: Vec::new(),
+                },
+            );
+            for (id, body) in &outbox {
+                send(&mut out, id, body.clone());
+            }
+            loop {
+                line.clear();
+                if lines.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(message) = decode_from_bridge(&line) else {
+                    continue;
+                };
+                match message.body {
+                    FromBridge::MessageIn { .. } => {
+                        for (id, body) in answer(&message.id) {
+                            send(&mut out, &id, body.clone());
+                            outbox.push((id, body));
+                        }
+                    }
+                    FromBridge::Ack { of } => outbox.retain(|(id, _)| id != of.as_str()),
+                    _ => {}
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn a_reply_that_ended_its_turn_but_could_not_be_stored_is_kept_when_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    group(&hub, &store);
+    // The database refuses main's reply, as a full disk would.
+    let reply = new_id().unwrap();
+    let database = rusqlite::Connection::open(dir.path().join("bridge.db")).unwrap();
+    database
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse BEFORE INSERT ON messages WHEN NEW.id = '{reply}'
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;"
+        ))
+        .unwrap();
+    let id = reply.clone();
+    let (asked, to_main) = channel();
+    outbox_member(dir.path(), "main", move |sent| {
+        let _ = asked.send(sent.as_str().to_owned());
+        vec![(
+            id.clone(),
+            says("g-1", "here it is", OutKind::Reply, Some(sent)),
+        )]
+    });
+    let _to_coder = member(
+        dir.path(),
+        "coder",
+        Duration::ZERO,
+        Vec::new(),
+        |sent, _| {
+            vec![(
+                new_id().unwrap(),
+                says("g-1", "thanks", OutKind::Reply, Some(sent)),
+            )]
+        },
+    );
+    person_says(&hub, &store, "g-1", "p-1", "hello");
+    // Not stored: main's turn failed, coder's ran, and main's connection ended.
+    until(|| state(&hub, &store, "g-1").state == "settled");
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("failed")
+    );
+    until(|| !hub.plugins.lock().unwrap().contains_key("lab/main"));
+    database.execute_batch("DROP TRIGGER refuse").unwrap();
+    // The bridge connects again, and the plugin sends the reply again: kept.
+    hub.plugin("lab/main").unwrap();
+    let main = |store: &Store| {
+        store
+            .messages_after("g-1", 0)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.from == From::Member("main".into()))
+            .map(|m| m.text)
+            .collect::<Vec<_>>()
+    };
+    until(|| !main(&store).is_empty());
+    assert_eq!(main(&store), ["here it is"]);
+    let sent = to_main.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (_, status, _) = store.turn_sent(&sent, "g-1", "main").unwrap().unwrap();
+    assert_eq!(status, "replied");
 }
