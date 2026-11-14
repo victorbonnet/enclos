@@ -8,6 +8,7 @@
 mod tests;
 
 use super::*;
+use crate::bridge::groups::is_pass;
 
 impl Hub {
     /// The person said `text` (message `seq`) in group `id`: a discussion
@@ -16,7 +17,7 @@ impl Hub {
         if store.deletion_started(id).unwrap_or(true) {
             return;
         }
-        let Some((_, handles)) = group_of(store, id) else {
+        let Ok(Some((_, handles))) = group_of(store, id) else {
             return;
         };
         {
@@ -38,7 +39,7 @@ impl Hub {
         if store.deletion_started(id).unwrap_or(true) {
             return;
         }
-        let Some((sandbox, handles)) = group_of(store, id) else {
+        let Ok(Some((sandbox, handles))) = group_of(store, id) else {
             return;
         };
         let owner = store.owner(id).ok().flatten().unwrap_or_default();
@@ -157,6 +158,36 @@ impl Hub {
         }
     }
 
+    /// `member`'s reply to plugin message `sent`, which ended its turn in
+    /// group `id`, was `stored` or not. Stored, the turn is replied. Not
+    /// stored (the database failed), the turn failed, as if no reply came:
+    /// the plugin sends the reply again, which is then kept as a reply to
+    /// a failed turn, and not dropped as one to a turn replied already.
+    pub(super) fn turn_replied(
+        &self,
+        store: &Store,
+        id: &str,
+        member: &str,
+        sent: Option<&str>,
+        stored: bool,
+    ) {
+        let Some(sent) = sent else { return };
+        let Ok(Some((turn, _, _))) = store.turn_sent(sent, id, member) else {
+            return;
+        };
+        if stored {
+            let _ = store.turn_status(&turn, "replied", None);
+            return;
+        }
+        let _ = store.turn_status(&turn, "failed", Some("its reply could not be stored"));
+        // group.state says so when the next turn starts (`advance`)
+        if let Some(d) = self.groups.lock().expect("not poisoned").get_mut(id)
+            && d.turns.get(member).is_some_and(|t| t == "replied")
+        {
+            d.turns.insert(member.to_owned(), "failed".to_owned());
+        }
+    }
+
     /// Whether `turn` is group `id`'s running turn.
     fn runs(&self, id: &str, turn: &str) -> bool {
         self.groups
@@ -170,20 +201,23 @@ impl Hub {
     /// A message of `member`'s to group `id`, with `files` when it carries
     /// any: `Some(true)` for the reply that ends its running turn, to keep,
     /// then go on; `Some(false)` for one to keep (what it says before its
-    /// reply, or on its own); `None` for one to drop (a pass, or the reply
-    /// to a turn that was stopped).
+    /// reply, after it for the same turn, or on its own); `None` for one to
+    /// drop (a pass, or the reply to a turn that was stopped).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn group_reply(
+    pub(super) fn member_said(
         self: &Arc<Hub>,
         store: &Store,
         id: &str,
+        members: &[String],
         member: &str,
         reply_to: Option<&str>,
         text: &str,
         files: bool,
         kind: &str,
     ) -> Option<bool> {
-        let (_, handles) = group_of(store, id)?;
+        // The group's members, as the caller read them: not read again,
+        // where a failing store would read as no group
+        let handles = members.to_vec();
         let mut groups = self.groups.lock().expect("not poisoned");
         if let Some(d) = groups.get_mut(id)
             && let Some(run) = &d.running
@@ -194,10 +228,8 @@ impl Hub {
             let ended = d.replied(text, files, &handles);
             drop(groups);
             return match ended {
-                Ended::Replied => {
-                    let _ = store.turn_status(&turn, "replied", None);
-                    Some(true)
-                }
+                // Recorded replied once the reply is stored (`turn_replied`)
+                Ended::Replied => Some(true),
                 Ended::Passed => {
                     let _ = store.turn_status(&turn, "passed", None);
                     self.advance(store, id);
@@ -215,29 +247,74 @@ impl Hub {
         if reply_to.is_some_and(|r| self.stops.lock().expect("not poisoned").remove(r)) {
             return None;
         }
-        // A reply to no running turn of its: kept only when its own turn
-        // in this group failed because the bridge restarted (the plugin
-        // sent it again since).
+        // A reply to no running turn of its own: what the member said, kept,
+        // unless the person stopped that turn, or it is a pass. Its turn
+        // ended with its first message; the others it sends for the same
+        // turn (Hermes sends a reply's files after its text, or the plugin
+        // sends again one the bridge could not store) are kept, and end no
+        // turn. One sent again under an id stored already is the store's
+        // to drop. Its turn failed (the bridge restarted, no reply in
+        // time): the reply that comes yet makes it replied.
         if kind == "reply"
             && let Some(sent) = reply_to
         {
-            return match store.turn_sent(sent, id, member) {
-                Ok(Some((turn, status, _))) if status == "failed" => {
-                    let _ = store.turn_status(&turn, "replied", None);
-                    Some(false)
+            match store.turn_sent(sent, id, member) {
+                Ok(Some((_, status, _))) if status == "cancelled" => return None,
+                Ok(Some(_)) if is_pass(text) && !files => return None,
+                Ok(Some((turn, status, _))) => {
+                    if status == "failed" {
+                        let _ = store.turn_status(&turn, "replied", None);
+                    }
+                    self.also_said(store, id, member, &turn, text, &handles);
+                    return Some(false);
                 }
-                Ok(Some(_)) => None,
                 // Not a turn's: the member answered on its own.
-                _ => Some(false),
-            };
+                _ => {}
+            }
+        }
+        // What it says while its turn runs, before its reply.
+        let running = self
+            .groups
+            .lock()
+            .expect("not poisoned")
+            .get(id)
+            .and_then(|d| d.running.as_ref())
+            .filter(|r| r.member == member)
+            .map(|r| r.turn.clone());
+        if let Some(turn) = running {
+            self.also_said(store, id, member, &turn, text, &handles);
         }
         Some(false)
+    }
+
+    /// `member` said `text` in group `id` for its turn `turn`, besides the
+    /// reply that ends it (`Discussion::also_said`): the members it
+    /// mentions are asked for a turn while the discussion goes on, and a
+    /// late reply to a failed turn shows as replied.
+    fn also_said(
+        &self,
+        store: &Store,
+        id: &str,
+        member: &str,
+        turn: &str,
+        text: &str,
+        handles: &[String],
+    ) {
+        let changed = self
+            .groups
+            .lock()
+            .expect("not poisoned")
+            .get_mut(id)
+            .is_some_and(|d| d.also_said(member, turn, text, handles));
+        if changed {
+            self.deliver_group_state(store, id);
+        }
     }
 
     /// The person stopped group `id`'s discussion: what is queued is
     /// cancelled, and the running member is sent `/stop`.
     pub(super) fn group_stop(self: &Arc<Hub>, store: &Store, id: &str) {
-        let Some((sandbox, _)) = group_of(store, id) else {
+        let Ok(Some((sandbox, _))) = group_of(store, id) else {
             return;
         };
         let running = self
@@ -318,7 +395,7 @@ impl Hub {
                 if run.member != member || sent.is_some_and(|s| s != run.sent) {
                     return None;
                 }
-                if !matches!(group_of(store, id), Some((s, _)) if s == sandbox) {
+                if !matches!(group_of(store, id), Ok(Some((s, _))) if s == sandbox) {
                     return None;
                 }
                 let turn = run.turn.clone();
@@ -339,13 +416,13 @@ impl Hub {
         let mut groups = self.groups.lock().expect("not poisoned");
         for (turn, conversation, member) in store.running_turns().unwrap_or_default() {
             let _ = store.turn_status(&turn, "failed", Some("the bridge restarted"));
-            groups.insert(conversation, Discussion::interrupted(&member));
+            groups.insert(conversation, Discussion::interrupted(&member, &turn));
         }
     }
 
     /// Where group `id`'s discussion is; settled, with no turns, before the first.
     pub(super) fn group_state(&self, store: &Store, id: &str) -> Option<GroupState> {
-        let (sandbox, handles) = group_of(store, id)?;
+        let (sandbox, handles) = group_of(store, id).ok()??;
         let groups = self.groups.lock().expect("not poisoned");
         let d = groups.get(id);
         Some(GroupState {
@@ -415,6 +492,23 @@ impl Hub {
             )
             .map_err(|e| e.to_string())
     }
+
+    /// [`Hub::member_said`], with group `id`'s members read from the store.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn group_reply(
+        self: &Arc<Hub>,
+        store: &Store,
+        id: &str,
+        member: &str,
+        reply_to: Option<&str>,
+        text: &str,
+        files: bool,
+        kind: &str,
+    ) -> Option<bool> {
+        let (_, handles) = group_of(store, id).ok()??;
+        self.member_said(store, id, &handles, member, reply_to, text, files, kind)
+    }
 }
 
 /// The person's `group.new`: two to six known agents of one sandbox, each
@@ -459,7 +553,9 @@ pub(super) fn new_group(
         let same = owner == person
             && agent.is_empty()
             && s == sandbox
-            && group_of(store, id).is_some_and(|(_, handles)| handles == names);
+            && group_of(store, id)
+                .map_err(|e| e.to_string())?
+                .is_some_and(|(_, handles)| handles == names);
         if !same {
             return Ok(Err(format!("conversation {id} exists already")));
         }
