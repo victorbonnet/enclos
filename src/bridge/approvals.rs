@@ -5,6 +5,40 @@ use crate::{engine::Engine, model::sandbox::SandboxName};
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 use std::collections::HashMap;
 
+/// Why request `a` cannot be closed yet, if it cannot: a failed application
+/// may have left a pending policy change (`pending` says whether its
+/// sandbox has one), and the request is then the phone's only sign of it,
+/// so it stays until the host applies or discards that change.
+pub(super) fn close_blocked(a: &Approval, pending: bool) -> Option<String> {
+    let name = &a.sandbox;
+    (a.state == "failed" && pending).then(|| {
+        format!(
+            "A policy change waits on the host for {name}. Apply it with `enclos policy apply {name}` or drop it with `enclos policy discard {name}`, then close this request."
+        )
+    })
+}
+
+const PROBE_NOT_CLOSED: &str =
+    "This is an Enclos diagnostic probe; it needs no attention and was not closed.";
+
+/// Scope `access` of `sandbox` keyed under its active policy: a request for
+/// it that was decided or closed is not asked again until the policy changes.
+fn scope_key(engine: &Engine, sandbox: &str, access: &Access) -> Result<String, String> {
+    let policy = sandbox
+        .parse::<SandboxName>()
+        .ok()
+        .and_then(|n| engine.policy(&n).ok())
+        .map(|v| v.snapshot.id.to_string())
+        .unwrap_or_default();
+    Ok(crate::policy::sha256_hex(
+        format!(
+            "{sandbox}:{policy}:{}",
+            serde_json::to_string(access).map_err(|e| e.to_string())?
+        )
+        .as_bytes(),
+    ))
+}
+
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
         && crate::net::host::AllowEntry::parse(&access.target)
@@ -181,46 +215,35 @@ impl Hub {
                 Ok(())
             };
         }
-        let policy = sandbox
-            .parse::<SandboxName>()
-            .ok()
-            .and_then(|n| {
-                Engine::open(self.layout.clone(), crate::state::Wait::Background)
-                    .policy(&n)
-                    .ok()
-            })
-            .map(|v| v.snapshot.id.to_string())
-            .unwrap_or_default();
-        let mut key = crate::policy::sha256_hex(
-            format!(
-                "{sandbox}:{policy}:{}",
-                serde_json::to_string(&access).map_err(|e| e.to_string())?
-            )
-            .as_bytes(),
-        );
-        // Decided under this policy: not asked again until it changes. An
-        // agent is told so, not left waiting for a request nobody sees.
-        // One that failed (the bridge stopped mid-decision, the state lock
-        // was busy) changed nothing: it is asked again
-        let told = |known: &Approval| -> Result<(), String> {
-            if agent.contains('/') && !matches!(known.state.as_str(), "pending" | "applying") {
+        let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
+        let mut key = scope_key(&engine, sandbox, &access)?;
+        // Decided or closed under this policy: not asked again until it
+        // changes. An agent is told so, not left waiting for a request
+        // nobody sees. One that failed (the bridge stopped mid-decision,
+        // the state lock was busy) changed nothing: it is asked again
+        let known = |state: &str| {
+            if agent.contains('/') && !matches!(state, "pending" | "applying") {
                 Err(format!(
-                    "A request for this scope was already {} under {sandbox}'s active policy. It is not asked again until the policy changes.",
-                    known.state
+                    "A request for this scope was already {state} under {sandbox}'s active policy. It is not asked again until the policy changes."
                 ))
             } else {
                 Ok(())
             }
         };
-        let mut known = store.approval(&key).map_err(|e| e.to_string())?;
-        if known.as_ref().is_some_and(|k| k.state == "diagnostic") {
+        // Closed under this policy, though it may have been asked under an
+        // earlier one, whose id this key is not.
+        if store.scope_closed(&key).map_err(|e| e.to_string())? {
+            return known("closed");
+        }
+        let mut old = store.approval(&key).map_err(|e| e.to_string())?;
+        if old.as_ref().is_some_and(|k| k.state == "diagnostic") {
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
-            known = store.approval(&key).map_err(|e| e.to_string())?;
+            old = store.approval(&key).map_err(|e| e.to_string())?;
         }
-        let reopen = known.as_ref().is_some_and(|k| k.state == "failed");
-        if let Some(known) = known.filter(|_| !reopen) {
-            return told(&known);
+        let reopen = old.as_ref().is_some_and(|k| k.state == "failed");
+        if let Some(old) = old.filter(|_| !reopen) {
+            return known(&old.state);
         }
         let mut a = Approval {
             request: key,
@@ -245,10 +268,7 @@ impl Hub {
             available: false,
             reason: None,
         };
-        preview(
-            &Engine::open(self.layout.clone(), crate::state::Wait::Background),
-            &mut a,
-        );
+        preview(&engine, &mut a);
         let stored = if reopen {
             store.reopen_approval(&a)
         } else {
@@ -383,6 +403,98 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn close_access(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        id: &str,
+    ) -> Result<(), String> {
+        self.host_authority(store, device, person)
+            .map_err(|(_, message)| message)?;
+        let read = || -> Result<Approval, String> {
+            Ok(store
+                .approval(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("Unknown policy request")?)
+        };
+        let mut a = read()?;
+        // As a decision would: a probe's refusal is marked as one, not closed.
+        if self.is_probe(&a, &mut HashMap::new()) {
+            if let Some(marked) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
+                self.deliver(person, ToDevice::Approval(marked));
+            }
+            return Err(PROBE_NOT_CLOSED.into());
+        }
+        let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
+        // Closed under the policy active now too, which the request's id,
+        // made under the policy of its time, may not name.
+        let scope = scope_key(&engine, &a.sandbox, &a.access)?;
+        // Closed from one reading of its state. A request that changed
+        // since, such as an application that failed after it was read, is
+        // read and checked again; states only move forward, so this ends.
+        for _ in 0..3 {
+            if !matches!(a.state.as_str(), "pending" | "failed") {
+                break;
+            }
+            if self.close_from(&engine, store, &a, &scope, device, person)? {
+                a.state = "closed".into();
+                break;
+            }
+            a = read()?;
+        }
+        let state = a.state.clone();
+        self.deliver(person, ToDevice::Approval(a));
+        match state.as_str() {
+            "closed" => Ok(()),
+            "applying" => Err(
+                "This request is already being decided. Wait for the result before closing it."
+                    .into(),
+            ),
+            "pending" | "failed" => {
+                Err("This request kept changing while it was being closed. Try again.".into())
+            }
+            "diagnostic" => Err(PROBE_NOT_CLOSED.into()),
+            decided => Err(format!(
+                "This request was already {decided}, so it was not closed."
+            )),
+        }
+    }
+
+    /// Closes `a` from the state it was read in, `pending` or `failed`. A
+    /// failed one is checked and closed under the state lock, so that no
+    /// pending policy change appears in between; a pending change that
+    /// cannot be read keeps it.
+    fn close_from(
+        &self,
+        engine: &Engine,
+        store: &Store,
+        a: &Approval,
+        scope: &str,
+        device: &Device,
+        person: &str,
+    ) -> Result<bool, String> {
+        // The store transition also checks the state atomically against other devices.
+        let close = || {
+            store
+                .close_approval(&a.request, &a.state, scope, &device.id, person)
+                .map_err(|e| e.to_string())
+        };
+        let (true, Ok(name)) = (a.state == "failed", a.sandbox.parse::<SandboxName>()) else {
+            return close();
+        };
+        engine
+            .with_pending_policy(&name, |pending| match close_blocked(a, pending) {
+                Some(why) => Err(why),
+                None => close(),
+            })
+            .map_err(|e| {
+                format!(
+                    "Enclos could not check {name} for a pending policy change, so this request stays. Check it with `enclos policy show {name}`: {e}"
+                )
+            })?
     }
 
     pub(super) fn decide_access(

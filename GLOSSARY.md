@@ -29,7 +29,7 @@ What a sandbox may do with files, programs, network, resources and secrets. Buil
 _Avoid_: rules, permissions, config
 
 **Policy request**:
-A proposed grant of access for a sandbox, such as one destination or one writable path, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+A proposed grant of access for a sandbox, such as one destination or one writable path, which the host's person may approve, deny or close without a new decision. Approving it changes the sandbox's policy for all of its agents; closing puts it aside without accepting or rejecting it.
 _Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision), scope (a session's systemd unit)
 
 **Runtime approval**:

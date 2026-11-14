@@ -62,6 +62,7 @@ class Approvals(unittest.TestCase):
             """An agent's connection whose bridge answers each request with `reply`."""
             def __init__(self, loop, reply):
                 self._loop, self._reply, self._answers = loop, reply, {}
+                self._path = "/absent/main.sock"
                 self._last_in = {"c1": ("m", 0.0)}
                 self._outbox = Mock()
                 self._outbox.put.return_value = True
@@ -88,6 +89,9 @@ class Approvals(unittest.TestCase):
 
         with patch.dict(sys.modules, {"gateway": types.ModuleType("gateway"), "gateway.session_context": module}):
             self.assertEqual(ask(None)["status"], "requested")
+            closed = ask("A request for this scope was already closed.")
+            self.assertNotIn("status", closed)
+            self.assertIn("already closed", closed["error"])
             denied = ask("A request for this scope was already denied.")
             self.assertNotIn("status", denied)
             self.assertIn("already denied", denied["error"])

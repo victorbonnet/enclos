@@ -20,6 +20,7 @@ impl Hub {
         let mut capabilities = Vec::new();
         if self.known_host().as_deref() == Some(person) {
             capabilities.push("audit".to_owned());
+            capabilities.push(enclos_protocol::device::APPROVAL_CLOSE.to_owned());
             if self.provisioning.is_some() {
                 capabilities.push("sandboxes".to_owned());
             }

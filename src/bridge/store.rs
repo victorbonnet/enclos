@@ -346,6 +346,9 @@ CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER
 CREATE TABLE IF NOT EXISTS agent_avatars (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>=0), version TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS approval_marks (name TEXT PRIMARY KEY, at INTEGER NOT NULL);
+-- A policy request's scope as closed under the policy active when it was
+-- closed, which the request's own id may not name (ADR 0054).
+CREATE TABLE IF NOT EXISTS closed_scopes (key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     sandbox TEXT NOT NULL,
@@ -949,6 +952,47 @@ impl Store {
             "UPDATE approvals SET state='applying' WHERE id=?1 AND state='pending'",
             [id],
         )? == 1)
+    }
+
+    /// Closes attention only. The original request and policy decision stay intact.
+    /// The first write races with claim_approval; only one transition can win.
+    /// It closes only from `expected`, the state the caller checked: a
+    /// request that changed since (an application that failed just after
+    /// the check) is not closed without being checked again. `scope` is the
+    /// request's scope keyed under the policy active now, which stays closed
+    /// with it ([`Store::scope_closed`]).
+    pub fn close_approval(
+        &self,
+        id: &str,
+        expected: &str,
+        scope: &str,
+        device: &str,
+        person: &str,
+    ) -> rusqlite::Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE approvals SET state='closed' WHERE id=?1 AND state=?2 AND state IN ('pending','failed')",
+            [id, expected],
+        )? == 1;
+        if changed {
+            tx.execute(
+                "INSERT INTO log (at,device,person,event,reason) VALUES (?1,?2,?3,'approval.closed',?4)",
+                params![now(), device, person, id],
+            )?;
+            tx.execute("INSERT OR IGNORE INTO closed_scopes VALUES (?1)", [scope])?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Whether a request for scope `key` (a scope keyed under a policy) was
+    /// closed while that policy was active.
+    pub fn scope_closed(&self, key: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM closed_scopes WHERE key=?1)",
+            [key],
+            |r| r.get(0),
+        )
     }
 
     /// Opens the database at `path`, made for the user alone (`0600`): it
