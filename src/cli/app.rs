@@ -613,6 +613,7 @@ fn chat(
                 conversation.as_str(),
                 &From::Person(person.to_string()),
                 "message",
+                &[],
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
         writer
@@ -733,6 +734,7 @@ fn read_agent(
                 conversation.as_str(),
                 &From::Agent,
                 kind,
+                &[],
             )
             .map_err(|e| e.to_string())?
             .is_some()
