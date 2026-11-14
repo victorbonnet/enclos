@@ -9,12 +9,16 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _stub_hermes() -> None:
-    """Stand-ins for the gateway modules adapter.py imports."""
+def _hermes_stand_ins() -> dict:
+    """Stand-ins for the gateway modules adapter.py imports, and no other
+    Hermes module: where a real Hermes is importable too (the hermes-latest
+    job), the adapter would list its commands after the hello, which these
+    tests do not expect."""
 
     class Platform(str):
         pass
@@ -77,14 +81,26 @@ def _stub_hermes() -> None:
     modules["gateway.platforms.base"].SendResult = SendResult
     modules["gateway.platforms.event"].MessageEvent = MessageEvent
     modules["gateway.platforms.event"].MessageType = MessageType
-    sys.modules.update(modules)
+    # The other Hermes packages the plugin reaches for, absent as they are
+    # outside a gateway.
+    for name in ("agent", "cron", "hermes_cli", "hermes_constants", "hermes_state", "hermes_time", "tools", "toolsets"):
+        modules[name] = None
+    return modules
 
 
-_stub_hermes()
+def setUpModule():
+    # For this module's tests only: left in `sys.modules`, the stand-ins would
+    # hide the real Hermes from every test that runs after these.
+    global EnclosAdapter, PlatformConfig
+    stand_ins = patch.dict(sys.modules, _hermes_stand_ins())
+    stand_ins.start()
+    unittest.addModuleCleanup(stand_ins.stop)
+    sys.modules.pop("enclos.adapter", None)
+    from enclos.adapter import EnclosAdapter
+    from gateway.config import PlatformConfig
+
 
 from enclos import protocol  # noqa: E402
-from enclos.adapter import EnclosAdapter  # noqa: E402
-from gateway.config import PlatformConfig  # noqa: E402
 
 TOKEN = "t" * 64
 
