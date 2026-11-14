@@ -142,8 +142,12 @@ impl Hub {
         }
     }
 
-    fn deletion_target_absent(&self, agent: &str) -> bool {
-        let Some((sandbox, agent)) = agent.split_once('/') else {
+    /// Whether `agent` (`<sandbox>/<agent>`) is gone with all its data, its
+    /// sandbox included, so no native chat is left to delete. When the
+    /// engine cannot tell, it is not: said on stderr, and the deletion then
+    /// needs the agent's channel.
+    fn deletion_target_absent(&self, target: &str) -> bool {
+        let Some((sandbox, agent)) = target.split_once('/') else {
             return false;
         };
         let (Ok(sandbox), Ok(agent)) = (sandbox.parse(), agent.parse()) else {
@@ -151,7 +155,10 @@ impl Hub {
         };
         crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Background)
             .app_agent_data_absent(&sandbox, &agent)
-            .unwrap_or(false)
+            .unwrap_or_else(|e| {
+                eprintln!("enclos app: cannot tell whether {target} has data left: {e}");
+                false
+            })
     }
 
     pub(super) fn delete_answer(
