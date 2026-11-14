@@ -799,6 +799,7 @@ enclos connect community -- hermes ...                     # Hermes told of the 
   app.db                       the bridge's conversations and paired devices (ADR 0042), hidden from every sandbox
   app-bridge.key               the bridge's Noise key pair, which paired devices pin, `0600`, hidden from every sandbox
   app-approvals.key            the key the bridge signs runtime-approval decisions with (ADR 0060), `0600`, hidden from every sandbox
+  app-push-key.json            the service-account key the bridge sends pushes through FCM with (ADR 0065, proposed; not built yet), `0600`, to be hidden from every sandbox
   app-media/                   the files agents sent with their messages (and those an import restores), one per attachment id; hidden from every sandbox
   probe-sources.db             which `policy test` runs are under way and the network log entries they made (ADR 0059), `0600`, hidden from every sandbox
   runtimes/<runtime>/<version>/  shared, read-only to every sandbox (planned; milestone 1 installs each runtime in its sandbox's home instead, ADR 0020)
@@ -889,7 +890,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - the bridge as a service of the install, served through `tailscale serve` (not built yet: the bridge runs in the foreground with `enclos app serve`, §4); conversations stored with their owner and a person on every message from the first version ([ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md), proposed), with the host's user the only person;
    - pairing: `app pair` (a QR code and a confirmation at the terminal), `app devices`, `app unpair`, audited; the first device paired names the host's person, whose each agent's Home is, and `app host` shows or changes it; Noise with the keys from pairing, and Tailscale's identity of the caller checked;
    - `app status` (devices, connected now, last seen) and `app log` (connections and refusals);
-   - push through FCM, from the host, the preview encrypted for the device;
+   - push through FCM, from the host, the preview encrypted for the device, with a narrow service-account key the host's user gives the bridge ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed);
    - the Android app, in its own repository: hosts, agents, conversations, notifications.
 
    Deliberately not yet: sharing with other people (`app invite`, `share`, `unshare`, `forget`), which comes next on the same data model; OpenClaw's plugin; iOS. Added to the plan since, and built under proposed ADRs: runtime approvals in the app ([ADR 0053](adr/0053-runtime-approvals-use-exact-native-requests-and-explicit-scopes.md), with signed decisions, [ADR 0060](adr/0060-the-bridge-signs-runtime-approval-decisions.md)), and, for the host's person only, sandbox policy requests and policy management ([ADR 0046](adr/0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md), [ADR 0047](adr/0047-the-hosts-person-manages-sandbox-policy-from-the-phone.md)) and creating a sandbox and installing its runtime ([ADR 0064](adr/0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md)). The rest of acting on a sandbox from the phone (a runtime's login, channel setup, starting, stopping and removing it) stays a non-goal (§2).
@@ -1027,6 +1028,7 @@ The design depends on these, and they have not been shown yet. Items the milesto
 
 - That the agent's app channel socket in the sandbox home is one the bridge reaches and nothing else of the host does without the agent's token (§3, the bridge): the end-to-end run on a Mac reached it, under Seatbelt; bubblewrap is not tried.
 - That `tailscale serve` gives the bridge the caller's tailnet address in `X-Forwarded-For`, last of its values, and its login in `Tailscale-User-Login`, overwriting any the caller sent. The bridge asks `tailscale whois` for the node at that address, checks its login against the header, and refuses a paired device calling from another node; tests show this with a stand-in for `whois`, not yet through `tailscale serve`.
+- That a high-priority FCM data message reaches an Android phone in Doze, with the app closed, and wakes the app long enough to open the preview and show the notification ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed): not built, not tried.
 
 **On a development Mac**:
 

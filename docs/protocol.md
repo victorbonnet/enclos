@@ -277,7 +277,7 @@ Each entry has `seq`, `time` (Unix seconds), `user`, `host`, `command`, `target`
 
 ### Notifications
 
-Not built yet: the bridge sends no push. `enclos-protocol`'s `preview` seals and opens a preview as below; nothing in the bridge calls it, and no FCM client exists.
+Not built yet: the bridge sends no push. `enclos-protocol`'s `preview` seals and opens a preview as below; nothing in the bridge calls it, and no FCM client exists. The bridge will send with a service-account key its host's user gives it ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed), and the app shows no notification for a preview that does not open.
 
 When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is
 
