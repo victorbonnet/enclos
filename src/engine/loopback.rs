@@ -44,9 +44,14 @@ fn free_after(addr: SocketAddr, wait: Duration, between: impl FnOnce()) -> bool 
 }
 
 /// Whether `stream` reached another socket than its own; one that reached
-/// itself is reset as it closes.
+/// itself is reset as it closes. Only addresses both known and equal say it
+/// reached itself: a peer that already reset leaves its address unknown,
+/// and still answered.
 pub(super) fn reached_another(stream: TcpStream) -> bool {
-    let itself = stream.local_addr().ok() == stream.peer_addr().ok();
+    let itself = matches!(
+        (stream.local_addr(), stream.peer_addr()),
+        (Ok(local), Ok(peer)) if local == peer
+    );
     if itself {
         // A linger of zero makes the close a reset, which skips TIME-WAIT.
         let _ = rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO));

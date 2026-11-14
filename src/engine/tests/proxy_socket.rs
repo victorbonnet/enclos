@@ -154,6 +154,16 @@ fn assert_nothing_listens(port: u16) {
     }
 }
 
+/// The control for [`assert_nothing_listens`]: a listener on the port fails
+/// it. The listener's port is outside the proxy range, so no proxy test
+/// shares it.
+#[test]
+#[should_panic(expected = "something listens on 127.0.0.1:")]
+fn a_listener_on_the_port_fails_the_check_that_nothing_listens() {
+    let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+    assert_nothing_listens(listener.local_addr().unwrap().port());
+}
+
 impl Drop for ProxyChild {
     fn drop(&mut self) {
         let _ = self.child.kill();
