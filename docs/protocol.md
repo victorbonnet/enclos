@@ -99,6 +99,7 @@ The bridge runs outside the sandbox, and everything in the sandbox home is the s
 enclos://pair?v=1&host=<host name>&url=https://<host>.<tailnet>.ts.net&key=<bridge static key>&code=<one-time secret>&exp=<unix time>
 ```
 
+- `host`: the first label of the bridge's address: 1 to 63 letters, digits, `-`, `_` or `.`. A link with any other is refused, so a host's name never holds the `/` or `:` an app may join a host, a sandbox and an agent with.
 - `key`: the bridge's static X25519 public key, base64url, which the app pins.
 - `code`: 128 random bits, base64url, single use, valid until `exp` (5 minutes).
 

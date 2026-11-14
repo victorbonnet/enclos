@@ -54,9 +54,23 @@ fn plain(value: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
 }
 
+/// The longest host name a link carries: a DNS label's.
+pub const MAX_HOST_NAME: usize = 63;
+
+/// Whether `host` is a host name a link may carry: what `enclos app pair`
+/// writes, the first label of the bridge's address. Never a `/` or a `:`,
+/// so a host's name cannot pass for a host and a sandbox together where an
+/// app joins them into one address.
+pub fn host_name(host: &str) -> bool {
+    (1..=MAX_HOST_NAME).contains(&host.len())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
 impl PairLink {
     pub fn to_link(&self) -> Result<String, PairingError> {
-        if !plain(&self.host) || !plain(&self.url) {
+        if !host_name(&self.host) || !plain(&self.url) {
             return Err(PairingError::BadLink(
                 "the host or the URL holds a character a pairing link does not carry".to_owned(),
             ));
@@ -125,6 +139,11 @@ impl PairLink {
         if link.key.len() != 32 || link.code.len() != 16 || !link.url.starts_with("https://") {
             return Err(PairingError::BadLink(
                 "its key, code or URL is not of the expected kind".to_owned(),
+            ));
+        }
+        if !host_name(&link.host) {
+            return Err(PairingError::BadLink(
+                "its host name is not one a host has".to_owned(),
             ));
         }
         Ok(link)
@@ -243,9 +262,21 @@ mod tests {
             good.replace("https://mac", "http://mac"),
             good.replace("&exp=1800000000", ""),
             good.replace("host=mac", "host=m%20c"),
+            // A name that would pass for host `mac` and sandbox `work`
+            // where an app joins them, an empty one, a too long one
+            good.replace("host=mac", "host=mac/work"),
+            good.replace("host=mac", "host=mac:8443"),
+            good.replace("host=mac", "host="),
+            good.replace(
+                "host=mac",
+                &format!("host={}", "m".repeat(MAX_HOST_NAME + 1)),
+            ),
         ] {
             assert!(PairLink::parse(&bad).is_err(), "{bad}");
         }
+        let mut slashed = link();
+        slashed.host = "mac/work".into();
+        assert!(slashed.to_link().is_err());
         let mut long_code = link();
         long_code.code = vec![1; 17];
         assert!(PairLink::parse(&long_code.to_link().unwrap()).is_err());

@@ -198,10 +198,13 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     store
         .add_pairing(&code, expires)
         .map_err(|e| failed(format!("cannot record the code: {e}")))?;
+    // The address's first label: never a port, which a link's host name
+    // cannot hold (`pairing::host_name`)
     let host = url
         .trim_start_matches("https://")
-        .split('.')
+        .split(['.', ':', '/'])
         .next()
+        .filter(|label| enclos_protocol::pairing::host_name(label))
         .unwrap_or("host")
         .to_owned();
     let link = PairLink {
