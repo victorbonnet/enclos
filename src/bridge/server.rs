@@ -318,7 +318,12 @@ impl Hub {
                             "completed"
                         }
                     ),
-                    Some(&sandbox),
+                    // Why, as the phone was told: kept for when no phone
+                    // was connected to hear it.
+                    Some(&match &failed {
+                        Some(why) => format!("{sandbox}: {why}"),
+                        None => sandbox.clone(),
+                    }),
                 );
             }
         });
@@ -3217,6 +3222,14 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             device.receive(),
             Some(ToDevice::SandboxesList { .. })
         ));
+        // The bridge's log keeps why, for when no phone was there to hear
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(eventually(|| store.log_lines(20).unwrap().iter().any(
+            |l| {
+                l.event == "runtime.install failed"
+                    && l.reason.as_deref() == Some("lab: installer refused the operation")
+            }
+        )));
         device.send(
             "duplicate-create",
             FromDevice::SandboxCreate {

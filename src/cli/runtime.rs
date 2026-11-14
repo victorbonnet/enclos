@@ -3,6 +3,7 @@
 //! `enclos connect` (ADR 0024).
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -30,6 +31,11 @@ enum RuntimeVerb {
         runtime: RuntimeKind,
         #[arg(long)]
         sandbox: SandboxName,
+        /// Stop the installer, and every process it started, once it has
+        /// run this many seconds, and fail the install: for the mobile
+        /// app's bridge, which runs this command with nobody watching.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        time_limit: Option<u64>,
     },
     /// Set an agent up with the runtime's own commands: it reads the
     /// secrets the policy grants it under [secrets.agents.<agent>], then
@@ -62,8 +68,12 @@ enum RuntimeVerb {
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
-    let (runtime, sandbox) = match args.verb {
-        RuntimeVerb::Install { runtime, sandbox } => (runtime, sandbox),
+    let (runtime, sandbox, limit) = match args.verb {
+        RuntimeVerb::Install {
+            runtime,
+            sandbox,
+            time_limit,
+        } => (runtime, sandbox, time_limit.map(Duration::from_secs)),
         RuntimeVerb::Configure {
             target,
             set,
@@ -79,7 +89,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             return configure(engine, by, confirm, target, channel, &set);
         }
     };
-    let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
+    let installed = match limit {
+        None => engine.install_runtime(by, &sandbox, runtime, confirm)?,
+        Some(limit) => engine.install_runtime_within(by, &sandbox, runtime, confirm, limit)?,
+    };
+    let end = match installed {
         Planned::DryRun(plan) => {
             output::show_plan(&plan);
             return Ok(exit::OK);
@@ -89,10 +103,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     let shown = runtime.display_name();
     // How the installer ended, and what that leaves recorded: the same in
     // text and in JSON, since a policy left wider must be said.
-    let ended = match end.end.signal {
-        Some(signal) => format!("was ended by signal {signal}"),
-        None => format!("exited with {}", end.end.exit),
-    };
+    let ended = end.ended();
     let after = match end.recorded {
         Some(kept) => format!(
             "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
@@ -250,6 +261,30 @@ fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_install_may_be_given_a_time_limit_in_seconds() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let limit = |args: &[&str]| {
+            let parsed = Cli::try_parse_from(
+                ["enclos", "install", "hermes", "--sandbox", "lab"]
+                    .iter()
+                    .chain(args),
+            )
+            .unwrap();
+            let RuntimeVerb::Install { time_limit, .. } = parsed.args.verb else {
+                panic!("not an install");
+            };
+            time_limit
+        };
+        assert_eq!(limit(&[]), None);
+        assert_eq!(limit(&["--time-limit=3600"]), Some(3600));
+    }
 
     #[test]
     fn a_target_is_a_sandbox_or_one_of_its_agents() {

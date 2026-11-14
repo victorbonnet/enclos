@@ -4,10 +4,12 @@
 //! the runtime's own command, through `enclos connect` (ADR 0024).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
-use super::session::SessionEnd;
+use super::service::STOP_GRACE;
+use super::session::{END_WAIT, SessionEnd, spoken};
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -36,6 +38,31 @@ pub struct InstallEnd {
     /// What a person runs in the sandbox to log `kind` in and set it up,
     /// even after a failed install.
     pub login: String,
+    /// The install's time limit, when its installer was still running then
+    /// and was stopped: the install failed.
+    pub stopped_after: Option<Duration>,
+}
+
+/// How long an install whose installer runs past its time limit
+/// ([`Engine::install_runtime_within`]) may take after it to stop it and
+/// record that: TERM then KILL, `STOP_GRACE` each, to the session's
+/// members, the same to what they left running, the session's end, which
+/// waits for the state lock up to `END_WAIT`, then the undo, with a minute
+/// to spare.
+pub const INSTALL_STOP_TIME: Duration =
+    Duration::from_secs(4 * STOP_GRACE.as_secs() + END_WAIT.as_secs() + 60);
+
+impl InstallEnd {
+    /// How the installer ended, as a person reads it after "the installer".
+    pub fn ended(&self) -> String {
+        match (self.stopped_after, self.end.signal) {
+            (Some(limit), _) => {
+                format!("did not finish within {} and was stopped", spoken(limit))
+            }
+            (None, Some(signal)) => format!("was ended by signal {signal}"),
+            (None, None) => format!("exited with {}", self.end.exit),
+        }
+    }
 }
 
 /// What an install would change, worked out without changing anything.
@@ -96,6 +123,24 @@ impl Engine {
         self.install_runtime_with(by, name, adapter(kind).as_ref(), confirm)
     }
 
+    /// [`Engine::install_runtime`], for a caller nobody watches, such as
+    /// the mobile app's bridge: an installer still running after `limit`
+    /// is stopped, with every process it started whatever its process
+    /// group, its session's end is recorded, and the install fails, undone
+    /// as when the installer exits non-zero. This takes up to
+    /// [`INSTALL_STOP_TIME`] more.
+    pub fn install_runtime_within(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        kind: RuntimeKind,
+        confirm: Confirm,
+        limit: Duration,
+    ) -> Result<Planned<InstallEnd>> {
+        let runtime = adapter(kind);
+        self.install_runtime_limited(by, name, runtime.as_ref(), confirm, Some(limit))
+    }
+
     /// `install_runtime` with the adapter given, so tests can install from
     /// a file of their own.
     pub(crate) fn install_runtime_with(
@@ -104,6 +149,18 @@ impl Engine {
         name: &SandboxName,
         runtime: &dyn RuntimeAdapter,
         confirm: Confirm,
+    ) -> Result<Planned<InstallEnd>> {
+        self.install_runtime_limited(by, name, runtime, confirm, None)
+    }
+
+    /// `install_runtime_with`, stopping the installer after `limit`.
+    pub(crate) fn install_runtime_limited(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        confirm: Confirm,
+        limit: Option<Duration>,
     ) -> Result<Planned<InstallEnd>> {
         let kind = runtime.kind();
         let plan = self.plan_install(name, runtime)?;
@@ -132,24 +189,37 @@ impl Engine {
                 self.save_policy_for_runtime(lock, by, name, &plan.overrides, Some(kind))
             },
         )?;
-        let end = match self.run_in_sandbox(by, name, command, "runtime installer") {
-            Ok(end) => end,
+        let ran = match limit {
+            None => self
+                .run_in_sandbox(by, name, command, "runtime installer")
+                .map(|end| (end, false)),
+            Some(limit) => {
+                self.run_in_sandbox_within(by, name, command, "runtime installer", limit)
+            }
+        };
+        let (end, timed_out) = match ran {
+            Ok(ran) => ran,
             Err(e) => {
                 self.undo_install(by, name, kind, &e.to_string())?;
                 return Err(e);
             }
         };
-        if end.exit != 0 {
-            let why = format!("the installer exited with {}", end.exit);
-            let (policy, recorded) = self.undo_install(by, name, kind, &why)?;
-            return Ok(Planned::Done(InstallEnd {
+        // Told to end, it failed, even if it then exited 0: it may have
+        // trapped TERM and stopped halfway.
+        let stopped_after = limit.filter(|_| timed_out);
+        if end.exit != 0 || stopped_after.is_some() {
+            let mut failed = InstallEnd {
                 kind,
                 end,
                 installed: false,
-                recorded,
-                policy,
+                recorded: None,
+                policy: 0,
                 login: runtime.login(),
-            }));
+                stopped_after,
+            };
+            let why = format!("the installer {}", failed.ended());
+            (failed.policy, failed.recorded) = self.undo_install(by, name, kind, &why)?;
+            return Ok(Planned::Done(failed));
         }
         self.write(
             by,
@@ -180,6 +250,7 @@ impl Engine {
             recorded: Some(kind),
             policy: version.version,
             login: runtime.login(),
+            stopped_after: None,
         }))
     }
 
