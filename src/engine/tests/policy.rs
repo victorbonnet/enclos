@@ -5,7 +5,7 @@ use super::*;
 use crate::model::sandbox::SandboxName;
 
 /// An initialized engine with sandbox `home`, created as the CLI does.
-pub(super) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
+pub(crate) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
     with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt))
 }
 

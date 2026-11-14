@@ -973,7 +973,8 @@ impl Hub {
                         let id = conversation.as_str();
                         if approvals::speaks_in(&store, &agent, id) {
                             // Refused or not, the plugin is answered, so its outbox
-                            // does not send the same request again forever.
+                            // does not send the same request again forever, and its
+                            // tool tells the agent why.
                             if let Err(e) =
                                 hub.request_access(&store, &agent, Some(id), access, &action)
                             {
@@ -2338,6 +2339,16 @@ fn run_session(
                         of: Some(message.id),
                         code: ErrorCode::BadMessage,
                         message: why,
+                    }))?,
+                }
+            }
+            FromDevice::ApprovalClose { request } => {
+                match hub.close_access(store, device, person, &request) {
+                    Ok(()) => link.send(ToDevice::Ack { of: message.id })?,
+                    Err(e) => link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::NotAllowed,
+                        message: e,
                     }))?,
                 }
             }
