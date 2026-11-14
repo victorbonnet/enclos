@@ -49,6 +49,83 @@ fn refused(what: impl Into<String>) -> Error {
 /// addresses an agent may ask for from the phone (ADR 0046).
 const LOCAL_NAME_SUFFIXES: &[&str] = &[".local", ".home.arpa", ".internal", ".lan"];
 
+/// Folders under the user's home that hold code or settings the host runs
+/// outside any sandbox: macOS's `Library` (launch agents, editor and IDE
+/// settings), apps, and the usual personal `bin` folders.
+const HOME_RUN_FOLDERS: &[&str] = &["Library", "Applications", "bin", "go/bin"];
+
+/// Whether `a` is, or is inside, `b`. On macOS without case: its usual file
+/// system does not tell `~/library` from `~/Library`, and a folder that does
+/// not exist yet keeps the case the agent wrote.
+fn within(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if cfg!(target_os = "macos") {
+        let lower =
+            |p: &std::path::Path| std::path::PathBuf::from(p.to_string_lossy().to_lowercase());
+        lower(a).starts_with(lower(b))
+    } else {
+        a.starts_with(b)
+    }
+}
+
+/// Why a writable path an agent asks for lets the agent run code on the
+/// host, if it does: the path is, holds or is inside a place the host reads
+/// settings or programs from (ADR 0046). The preview leads with it, so this
+/// grant does not read like an ordinary project folder's. Approval does not
+/// refuse it: the host's person decides, as in the policy editor. `target`
+/// and `home` are real paths; `path` is the host's `PATH`.
+pub(crate) fn write_risk(
+    target: &std::path::Path,
+    home: &std::path::Path,
+    path: &[std::path::PathBuf],
+) -> Option<String> {
+    use std::path::{Component, Path};
+    let runs = "what an agent writes there can run as you, outside the sandbox";
+    if let Ok(rest) = target.strip_prefix(home) {
+        if rest.components().any(|c| match c {
+            Component::Normal(part) => part.to_string_lossy().starts_with('.'),
+            _ => false,
+        }) {
+            return Some(format!(
+                "{} is or is inside a hidden file or folder, where shell startup files and git, editor and tool settings live: {runs}.",
+                target.display()
+            ));
+        }
+        // Both ways: a grant on `~/go` covers `~/go/bin`.
+        if let Some(folder) = HOME_RUN_FOLDERS
+            .iter()
+            .find(|f| within(rest, Path::new(f)) || within(Path::new(f), rest))
+        {
+            return Some(format!(
+                "{} is, holds or is inside ~/{folder}, which holds programs or settings the host runs: {runs}.",
+                target.display()
+            ));
+        }
+    }
+    if let Some(folder) = path
+        .iter()
+        .find(|p| p.is_absolute() && (within(target, p) || within(p, target)))
+    {
+        return Some(format!(
+            "{} is, holds or is inside {}, a folder on the host's PATH: an agent could replace programs the host runs, outside the sandbox.",
+            target.display(),
+            folder.display()
+        ));
+    }
+    None
+}
+
+/// The host's `PATH`, each folder as a real path.
+fn host_path() -> Vec<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .filter(|p| p.is_absolute())
+                .map(|p| crate::policy::paths::real_path(&p))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl Engine {
     pub fn deny_access(&self, by: &Actor, name: &SandboxName, id: &str) -> Result<()> {
         self.write(
@@ -101,7 +178,7 @@ impl Engine {
                 };
                 if access.private && local_name == Some(false) {
                     return Err(refused(format!(
-                        "From the phone, private addresses can be approved for an IP address or a local name ({}). {} is a public name its owner could point at your network later; grant it on the host with `enclos policy edit` if you mean it.",
+                        "From the phone, private addresses can be approved for an IP address or a local name ({}). {} is a public name its owner could point at your network later; add it in the app's policy editor or with `enclos policy edit` on the host if you mean it.",
                         LOCAL_NAME_SUFFIXES.join(", "),
                         entry.host_text()
                     )));
@@ -155,9 +232,20 @@ impl Engine {
                 // Store the resolved destination: changing a symlink after approval cannot
                 // redirect the persistent grant to another host folder.
                 let real = crate::policy::paths::real_path(path);
-                // The host's person reviews the grant, just as in the app's
-                // policy editor. The shared policy validator below holds the
-                // protected paths and backend restrictions on either surface.
+                // The host's person reviews the grant, as in the app's policy
+                // editor, and the shared validator below holds the protected
+                // paths and backend restrictions. One narrowing is the
+                // agent's alone: the home folder, or a folder holding it,
+                // would let it change everything there in one approval, and
+                // only enclos's own folders inside it would otherwise stop it.
+                let home = crate::policy::paths::real_path(self.layout.user_home());
+                if within(&home, &real) {
+                    return Err(refused(format!(
+                        "{} is your home folder or holds it, so approving it would let every agent change everything in your home folder. Only a folder inside it can be approved here.",
+                        real.display()
+                    )));
+                }
+                let risk = write_risk(&real, &home, &host_path());
                 let target = real.display().to_string();
                 scope = target.clone();
                 if !expected.fs.write.contains(&target) {
@@ -165,7 +253,8 @@ impl Engine {
                     expected.fs.write.push(target.clone());
                 }
                 format!(
-                    "Allow every agent in {name} to create, change or delete files at {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
+                    "{}Allow every agent in {name} to create, change or delete files at {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval.",
+                    risk.map(|r| format!("Warning: {r} ")).unwrap_or_default()
                 )
             }
             AccessKind::Read => {

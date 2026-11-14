@@ -19,6 +19,13 @@ pub(super) fn with_sandbox_under(
     root: &super::Root,
 ) -> (TempDir, Engine, SandboxName) {
     let (dir, engine) = engine_under(vec![Box::new(backend)], root);
+    let name = home_sandbox(&engine);
+    (dir, engine, name)
+}
+
+/// Sets enclos up on `engine` and creates the `home` sandbox from the
+/// `assistant` template.
+pub(super) fn home_sandbox(engine: &Engine) -> SandboxName {
     done(engine.init(&alice(), Confirm::Yes).unwrap());
     let name: SandboxName = "home".parse().unwrap();
     let spec = crate::engine::SandboxSpec {
@@ -27,7 +34,7 @@ pub(super) fn with_sandbox_under(
         template: "assistant".parse().unwrap(),
     };
     done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
-    (dir, engine, name)
+    name
 }
 
 /// What a grant over the folder the user's manager reads units from would
