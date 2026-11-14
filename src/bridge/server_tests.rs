@@ -51,7 +51,8 @@ fn a_file_replaced_since_it_was_read_is_not_removed() {
     let (_dir, home, inbox, media) = folders();
     std::fs::write(inbox.join("a1.png"), b"\x89PNG").unwrap();
     let taken = take_attachment(&home, &media, "c-1", &out("a1.png")).unwrap();
-    std::fs::remove_file(inbox.join("a1.png")).unwrap();
+    // Moved aside, not removed: Linux would give a new file its inode.
+    std::fs::rename(inbox.join("a1.png"), inbox.join("read.png")).unwrap();
     std::fs::write(inbox.join("a1.png"), b"another").unwrap();
     taken.release();
     assert_eq!(std::fs::read(inbox.join("a1.png")).unwrap(), b"another");
