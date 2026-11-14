@@ -122,7 +122,10 @@ fn details_that_leave_no_room_are_refused() {
         name: "n".to_owned(),
         size: 1,
     }];
-    assert!(pieces(&MessageId::new("m-1").unwrap(), &message).is_err());
+    assert_eq!(
+        pieces(&MessageId::new("m-1").unwrap(), &message),
+        Err(NO_ROOM.to_owned())
+    );
 }
 
 fn out(file: &str) -> OutAttachment {

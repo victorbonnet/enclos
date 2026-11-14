@@ -299,9 +299,9 @@ impl Layout {
         self.data.join("app-approvals.key")
     }
 
-    /// The files of the bridge's messages, one per attachment id: what
-    /// agents sent to people and what people sent to agents. For the host
-    /// alone: a sandbox that read it would read other sandboxes' files.
+    /// The files agents sent with their messages (and those an import
+    /// restores), one per attachment id. For the host alone: a sandbox that
+    /// read it would read other sandboxes' files.
     pub fn app_media(&self) -> PathBuf {
         self.data.join(APP_MEDIA_DIR)
     }

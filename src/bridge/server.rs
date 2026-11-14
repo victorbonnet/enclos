@@ -831,6 +831,18 @@ impl Hub {
                             Ok(_) => {
                                 let _ = acks.ack(&message.id);
                             }
+                            // Sent again, it would be refused again
+                            Err(e) if e == NO_ROOM => {
+                                eprintln!("enclos app: {agent}: a message is refused: {e}");
+                                let _ = acks.send(FromBridge::Error(
+                                    enclos_protocol::plugin::ErrorBody {
+                                        of: Some(message.id.clone()),
+                                        code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                                        message: NO_ROOM.into(),
+                                    },
+                                ));
+                                let _ = acks.ack(&message.id);
+                            }
                             Err(e) => eprintln!("enclos app: {agent}: {e}"),
                         }
                         // The member's reply ended its turn: the next turn
@@ -1078,7 +1090,7 @@ pub fn pieces(
         ..message.clone()
     });
     if !fits_device(&bare) {
-        return Err("the message's details do not fit a device message".to_owned());
+        return Err(NO_ROOM.to_owned());
     }
     split_text(message)
         .into_iter()
@@ -1092,6 +1104,11 @@ pub fn pieces(
         })
         .collect()
 }
+
+/// Why [`pieces`] refuses a message: its other fields leave no room for
+/// text in a device message. The plugin is told (`bad_message`), and the
+/// message acknowledged, so it is not sent again at every connection.
+const NO_ROOM: &str = "the message's details leave no room for its text in a device message";
 
 /// Whether `body` fits one device-leg message once sealed, with an id as
 /// long as [`new_id`] makes.
@@ -1635,7 +1652,8 @@ fn connection(
             Err(e) => return Err(e),
         }
     };
-    // In time: what follows (a pairing the person confirms) has no deadline
+    // In time: what follows is under its own bounds, not this deadline (a
+    // pairing the person confirms waits at most PAIRING_WAIT)
     drop(first_message_due);
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
