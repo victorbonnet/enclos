@@ -49,98 +49,6 @@ fn refused(what: impl Into<String>) -> Error {
 /// addresses an agent may ask for from the phone (ADR 0046).
 const LOCAL_NAME_SUFFIXES: &[&str] = &[".local", ".home.arpa", ".internal", ".lan"];
 
-/// Folders under the user's home that hold code or settings the host runs
-/// outside any sandbox: macOS's `Library` (launch agents, editor and IDE
-/// settings), apps, and the usual personal `bin` folders.
-const HOME_REFUSED: &[&str] = &["Library", "Applications", "bin", "go/bin"];
-
-/// Whether `a` is, or is inside, `b`. On macOS without case: its usual file
-/// system does not tell `~/library` from `~/Library`, and a folder that does
-/// not exist yet keeps the case the agent wrote.
-fn within(a: &std::path::Path, b: &std::path::Path) -> bool {
-    if cfg!(target_os = "macos") {
-        let lower =
-            |p: &std::path::Path| std::path::PathBuf::from(p.to_string_lossy().to_lowercase());
-        lower(a).starts_with(lower(b))
-    } else {
-        a.starts_with(b)
-    }
-}
-
-/// Why an agent-proposed write scope cannot be approved from the phone, if
-/// it cannot (ADR 0046). `target` and `home` are real paths; `path` is the
-/// host's `PATH`. The host's own `enclos policy edit` is not narrowed: there
-/// the person writes the path, here the agent does.
-pub(crate) fn phone_write_refusal(
-    target: &std::path::Path,
-    home: &std::path::Path,
-    path: &[std::path::PathBuf],
-) -> Option<String> {
-    use std::path::{Component, Path};
-    let on_host = "; grant it on the host with `enclos policy edit` if you mean it";
-    let below = |root: &Path, depth: usize| {
-        target
-            .strip_prefix(root)
-            .ok()
-            .filter(|rest| rest.components().count() >= depth)
-            .map(Path::to_owned)
-    };
-    // A folder inside the home, or on an external volume: never the system's.
-    let Some(rest) = below(home, 1)
-        .or_else(|| below(Path::new("/Volumes"), 2))
-        .or_else(|| below(Path::new("/mnt"), 2))
-        .or_else(|| below(Path::new("/media"), 3))
-    else {
-        return Some(format!(
-            "{} is outside your home folder and external volumes{on_host}",
-            target.display()
-        ));
-    };
-    if rest.components().any(|c| match c {
-        Component::Normal(part) => part.to_string_lossy().starts_with('.'),
-        _ => false,
-    }) {
-        return Some(format!(
-            "{} is or is inside a hidden file or folder, where shell startup files, git, editor and tool settings live and run outside the sandbox{on_host}",
-            target.display()
-        ));
-    }
-    // Both ways: a grant on `~/go` covers `~/go/bin`.
-    if target.starts_with(home)
-        && let Some(folder) = HOME_REFUSED
-            .iter()
-            .find(|f| within(&rest, Path::new(f)) || within(Path::new(f), &rest))
-    {
-        return Some(format!(
-            "{} is, holds or is inside ~/{folder}, which holds programs or settings the host runs outside the sandbox{on_host}",
-            target.display()
-        ));
-    }
-    if let Some(folder) = path
-        .iter()
-        .find(|p| p.is_absolute() && (within(target, p) || within(p, target)))
-    {
-        return Some(format!(
-            "{} is, holds or is inside {}, a folder on the host's PATH, whose programs run outside the sandbox{on_host}",
-            target.display(),
-            folder.display()
-        ));
-    }
-    None
-}
-
-/// The host's `PATH`, each folder as a real path.
-fn host_path() -> Vec<std::path::PathBuf> {
-    std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .filter(|p| p.is_absolute())
-                .map(|p| crate::policy::paths::real_path(&p))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 impl Engine {
     pub fn deny_access(&self, by: &Actor, name: &SandboxName, id: &str) -> Result<()> {
         self.write(
@@ -247,10 +155,9 @@ impl Engine {
                 // Store the resolved destination: changing a symlink after approval cannot
                 // redirect the persistent grant to another host folder.
                 let real = crate::policy::paths::real_path(path);
-                let home = crate::policy::paths::real_path(self.layout.user_home());
-                if let Some(why) = phone_write_refusal(&real, &home, &host_path()) {
-                    return Err(refused(format!("{why}.")));
-                }
+                // The host's person reviews the grant, just as in the app's
+                // policy editor. The shared policy validator below holds the
+                // protected paths and backend restrictions on either surface.
                 let target = real.display().to_string();
                 scope = target.clone();
                 if !expected.fs.write.contains(&target) {
@@ -258,7 +165,7 @@ impl Engine {
                     expected.fs.write.push(target.clone());
                 }
                 format!(
-                    "Allow every agent in {name} to write {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
+                    "Allow every agent in {name} to create, change or delete files at {target} and everything beneath it, hidden files and folders included (such as .git, .envrc or .vscode), which tools on the host may read and run outside the sandbox. A running sandbox restarts to apply it. Future writes in this scope need no further approval."
                 )
             }
             AccessKind::Read => {
