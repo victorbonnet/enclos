@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    GroupState, MemberTurn, ToDevice, commands_for_devices, decode_from_device, split_text,
+    GroupState, MAX_DEVICE_MESSAGE, MemberTurn, ToDevice, commands_for_devices, decode_from_device,
+    split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
@@ -960,20 +961,7 @@ impl Hub {
         home: &Path,
         from: &From,
     ) -> Result<Option<i64>, String> {
-        // Measured with its files' details, which the first piece carries
-        let measured = ConversationMessage {
-            attachments: attachments
-                .iter()
-                .map(|a| Attachment {
-                    id: "f".repeat(36),
-                    mime: a.mime.clone(),
-                    name: a.name.clone(),
-                    size: a.size,
-                })
-                .collect(),
-            ..whole.clone()
-        };
-        let pieces = pieces(id, &measured)?;
+        let pieces = pieces(id, &measured(&whole, attachments))?;
         let conversation = whole.conversation.as_str();
         let Some(seqs) = store
             .add_pieces(&pieces, conversation, from, &whole.kind)
@@ -1075,6 +1063,16 @@ pub fn pieces(
     id: &MessageId,
     message: &ConversationMessage,
 ) -> Result<Vec<(String, String)>, String> {
+    // Every piece carries the rest of the message: when that alone leaves
+    // no room, no split fits, and the text would go one character a piece.
+    let bare = ToDevice::Message(ConversationMessage {
+        text: "x".to_owned(),
+        seq: i64::MAX,
+        ..message.clone()
+    });
+    if !fits_device(&bare) {
+        return Err("the message's details do not fit a device message".to_owned());
+    }
     split_text(message)
         .into_iter()
         .enumerate()
@@ -1086,6 +1084,34 @@ pub fn pieces(
             Ok((piece_id, text))
         })
         .collect()
+}
+
+/// Whether `body` fits one device-leg message once sealed, with an id as
+/// long as [`new_id`] makes.
+fn fits_device(body: &ToDevice) -> bool {
+    let id = MessageId::new("f".repeat(36)).expect("a valid id");
+    encode_line(&Envelope::new(id, body.clone())).len() <= MAX_DEVICE_MESSAGE
+}
+
+/// An agent's message as its first piece carries it, to measure: with the
+/// details of the files the bridge will take, as it will store them.
+fn measured(whole: &ConversationMessage, attachments: &[OutAttachment]) -> ConversationMessage {
+    ConversationMessage {
+        attachments: attachments
+            .iter()
+            .take(MAX_ATTACHMENTS)
+            .map(|a| {
+                let (mime, name) = stored_details(a);
+                Attachment {
+                    id: "f".repeat(36),
+                    mime,
+                    name,
+                    size: a.size,
+                }
+            })
+            .collect(),
+        ..whole.clone()
+    }
 }
 
 /// The longest tool label passed on, in characters, before its hidden
@@ -2111,7 +2137,7 @@ fn run_session(
                             question: current.info,
                         })?;
                     }
-                    link.send(ToDevice::Message(ConversationMessage {
+                    let body = ToDevice::Message(ConversationMessage {
                         question: m.question,
                         conversation: ConversationId::new(m.conversation)
                             .map_err(|e| e.to_string())?,
@@ -2126,7 +2152,20 @@ fn run_session(
                         time: m.at,
                         seq: m.seq,
                         attachments,
-                    }))?;
+                    });
+                    // One stored before its details were bounded, or
+                    // imported, is passed over rather than ending every
+                    // sync at it.
+                    if !fits_device(&body) {
+                        let _ = store.log(
+                            Some(&device.id),
+                            Some(person),
+                            "skipped",
+                            Some(&format!("message {} is too large for a device", m.id)),
+                        );
+                        continue;
+                    }
+                    link.send(body)?;
                 }
                 link.send(ToDevice::Synced { seq: last })?;
             }
@@ -2363,13 +2402,37 @@ fn take_attachment(
     {
         let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
     }
-    let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
-        !t.is_empty()
-            && !s.is_empty()
-            && a.mime
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
-    });
+    let (mime, name) = stored_details(a);
+    Ok(StoredAttachment {
+        id,
+        conversation: conversation.to_owned(),
+        mime,
+        name,
+        size: size as i64,
+    })
+}
+
+/// The longest media type kept, in bytes: RFC 6838 bounds a type and a
+/// subtype at 127 characters each.
+pub(super) const MAX_MIME_BYTES: usize = 255;
+
+/// The longest file name kept, in characters.
+pub(super) const MAX_ATTACHMENT_NAME_CHARS: usize = 120;
+
+/// The media type and name an agent's file is stored and shown with, so
+/// that its details stay small whatever the plugin sends: a media type
+/// that is not plain or is longer than [`MAX_MIME_BYTES`] becomes
+/// `application/octet-stream`, and the name loses its folders and hidden
+/// characters and keeps [`MAX_ATTACHMENT_NAME_CHARS`].
+fn stored_details(a: &OutAttachment) -> (String, String) {
+    let typed = a.mime.len() <= MAX_MIME_BYTES
+        && a.mime.split_once('/').is_some_and(|(t, s)| {
+            !t.is_empty()
+                && !s.is_empty()
+                && a.mime
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
+        });
     // The name titles the artefact card, the viewer and the Share sheet: a
     // bidirectional override or a line break in it would make the file read
     // as another type or another line, so hidden characters are dropped.
@@ -2378,21 +2441,19 @@ fn take_attachment(
         false,
     );
     let name = name.trim();
-    Ok(StoredAttachment {
-        id,
-        conversation: conversation.to_owned(),
-        mime: if typed {
+    let name = if name.is_empty() {
+        a.file.as_str()
+    } else {
+        name
+    };
+    (
+        if typed {
             a.mime.to_ascii_lowercase()
         } else {
             "application/octet-stream".to_owned()
         },
-        name: if name.is_empty() {
-            a.file.clone()
-        } else {
-            name.chars().take(120).collect()
-        },
-        size: size as i64,
-    })
+        name.chars().take(MAX_ATTACHMENT_NAME_CHARS).collect(),
+    )
 }
 
 /// The bytes of an attachment from `offset`, at most [`ATTACHMENT_CHUNK`],

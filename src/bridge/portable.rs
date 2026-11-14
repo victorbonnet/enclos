@@ -1,8 +1,10 @@
 //! Logical agent-owned history. Import allocates destination-local identifiers
 //! and sequences, and never recreates a pending action or a paired identity.
 use super::ids::new_id;
+use super::server::{MAX_ATTACHMENT_NAME_CHARS, MAX_MIME_BYTES};
 use super::store::{Store, home_id, is_home};
 use crate::model::secret::SecretValue;
+use enclos_protocol::device::MAX_DEVICE_MESSAGE;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +90,10 @@ pub struct Attachment {
     pub data: String,
 }
 
+/// The longest message kind, person or speaker an import takes, in bytes:
+/// far above any the bridge writes (a kind, a tailnet login, an agent).
+const MAX_LABEL_BYTES: usize = 512;
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -135,10 +141,18 @@ impl History {
         }
         let mut last = 0;
         for m in &self.messages {
+            // What the bridge stores always fits a device message; one that
+            // does not could only be made by hand, and would end every sync.
             if !id(&m.id)
                 || !cs.contains(&m.conversation)
                 || m.seq <= last
                 || m.question.as_ref().is_some_and(|q| !qs.contains(q))
+                || m.text.len() > MAX_DEVICE_MESSAGE
+                || m.kind.len() > MAX_LABEL_BYTES
+                || m.person.as_ref().is_some_and(|p| p.len() > MAX_LABEL_BYTES)
+                || m.speaker
+                    .as_ref()
+                    .is_some_and(|s| s.len() > MAX_LABEL_BYTES)
             {
                 return Err(invalid());
             }
@@ -159,6 +173,9 @@ impl History {
                 || !ms.contains(&a.message)
                 || !cs.contains(&a.conversation)
                 || a.data.len() > 25 * 1024 * 1024 * 4 / 3 + 4
+                || a.mime.len() > MAX_MIME_BYTES
+                || a.name.chars().count() > MAX_ATTACHMENT_NAME_CHARS
+                || enclos_protocol::visible::stripped(&a.name, false) != a.name
             {
                 return Err(invalid());
             }
@@ -586,6 +603,30 @@ mod tests {
         );
         history.attachments[0].id = "../escape".into();
         assert!(history.validate().is_err());
+    }
+    /// An archive can be edited by hand: a row the bridge would never store,
+    /// one no device message could carry, is refused rather than imported
+    /// to end every sync at it.
+    #[test]
+    fn an_import_refuses_rows_the_bridge_would_never_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_source, history) = source(dir.path());
+        history.validate().unwrap();
+        type Edit = fn(&mut History);
+        let edits: [Edit; 5] = [
+            |h| h.messages[0].text = "x".repeat(MAX_DEVICE_MESSAGE + 1),
+            |h| h.messages[0].kind = "k".repeat(MAX_LABEL_BYTES + 1),
+            |h| h.attachments[0].mime = format!("a/{}", "b".repeat(MAX_MIME_BYTES)),
+            |h| h.attachments[0].name = "n".repeat(MAX_ATTACHMENT_NAME_CHARS + 1),
+            |h| h.attachments[0].name = "report\u{202e}fdp.html".into(),
+        ];
+        for (n, edit) in edits.into_iter().enumerate() {
+            let each = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&each).unwrap();
+            let (_source, mut history) = source(&each);
+            edit(&mut history);
+            assert!(history.validate().is_err(), "edit {n}");
+        }
     }
     #[test]
     fn credentials_reject_reserved_variables_and_debug_redacts_values() {
