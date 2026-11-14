@@ -426,13 +426,13 @@ jobs:
           python3 -I -m unittest discover -s src/runtime/hermes/tests -v
 
   # The same tests against the latest Hermes, its default branch, never
-  # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`),
-  # and one that skips for want of it fails the job, so a Hermes change the
-  # plugin relies on shows here rather than in a gateway. It is in `ci-ok`
-  # on purpose: an upstream change that breaks the plugin blocks every PR
-  # until enclos is changed to fit it, since enclos follows the latest
-  # Hermes rather than pinning one. It runs Hermes's code, so neither
-  # checkout keeps the token.
+  # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`,
+  # and `ENCLOS_HERMES_APPROVAL_SOURCE` for the native runtime approvals),
+  # and one that skips fails the job, so a Hermes change the plugin relies on
+  # shows here rather than in a gateway. It is in `ci-ok` on purpose: an
+  # upstream change that breaks the plugin blocks every PR until enclos is
+  # changed to fit it, since enclos follows the latest Hermes rather than
+  # pinning one. It runs Hermes's code, so no checkout keeps the token.
   hermes-latest:
     runs-on: ubuntu-24.04
     steps:
@@ -444,19 +444,41 @@ jobs:
           repository: NousResearch/hermes-agent
           path: hermes-agent
           persist-credentials: false
+      # The one fixed revision, and on purpose: the last Hermes without the
+      # exact approval API (`resolve_gateway_approval_card`, added by the
+      # commit after it), for the test that an older runtime's approvals go
+      # as text (`ENCLOS_HERMES_LEGACY_SOURCE`). Only its source is read, with
+      # the latest Hermes's packages.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: c10474fbb6300d2634f063139dcb06c3c96fb6ef
+          path: hermes-legacy
+          persist-credentials: false
       - run: git -C hermes-agent log -1 --format='Hermes %H, %cI'
       # Hermes installs with uv, as Hermes itself does: from its own lock and
       # the overrides in its `[tool.uv]` (pip cannot resolve its pins without
       # them), with the Python its `.python-version` names.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv sync --frozen --no-dev --project hermes-agent
+      # `shell: bash` adds pipefail: without it the step took tee's status,
+      # and passed while tests failed. No test may skip here: the summary
+      # unittest writes after `Ran N tests` must be a bare `OK`, not
+      # `OK (skipped=N)`. It is read there, since a test's own output could
+      # be a line reading `OK`; the per-test `skipped` lines are only listed,
+      # since a test writing to stderr splits its line.
       - name: Run every test, the real-Hermes ones included
+        shell: bash
         env:
           ENCLOS_HERMES_SOURCE: ${{ github.workspace }}/hermes-agent
+          ENCLOS_HERMES_APPROVAL_SOURCE: ${{ github.workspace }}/hermes-agent
+          ENCLOS_HERMES_LEGACY_SOURCE: ${{ github.workspace }}/hermes-legacy
         run: |
           hermes-agent/.venv/bin/python -I -m unittest discover -s channels/hermes/tests -v 2>&1 | tee unittest.log
-          if grep -n "skipped 'optional \(real Hermes\|cryptography\)" unittest.log; then
-            echo "::error::a real-Hermes or signed-decision test skipped although Hermes is installed"
+          if ! grep -A2 '^Ran [0-9]* tests* in ' unittest.log | grep -qx 'OK'; then
+            grep -n ' \.\.\. skipped ' unittest.log || true
+            grep -A2 '^Ran [0-9]* tests* in ' unittest.log || true
+            echo "::error::the run is not a bare OK: a test skipped although Hermes is installed, or failed as expected"
             exit 1
           fi
 
