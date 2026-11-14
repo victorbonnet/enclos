@@ -840,21 +840,33 @@ impl Hub {
                             &home,
                             &from,
                         );
-                        match &stored {
-                            Ok(_) => {
-                                let _ = acks.ack(&message.id);
-                            }
-                            Err(e) => eprintln!("enclos app: {agent}: {e}"),
+                        if stored.is_ok() {
+                            let _ = acks.ack(&message.id);
                         }
                         // The member's reply ended its turn: the next turn
                         // starts. Its position stays at the last message it
                         // was given (a person's message sent while it worked
                         // is still to give it); its own reply is no news to
-                        // it (`Store::news_for`). The turn ended whatever the
-                        // store made of the reply (an id it had already, or a
-                        // failure): the discussion goes on all the same.
+                        // it (`Store::news_for`). The turn is replied once
+                        // the reply is stored (or was already); not stored,
+                        // it failed, so the reply the plugin sends again is
+                        // kept, as one to a failed turn. The discussion goes
+                        // on all the same.
                         if ends_turn {
+                            hub.turn_replied(
+                                &store,
+                                conversation.as_str(),
+                                &member,
+                                reply_to.as_ref().map(|r| r.as_str()),
+                                stored.is_ok(),
+                            );
                             hub.advance(&store, conversation.as_str());
+                        }
+                        // Not stored, so not acknowledged: the connection
+                        // ends, and the plugin sends it again within seconds.
+                        if let Err(e) = &stored {
+                            hub.kept_by_plugin(&agent, &acks, e);
+                            break;
                         }
                     }
                     FromPlugin::Ack { of } => {
@@ -4071,6 +4083,63 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 then(lines, out);
             }
         });
+    }
+
+    #[test]
+    fn a_message_the_bridge_could_not_store_comes_again_within_seconds() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        // The database refuses it, as a full disk would.
+        let database = rusqlite::Connection::open(&bridge.store).unwrap();
+        database
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON messages WHEN NEW.id = 'o-1'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let (told, heard) = std::sync::mpsc::channel();
+        plugin_that(&bridge.socket, move |mut lines, mut out| {
+            // What its outbox holds, sent after each hello.
+            let said = FromPlugin::MessageOut {
+                conversation: ConversationId::new("c-1").unwrap(),
+                text: "the answer".into(),
+                kind: OutKind::Reply,
+                reply_to: None,
+                attachments: vec![],
+            };
+            out.write_all(&encode_line(&Envelope::new(
+                MessageId::new("o-1").unwrap(),
+                said,
+            )))
+            .unwrap();
+            let mut line = Vec::new();
+            let mut acked = false;
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                if let Ok(message) = decode_from_bridge(&line)
+                    && let FromBridge::Ack { of } = message.body
+                    && of.as_str() == "o-1"
+                {
+                    acked = true;
+                    break;
+                }
+                line.clear();
+            }
+            let _ = told.send(acked);
+        });
+        // Not stored, not acknowledged, and the connection ends.
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)), Ok(false));
+        database.execute_batch("DROP TRIGGER refuse").unwrap();
+        // The bridge opens it again, and the plugin sends it again.
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)), Ok(true));
+        let stored = store.since(PERSON, 0).unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|m| m.id == "o-1" && m.text == "the answer"),
+            "{stored:?}"
+        );
     }
 
     #[test]

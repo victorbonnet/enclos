@@ -158,6 +158,36 @@ impl Hub {
         }
     }
 
+    /// `member`'s reply to plugin message `sent`, which ended its turn in
+    /// group `id`, was `stored` or not. Stored, the turn is replied. Not
+    /// stored (the database failed), the turn failed, as if no reply came:
+    /// the plugin sends the reply again, which is then kept as a reply to
+    /// a failed turn, and not dropped as one to a turn replied already.
+    pub(super) fn turn_replied(
+        &self,
+        store: &Store,
+        id: &str,
+        member: &str,
+        sent: Option<&str>,
+        stored: bool,
+    ) {
+        let Some(sent) = sent else { return };
+        let Ok(Some((turn, _, _))) = store.turn_sent(sent, id, member) else {
+            return;
+        };
+        if stored {
+            let _ = store.turn_status(&turn, "replied", None);
+            return;
+        }
+        let _ = store.turn_status(&turn, "failed", Some("its reply could not be stored"));
+        // group.state says so when the next turn starts (`advance`)
+        if let Some(d) = self.groups.lock().expect("not poisoned").get_mut(id)
+            && d.turns.get(member).is_some_and(|t| t == "replied")
+        {
+            d.turns.insert(member.to_owned(), "failed".to_owned());
+        }
+    }
+
     /// Whether `turn` is group `id`'s running turn.
     fn runs(&self, id: &str, turn: &str) -> bool {
         self.groups
@@ -198,10 +228,8 @@ impl Hub {
             let ended = d.replied(text, files, &handles);
             drop(groups);
             return match ended {
-                Ended::Replied => {
-                    let _ = store.turn_status(&turn, "replied", None);
-                    Some(true)
-                }
+                // Recorded replied once the reply is stored (`turn_replied`)
+                Ended::Replied => Some(true),
                 Ended::Passed => {
                     let _ = store.turn_status(&turn, "passed", None);
                     self.advance(store, id);
