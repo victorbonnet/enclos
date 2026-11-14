@@ -30,6 +30,12 @@ pub enum Error {
         "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
     )]
     SandboxHasServices { name: String },
+    /// A start ran while `sandbox stop` removed the services, and installed
+    /// them again: the stop changed nothing more.
+    #[error(
+        "sandbox `{name}` was started again while it stopped, and runs. Run `enclos sandbox stop {name}` again to stop it"
+    )]
+    StartedWhileStopping { name: String },
     /// A sandbox marked failed, by a stop that left members running or by
     /// a command that failed, still has sessions running; `rm` waits until
     /// they are gone.
@@ -424,6 +430,7 @@ impl Error {
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
             | Error::SandboxHasServices { .. }
+            | Error::StartedWhileStopping { .. }
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
