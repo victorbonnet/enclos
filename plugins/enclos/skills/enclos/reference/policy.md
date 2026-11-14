@@ -1,6 +1,6 @@
 # Policy: the templates and every setting
 
-From `docs/policy-compilation.md` in enclos's repository, as of enclos 0.4.0. Read a sandbox's own policy with `enclos policy show <sandbox>`; widen it with `enclos policy allow`, or edit it with `enclos policy edit` and `enclos policy apply`.
+From `docs/policy-compilation.md` in enclos's repository, as of enclos 0.5.0. Read a sandbox's own policy with `enclos policy show <sandbox>`; widen it with `enclos policy allow`, or edit it with `enclos policy edit` and `enclos policy apply`.
 
 ## The templates
 

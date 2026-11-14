@@ -1,6 +1,6 @@
 # enclos commands
 
-Every command of enclos 0.4.0, rendered from its own definitions; `enclos <command> --help` says the same. When `enclos --version` prints another version, read `--help` instead of this file.
+Every command of enclos 0.5.0, rendered from its own definitions; `enclos <command> --help` says the same. When `enclos --version` prints another version, read `--help` instead of this file.
 
 Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log
 

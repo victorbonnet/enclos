@@ -1,6 +1,6 @@
 # The mobile app protocol
 
-Status: **proposed, version 1 draft**, with [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md). This is the evolving contract of the mobile PR stack; each feature records its verification separately. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
+Status: **version 1, released with enclos 0.5.0.** The decisions behind it are still proposed, with [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md); each feature records its verification separately. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
 
 The protocol has two legs, one message format:
 
@@ -331,7 +331,7 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 
 ## Versions
 
-`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A new value of a field with a fixed set, such as a `message.out` `kind`, is a change an older peer would misread: a `kind` the receiver does not know is a version mismatch, not an optional addition. The bridge answers such a message `bad_message` and the plugin keeps it until an `ack`, so it would come back after every `hello`. `status` joined version 1 before any release: version 1 is not released yet, and the plugin and the bridge come in the same enclos binary. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
+`v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A new value of a field with a fixed set, such as a `message.out` `kind`, is a change an older peer would misread: a `kind` the receiver does not know is a version mismatch, not an optional addition. The bridge answers such a message `bad_message` and the plugin keeps it until an `ack`, so it would come back after every `hello`. `status` joined version 1 before its first release, in enclos 0.5.0; the plugin and the bridge come in the same enclos binary. From 0.5.0 on, such a change raises the version. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
 
 ## Sandbox policy requests
 
