@@ -8,6 +8,7 @@
 mod tests;
 
 use super::*;
+use crate::bridge::groups::is_pass;
 
 impl Hub {
     /// The person said `text` (message `seq`) in group `id`: a discussion
@@ -170,8 +171,8 @@ impl Hub {
     /// A message of `member`'s to group `id`, with `files` when it carries
     /// any: `Some(true)` for the reply that ends its running turn, to keep,
     /// then go on; `Some(false)` for one to keep (what it says before its
-    /// reply, or on its own); `None` for one to drop (a pass, or the reply
-    /// to a turn that was stopped).
+    /// reply, after it for the same turn, or on its own); `None` for one to
+    /// drop (a pass, or the reply to a turn that was stopped).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn group_reply(
         self: &Arc<Hub>,
@@ -215,18 +216,24 @@ impl Hub {
         if reply_to.is_some_and(|r| self.stops.lock().expect("not poisoned").remove(r)) {
             return None;
         }
-        // A reply to no running turn of its: kept only when its own turn
-        // in this group failed because the bridge restarted (the plugin
-        // sent it again since).
+        // A reply to no running turn of its own: what the member said, kept,
+        // unless the person stopped that turn, or it is a pass. Its turn
+        // ended with its first message; the others it sends for the same
+        // turn (Hermes sends a reply's files after its text, or the plugin
+        // sends again one the bridge could not store) are kept, and end no
+        // turn. One sent again under an id stored already is the store's
+        // to drop. Its turn failed (the bridge restarted, no reply in
+        // time): the reply that comes yet makes it replied.
         if kind == "reply"
             && let Some(sent) = reply_to
         {
             return match store.turn_sent(sent, id, member) {
+                Ok(Some((_, status, _))) if status == "cancelled" => None,
+                Ok(Some(_)) if is_pass(text) && !files => None,
                 Ok(Some((turn, status, _))) if status == "failed" => {
                     let _ = store.turn_status(&turn, "replied", None);
                     Some(false)
                 }
-                Ok(Some(_)) => None,
                 // Not a turn's: the member answered on its own.
                 _ => Some(false),
             };
