@@ -20,9 +20,12 @@ const MOUNT_CHANGED: &str = "Unable to apply mount flags: remount";
 
 /// As root: mounts a tmpfs at the folder named first, holds it `on`
 /// seconds, takes it away, waits `off` seconds, and again, as long as the
-/// file named second is there; then removes the folder.
+/// file named second is there; then removes the folder. Taking it away
+/// fails with `EBUSY` while something briefly holds the mount, as it did in
+/// about one run in twenty with sessions starting: that is tried again for
+/// up to five seconds.
 const CHURN: &str = r#"
-import ctypes, os, sys, time
+import ctypes, errno, os, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
 path, flag, on, off = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
 os.makedirs(path, exist_ok=True)
@@ -30,8 +33,12 @@ while os.path.exists(flag):
     if libc.mount(b"enclos-churn", path.encode(), b"tmpfs", 0, None) != 0:
         sys.exit("mount: " + os.strerror(ctypes.get_errno()))
     time.sleep(on)
-    if libc.umount2(path.encode(), 0) != 0:
-        sys.exit("umount: " + os.strerror(ctypes.get_errno()))
+    deadline = time.monotonic() + 5
+    while libc.umount2(path.encode(), 0) != 0:
+        error = ctypes.get_errno()
+        if error != errno.EBUSY or time.monotonic() > deadline:
+            sys.exit("umount: " + os.strerror(error))
+        time.sleep(0.001)
     time.sleep(off)
 os.rmdir(path)
 "#;
