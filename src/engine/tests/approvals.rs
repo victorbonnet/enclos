@@ -64,11 +64,12 @@ fn access_approval_write_paths_use_the_same_validation_as_the_policy_editor() {
     let home = dir.path();
     std::fs::create_dir_all(home.join("project/.git/hooks")).unwrap();
     let state = e.mobile_policy(&name).unwrap();
-    let mut library = home.join("Library/LaunchAgents");
+    // Not `LaunchAgents`, which the deny list hides, so the editor refuses it.
+    let mut library = home.join("Library/Developer");
     if cfg!(target_os = "macos") {
         // Not there yet, so it keeps the agent's case; macOS's usual file
         // system does not tell it from `Library`.
-        library = home.join("library/LaunchAgents");
+        library = home.join("library/Developer");
     }
     // Places the host runs programs or settings from, then ordinary folders.
     let risky = [
