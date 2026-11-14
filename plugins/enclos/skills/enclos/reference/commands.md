@@ -306,7 +306,7 @@ enclos agent rm [OPTIONS] <AGENT>
 
 ### `enclos app`
 
-The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, or chat with an agent through its app channel
+The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, push notifications, or chat with an agent through its app channel
 
 #### `enclos app chat`
 
@@ -386,6 +386,28 @@ enclos app log [OPTIONS]
 ```
 
 - `-n <LINES>`: How many lines, the newest last. Default: `50`.
+
+#### `enclos app push`
+
+Notifications on paired devices through FCM (ADR 0065): give the bridge a key to send with, or take it away
+
+##### `enclos app push key`
+
+Give the bridge the service-account key it sends pushes with: the JSON file Google Cloud gives, of a service account of the app's Firebase project allowed `cloudmessaging.messages.create` alone. It replaces any key given before; the running bridge takes it at its next push
+
+```text
+enclos app push key [OPTIONS] <FILE>
+```
+
+- `<FILE>`: The key file. Remove it once given: enclos keeps its own copy.
+
+##### `enclos app push off`
+
+Remove the bridge's push key: it sends no push from then on
+
+```text
+enclos app push off [OPTIONS]
+```
 
 ### `enclos policy`
 

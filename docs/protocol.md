@@ -308,15 +308,21 @@ Each entry has `seq`, `time` (Unix seconds), `user`, `host`, `command`, `target`
 
 ### Notifications
 
-Not built yet: the bridge sends no push. `enclos-protocol`'s `preview` seals and opens a preview as below; nothing in the bridge calls it, and no FCM client exists. The bridge will send with a service-account key its host's user gives it ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed), and the app shows no notification for a preview that does not open.
+The bridge sends through FCM's HTTP v1 API with a service-account key its host's user gives it with `enclos app push key` ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed). Without one it sends no push, and a device gets what came at its next sync.
 
-When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is
+A device gives its FCM token at pairing (`pair.request`'s `push`) and whenever it changes (`push.token`). The bridge keeps only a token of kind `fcm`, of at most 4,096 letters, digits and `-_:.`; it logs any other as `push token refused`.
+
+When an agent's message is stored for a conversation whose owner has no device connected, or a question or a runtime approval is asked there, the bridge sends a push to each of the owner's devices that gave a token. It is a high-priority data message, with no notification part of Google's, whose data are, all strings as FCM requires:
 
 ```json
-{"v":1,"host":"<host name>","seq":1234,"preview":"<base64url: nonce ‖ ciphertext>"}
+{"v":"1","host":"<host name>","seq":"1234","preview":"<base64url: nonce ‖ ciphertext>"}
 ```
 
-`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`, padded to 2,048 bytes (the byte `0x80`, then zeros) so its length does not tell the text's. Its associated data are `v`, `host` and `seq`, so a preview opens only with the ones it was sealed with: one kept by the push service cannot come back under another `seq`. The app drops a `seq` it has already shown. Google sees the host's name, a number and ciphertext of one size. The app decrypts it, shows the notification, and fetches the message with `sync` over the tailnet when it can.
+`host` is the name `enclos app pair` gives the host in its links, from the same address. `seq` is the message's (the last piece's, for a message stored in several). Pushes waiting together go once per device, the newest.
+
+`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`, padded to 2,048 bytes (the byte `0x80`, then zeros) so its length does not tell the text's. The text is the message on one line, without hidden characters and with its markdown marks, which the app takes out. Its associated data are `v`, `host` and `seq`, so a preview opens only with the ones it was sealed with: one kept by the push service cannot come back under another `seq`. Google sees the host's name, a number and ciphertext of one size. The app opens it with the `push_key` of each host it paired with, under the push's own `host`; it shows no notification for a preview that opens under none, and drops a `seq` it has already shown. It shows the notification, and fetches the message with `sync` over the tailnet when it can.
+
+The bridge keeps what became of the last push to each device. When FCM no longer knows a token (`UNREGISTERED`), the bridge forgets it until the device gives a new one and logs `push token dropped`. When a push fails, `enclos app status` shows why for that device; the bridge logs `push failed` when the reason changes, and `push working` once one goes through again.
 
 ## Capabilities
 

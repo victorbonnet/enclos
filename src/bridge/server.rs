@@ -229,6 +229,9 @@ struct Hub {
     /// 0060, proposed), which the plugin checks; without it the bridge
     /// passes on no runtime-approval decision.
     approval_key: Option<enclos_protocol::decision::DecisionKey>,
+    /// Where pushes go (ADR 0065, proposed), and the host's name in each;
+    /// none in tests that do not ask for it.
+    push: Option<(super::push::Pusher, String)>,
 }
 
 /// Where a connected device's messages go: the person it speaks for, its
@@ -461,6 +464,7 @@ impl Hub {
             refusals: Mutex::new(HashMap::new()),
             silence,
             approval_key: None,
+            push: None,
         }
     }
 
@@ -469,6 +473,71 @@ impl Hub {
         Hub {
             approval_key: Some(key),
             ..self
+        }
+    }
+
+    /// The hub, pushing through `pusher` as host `host`.
+    fn with_push(self, pusher: super::push::Pusher, host: String) -> Hub {
+        Hub {
+            push: Some((pusher, host)),
+            ..self
+        }
+    }
+
+    /// Pushes message `seq` of `conversation`, `text` by `agent`, to each
+    /// device of `person` that gave a push token, when none of their
+    /// devices is connected (`docs/protocol.md`, Notifications): a
+    /// connected one has the message already.
+    pub(super) fn push_if_away(
+        &self,
+        store: &Store,
+        person: &str,
+        agent: &str,
+        conversation: &str,
+        seq: i64,
+        text: &str,
+    ) {
+        let Some((pusher, _)) = &self.push else {
+            return;
+        };
+        if self
+            .devices
+            .lock()
+            .expect("not poisoned")
+            .values()
+            .any(|(owner, _, _)| owner == person)
+        {
+            return;
+        }
+        let preview = serde_json::json!({
+            "agent": agent,
+            "conversation": conversation,
+            "text": super::store::preview_text(text),
+        })
+        .to_string()
+        .into_bytes();
+        let devices = match store.devices() {
+            Ok(devices) => devices,
+            Err(e) => {
+                eprintln!("enclos app: no push for {conversation}: cannot read the devices: {e}");
+                return;
+            }
+        };
+        for device in devices {
+            if device.person != person {
+                continue;
+            }
+            let Some(token) = device.push_token else {
+                continue;
+            };
+            pusher.push(super::push::Job {
+                device: device.id,
+                person: device.person,
+                token,
+                push_key: device.push_key,
+                seq,
+                preview: preview.clone(),
+            });
         }
     }
 
@@ -1240,6 +1309,9 @@ impl Hub {
         let last = seqs.last().copied();
         let mut files: Vec<Attachment> = stored.into_iter().map(attachment_info).collect();
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
+            if let Some(last) = last {
+                self.push_if_away(store, &owner, &whole.agent, conversation, last, &whole.text);
+            }
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
                 self.deliver(
                     &owner,
@@ -1569,6 +1641,7 @@ pub fn serve(
     approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
     provisioning: Host,
+    push: Push,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     if let Ok(store) = Store::open(&store_path)
@@ -1578,6 +1651,11 @@ pub fn serve(
             "enclos app: no device is paired yet: the first one paired with `enclos app pair` names the host's person, whose each agent's Home is"
         );
     }
+    let pusher = super::push::Pusher::start(
+        Box::new(super::push::Fcm::new(push.key)),
+        push.host.clone(),
+        store_path.clone(),
+    );
     let hub = Arc::new(
         Hub::new(
             transport,
@@ -1590,10 +1668,19 @@ pub fn serve(
             SILENCE,
         )
         .with_approval_key(approval_key)
-        .with_provisioning(provisioning),
+        .with_provisioning(provisioning)
+        .with_push(pusher, push.host),
     );
     serve_on(listener, hub, RETRY);
     Ok(())
+}
+
+/// How the bridge pushes (ADR 0065, proposed): the file of the key it
+/// sends with, read whenever it changes, and the host's name, which each
+/// push carries and its preview is bound to.
+pub struct Push {
+    pub key: PathBuf,
+    pub host: String,
 }
 
 /// Tries every `retry` to give agents the messages pending for them, and
@@ -2305,7 +2392,11 @@ fn pair(
         noise_key: noise_key.to_vec(),
         device_key,
         push_key: random_bytes(32).map_err(|e| e.to_string())?,
-        push_token: push.map(|p| p.token),
+        // A token of another kind, or not an FCM token, is not kept: the
+        // device can give one later with `push.token`.
+        push_token: push
+            .filter(|p| super::push::token_ok(&p.kind, &p.token))
+            .map(|p| p.token),
         paired: now(),
         seen: None,
         node: Some(caller.node_id.clone()),
@@ -2901,6 +2992,16 @@ fn run_session(
             }
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
+            }
+            FromDevice::PushTokenUpdate(push)
+                if !super::push::token_ok(&push.kind, &push.token) =>
+            {
+                let _ = store.log(
+                    Some(&device.id),
+                    Some(person),
+                    "push token refused",
+                    Some("not an FCM token"),
+                );
             }
             FromDevice::PushTokenUpdate(push) => {
                 store

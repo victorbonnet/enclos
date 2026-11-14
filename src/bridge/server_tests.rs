@@ -3984,3 +3984,119 @@ fn a_plugin_that_no_longer_reports_tasks_has_its_kept_tasks_dropped() {
     );
     plugin.send(None).unwrap();
 }
+
+/// A push service that records what it is asked to send.
+struct Recorder(std::sync::mpsc::Sender<(String, super::super::push::Payload)>);
+
+impl super::super::push::PushService for Recorder {
+    fn send(
+        &mut self,
+        token: &str,
+        payload: &super::super::push::Payload,
+    ) -> Option<super::super::push::Outcome> {
+        let _ = self.0.send((token.to_owned(), payload.clone()));
+        Some(super::super::push::Outcome::Sent)
+    }
+}
+
+/// A hub pushing through a [`Recorder`], with `connected` people's devices
+/// connected, and a device of Alice's with a push token paired.
+fn pushing_hub(
+    dir: &std::path::Path,
+    connected: &[&str],
+) -> (
+    Hub,
+    std::sync::mpsc::Receiver<(String, super::super::push::Payload)>,
+) {
+    let (hub, _) = hub_with(dir, connected);
+    let (sent, pushed) = channel();
+    let pusher = super::super::push::Pusher::start(
+        Box::new(Recorder(sent)),
+        "mac".to_owned(),
+        dir.join("app.db"),
+    );
+    let hub = hub.with_push(pusher, "mac".to_owned());
+    let store = hub.store().unwrap();
+    store
+        .add_device(&super::super::store::Device {
+            id: "phone".to_owned(),
+            name: "Pixel".to_owned(),
+            person: "alice@example.com".to_owned(),
+            noise_key: vec![1; 32],
+            device_key: vec![2; 32],
+            push_key: vec![7; 32],
+            push_token: Some("token-phone".to_owned()),
+            paired: 1,
+            seen: None,
+            node: None,
+        })
+        .unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    (hub, pushed)
+}
+
+#[test]
+fn an_agent_message_reaches_an_away_owner_as_a_push_only_their_device_opens() {
+    use base64::Engine as _;
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, pushed) = pushing_hub(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    let text = format!("**The weather** in Lyon:\n\n{}", "sunny ".repeat(40));
+    let seq = hub
+        .store_agent_text(
+            &store,
+            &MessageId::new("m-1").unwrap(),
+            agent_says(&text),
+            &[],
+            &home,
+            &From::Agent,
+        )
+        .unwrap()
+        .unwrap();
+    let (token, payload) = pushed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (token.as_str(), payload.host.as_str(), payload.seq),
+        ("token-phone", "mac", seq)
+    );
+    let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&payload.preview)
+        .unwrap();
+    let opened = enclos_protocol::preview::open(
+        &[7; 32],
+        &enclos_protocol::preview::PushFields { host: "mac", seq },
+        &sealed,
+    )
+    .unwrap();
+    let preview: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(preview["agent"], "lab/main");
+    assert_eq!(preview["conversation"], "c-1");
+    let shown = preview["text"].as_str().unwrap();
+    assert!(
+        shown.starts_with("**The weather** in Lyon: sunny"),
+        "{shown}"
+    );
+    assert_eq!(
+        shown.chars().count(),
+        crate::bridge::store::MAX_PREVIEW_CHARS
+    );
+}
+
+#[test]
+fn no_push_while_a_device_of_the_owner_is_connected() {
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, pushed) = pushing_hub(dir.path(), &["alice@example.com"]);
+    let store = hub.store().unwrap();
+    hub.store_agent_text(
+        &store,
+        &MessageId::new("m-1").unwrap(),
+        agent_says("hello"),
+        &[],
+        &home,
+        &From::Agent,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(pushed.recv_timeout(Duration::from_millis(300)).is_err());
+}

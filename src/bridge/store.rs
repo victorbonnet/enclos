@@ -188,6 +188,23 @@ pub fn conversation_title(text: &str) -> String {
     visible_within(&words.join(" "), MAX_TITLE_CHARS)
 }
 
+/// The most characters of a message a push's preview holds
+/// (`docs/protocol.md`, Notifications).
+pub const MAX_PREVIEW_CHARS: usize = 120;
+
+/// What a push's preview shows of `text`: one line, without hidden
+/// characters, of at most [`MAX_PREVIEW_CHARS`]. The app takes the
+/// markdown's marks out itself.
+pub fn preview_text(text: &str) -> String {
+    let one_line: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let visible = enclos_protocol::visible::stripped(&one_line, false);
+    let words: Vec<&str> = visible.split_whitespace().collect();
+    visible_within(&words.join(" "), MAX_PREVIEW_CHARS)
+}
+
 /// `text`, without hidden characters, cut to at most `max` characters and
 /// trimmed: stripped again after each cut, since a cut can leave a joiner
 /// last, where [`enclos_protocol::visible`] calls it hidden, until nothing
@@ -599,6 +616,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("pairings", "request_node_id", "TEXT"),
     // The device a pairing made, for the terminal's audit entry.
     ("pairings", "device", "TEXT"),
+    // Why the last push to the device failed (ADR 0065, proposed); none
+    // once one goes through.
+    ("devices", "push_failure", "TEXT"),
 ];
 
 /// How many lines of its log the bridge keeps: refused callers write
@@ -2190,10 +2210,43 @@ impl Store {
         Ok(())
     }
 
+    /// Keeps the push token a device gave, in place of its last: a new
+    /// token has not failed yet.
     pub fn set_push_token(&self, id: &str, token: &str) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE devices SET push_token = ?2 WHERE id = ?1",
+            "UPDATE devices SET push_token = ?2, push_failure = NULL WHERE id = ?1",
             params![id, token],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a device's push token, when it is still `token`: one the
+    /// device gave since stays. Whether it was forgotten.
+    pub fn drop_push_token(&self, id: &str, token: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE devices SET push_token = NULL, push_failure = NULL WHERE id = ?1 AND push_token = ?2",
+            params![id, token],
+        )? == 1)
+    }
+
+    /// Why the last push to a device failed; `None` when it went through,
+    /// or none was tried.
+    pub fn push_failure(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT push_failure FROM devices WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn set_push_failure(&self, id: &str, why: Option<&str>) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE devices SET push_failure = ?2 WHERE id = ?1",
+            params![id, why],
         )?;
         Ok(())
     }

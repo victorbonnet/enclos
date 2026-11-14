@@ -804,6 +804,20 @@ impl Hub {
                 attachments: vec![],
             })
         });
+        // A question or a runtime approval waits for the person: one asked
+        // while they are away reaches them as a push. Its later states do not.
+        if let Some(ToDevice::Message(m)) = &message
+            && matches!(m.kind.as_str(), "question" | "runtime_approval")
+        {
+            self.push_if_away(
+                store,
+                &current.owner,
+                &m.agent,
+                m.conversation.as_str(),
+                m.seq,
+                &m.text,
+            );
+        }
         let paired = store.devices().unwrap_or_default();
         let shown = self.shows_question(&current.owner, &current.info.definition);
         let devices = self.devices.lock().expect("not poisoned");

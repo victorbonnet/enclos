@@ -267,6 +267,79 @@ fn an_agents_calls_outside_the_app_count_under_it_for_the_hosts_person() {
     assert_eq!(own[0].1.tokens.input, Some(10));
 }
 
+/// A push service that records the tokens it is asked to send to.
+struct Recorder(std::sync::mpsc::Sender<(String, i64)>);
+
+impl super::super::super::push::PushService for Recorder {
+    fn send(
+        &mut self,
+        token: &str,
+        payload: &super::super::super::push::Payload,
+    ) -> Option<super::super::super::push::Outcome> {
+        let _ = self.0.send((token.to_owned(), payload.seq));
+        Some(super::super::super::push::Outcome::Sent)
+    }
+}
+
+#[test]
+fn a_question_asked_while_its_owner_is_away_reaches_them_as_a_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sent, pushed) = channel();
+    let pusher = super::super::super::push::Pusher::start(
+        Box::new(Recorder(sent)),
+        "mac".into(),
+        dir.path().join("app.db"),
+    );
+    let hub = Arc::new(
+        Hub::new(
+            Transport::Tailscale,
+            Arc::new(|_: &str| Err("no transport in this test".to_owned())),
+            dir.path().join("app.db"),
+            crate::layout::Layout::at(dir.path().join("enclos")),
+            vec![],
+            vec![AgentEndpoint {
+                name: AGENT.into(),
+                runtime: "hermes".into(),
+                socket: dir.path().join("plugin.sock"),
+                token: "secret".into(),
+            }],
+            Some(OWNER.into()),
+            SILENCE,
+        )
+        .with_approval_key(approval_key())
+        .with_push(pusher, "mac".into()),
+    );
+    let store = hub.store().unwrap();
+    store.conversation("owned", "lab", "coder", OWNER).unwrap();
+    // Paired, with a push token, and not connected.
+    store
+        .add_device(&Device {
+            id: "phone".into(),
+            name: "phone".into(),
+            person: OWNER.into(),
+            noise_key: vec![1; 32],
+            device_key: vec![],
+            push_key: vec![7; 32],
+            push_token: Some("token-phone".into()),
+            paired: now(),
+            seen: None,
+            node: None,
+        })
+        .unwrap();
+    let mut native = native(&hub, vec![Capability::Questions]);
+    native.send(
+        "ask",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("q-away"),
+        },
+    );
+    native.ack("ask");
+    let (token, seq) = pushed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(token, "token-phone");
+    assert_eq!(seq, store.newest_seq().unwrap());
+}
+
 #[test]
 fn a_question_brings_its_archived_conversation_back_first() {
     let (_dir, hub, store, _device, rx) = fixture();
