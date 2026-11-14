@@ -91,6 +91,15 @@ def _hermes_stand_ins() -> dict:
 def setUpModule():
     # For this module's tests only: left in `sys.modules`, the stand-ins would
     # hide the real Hermes from every test that runs after these.
+    #
+    # Two things this relies on. Stopping the patch puts back `sys.modules` as
+    # it was, so a module first imported during these tests is dropped while
+    # the `enclos` package still names it: keep every `enclos` submodule the
+    # adapter imports imported at module level by some test file, so that
+    # discovery loads it before this runs (only `enclos.adapter` is imported
+    # here, and a later test imports it again with `importlib`). And a `None`
+    # hides a package, not its submodules already loaded: none of the Hermes
+    # packages hidden here may be imported at module level by a test file.
     global EnclosAdapter, PlatformConfig
     stand_ins = patch.dict(sys.modules, _hermes_stand_ins())
     stand_ins.start()
