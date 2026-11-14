@@ -1198,10 +1198,18 @@ impl Store {
         rows.collect()
     }
 
-    /// The plugin acknowledged message `id`: it is the runtime's now.
-    pub fn delivered(&self, id: &str) -> rusqlite::Result<()> {
-        self.db
-            .execute("UPDATE messages SET pending = 0 WHERE id = ?1", params![id])?;
+    /// The plugin of `agent` (`<sandbox>/<agent>`) acknowledged message
+    /// `id`: it is the runtime's now. Only a message of one of that agent's
+    /// own conversations: another agent's plugin cannot mark it delivered.
+    pub fn delivered(&self, id: &str, agent: &str) -> rusqlite::Result<()> {
+        let Some((sandbox, agent)) = agent.split_once('/') else {
+            return Ok(());
+        };
+        self.db.execute(
+            "UPDATE messages SET pending = 0 WHERE id = ?1 AND conversation IN
+             (SELECT id FROM conversations WHERE sandbox = ?2 AND agent = ?3)",
+            params![id, sandbox, agent],
+        )?;
         Ok(())
     }
 
@@ -2353,7 +2361,10 @@ mod tests {
             2,
             "both agents wait"
         );
-        store.delivered("b-1").unwrap();
+        // Another agent's plugin cannot mark it delivered
+        store.delivered("b-1", "lab/scout").unwrap();
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+        store.delivered("b-1", "lab/main").unwrap();
         assert!(store.pending("lab", "main").unwrap().is_empty());
         assert_eq!(
             store.agents_with_pending().unwrap(),

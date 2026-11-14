@@ -845,7 +845,7 @@ impl Hub {
                         if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
                             continue;
                         }
-                        let _ = store.delivered(of.as_str());
+                        let _ = store.delivered(of.as_str(), &agent);
                     }
                     FromPlugin::Typing { conversation, on } => {
                         // Only in this agent's own conversations
@@ -2053,11 +2053,15 @@ fn run_session(
                 if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
                     continue;
                 }
-                store
+                let (_, _, owner) = store
                     .conversation(conversation.as_str(), sandbox, name, person)
                     .map_err(|e| e.to_string())?;
-                // The person's other devices learn of it too.
-                hub.deliver_conversation(store, person, conversation.as_str());
+                // The person's other devices learn of it too. An id that is
+                // someone else's conversation already stays theirs, and
+                // nothing of it is told.
+                if owner == person {
+                    hub.deliver_conversation(store, person, conversation.as_str());
+                }
             }
             FromDevice::GroupNew {
                 conversation,
@@ -3050,13 +3054,20 @@ mod connection_end_tests {
         /// or is named) are passed over: these tests are about messages.
         fn receive(&mut self) -> Option<ToDevice> {
             loop {
+                match self.receive_any()? {
+                    ToDevice::Conversation(_) => continue,
+                    body => return Some(body),
+                }
+            }
+        }
+
+        /// The next message, conversations' details included.
+        fn receive_any(&mut self) -> Option<ToDevice> {
+            loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
                         let plain = self.session.decrypt(&bytes).unwrap();
-                        match decode_to_device(&plain).unwrap().body {
-                            ToDevice::Conversation(_) => continue,
-                            body => return Some(body),
-                        }
+                        return Some(decode_to_device(&plain).unwrap().body);
                     }
                     Ok(Message::Close(_)) => return None,
                     Ok(_) => {}
@@ -3373,6 +3384,42 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         );
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
+        );
+    }
+
+    /// A person who names another person's conversation as a new one of
+    /// their own learns nothing of it, and it stays the other's.
+    #[test]
+    fn a_new_conversation_with_anothers_id_tells_nothing_of_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        Store::open(&bridge.store)
+            .unwrap()
+            .conversation("c-1", "lab", "main", "bob@example.com")
+            .unwrap();
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        // A request answered after it: what came before is all it told
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive_any() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(ToDevice::Conversation(c)) => {
+                    assert_ne!(c.conversation.as_str(), "c-1", "told of bob's");
+                }
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        }
+        assert_eq!(
+            Store::open(&bridge.store)
+                .unwrap()
+                .owner("c-1")
+                .unwrap()
+                .as_deref(),
+            Some("bob@example.com")
         );
     }
 
