@@ -447,7 +447,7 @@ impl Hub {
     /// Where the bridge keeps the files of messages, by attachment id:
     /// beside its database.
     fn media(&self) -> std::path::PathBuf {
-        self.store_path.with_file_name("app-media")
+        self.store_path.with_file_name(crate::layout::APP_MEDIA_DIR)
     }
 
     /// Sends `message` to every connected device of `person`.

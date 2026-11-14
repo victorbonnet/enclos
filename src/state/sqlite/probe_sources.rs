@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 
 impl SqliteStateStore {
     fn attach_probe_sources(&self, conn: &Connection, create: bool) -> Result<bool> {
-        let path = self.db.with_file_name("probe-sources.db");
+        let path = self.db.with_file_name(crate::layout::PROBE_SOURCES_FILE);
         if !path.exists() && !create {
             return Ok(false);
         }

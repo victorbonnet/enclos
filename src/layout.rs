@@ -16,6 +16,14 @@ pub const HOME_VAR: &str = "ENCLOS_HOME";
 /// What follows an agent's name in its secrets file's name (ADR 0036).
 pub const AGENT_SECRETS_SUFFIX: &str = ".env";
 
+/// The bridge's folder of message files, beside its database
+/// ([`Layout::app_media`]).
+pub const APP_MEDIA_DIR: &str = "app-media";
+
+/// The side database of diagnostic provenance (ADR 0059), beside
+/// `state.db` ([`Layout::probe_sources`]).
+pub const PROBE_SOURCES_FILE: &str = "probe-sources.db";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     MacOs,
@@ -291,6 +299,19 @@ impl Layout {
         self.data.join("app-approvals.key")
     }
 
+    /// The files of the bridge's messages, one per attachment id: what
+    /// agents sent to people and what people sent to agents. For the host
+    /// alone: a sandbox that read it would read other sandboxes' files.
+    pub fn app_media(&self) -> PathBuf {
+        self.data.join(APP_MEDIA_DIR)
+    }
+
+    /// Which runs of `policy test` are under way and which network log
+    /// entries they made (ADR 0059). For the host alone.
+    pub fn probe_sources(&self) -> PathBuf {
+        self.data.join(PROBE_SOURCES_FILE)
+    }
+
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
@@ -371,6 +392,7 @@ impl Layout {
             // The key the bridge signs runtime-approval decisions with: a
             // sandbox that read it could sign its own (ADR 0060).
             self.app_approval_key(),
+            self.probe_sources(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
         // stores: the two change together.
@@ -382,7 +404,7 @@ impl Layout {
 
     /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
     pub fn hidden_dirs(&self) -> Vec<PathBuf> {
-        vec![self.run_dir()]
+        vec![self.run_dir(), self.app_media()]
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -579,6 +601,7 @@ mod tests {
                 layout.app_store(),
                 layout.app_bridge_key(),
                 layout.app_approval_key(),
+                layout.probe_sources(),
             ]
         );
         assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
@@ -596,11 +619,29 @@ mod tests {
                 layout.app_store(),
                 layout.app_bridge_key(),
                 layout.app_approval_key(),
+                layout.probe_sources(),
             ] {
                 assert!(file.starts_with(layout.data()));
                 assert!(hidden.contains(&file), "{os:?}: {}", file.display());
             }
         }
+        // The message files are a folder: hidden whole.
+        assert!(layout.hidden_dirs().contains(&layout.app_media()));
+    }
+
+    /// The bridge and the state store find these beside their databases,
+    /// under the names the layout hides.
+    #[test]
+    fn the_side_files_are_beside_their_databases() {
+        let layout = Layout::at("/data/enclos");
+        assert_eq!(
+            layout.state_db().with_file_name(PROBE_SOURCES_FILE),
+            layout.probe_sources()
+        );
+        assert_eq!(
+            layout.app_store().with_file_name(APP_MEDIA_DIR),
+            layout.app_media()
+        );
     }
 
     #[test]

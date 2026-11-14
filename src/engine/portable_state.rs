@@ -39,11 +39,7 @@ impl Engine {
         let history = if self.app_store_path().exists() {
             Store::open(&self.app_store_path())
                 .map_err(failed)?
-                .export_history(
-                    name.as_str(),
-                    agent.as_str(),
-                    &self.layout.data().join("app-media"),
-                )
+                .export_history(name.as_str(), agent.as_str(), &self.layout.app_media())
                 .map_err(failed)?
         } else {
             Default::default()
@@ -215,7 +211,7 @@ impl Engine {
             Confirm::Yes,
         )?;
         if !state.history.conversations.is_empty() {
-            self.write(by,"agent import history",Some(format!("{name}/{agent}")),|_|format!("restored {} conversations and {} messages; imported requests cannot execute",state.history.conversations.len(),state.history.messages.len()),|_|Store::open(&self.app_store_path()).map_err(failed)?.import_history(&state.history,&format!("{name}/{agent}"),conversations,&self.layout.data().join("app-media")).map_err(failed))?;
+            self.write(by,"agent import history",Some(format!("{name}/{agent}")),|_|format!("restored {} conversations and {} messages; imported requests cannot execute",state.history.conversations.len(),state.history.messages.len()),|_|Store::open(&self.app_store_path()).map_err(failed)?.import_history(&state.history,&format!("{name}/{agent}"),conversations,&self.layout.app_media()).map_err(failed))?;
         }
         Ok(())
     }

@@ -390,7 +390,8 @@ pub struct ProbeInputs {
     /// The enclos data folder and `config.toml`.
     pub data: PathBuf,
     pub config_file: PathBuf,
-    /// The files no sandbox may read: each that exists gets a probe.
+    /// The files and folders no sandbox may read, besides `run/` and other
+    /// sandboxes' folders: each that exists gets a probe.
     pub hidden_files: Vec<PathBuf>,
     /// The sandbox's own folder, which holds its `policy.toml` and
     /// `compiled/`, and its home.
