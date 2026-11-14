@@ -1734,6 +1734,9 @@ fn run_session(
     person: &str,
     outbox: &Receiver<ToDevice>,
 ) -> Result<(), String> {
+    // The newest `seq` of the person's messages this session sent, once
+    // its device synced; none before.
+    let mut sent: Option<i64> = None;
     loop {
         if link.heard.elapsed() > hub.silence {
             return Err(SILENT.to_owned());
@@ -1748,9 +1751,7 @@ fn run_session(
             let _ = link.socket.flush();
             return Err(UNPAIRED.to_owned());
         }
-        while let Ok(message) = outbox.try_recv() {
-            link.send(message)?;
-        }
+        drain(hub, store, link, person, outbox, &mut sent)?;
         let Some(message) = link.receive()? else {
             continue;
         };
@@ -2022,9 +2023,7 @@ fn run_session(
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
                     // After the echo, which the outbox holds
-                    while let Ok(message) = outbox.try_recv() {
-                        link.send(message)?;
-                    }
+                    drain(hub, store, link, person, outbox, &mut sent)?;
                     link.send(answer)?;
                 }
             }
@@ -2085,50 +2084,17 @@ fn run_session(
                         })?;
                     }
                 }
-                let mut last = since;
                 // Where each group's discussion is, before its messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(state) = hub.group_state(store, &c.id) {
                         link.send(ToDevice::GroupState(state))?;
                     }
                 }
-                for m in store.since(person, since).map_err(|e| e.to_string())? {
-                    let agent = message_agent(store, &m.conversation, &m.from);
-                    last = m.seq;
-                    let attachments = store
-                        .attachments_of(&m.id)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(attachment_info)
-                        .collect();
-                    if let Some(question) = &m.question
-                        && let Some(current) =
-                            store.question(question).map_err(|e| e.to_string())?
-                        && current.owner == person
-                        && hub.shows_question(person, &current.info.definition)
-                    {
-                        link.send(ToDevice::Question {
-                            question: current.info,
-                        })?;
-                    }
-                    link.send(ToDevice::Message(ConversationMessage {
-                        question: m.question,
-                        conversation: ConversationId::new(m.conversation)
-                            .map_err(|e| e.to_string())?,
-                        agent,
-                        from: match m.from {
-                            From::Agent | From::Member(_) => "agent".to_owned(),
-                            From::Person(p) => p,
-                        },
-                        text: m.text,
-                        kind: m.kind,
-                        // When it was said, not when it is synced.
-                        time: m.at,
-                        seq: m.seq,
-                        attachments,
-                    }))?;
-                }
+                let last = send_history(hub, store, link, person, since)?;
                 link.send(ToDevice::Synced { seq: last })?;
+                // What was stored meanwhile is in the history above, or
+                // comes after it.
+                sent = Some(sent.map_or(last, |s| s.max(last)));
             }
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
@@ -2162,6 +2128,86 @@ fn run_session(
             _ => {}
         }
     }
+}
+
+/// Sends what the session's outbox holds. A message of the person's goes
+/// to the device only once it synced (`sent` is the newest `seq` the
+/// session sent then), and with every message of the person's stored
+/// before it that the session has not sent, read from the store in `seq`
+/// order: two messages stored at once may reach the outbox in the other
+/// order. So the newest `seq` a device holds always comes with every one
+/// before it, and a device that syncs from it misses none, whenever the
+/// connection ends (`docs/protocol.md`, `sync`). A message is stored before
+/// it is passed on, so the one the outbox holds is in the store.
+fn drain(
+    hub: &Hub,
+    store: &Store,
+    link: &mut Link,
+    person: &str,
+    outbox: &Receiver<ToDevice>,
+    sent: &mut Option<i64>,
+) -> Result<(), String> {
+    while let Ok(message) = outbox.try_recv() {
+        match message {
+            ToDevice::Message(m) => {
+                if let Some(after) = *sent
+                    && m.seq > after
+                {
+                    *sent = Some(send_history(hub, store, link, person, after)?);
+                }
+            }
+            other => link.send(other)?,
+        }
+    }
+    Ok(())
+}
+
+/// Sends the messages of `person`'s conversations after `since`, in `seq`
+/// order, each after its question's current metadata; the newest `seq`
+/// sent, or `since` when none.
+fn send_history(
+    hub: &Hub,
+    store: &Store,
+    link: &mut Link,
+    person: &str,
+    since: i64,
+) -> Result<i64, String> {
+    let mut last = since;
+    for m in store.since(person, since).map_err(|e| e.to_string())? {
+        let agent = message_agent(store, &m.conversation, &m.from);
+        last = m.seq;
+        let attachments = store
+            .attachments_of(&m.id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(attachment_info)
+            .collect();
+        if let Some(question) = &m.question
+            && let Some(current) = store.question(question).map_err(|e| e.to_string())?
+            && current.owner == person
+            && hub.shows_question(person, &current.info.definition)
+        {
+            link.send(ToDevice::Question {
+                question: current.info,
+            })?;
+        }
+        link.send(ToDevice::Message(ConversationMessage {
+            question: m.question,
+            conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
+            agent,
+            from: match m.from {
+                From::Agent | From::Member(_) => "agent".to_owned(),
+                From::Person(p) => p,
+            },
+            text: m.text,
+            kind: m.kind,
+            // When it was said, not when it is synced.
+            time: m.at,
+            seq: m.seq,
+            attachments,
+        }))?;
+    }
+    Ok(last)
 }
 
 /// The person forgot this host on `device`: its row goes, so its keys
@@ -3287,6 +3333,21 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         );
     }
 
+    /// Syncs `device` from `since`, as the app does once authenticated: the
+    /// messages it is sent, up to `synced`, whose `seq` comes last.
+    fn synced(device: &mut PhoneLink, since: i64) -> (Vec<ConversationMessage>, i64) {
+        device.send(&format!("sync-{since}"), FromDevice::Sync { since });
+        let mut messages = Vec::new();
+        loop {
+            match device.receive() {
+                Some(ToDevice::Message(m)) => messages.push(m),
+                Some(ToDevice::Synced { seq }) => return (messages, seq),
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        }
+    }
+
     fn say(device: &mut PhoneLink, id: &str, text: &str) {
         device.send(
             id,
@@ -3647,6 +3708,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let (mut first, _) = connect(&bridge, &phone);
         start_conversation(&mut first);
         let (mut second, _) = connect(&bridge, &phone);
+        synced(&mut second, 0);
         // A ends: B's route stays
         let _ = first.socket.close(None);
         let _ = first.socket.flush();
@@ -3897,6 +3959,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let (mut device, first) = connect(&bridge, &phone);
         assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
         start_conversation(&mut device);
+        synced(&mut device, 0);
         // The device did not hear back, and sends the same message again
         say(&mut device, "m-1", "hi");
         say(&mut device, "m-1", "hi");
@@ -3930,6 +3993,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let phone = paired(&bridge, "n-pixel");
         let (mut device, _) = connect(&bridge, &phone);
         start_conversation(&mut device);
+        synced(&mut device, 0);
         say(&mut device, "m-1", "long");
         let mut text = String::new();
         let mut seqs = Vec::new();
@@ -3960,6 +4024,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let phone = paired(&bridge, "n-pixel");
         let (mut device, _) = connect(&bridge, &phone);
         start_conversation(&mut device);
+        synced(&mut device, 0);
         // No plugin listens: the sandbox is stopped
         say(&mut device, "m-1", "are you there?");
         let echo = device.receive().unwrap();
@@ -3981,6 +4046,44 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let got = got.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].1, "are you there?");
+    }
+
+    #[test]
+    fn a_device_gets_no_message_before_its_sync_and_then_none_out_of_order() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        // Said while the device was away
+        store
+            .add("a-1", "c-1", &From::Agent, "while you were away", "reply")
+            .unwrap();
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // A message stored before the device synced comes with its sync,
+        // after the ones before it, never before them: a device that kept
+        // it and lost the connection would sync from past them.
+        say(&mut device, "m-1", "back");
+        let (messages, last) = synced(&mut device, 0);
+        let texts: Vec<_> = messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["while you were away", "back"]);
+        assert_eq!(last, messages[1].seq);
+        // Stored by one thread, passed on by another after a later one:
+        // the later one comes after it, not alone.
+        store
+            .add("a-2", "c-1", &From::Agent, "stored first", "reply")
+            .unwrap();
+        say(&mut device, "m-2", "and now");
+        let mut next = Vec::new();
+        while next.len() < 2 {
+            if let Some(ToDevice::Message(m)) = device.receive() {
+                next.push(m);
+            }
+        }
+        assert_eq!(next[0].text, "stored first");
+        assert_eq!(next[1].text, "and now");
+        assert!(last < next[0].seq && next[0].seq < next[1].seq);
     }
 
     #[test]
