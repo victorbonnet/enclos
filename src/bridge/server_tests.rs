@@ -1,4 +1,5 @@
 use super::*;
+use crate::bridge::store::MAX_MIME_BYTES;
 
 /// An agent's text in its own conversation, as the bridge stores it.
 fn agent_text(text: &str) -> ConversationMessage {
@@ -45,6 +46,45 @@ fn an_attachments_details_are_bounded_whatever_the_plugin_sends() {
         stored_details(&out("a1.png")),
         ("image/png".to_owned(), "unicorn.png".to_owned())
     );
+    // At the bounds: 255 bytes of media type and 120 characters of name
+    // are kept, one more is not.
+    let at = |mime_bytes: usize, name_chars: usize| {
+        stored_details(&OutAttachment {
+            file: "a1.bin".to_owned(),
+            mime: format!("a/{}", "b".repeat(mime_bytes - 2)),
+            name: "n".repeat(name_chars),
+            size: 1,
+        })
+    };
+    let (mime, name) = at(MAX_MIME_BYTES, MAX_ATTACHMENT_NAME_CHARS);
+    assert_eq!((mime.len(), name.chars().count()), (255, 120));
+    let (mime, name) = at(MAX_MIME_BYTES + 1, MAX_ATTACHMENT_NAME_CHARS + 1);
+    assert_eq!(
+        (mime.as_str(), name.chars().count()),
+        ("application/octet-stream", 120)
+    );
+}
+
+/// A name whose cut leaves a joiner last, where it is hidden (Persian
+/// names, long emoji sequences, or an agent on purpose), is taken with
+/// the joiner gone: the name the bridge keeps is its own result again,
+/// with no hidden character, so nothing downstream refuses it.
+#[test]
+fn a_name_cut_before_a_joiner_is_kept_without_it() {
+    let (_dir, home, inbox, media) = folders();
+    std::fs::write(inbox.join("a5.txt"), b"text").unwrap();
+    let a = OutAttachment {
+        name: "é\u{200D}".repeat(61) + "é",
+        ..out("a5.txt")
+    };
+    let taken = take_attachment(&home, &media, "c-1", &a).unwrap();
+    assert!(!taken.name.ends_with('\u{200D}'), "{:?}", taken.name);
+    assert_eq!(
+        enclos_protocol::visible::stripped(&taken.name, false),
+        taken.name
+    );
+    assert_eq!(attachment_name(&taken.name, ""), taken.name);
+    assert!(taken.name.chars().count() <= MAX_ATTACHMENT_NAME_CHARS);
 }
 
 /// One message from a plugin, whatever its files' details, is stored in

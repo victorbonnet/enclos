@@ -154,8 +154,72 @@ pub fn conversation_title(text: &str) -> String {
         .collect();
     let visible = enclos_protocol::visible::stripped(&one_line, false);
     let words: Vec<&str> = visible.split_whitespace().collect();
-    let cut: String = words.join(" ").chars().take(MAX_TITLE_CHARS).collect();
-    cut.trim_end().to_owned()
+    visible_within(&words.join(" "), MAX_TITLE_CHARS)
+}
+
+/// `text`, without hidden characters, cut to at most `max` characters and
+/// trimmed: stripped again after each cut, since a cut can leave a joiner
+/// last, where [`enclos_protocol::visible`] calls it hidden, until nothing
+/// changes. What it returns is its own result again.
+fn visible_within(text: &str, max: usize) -> String {
+    let mut kept = enclos_protocol::visible::stripped(text, false)
+        .trim()
+        .to_owned();
+    loop {
+        let cut: String = kept.chars().take(max).collect();
+        let again = enclos_protocol::visible::stripped(&cut, false)
+            .trim()
+            .to_owned();
+        if again == kept {
+            return kept;
+        }
+        kept = again;
+    }
+}
+
+/// The longest media type an attachment keeps, in bytes: RFC 6838 bounds a
+/// type and a subtype at 127 characters each.
+pub const MAX_MIME_BYTES: usize = 255;
+
+/// The longest name an attachment keeps, in characters.
+pub const MAX_ATTACHMENT_NAME_CHARS: usize = 120;
+
+/// An attachment's media type as the bridge keeps it, whoever gave it: a
+/// plain `type/subtype` of at most [`MAX_MIME_BYTES`], in lower case, and
+/// `application/octet-stream` for anything else. Its own result again.
+pub fn attachment_mime(mime: &str) -> String {
+    let plain = mime.len() <= MAX_MIME_BYTES
+        && mime.split_once('/').is_some_and(|(t, s)| {
+            !t.is_empty()
+                && !s.is_empty()
+                && mime
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
+        });
+    if plain {
+        mime.to_ascii_lowercase()
+    } else {
+        "application/octet-stream".to_owned()
+    }
+}
+
+/// An attachment's name as the bridge keeps it, whoever gave it: without
+/// its folders and hidden characters, which would make a file read as
+/// another type or another line on the artefact card, the viewer and the
+/// Share sheet, and at most [`MAX_ATTACHMENT_NAME_CHARS`]; `fallback`, kept
+/// the same way, when nothing is left, and `file` when nothing is left of
+/// that either. Its own result again.
+pub fn attachment_name(name: &str, fallback: &str) -> String {
+    [name, fallback, "file"]
+        .into_iter()
+        .map(|n| {
+            visible_within(
+                n.rsplit(['/', '\\']).next().unwrap_or_default(),
+                MAX_ATTACHMENT_NAME_CHARS,
+            )
+        })
+        .find(|n| !n.is_empty())
+        .unwrap_or_default()
 }
 
 pub struct Store {
@@ -215,7 +279,55 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
          WHERE archived != 0 AND substr(id, 1, 5) = 'home.'",
         [],
     )?;
+    keep_attachment_details(db)?;
     Ok(())
+}
+
+/// The `settings` row that says [`keep_attachment_details`] has run.
+const ATTACHMENT_DETAILS_KEPT: &str = "attachment_details_kept";
+
+/// Brings the attachments stored before their details were bounded within
+/// [`attachment_mime`] and [`attachment_name`]: a media type too long to
+/// reach a device stored as it came would end every sync of its owner.
+/// Once per database, recorded in `settings`; a second process opening it
+/// meanwhile finds every row kept already and changes nothing.
+fn keep_attachment_details(db: &Connection) -> rusqlite::Result<()> {
+    let done = db
+        .query_row(
+            "SELECT 1 FROM settings WHERE name = ?1",
+            params![ATTACHMENT_DETAILS_KEPT],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if done {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let rows = tx
+        .prepare("SELECT id, mime, name FROM attachments")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, mime, name) in rows {
+        let (kept_mime, kept_name) = (attachment_mime(&mime), attachment_name(&name, ""));
+        if (&kept_mime, &kept_name) != (&mime, &name) {
+            tx.execute(
+                "UPDATE attachments SET mime = ?1, name = ?2 WHERE id = ?3",
+                params![kept_mime, kept_name, id],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO settings (name, value) VALUES (?1, '1')",
+        params![ATTACHMENT_DETAILS_KEPT],
+    )?;
+    tx.commit()
 }
 
 const SCHEMA: &str = "

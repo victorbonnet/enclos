@@ -74,8 +74,9 @@ use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
 use super::store::{
-    Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
-    StoredAttachment, conversation_title, home_id, is_home, now,
+    Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
+    PairingRequest, Store, StoredAttachment, attachment_mime, attachment_name, conversation_title,
+    home_id, is_home, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
@@ -2474,6 +2475,21 @@ fn take_attachment(
         let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
     }
     let (mime, name) = stored_details(a);
+    if mime != a.mime.to_ascii_lowercase() {
+        eprintln!(
+            "enclos app: {}: its media type ({} bytes) is not a plain one, kept as {mime}",
+            a.file,
+            a.mime.len()
+        );
+    }
+    if name.chars().count() == MAX_ATTACHMENT_NAME_CHARS
+        && a.name.chars().count() > name.chars().count()
+    {
+        eprintln!(
+            "enclos app: {}: its name is cut to {MAX_ATTACHMENT_NAME_CHARS} characters",
+            a.file
+        );
+    }
     Ok(StoredAttachment {
         id,
         conversation: conversation.to_owned(),
@@ -2483,48 +2499,12 @@ fn take_attachment(
     })
 }
 
-/// The longest media type kept, in bytes: RFC 6838 bounds a type and a
-/// subtype at 127 characters each.
-pub(super) const MAX_MIME_BYTES: usize = 255;
-
-/// The longest file name kept, in characters.
-pub(super) const MAX_ATTACHMENT_NAME_CHARS: usize = 120;
-
 /// The media type and name an agent's file is stored and shown with, so
-/// that its details stay small whatever the plugin sends: a media type
-/// that is not plain or is longer than [`MAX_MIME_BYTES`] becomes
-/// `application/octet-stream`, and the name loses its folders and hidden
-/// characters and keeps [`MAX_ATTACHMENT_NAME_CHARS`].
+/// that its details stay small whatever the plugin sends
+/// ([`attachment_mime`], [`attachment_name`]; its file's name when it gives
+/// no name left once kept).
 fn stored_details(a: &OutAttachment) -> (String, String) {
-    let typed = a.mime.len() <= MAX_MIME_BYTES
-        && a.mime.split_once('/').is_some_and(|(t, s)| {
-            !t.is_empty()
-                && !s.is_empty()
-                && a.mime
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
-        });
-    // The name titles the artefact card, the viewer and the Share sheet: a
-    // bidirectional override or a line break in it would make the file read
-    // as another type or another line, so hidden characters are dropped.
-    let name = enclos_protocol::visible::stripped(
-        a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
-        false,
-    );
-    let name = name.trim();
-    let name = if name.is_empty() {
-        a.file.as_str()
-    } else {
-        name
-    };
-    (
-        if typed {
-            a.mime.to_ascii_lowercase()
-        } else {
-            "application/octet-stream".to_owned()
-        },
-        name.chars().take(MAX_ATTACHMENT_NAME_CHARS).collect(),
-    )
+    (attachment_mime(&a.mime), attachment_name(&a.name, &a.file))
 }
 
 /// The bytes of an attachment from `offset`, at most [`ATTACHMENT_CHUNK`],
