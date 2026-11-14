@@ -354,6 +354,8 @@ An edit adds, replaces or removes one entry or replaces one scalar. The host val
 
 Edits are audited with the owner and device. Network-only changes go live; launch-time changes explicitly require Save & restart and use the existing restart path. After an application attempt, the owner gets the current policy and every capable agent plugin gets active policy context. Nothing is automatically replayed after interruption. Cached policy data on the phone is read-only until a fresh host response; clear cache and forgetting a host remove it.
 
+A `sandbox.policy` or `sandbox.policy.preview` that would not fit one device-leg message is not sent: the request is answered with an `error` (`unsupported`, its `of`) naming the host command that shows the policy or makes the change, and a broadcast of it is left out. `sandboxes.list` is bounded the same way.
+
 ### Diagnostic probe notifications
 
 The reserved `probe.enclos.invalid` network destination is used by the built-in policy probes, not an actionable resource. The bridge never creates access requests for that exact host, on any port, and refuses explicit agent requests for it. Existing pending notifications are atomically reclassified as terminal `diagnostic`, with approval unavailable and no policy change, then delivered so connected devices hide them. Startup and sync perform this cleanup too; a stale phone decision cannot approve the old notification. Network logs remain intact. Other destinations, including private addresses and other `.invalid` names, are never excluded by address alone.

@@ -304,7 +304,7 @@ impl Hub {
                 .expect("provisioning request checked")
                 .sandboxes()
             {
-                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+                hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
                 let _ = store.log(
@@ -1824,7 +1824,7 @@ fn run_session(
                 match result {
                     Ok(mut state) => {
                         state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
+                        link.send(policy::fitting(ToDevice::SandboxPolicy(state), &message.id))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1851,7 +1851,10 @@ fn run_session(
                 match result {
                     Ok(mut preview) => {
                         preview.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                        link.send(policy::fitting(
+                            ToDevice::SandboxPolicyPreview(preview),
+                            &message.id,
+                        ))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1867,7 +1870,7 @@ fn run_session(
                 match result {
                     Ok(mut state) => {
                         state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
+                        link.send(policy::fitting(ToDevice::SandboxPolicy(state), &message.id))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1920,7 +1923,10 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
+                            Ok(sandboxes) => link.send(policy::fitting(
+                                ToDevice::SandboxesList { sandboxes },
+                                &message.id,
+                            ))?,
                             Err(why) => link.send(ToDevice::Error(ErrorBody {
                                 of: Some(message.id),
                                 code: ErrorCode::OperationFailed,

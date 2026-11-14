@@ -2658,3 +2658,51 @@ fn review_imported_presentation_reaches_connected_paired_devices_without_relisti
     };
     assert!(photo.image.is_none());
 }
+
+#[test]
+fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
+    use enclos_protocol::device::SandboxInfo;
+    use enclos_protocol::plugin::ErrorCode;
+    use enclos_protocol::policy::PolicyState;
+    let policy = |reason: usize| {
+        ToDevice::SandboxPolicy(PolicyState {
+            sandbox: "lab".into(),
+            version: 1,
+            base: "b".into(),
+            editable: true,
+            reason: Some("x".repeat(reason)),
+            fields: Vec::new(),
+            of: "get-1".into(),
+        })
+    };
+    let of = MessageId::new("get-1").unwrap();
+    assert_eq!(policy::fitting(policy(10), &of), policy(10));
+    let ToDevice::Error(error) = policy::fitting(policy(70_000), &of) else {
+        panic!("sent as it is");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::Unsupported);
+    assert!(
+        error.message.contains("enclos policy show lab"),
+        "{}",
+        error.message
+    );
+    let sandboxes = (0..3_000)
+        .map(|n| SandboxInfo {
+            sandbox: format!("sandbox-{n}"),
+            runtime: Some("hermes".into()),
+            state: "running".into(),
+        })
+        .collect();
+    assert!(matches!(
+        policy::fitting(ToDevice::SandboxesList { sandboxes }, &of),
+        ToDevice::Error(_)
+    ));
+    // Not broadcast at all: sealed, it would end the device's connection.
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, received) = hub_with(dir.path(), &["alice@example.com"]);
+    hub.deliver_fitting("alice@example.com", policy(70_000));
+    hub.deliver_fitting("alice@example.com", policy(10));
+    assert_eq!(received[0].try_recv().ok(), Some(policy(10)));
+    assert!(received[0].try_recv().is_err());
+}

@@ -33,7 +33,43 @@ pub(super) fn accepted_entry(
     }
 }
 
+/// What a device is sent for `body`, a sandbox's policy, its preview or
+/// the sandboxes' list, as the answer to `of`: `body`, or, when it does not
+/// fit one device-leg message (`agent_names::agent_message_fits`), an error
+/// saying where to see it. Sent as it is, it could not be sealed, and the
+/// device's connection would end.
+pub(super) fn fitting(body: ToDevice, of: &MessageId) -> ToDevice {
+    if super::agent_names::agent_message_fits(&body).unwrap_or(false) {
+        return body;
+    }
+    let message = match &body {
+        ToDevice::SandboxPolicy(state) => format!(
+            "The policy of sandbox {} is too large to show on the phone. See it on the host with `enclos policy show {}`.",
+            state.sandbox, state.sandbox
+        ),
+        ToDevice::SandboxPolicyPreview(preview) => format!(
+            "This change to sandbox {} is too large to preview on the phone. Make it on the host with `enclos policy edit {}`.",
+            preview.sandbox, preview.sandbox
+        ),
+        _ => "The list is too large to show on the phone. See it on the host with `enclos sandbox list`.".to_owned(),
+    };
+    ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+        of: Some(of.clone()),
+        code: enclos_protocol::plugin::ErrorCode::Unsupported,
+        message,
+    })
+}
+
 impl Hub {
+    /// Sends `body` to `person`'s devices when it fits one device-leg
+    /// message; else none, which would end each device's connection: a
+    /// device that asks for it is told why it does not come ([`fitting`]).
+    pub(super) fn deliver_fitting(&self, person: &str, body: ToDevice) {
+        if super::agent_names::agent_message_fits(&body).unwrap_or(false) {
+            self.deliver(person, body);
+        }
+    }
+
     pub(super) fn policy_authority(
         &self,
         store: &Store,
@@ -92,7 +128,7 @@ impl Hub {
             .mobile_policy_apply(&actor, name, &edit.base, &edit.revision, &edit.change);
         self.refresh_access_context(name.as_str());
         if let Ok(state) = self.managed_policy(store, name) {
-            self.deliver(person, ToDevice::SandboxPolicy(state));
+            self.deliver_fitting(person, ToDevice::SandboxPolicy(state));
         }
         result.map_err(|e| format!("{e}. Refresh the policy before retrying."))?;
         // Saved and audited: a failure to read it back is not a refusal
