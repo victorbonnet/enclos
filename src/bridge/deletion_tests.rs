@@ -391,14 +391,28 @@ fn next_line(lines: &mut BufReader<UnixStream>) -> Option<FromBridge> {
     }
 }
 
-/// Whether the bridge ended the connection: the plugin reads its end
-/// within 5 seconds, and nothing before it.
+/// Whether the bridge ended the connection: the plugin reads its end,
+/// and nothing before it. The wait only bounds a bridge that never ends
+/// it: a loaded macOS runner has gone past 5 seconds. What was read
+/// instead is printed, so an acknowledgement and a wait that ran out
+/// tell themselves apart.
 fn ended(lines: &mut BufReader<UnixStream>) -> bool {
     lines
         .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    matches!(lines.read_line(&mut String::new()), Ok(0))
+    let started = std::time::Instant::now();
+    let mut line = String::new();
+    match lines.read_line(&mut line) {
+        Ok(0) => true,
+        other => {
+            eprintln!(
+                "not ended after {:?}: {other:?}, read {line:?}",
+                started.elapsed()
+            );
+            false
+        }
+    }
 }
 
 /// The plugin for `lab/<name>`, connected again once the bridge let its
@@ -407,7 +421,7 @@ fn reconnected(hub: &Arc<Hub>, dir: &Path, name: &str) -> (UnixStream, BufReader
     let agent = format!("lab/{name}");
     let started = std::time::Instant::now();
     while hub.plugins.lock().unwrap().contains_key(&agent) {
-        assert!(started.elapsed() < Duration::from_secs(5), "never let go");
+        assert!(started.elapsed() < Duration::from_secs(30), "never let go");
         std::thread::sleep(Duration::from_millis(20));
     }
     std::fs::remove_file(dir.join(format!("{name}.sock"))).unwrap();
