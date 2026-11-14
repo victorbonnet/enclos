@@ -531,7 +531,7 @@ fn a_request_that_waits_for_the_person_unarchives_its_conversation() {
         .add("asks-1", "c-asks", &From::Agent, "still working", "reply")
         .unwrap();
     assert!(store.conversation_info("c-asks").unwrap().unwrap().archived);
-    // A question or a command approval brings it back, on every device.
+    // A question or a runtime approval brings it back, on every device.
     assert!(hub.unarchive_for_request(&store, "c-asks").unwrap());
     let ToDevice::Conversation(info) = phone_rx.try_recv().unwrap() else {
         panic!("expected conversation metadata");
