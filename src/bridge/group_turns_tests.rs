@@ -296,7 +296,7 @@ fn a_reply_after_stop_and_the_answer_to_stop_are_dropped() {
 }
 
 #[test]
-fn a_late_reply_after_a_restart_is_kept_once_and_for_its_own_turn_only() {
+fn a_late_reply_after_a_restart_is_kept_for_its_own_turn_only() {
     let dir = tempfile::tempdir().unwrap();
     let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
     let store = hub.store().unwrap();
@@ -325,9 +325,144 @@ fn a_late_reply_after_a_restart_is_kept_once_and_for_its_own_turn_only() {
         Some(false)
     );
     assert_eq!(status(&store), "replied");
+    // group.state says so too.
     assert_eq!(
-        hub.group_reply(&store, "g-1", "main", Some("s-1"), "done", false, "reply"),
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
+    // Its further messages for that turn are what it said, kept (one sent
+    // again under the same id is the store's to drop); a pass is not.
+    assert_eq!(
+        hub.group_reply(
+            &store,
+            "g-1",
+            "main",
+            Some("s-1"),
+            "and more",
+            false,
+            "reply"
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "(pass)", false, "reply"),
         None
+    );
+    assert_eq!(status(&store), "replied");
+}
+
+#[test]
+fn a_members_messages_after_the_reply_that_ended_its_turn_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    running(&hub, &store);
+    assert_eq!(
+        hub.group_reply(
+            &store,
+            "g-1",
+            "main",
+            Some("s-1"),
+            "here it is",
+            false,
+            "reply"
+        ),
+        Some(true)
+    );
+    // Hermes sends a reply's files after its text, answering the same
+    // message: kept, ending no other turn.
+    assert_eq!(
+        hub.group_reply(&store, "g-1", "main", Some("s-1"), "", true, "reply"),
+        Some(false)
+    );
+    assert_eq!(
+        hub.group_reply(
+            &store,
+            "g-1",
+            "main",
+            Some("s-1"),
+            "and a note for @coder",
+            false,
+            "reply"
+        ),
+        Some(false)
+    );
+    // Its turn ended once, with the first.
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
+    // The note's mention asks coder for a turn in the next round, as the
+    // reply's own would.
+    assert_eq!(hub.groups.lock().unwrap()["g-1"].next, ["coder"]);
+}
+
+#[test]
+fn every_message_a_member_sends_for_its_turn_is_stored_and_its_turn_ends_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
+    let store = hub.store().unwrap();
+    group(&hub, &store);
+    // main answers its turn with its text, sends it again under the same
+    // id (its ack lost), then a second message for the same turn, as
+    // Hermes sends a reply's files after its text.
+    let to_main = member(dir.path(), "main", Duration::ZERO, Vec::new(), |sent, _| {
+        let first = new_id().unwrap();
+        vec![
+            (
+                first.clone(),
+                says("g-1", "here it is", OutKind::Reply, Some(sent)),
+            ),
+            (first, says("g-1", "here it is", OutKind::Reply, Some(sent))),
+            (
+                new_id().unwrap(),
+                says("g-1", "and the chart", OutKind::Reply, Some(sent)),
+            ),
+        ]
+    });
+    let to_coder = member(
+        dir.path(),
+        "coder",
+        Duration::ZERO,
+        Vec::new(),
+        |sent, _| {
+            vec![(
+                new_id().unwrap(),
+                says("g-1", "thanks", OutKind::Reply, Some(sent)),
+            )]
+        },
+    );
+    person_says(&hub, &store, "g-1", "p-1", "hello");
+    to_main.recv_timeout(Duration::from_secs(5)).unwrap();
+    to_coder.recv_timeout(Duration::from_secs(5)).unwrap();
+    let said = |store: &Store| -> Vec<(From, String)> {
+        store
+            .messages_after("g-1", 0)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.from, m.text))
+            .collect()
+    };
+    until(|| said(&store).len() == 4 && state(&hub, &store, "g-1").state == "settled");
+    let said = said(&store);
+    // The one sent again is dropped: each of main's messages is stored once.
+    for text in ["here it is", "and the chart"] {
+        let main = (From::Member("main".into()), text.to_owned());
+        assert_eq!(said.iter().filter(|m| **m == main).count(), 1, "{said:?}");
+    }
+    assert!(
+        said.contains(&(From::Member("coder".into()), "thanks".into())),
+        "{said:?}"
+    );
+    // One turn each: main's second message ended no other.
+    assert!(to_main.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "coder").as_deref(),
+        Some("replied")
     );
 }
 
