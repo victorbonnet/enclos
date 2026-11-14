@@ -1402,7 +1402,7 @@ fn a_start_while_the_services_are_removed_leaves_the_sandbox_running_not_stopped
     assert!(matches!(err, Error::StartedWhileStopping { .. }), "{err:?}");
     fake.on_stop.borrow_mut().take();
     assert_eq!(state_of(&engine, &name), SandboxState::Running);
-    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert!(engine.has_services(&name).unwrap());
     // Stopped again, it stops.
     done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
     assert_eq!(state_of(&engine, &name), SandboxState::Stopped);

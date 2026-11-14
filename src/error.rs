@@ -33,7 +33,7 @@ pub enum Error {
     /// A start ran while `sandbox stop` removed the services, and installed
     /// them again: the stop changed nothing more.
     #[error(
-        "sandbox `{name}` was started again while it stopped, and runs. Run `enclos sandbox stop {name}` again to stop it"
+        "sandbox `{name}` was not stopped: a start or restart that ran meanwhile installed its services again. Run `enclos sandbox stop {name}` again to stop it"
     )]
     StartedWhileStopping { name: String },
     /// A sandbox marked failed, by a stop that left members running or by
