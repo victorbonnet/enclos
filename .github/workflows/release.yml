@@ -28,8 +28,11 @@ env:
 
 jobs:
   # A tag releases only a commit on which the `ci` workflow passed on `main`
-  # (docs/releases.md). A run still going is waited for; one that failed or
-  # was cancelled, or none at all, refuses the tag. A dry run checks nothing.
+  # (docs/releases.md). A run still going is waited for, and so is a run not
+  # yet listed, for ten minutes, since a tag pushed with its commit can be
+  # checked before GitHub creates that commit's run. A run that failed or was
+  # cancelled, or no run after ten minutes, refuses the tag. A failed query is
+  # retried. A dry run checks nothing.
   ci-passed:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -46,13 +49,25 @@ jobs:
           COMMIT: ${{ github.sha }}
         run: |
           runs="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$COMMIT&event=push&branch=main&per_page=100"
+          # How long to wait for a run to be listed at all.
+          grace=600
           while :; do
-            gh api "$runs" > runs.json
+            if ! gh api "$runs" > runs.json; then
+              echo "::warning::Listing the ci runs failed; trying again in a minute"
+              sleep 60
+              continue
+            fi
             jq -r '.workflow_runs[] | "\(.status) \(.conclusion // "-") \(.html_url)"' runs.json
             verdict="$(jq -r '.workflow_runs
               | if any(.[]; .conclusion == "success") then "passed"
                 elif any(.[]; .status != "completed") then "running"
+                elif length == 0 then "none"
                 else "refused" end' runs.json)"
+            if [ "$verdict" = none ] && [ "$SECONDS" -lt "$grace" ]; then
+              echo "No ci run on $COMMIT yet; checking again in a minute"
+              sleep 60
+              continue
+            fi
             case "$verdict" in
               passed)
                 echo "ci passed on $COMMIT"
@@ -61,6 +76,10 @@ jobs:
               running)
                 echo "ci is still running on $COMMIT; checking again in a minute"
                 sleep 60
+                ;;
+              none)
+                echo "::error::No ci run on $COMMIT on main after $((grace / 60)) minutes. Push the commit to main and wait for ci to pass there, then rerun this workflow."
+                exit 1
                 ;;
               *)
                 echo "::error::No ci run passed on $COMMIT on main. Rerun ci there, or tag a commit it passed on, then rerun this workflow."

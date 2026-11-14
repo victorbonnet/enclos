@@ -21,7 +21,7 @@ The Linux binaries are static, linked against musl rather than the host's glibc,
 3. Push a tag named `v` and that version, such as `v0.1.0` for `0.1.0`, on that commit.
 4. Once it is published, put its notes on the release: `gh release edit v0.1.0 --notes-file docs/release-notes/0.1.0.md`. The workflow only generates a list of changes.
 
-The tag runs [`release.yml`](../.github/workflows/release.yml) in four jobs. **ci-passed** first: the `ci` workflow must have passed on the tagged commit on `main`. It waits for a run still going, and refuses the tag when the run failed or was cancelled, or when there is none; rerun `ci` on that commit, then rerun the release. A run on `main` is never cancelled by a later push.
+The tag runs [`release.yml`](../.github/workflows/release.yml) in four jobs. **ci-passed** first: the `ci` workflow must have passed on the tagged commit on `main`. It waits for a run still going, and for ten minutes for a run not yet listed (a tag pushed together with its commit can be checked before that run exists). It refuses the tag when the run failed or was cancelled, or when there is still none; rerun `ci` on that commit, then rerun the release. A run on `main` is never cancelled by a later push.
 
 **build**, once for each archive, with read access only, so dependency build scripts never see a token that can publish:
 
