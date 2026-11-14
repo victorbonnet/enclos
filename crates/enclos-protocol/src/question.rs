@@ -58,7 +58,7 @@ impl RuntimeApprovalAction {
 /// At most this many runtime patterns name what a session or always grant covers.
 pub const MAX_APPROVAL_PATTERNS: usize = 16;
 
-/// Only the native runtime supplies the already-redacted display command and allowed scopes.
+/// Only the native runtime supplies the already-redacted display command and allowed consents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeApprovalDefinition {
     pub command: String,

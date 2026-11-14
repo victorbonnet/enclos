@@ -1,4 +1,4 @@
-//! The bridge's service (ADR 0042, proposed; `docs/protocol.md`, The
+//! The bridge's device leg (ADR 0042, proposed; `docs/protocol.md`, The
 //! device leg): a WebSocket listener on the host's loopback, which its
 //! transport puts on the person's network (`tailscale serve`, the only one
 //! for now). Each connection is a Noise session with a paired device, or

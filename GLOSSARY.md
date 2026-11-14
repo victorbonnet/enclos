@@ -202,7 +202,7 @@ A file enclos gives a program as a session starts, which the program and everyth
 
 **Scope**:
 On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
-_Avoid_: scope for what a policy request asks (a grant) or a runtime approval allows (a consent)
+_Avoid_: scope for what a policy request asks (a grant) or a runtime approval allows (a consent), except the protocol's `scope` field and the titles of ADRs 0046 and 0053, which keep the earlier word
 
 **Slice**:
 On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.

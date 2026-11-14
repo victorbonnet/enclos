@@ -22,10 +22,12 @@ THEMES = {
 TITLE = "Every client goes through one core; each sandbox runs as its own services"
 SUBTITLE = "No daemon: the CLI writes state and audit, and the service manager keeps each sandbox's proxy and gateway running"
 
+CLIENT_W = 247
 CLIENTS = [  # x, title, lines, kind
     (40, "enclos (CLI)", ["every operation", "milestone 1"], "accent"),
-    (420, "enclos ui", ["local web UI", "same audit log; later"], "later"),
-    (800, "Host assistants", ["Claude Code, Codex: run the CLI", "with the enclos plugin"], "solid"),
+    (311, "Host assistants", ["Claude Code, Codex: run the CLI", "with the enclos plugin"], "solid"),
+    (582, "Bridge", ["the mobile app's way in:", "enclos app serve, milestone 4"], "solid"),
+    (853, "enclos ui", ["local web UI", "same audit log; later"], "later"),
 ]
 CORE = [
     (60, "State + audit", ["SQLite + JSONL"]),
@@ -127,8 +129,8 @@ def draw_architecture(t: dict) -> str:
     c.text(40, 62, SUBTITLE, 13.5, t["sub"], anchor="start")
 
     for x, title, lines, kind in CLIENTS:
-        c.box(x, 84, 300, 80, title, lines, kind)
-        c.arrow(x + 150, 164, x + 150, 190)
+        c.box(x, 84, CLIENT_W, 80, title, lines, kind)
+        c.arrow(x + CLIENT_W / 2, 164, x + CLIENT_W / 2, 190)
 
     c.rect(40, 192, 1060, 124)
     c.text(60, 216, "Core library", 15, t["text"], "600", "start")
