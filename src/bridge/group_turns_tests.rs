@@ -325,6 +325,11 @@ fn a_late_reply_after_a_restart_is_kept_for_its_own_turn_only() {
         Some(false)
     );
     assert_eq!(status(&store), "replied");
+    // group.state says so too.
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
     // Its further messages for that turn are what it said, kept (one sent
     // again under the same id is the store's to drop); a pass is not.
     assert_eq!(
@@ -376,7 +381,7 @@ fn a_members_messages_after_the_reply_that_ended_its_turn_are_kept() {
             "g-1",
             "main",
             Some("s-1"),
-            "and a note",
+            "and a note for @coder",
             false,
             "reply"
         ),
@@ -384,6 +389,9 @@ fn a_members_messages_after_the_reply_that_ended_its_turn_are_kept() {
     );
     let turn = store.turn_sent("s-1", "g-1", "main").unwrap().unwrap();
     assert_eq!(turn.1, "replied");
+    // The note's mention asks coder for a turn in the next round, as the
+    // reply's own would.
+    assert_eq!(hub.groups.lock().unwrap()["g-1"].next, ["coder"]);
 }
 
 #[test]
@@ -392,14 +400,17 @@ fn every_message_a_member_sends_for_its_turn_is_stored_and_its_turn_ends_once() 
     let hub = hub(dir.path(), &["lab/main", "lab/coder"]);
     let store = hub.store().unwrap();
     group(&hub, &store);
-    // main answers its turn with its text, then a second message for the
-    // same turn, as Hermes sends a reply's files after its text.
+    // main answers its turn with its text, sends it again under the same
+    // id (its ack lost), then a second message for the same turn, as
+    // Hermes sends a reply's files after its text.
     let to_main = member(dir.path(), "main", Duration::ZERO, Vec::new(), |sent, _| {
+        let first = new_id().unwrap();
         vec![
             (
-                new_id().unwrap(),
+                first.clone(),
                 says("g-1", "here it is", OutKind::Reply, Some(sent)),
             ),
+            (first, says("g-1", "here it is", OutKind::Reply, Some(sent))),
             (
                 new_id().unwrap(),
                 says("g-1", "and the chart", OutKind::Reply, Some(sent)),
@@ -431,11 +442,10 @@ fn every_message_a_member_sends_for_its_turn_is_stored_and_its_turn_ends_once() 
     };
     until(|| said(&store).len() == 4 && state(&hub, &store, "g-1").state == "settled");
     let said = said(&store);
+    // The one sent again is dropped: each of main's messages is stored once.
     for text in ["here it is", "and the chart"] {
-        assert!(
-            said.contains(&(From::Member("main".into()), text.into())),
-            "{said:?}"
-        );
+        let main = (From::Member("main".into()), text.to_owned());
+        assert_eq!(said.iter().filter(|m| **m == main).count(), 1, "{said:?}");
     }
     assert!(
         said.contains(&(From::Member("coder".into()), "thanks".into())),

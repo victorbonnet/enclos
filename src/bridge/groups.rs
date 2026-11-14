@@ -231,6 +231,8 @@ pub struct Discussion {
     /// Each member's turn in this discussion: `queued`, `working`,
     /// `replied`, `passed`, `failed`, `cancelled`.
     pub turns: std::collections::HashMap<String, String>,
+    /// Each member's latest turn in this discussion, by id.
+    pub latest: std::collections::HashMap<String, String>,
     /// `working`, `settled`, `bounded`, `stopped` or `failed`.
     pub state: String,
     pub reason: Option<String>,
@@ -250,6 +252,7 @@ impl Discussion {
             running: None,
             pending: None,
             turns: Default::default(),
+            latest: Default::default(),
             state: "working".to_owned(),
             reason: None,
         };
@@ -261,12 +264,13 @@ impl Discussion {
         d
     }
 
-    /// A discussion the bridge's restart ended: `member`'s turn was running,
-    /// and fails; nothing queued runs. The person's next message starts a
-    /// new one.
-    pub fn interrupted(member: &str) -> Discussion {
+    /// A discussion the bridge's restart ended: `member`'s turn `turn` was
+    /// running, and fails; nothing queued runs. The person's next message
+    /// starts a new one.
+    pub fn interrupted(member: &str, turn: &str) -> Discussion {
         let mut d = Discussion::new(0, "", &[]);
         d.turns.insert(member.to_owned(), "failed".to_owned());
+        d.latest.insert(member.to_owned(), turn.to_owned());
         d.end("failed", Some("bridge_restarted"));
         d
     }
@@ -332,6 +336,7 @@ impl Discussion {
     /// A member's turn started, sent as plugin message `sent`.
     pub fn started(&mut self, member: &str, turn: String, sent: String, seen: i64, direct: bool) {
         self.turns.insert(member.to_owned(), "working".to_owned());
+        self.latest.insert(member.to_owned(), turn.clone());
         self.running = Some(Running {
             member: member.to_owned(),
             turn,
@@ -371,6 +376,32 @@ impl Discussion {
         }
         self.turns.insert(run.member, "replied".to_owned());
         Ended::Replied
+    }
+
+    /// `member` said `text` for its turn `turn` besides the reply that
+    /// ends it: before that reply, or after it (a reply's files, a reply
+    /// that came after its turn failed). It counts when `turn` is the
+    /// member's latest in this discussion: a failed turn is then replied,
+    /// and, while the discussion goes on, the members `text` mentions are
+    /// asked for a turn in the next round, as a reply's are. Whether the
+    /// member's turn changed.
+    pub fn also_said(&mut self, member: &str, turn: &str, text: &str, handles: &[String]) -> bool {
+        if self.latest.get(member).map(String::as_str) != Some(turn) {
+            return false;
+        }
+        let changed = self.turns.get(member).is_some_and(|s| s == "failed");
+        if changed {
+            self.turns.insert(member.to_owned(), "replied".to_owned());
+        }
+        if self.state == "working" {
+            self.spoke = true;
+            for m in mentions(text, handles) {
+                if m != member && !self.next.contains(&m) {
+                    self.next.push(m);
+                }
+            }
+        }
+        changed
     }
 
     /// The running turn failed (no reply in time, the bridge restarted).
@@ -661,8 +692,35 @@ mod tests {
     }
 
     #[test]
+    fn what_a_member_says_besides_its_reply_brings_in_whom_it_mentions() {
+        // main is asked first, then coder; writer is not addressed.
+        let mut d = Discussion::new(1, "@main @coder", &handles());
+        let (m, direct) = d.next_turn(&handles(), |_| true).unwrap();
+        d.started(&m, "t-main".into(), "s-main".into(), 0, direct);
+        assert_eq!(d.replied("here", false, &handles()), Ended::Replied);
+        // Its files, then a note for the same turn: the note's mention counts.
+        assert!(!d.also_said("main", "t-main", "", &handles()));
+        assert!(!d.also_said("main", "t-main", "@writer please check", &handles()));
+        // Not its latest turn here, or another member's: nothing changes.
+        assert!(!d.also_said("main", "t-old", "@main @coder", &handles()));
+        assert!(!d.also_said("coder", "t-main", "@coder", &handles()));
+        assert_eq!(d.next, ["writer"]);
+        let (m, direct) = d.next_turn(&handles(), |_| true).unwrap();
+        assert_eq!(m, "coder");
+        d.started(&m, "t-coder".into(), "s-coder".into(), 0, direct);
+        // No reply in time; it comes late, while the discussion goes on.
+        d.failed();
+        assert!(d.also_said("coder", "t-coder", "done", &handles()));
+        assert_eq!(d.turns["coder"], "replied");
+        assert_eq!(
+            d.next_turn(&handles(), |_| true),
+            Some(("writer".to_owned(), false))
+        );
+    }
+
+    #[test]
     fn a_restart_ends_the_discussion_with_the_running_turn_failed() {
-        let mut d = Discussion::interrupted("coder");
+        let mut d = Discussion::interrupted("coder", "t-1");
         assert_eq!(
             (
                 d.state.as_str(),
