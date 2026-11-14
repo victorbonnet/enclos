@@ -164,7 +164,7 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `sandbox.policy.preview` | bridge | `sandbox`, `base`, `revision`, `change`, `changes`, `restart`, `of` | Exact host-generated effects and restart requirement |
 | `sandbox.policy.apply` | device | `sandbox`, `base`, `revision`, `change` | Apply only the freshly reviewed edit, revalidated under the engine state lock |
 
-| `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, including archived ones, current pending questions regardless of `since`, then every `message` after `since` with current question metadata before any linked message, then `synced` |
+| `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, including archived ones, current pending questions regardless of `since`, then every `message` after `since` with current question metadata before any linked message, then `synced`. A stored conversation, policy request or message whose frame would be larger than one device message is not sent: the bridge says so on its stderr and in `enclos app log` (`skipped`), and `synced` still names the newest `seq`, so the device does not ask for it again. The bridge keeps what it stores and imports within bounds, so only a row stored by an earlier bridge can be one |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
 | `status.report` | bridge | as `enclos app status --json` | |

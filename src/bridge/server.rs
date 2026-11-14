@@ -1098,15 +1098,21 @@ pub(super) fn fits_device(body: &ToDevice) -> bool {
     encode_line(&Envelope::new(id, body.clone())).len() <= MAX_DEVICE_MESSAGE
 }
 
-/// Says in the bridge's log that a sync passed over `what`, too large for a
-/// device.
-fn log_too_large(store: &Store, device: &str, person: &str, what: &str) {
-    let _ = store.log(
-        Some(device),
-        Some(person),
-        "skipped",
-        Some(&format!("{what} is too large for a device")),
-    );
+/// Says on stderr and in the bridge's log (`enclos app log`) that a sync
+/// passed over `what`, whose frame `body` is too large for a device: the
+/// device never gets it. A last resort: what the bridge stores and imports
+/// is kept within bounds before.
+fn log_too_large(store: &Store, device: &str, person: &str, what: &str, body: &ToDevice) {
+    let size = encode_line(&Envelope::new(
+        MessageId::new("f".repeat(36)).expect("a valid id"),
+        body.clone(),
+    ))
+    .len();
+    let why = format!("{what} is {size} bytes, too large for a device: not sent");
+    eprintln!("enclos app: sync for {person}: {why}");
+    if let Err(e) = store.log(Some(device), Some(person), "skipped", Some(&why)) {
+        eprintln!("enclos app: cannot log that: {e}");
+    }
 }
 
 /// Stored message `m` as a sync sends it, with its files' details.
@@ -2203,11 +2209,12 @@ fn run_session(
                         eprintln!("enclos app approvals: {e}");
                     }
                     for a in store.approvals().map_err(|e| e.to_string())? {
+                        let what = format!("policy request {}", a.request);
                         let body = ToDevice::Approval(a);
                         if fits_device(&body) {
                             link.send(body)?;
                         } else {
-                            log_too_large(store, &device.id, person, "a policy request");
+                            log_too_large(store, &device.id, person, &what, &body);
                         }
                     }
                 }
@@ -2215,11 +2222,12 @@ fn run_session(
                 // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
+                        let what = format!("conversation {}'s details", info.conversation.as_str());
                         let body = ToDevice::Conversation(info);
                         if fits_device(&body) {
                             link.send(body)?;
                         } else {
-                            log_too_large(store, &device.id, person, "a conversation's details");
+                            log_too_large(store, &device.id, person, &what, &body);
                         }
                     }
                 }
@@ -2253,12 +2261,12 @@ fn run_session(
                             question: current.info,
                         })?;
                     }
-                    let id = m.id.clone();
+                    let what = format!("message {} of conversation {}", m.id, m.conversation);
                     let body = message_frame(store, m)?;
-                    // One stored before its details were bounded is passed
-                    // over rather than ending every sync at it.
+                    // One too large is passed over rather than ending every
+                    // sync at it; the device's next sync starts after it.
                     if !fits_device(&body) {
-                        log_too_large(store, &device.id, person, &format!("message {id}"));
+                        log_too_large(store, &device.id, person, &what, &body);
                         continue;
                     }
                     link.send(body)?;
@@ -3418,6 +3426,70 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
         );
+    }
+
+    /// A stored message too large for a device (as an earlier bridge could
+    /// store one) is passed over at sync, said in the log, and nothing else
+    /// is: the message after it arrives, `synced` names the newest, and the
+    /// session goes on. It once ended every sync at it.
+    #[test]
+    fn a_sync_passes_over_a_message_too_large_for_a_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(eventually(|| store.owner("c-1").unwrap().is_some()));
+        store
+            .add("too-large", "c-1", &From::Agent, "a file", "reply")
+            .unwrap()
+            .unwrap();
+        store
+            .add_attachment(
+                &StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    mime: format!("a/{}", "b".repeat(70_000)),
+                    name: "a.bin".into(),
+                    size: 1,
+                },
+                "too-large",
+            )
+            .unwrap();
+        let after = store
+            .add("after", "c-1", &From::Agent, "and then", "reply")
+            .unwrap()
+            .unwrap();
+        device.send("s-1", FromDevice::Sync { since: 0 });
+        let mut texts = Vec::new();
+        let synced = loop {
+            match device.receive() {
+                Some(ToDevice::Message(m)) => texts.push(m.text),
+                Some(ToDevice::Synced { seq }) => break seq,
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        };
+        assert_eq!(texts, ["and then"]);
+        assert_eq!(synced, after);
+        assert!(
+            store
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .any(|l| l.event == "skipped"
+                    && l.reason.as_deref().is_some_and(|r| r.contains("too-large")))
+        );
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the session ended after the sync"),
+            }
+        }
     }
 
     /// A person who names another person's conversation as a new one of
