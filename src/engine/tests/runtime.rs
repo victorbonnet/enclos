@@ -523,6 +523,84 @@ fn an_installer_that_fails_leaves_the_sandbox_as_before() {
     assert!(lab.home.join("bin/mktemp").is_file());
 }
 
+/// An installer that ignores TERM and starts a process in a process group
+/// of its own, which ignores TERM too, as a stuck `curl | bash` child can:
+/// both pids go to `installer-pids` in the home.
+const HANGS: &str = "#!/bin/sh
+trap '' TERM
+/usr/bin/perl -e 'setpgrp(0, 0); exec \"/bin/sleep\", \"600\"' &
+printf '%s\\n%s\\n' $! $$ > \"$HOME/installer-pids.part\"
+mv \"$HOME/installer-pids.part\" \"$HOME/installer-pids\"
+exec /bin/sleep 600
+";
+
+/// The mobile app's bridge asks for an install nobody watches: past its
+/// limit, every process of the installer is stopped, whatever its process
+/// group, its session's end is recorded, and the install is undone.
+#[test]
+fn an_installer_past_its_time_limit_is_stopped_with_all_it_started_and_undone() {
+    use crate::model::session::SessionKind;
+    use std::time::{Duration, Instant};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    // KILL half a second after TERM, rather than `STOP_GRACE`.
+    let lab = Lab::stopping_with(|cgroups, session, _| {
+        crate::lifecycle::stop::stop(cgroups, session, Duration::from_millis(500))
+    });
+    let runtime = TestRuntime::new(lab._dir.path(), HANGS);
+    let started = Instant::now();
+    let limit = Duration::from_secs(3);
+    let end = done(
+        lab.engine
+            .install_runtime_limited(&alice(), &lab.name, &runtime, Confirm::Yes, Some(limit))
+            .unwrap(),
+    );
+    assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!end.installed, "{end:?}");
+    assert_eq!(end.stopped_after, Some(limit));
+    assert_eq!(
+        end.ended(),
+        "did not finish within 3 seconds and was stopped"
+    );
+    // It ignored TERM, so KILL ended it.
+    assert_eq!(end.end.signal, Some(9), "{end:?}");
+    assert_eq!(end.end.left, Left::Nothing, "{end:?}");
+    // The process in a group of its own is gone too.
+    assert_gone(&pids_in(&lab.home.join("installer-pids")));
+    let open: Vec<_> = lab
+        .engine
+        .state
+        .sessions(&lab.name, true)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.kind != SessionKind::Proxy)
+        .collect();
+    assert!(open.is_empty(), "{open:?}");
+    // Undone, as after an installer that fails.
+    assert_eq!(end.recorded, None);
+    assert_eq!(lab.runtime(), None);
+    assert!(!lab.allows("chatgpt.com"));
+    assert_eq!(
+        lab.summary("runtime install failed"),
+        format!(
+            "the installer did not finish within 3 seconds and was stopped; policy v{} without hermes's destinations",
+            end.policy
+        )
+    );
+    assert!(
+        lab.summary("session end")
+            .contains("stopped at its time limit"),
+        "{}",
+        lab.audit()
+    );
+    assert!(lab.engine.verify_audit().unwrap().intact());
+}
+
 #[test]
 fn a_reinstall_that_fails_keeps_the_runtime_and_its_destinations() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());

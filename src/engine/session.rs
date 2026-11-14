@@ -129,8 +129,9 @@ impl Engine {
             SandboxCommand::new(command),
             "exec",
             CommandKind::Exec,
+            None,
         )
-        .map(Planned::Done)
+        .map(|(end, _)| Planned::Done(end))
     }
 
     /// Runs `command` in the sandbox, in this terminal, as a recorded
@@ -142,12 +143,37 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
-        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Interactive)
+        self.run_in_sandbox_as(
+            by,
+            name,
+            command,
+            audit_name,
+            CommandKind::Interactive,
+            None,
+        )
+        .map(|(end, _)| end)
+    }
+
+    /// [`Engine::run_in_sandbox`], told to end at `deadline`, as `launch`
+    /// is when its service stops: every member of the session is stopped,
+    /// TERM then KILL, whatever its process group, and so is what it left
+    /// running, before the end is recorded. Also says whether it was told
+    /// to end.
+    pub(super) fn run_in_sandbox_within(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        deadline: Instant,
+    ) -> Result<(SessionEnd, bool)> {
+        let kind = CommandKind::Interactive;
+        self.run_in_sandbox_as(by, name, command, audit_name, kind, Some(deadline))
     }
 
     /// Runs `command` in the sandbox as a recorded session of `kind`, with
     /// this process's input and output (design §8 steps 1-6), and returns
-    /// when it exits.
+    /// when it exits, ending it at `deadline`, and whether it did.
     fn run_in_sandbox_as(
         &self,
         by: &Actor,
@@ -155,7 +181,8 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
         kind: CommandKind,
-    ) -> Result<SessionEnd> {
+        deadline: Option<Instant>,
+    ) -> Result<(SessionEnd, bool)> {
         let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
         let me = std::process::id();
@@ -180,12 +207,18 @@ impl Engine {
             self.failed_on_error(lock, name, audit_name, started)
         })?;
 
+        // Past its deadline, it is told to end: each member, whatever its
+        // process group, is stopped, not only the group it leads.
+        let ended = AtomicBool::new(false);
         // In a group of its own, the program hears of a signal only when
         // this process passes it on, to the group it leads. In a terminal,
         // it hears the terminal's signals itself, but not a TERM sent to
         // this process alone, which is passed on to the program.
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                ended.store(true, Ordering::Relaxed);
+            }
             for signal in keep_waiting.received() {
                 let sent = match (group, signal) {
                     (Group::Own, _) => signal_group(&session.root, pgid, signal),
@@ -201,10 +234,28 @@ impl Engine {
                 note(notes, format!("could not pass {} on: {why}", signal.name()));
             }
         };
-        let waited = self.wait_session(&session, &mut child, None, &mut pass_on)?;
+        let waited =
+            self.wait_session(&session, &mut child, deadline.map(|_| &ended), &mut pass_on);
+        let timed_out = ended.load(Ordering::Relaxed);
+        let why = timed_out.then_some("stopped at its time limit");
+        let mut waited = match (waited, why) {
+            (Ok(waited), _) => waited,
+            // A member survived TERM and KILL: the session stays open.
+            (Err(error), Some(why)) => {
+                let error = Error::Session {
+                    what: format!("{why}, but {error}"),
+                };
+                return Err(self.record_unended(by, "session end", &session, error));
+            }
+            (Err(error), None) => return Err(error),
+        };
+        if timed_out {
+            // Nobody is there to end what it left running.
+            self.stop_left(&session, &mut waited);
+        }
         let exit = waited.status;
         let mut end = self
-            .finish_session(by, "session end", &session, waited)
+            .finish_session_saying(by, "session end", &session, waited, why)
             .map_err(|error| Error::WithContext {
                 what: format!("{error} (the command itself ended: {exit})"),
                 error: Box::new(error),
@@ -212,7 +263,7 @@ impl Engine {
         // Why the session could not reach its runtime's service (ADR 0028),
         // which explains a runtime's own "connection failed".
         end.notes.extend(unreachable);
-        Ok(end)
+        Ok((end, timed_out))
     }
 
     /// Saves `Failed { reason: "<what> failed: …" }` on the sandbox when
@@ -685,6 +736,15 @@ pub(super) fn note(notes: &mut Vec<String>, note: String) {
 /// gets nothing from a terminal, so those signals are passed on to its
 /// group instead; a TERM sent to this process alone is passed on to the
 /// program either way ([`KeepWaiting::received`]).
+/// `limit` as a person reads it: in whole minutes, else in seconds.
+pub(super) fn spoken(limit: Duration) -> String {
+    match limit.as_secs() {
+        0 => count(limit.as_millis() as usize, "millisecond", "milliseconds"),
+        s if s % 60 == 0 => count((s / 60) as usize, "minute", "minutes"),
+        s => count(s as usize, "second", "seconds"),
+    }
+}
+
 struct KeepWaiting(Vec<(Signal, Arc<AtomicBool>, signal_hook::SigId)>);
 
 impl KeepWaiting {

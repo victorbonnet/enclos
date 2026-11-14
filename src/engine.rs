@@ -61,7 +61,7 @@ pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use portable::ImportedAgentExport;
 pub use probe::TestReport;
-pub use runtime::InstallEnd;
+pub use runtime::{INSTALL_STOP_TIME, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, SandboxStarted, Unit};

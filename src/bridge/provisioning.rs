@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use enclos_protocol::device::{RuntimeInfo, SandboxInfo};
 use serde_json::Value;
 
-use crate::engine::{Engine, SandboxSpec};
+use crate::engine::{Engine, INSTALL_STOP_TIME, SandboxSpec};
 use crate::layout::Layout;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Planned};
@@ -144,6 +144,9 @@ impl Host {
                 // host's user who runs the bridge; joined by `=`, so a
                 // value starting with `-` is not taken for an option
                 &format!("--requested-by={}", by.user),
+                // The CLI stops the installer and all it started, records
+                // that and undoes the install: it knows the session.
+                &format!("--time-limit={}", INSTALL_TIMEOUT.as_secs()),
             ])
             .envs(self.layout.env())
             .stdin(Stdio::null())
@@ -162,9 +165,17 @@ impl Host {
         // Installer output may contain secrets, so it is never sent to a
         // phone or added to the bridge's log.
         let output = std::thread::spawn(move || read_bounded(stdout, 65_536));
-        let status = child
-            .wait()
-            .map_err(|e| format!("cannot wait for the installer: {e}"))?;
+        let Some(status) = wait_at_most(
+            &mut child,
+            INSTALL_TIMEOUT + INSTALL_STOP_TIME,
+            INSTALL_STOP_GRACE,
+        )?
+        else {
+            return Err(format!(
+                "the installer did not finish within {} minutes, and enclos, which was to stop it, had not exited 5 minutes later, so it was killed: what the installer started may still run, with the runtime's destinations still in the sandbox's policy; check the sandbox on the host (`enclos sandbox show`, `enclos audit`)",
+                INSTALL_TIMEOUT.as_secs() / 60
+            ));
+        };
         let bytes = output
             .join()
             .map_err(|_| "cannot read the install result")??;
@@ -187,6 +198,54 @@ impl Host {
             login: result["login"].as_str().unwrap_or_default().to_owned(),
         })
     }
+}
+
+/// How long a runtime install asked from the phone may run. Nobody watches
+/// it at a terminal, and the sandbox stays busy for the phone while it
+/// runs: one that hangs (a download that never ends, a prompt nobody
+/// answers) is stopped rather than held for good. An hour leaves a slow
+/// host and network room. `runtime install --time-limit` enforces it.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How long the CLI has to end, once told to (TERM), when it did not
+/// within its own limit and the time it takes to stop, before its process
+/// group is killed.
+const INSTALL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits for `child`, which leads a process group of its own, at most
+/// `limit`: its exit status, or `None` when it ran longer and was stopped.
+/// Its group is then sent TERM and, after `grace` or as soon as `child`
+/// exits, KILL, so nothing of the group outlives it; `child` is reaped
+/// once its group is killed, so the group's id cannot be another's yet.
+/// What it started in other process groups is the CLI's to stop.
+fn wait_at_most(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    grace: std::time::Duration,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+    let poll = std::time::Duration::from_millis(200);
+    let lost = |e: std::io::Error| format!("cannot wait for the installer: {e}");
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
+        if let Some(status) = child.try_wait().map_err(lost)? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(poll.min(limit.saturating_sub(started.elapsed())));
+    }
+    let group = Pid::from_raw(child.id() as i32).ok_or("the installer has no process id")?;
+    let _ = kill_process_group(group, Signal::TERM);
+    // Whether it exited, without reaping it.
+    let exited = || {
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        waitid(WaitId::Pid(group), options).map(|status| status.is_some())
+    };
+    let told = std::time::Instant::now();
+    while told.elapsed() < grace && !exited().map_err(|e| lost(e.into()))? {
+        std::thread::sleep(poll);
+    }
+    let _ = kill_process_group(group, Signal::KILL);
+    child.wait().map_err(lost)?;
+    Ok(None)
 }
 
 fn read_bounded(mut stream: impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -278,6 +337,106 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let host = Host::new(Layout::at(dir.path().join("data")), executable);
         (dir, host)
+    }
+
+    /// `script` run by `sh`, leading a process group of its own, as the
+    /// CLI that runs the installer is.
+    fn group_child(script: &str) -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_cli_has_an_hour_then_five_minutes_as_docs_protocol_says() {
+        use std::time::Duration;
+        assert_eq!(INSTALL_TIMEOUT, Duration::from_secs(3600));
+        assert_eq!(INSTALL_STOP_TIME, Duration::from_secs(5 * 60));
+        assert_eq!(INSTALL_STOP_GRACE, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_installer_that_ends_in_time_gives_its_status() {
+        use std::time::Duration;
+        let mut child = group_child("exit 3");
+        let status = wait_at_most(&mut child, Duration::from_secs(10), Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    /// Whether `pid`, which this test started, is gone, looked at for up
+    /// to 5 seconds: what it was a child of is gone too, and the system
+    /// reaps it.
+    fn gone(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The pid `script` writes to `pid` in `dir`, once written.
+    fn written_pid(dir: &std::path::Path) -> u32 {
+        let file = dir.join("pid");
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn an_installer_past_its_time_is_stopped_then_killed() {
+        use std::time::{Duration, Instant};
+        // Ends on TERM: stopped within its grace, with what it started
+        // in its group, which ignores TERM, killed rather than left.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = group_child(&format!(
+            "(trap '' TERM; exec sleep 30) & echo $! > '{0}/pid.part' && mv '{0}/pid.part' '{0}/pid'; exec sleep 30",
+            dir.path().display()
+        ));
+        let member = written_pid(dir.path());
+        let started = Instant::now();
+        let waited = wait_at_most(
+            &mut child,
+            Duration::from_millis(300),
+            Duration::from_secs(10),
+        );
+        assert_eq!(waited, Ok(None));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "reaped");
+        assert!(gone(member), "pid {member} of its group still runs");
+        // Ignores TERM (and so does its `sleep`): killed after the grace.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = group_child(&format!(
+            "trap '' TERM; sleep 30 & echo $! > '{0}/pid.part' && mv '{0}/pid.part' '{0}/pid'; wait",
+            dir.path().display()
+        ));
+        let member = written_pid(dir.path());
+        let started = Instant::now();
+        let waited = wait_at_most(
+            &mut child,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        );
+        assert_eq!(waited, Ok(None));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "reaped");
+        assert!(gone(member), "pid {member} of its group still runs");
     }
 
     #[test]
@@ -396,7 +555,7 @@ mod tests {
     fn installs_in_a_child_with_exact_arguments_layout_no_input_and_no_yes() {
         let (_dir, host) = fake_host(
             r#"
-test "$#" = 7 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = "--requested-by=owner@example.org (device phone-1)" || exit 10
+test "$#" = 8 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = "--requested-by=owner@example.org (device phone-1)" && test "$8" = --time-limit=3600 || exit 10
 test -n "$ENCLOS_HOME" || exit 11
 if read -r ignored; then exit 12; fi
 printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enclos connect lab -- hermes setup"}'
