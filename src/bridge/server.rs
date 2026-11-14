@@ -2177,7 +2177,12 @@ fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(),
             &by,
             "app forget",
             device.id.clone(),
-            |_| "forgotten on the device: it can no longer connect".to_owned(),
+            |_| {
+                format!(
+                    "forgotten on the device, {}: it can no longer connect",
+                    device.name
+                )
+            },
             || {
                 store.remove_device(&device.id).map(|_| ()).map_err(|e| {
                     crate::error::Error::Session {
@@ -3154,7 +3159,7 @@ mod connection_end_tests {
         let layout = provisioning_state(folder.path());
         let executable = folder.path().join("fake-enclos");
         std::fs::write(&executable, r#"#!/bin/sh
-printf '%s' "$8" > "$ENCLOS_HOME/requested-by"
+printf '%s' "${7#--requested-by=}" > "$ENCLOS_HOME/requested-by"
 while [ ! -f "$ENCLOS_HOME/release" ]; do sleep 0.01; done
 if [ -f "$ENCLOS_HOME/fail" ]; then
   printf '%s\n' '{"error":{"message":"installer refused the operation"}}'
@@ -4034,6 +4039,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert!(audit.contains("app forget"), "{audit}");
         assert!(audit.contains(&phone.id), "{audit}");
         assert!(audit.contains(PERSON), "{audit}");
+        // And the device's name, which the actor no longer carries
+        assert!(audit.contains("Pixel"), "{audit}");
     }
 
     #[test]

@@ -290,6 +290,29 @@ mod tests {
     }
 
     #[test]
+    fn who_asked_may_start_with_a_dash_when_given_with_an_equals_sign() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let parsed = Cli::try_parse_from([
+            "enclos",
+            "install",
+            "hermes",
+            "--sandbox",
+            "lab",
+            "--requested-by=-alice (device d-1)",
+        ])
+        .unwrap();
+        let RuntimeVerb::Install { requested_by, .. } = parsed.args.verb else {
+            panic!("not an install");
+        };
+        assert_eq!(requested_by.as_deref(), Some("-alice (device d-1)"));
+    }
+
+    #[test]
     fn a_target_is_a_sandbox_or_one_of_its_agents() {
         let target: ChannelTarget = "home".parse().unwrap();
         assert_eq!((target.sandbox.as_str(), target.agent), ("home", None));

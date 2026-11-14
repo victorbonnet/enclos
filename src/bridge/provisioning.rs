@@ -141,9 +141,9 @@ impl Host {
                 "--sandbox",
                 name.as_str(),
                 // Its audit entry names the person and device, not the
-                // host's user who runs the bridge
-                "--requested-by",
-                by.user.as_str(),
+                // host's user who runs the bridge; joined by `=`, so a
+                // value starting with `-` is not taken for an option
+                &format!("--requested-by={}", by.user),
             ])
             .envs(self.layout.env())
             .stdin(Stdio::null())
@@ -226,7 +226,7 @@ fn sandbox_list(engine: &Engine) -> Result<Vec<SandboxInfo>, String> {
 }
 
 /// Creates sandbox `name` with the backend `sandbox create` takes when it
-/// names none: the host's default backend.
+/// names none: the configured default, else the first available.
 fn create(
     engine: &Engine,
     actor: &Actor,
@@ -396,7 +396,7 @@ mod tests {
     fn installs_in_a_child_with_exact_arguments_layout_no_input_and_no_yes() {
         let (_dir, host) = fake_host(
             r#"
-test "$#" = 8 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = --requested-by && test "$8" = "owner@example.org (device phone-1)" || exit 10
+test "$#" = 7 && test "$1" = --json && test "$2" = runtime && test "$3" = install && test "$4" = hermes && test "$5" = --sandbox && test "$6" = lab && test "$7" = "--requested-by=owner@example.org (device phone-1)" || exit 10
 test -n "$ENCLOS_HOME" || exit 11
 if read -r ignored; then exit 12; fi
 printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enclos connect lab -- hermes setup"}'
