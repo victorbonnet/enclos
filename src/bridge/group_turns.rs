@@ -167,23 +167,6 @@ impl Hub {
             .is_some_and(|r| r.turn == turn)
     }
 
-    /// [`Hub::member_said`], with group `id`'s members read from the store.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn group_reply(
-        self: &Arc<Hub>,
-        store: &Store,
-        id: &str,
-        member: &str,
-        reply_to: Option<&str>,
-        text: &str,
-        files: bool,
-        kind: &str,
-    ) -> Option<bool> {
-        let (_, handles) = group_of(store, id).ok()??;
-        self.member_said(store, id, &handles, member, reply_to, text, files, kind)
-    }
-
     /// A message of `member`'s to group `id`, with `files` when it carries
     /// any: `Some(true)` for the reply that ends its running turn, to keep,
     /// then go on; `Some(false)` for one to keep (what it says before its
@@ -434,6 +417,23 @@ impl Hub {
                 },
             )
             .map_err(|e| e.to_string())
+    }
+
+    /// [`Hub::member_said`], with group `id`'s members read from the store.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn group_reply(
+        self: &Arc<Hub>,
+        store: &Store,
+        id: &str,
+        member: &str,
+        reply_to: Option<&str>,
+        text: &str,
+        files: bool,
+        kind: &str,
+    ) -> Option<bool> {
+        let (_, handles) = group_of(store, id).ok()??;
+        self.member_said(store, id, &handles, member, reply_to, text, files, kind)
     }
 }
 
