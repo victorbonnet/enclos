@@ -105,6 +105,29 @@ impl Engine {
         })
     }
 
+    /// Runs `f` with whether the sandbox has a pending policy, under the
+    /// state lock: no command saves or settles a pending policy until `f`
+    /// returns. Without enclos set up there is none. Any other failure to
+    /// read it is an error, not an answer.
+    pub fn with_pending_policy<T>(
+        &self,
+        name: &SandboxName,
+        f: impl FnOnce(bool) -> T,
+    ) -> Result<T> {
+        use crate::state::StateError::NotInitialized;
+        let _lock = match self.state.lock() {
+            Ok(lock) => lock,
+            Err(NotInitialized { .. }) => return Ok(f(false)),
+            Err(e) => return Err(e.into()),
+        };
+        let pending = match self.state.pending_policy(name) {
+            Ok(pending) => pending.is_some(),
+            Err(NotInitialized { .. }) => false,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(f(pending))
+    }
+
     /// Whether the policy in force allows `destination`, written as
     /// `policy allow` writes it.
     pub fn allows(&self, name: &SandboxName, destination: &str) -> Result<bool> {

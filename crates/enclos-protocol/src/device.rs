@@ -138,6 +138,10 @@ pub enum FromDevice {
     Error(ErrorBody),
 }
 
+/// The host feature of closing a policy request: the message type a device
+/// sends to close one, advertised in `authenticated`'s capabilities.
+pub const APPROVAL_CLOSE: &str = "approval.close";
+
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.answer",
     "agent.name.get",
@@ -151,7 +155,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "auth",
     "pair.request",
     "approval.decide",
-    "approval.close",
+    APPROVAL_CLOSE,
     "agents",
     "conversation.new",
     "group.new",

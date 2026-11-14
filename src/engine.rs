@@ -39,7 +39,7 @@ mod start;
 mod state_check;
 mod status;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod unenforced;
 
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};

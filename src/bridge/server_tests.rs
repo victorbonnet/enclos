@@ -279,12 +279,12 @@ fn approval_close_persists_without_rewriting_the_request_or_deciding_access() {
     let original_body = body();
     assert!(
         store
-            .close_approval("r1", "pending", "phone", "owner@example.com")
+            .close_approval("r1", "pending", "scope", "phone", "owner@example.com")
             .unwrap()
     );
     assert!(
         !store
-            .close_approval("r1", "pending", "tablet", "owner@example.com")
+            .close_approval("r1", "pending", "scope", "tablet", "owner@example.com")
             .unwrap()
     );
     assert!(!store.claim_approval("r1").unwrap());
@@ -324,7 +324,7 @@ fn approval_close_allows_failed_requests_but_preserves_inflight_and_terminal_dec
         store.create_approval(&a).unwrap();
         assert_eq!(
             store
-                .close_approval(state, state, "phone", "owner@example.com")
+                .close_approval(state, state, "scope", "phone", "owner@example.com")
                 .unwrap(),
             state == "failed"
         );
@@ -335,7 +335,7 @@ fn approval_close_allows_failed_requests_but_preserves_inflight_and_terminal_dec
     }
     assert!(
         !store
-            .close_approval("unknown", "pending", "phone", "owner@example.com")
+            .close_approval("unknown", "pending", "scope", "phone", "owner@example.com")
             .unwrap()
     );
     assert_eq!(store.log_lines(20).unwrap().len(), 1);
@@ -351,20 +351,20 @@ fn approval_close_closes_only_from_the_state_that_was_checked() {
     // Read as applying, failed since: not closed without the failure's check.
     assert!(
         !store
-            .close_approval("r1", "applying", "phone", "owner@example.com")
+            .close_approval("r1", "applying", "scope", "phone", "owner@example.com")
             .unwrap()
     );
     // Read as pending, failed since: the same.
     assert!(
         !store
-            .close_approval("r1", "pending", "phone", "owner@example.com")
+            .close_approval("r1", "pending", "scope", "phone", "owner@example.com")
             .unwrap()
     );
     assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
     assert!(store.log_lines(20).unwrap().is_empty());
     assert!(
         store
-            .close_approval("r1", "failed", "phone", "owner@example.com")
+            .close_approval("r1", "failed", "scope", "phone", "owner@example.com")
             .unwrap()
     );
 }
@@ -382,7 +382,7 @@ fn approval_close_and_audit_are_atomic() {
     .unwrap();
     assert!(
         store
-            .close_approval("r1", "pending", "phone", "owner@example.com")
+            .close_approval("r1", "pending", "scope", "phone", "owner@example.com")
             .is_err()
     );
     assert_eq!(store.approval("r1").unwrap().unwrap().state, "pending");
@@ -403,7 +403,7 @@ fn approval_close_races_with_claim_and_exactly_one_wins() {
             let store = Store::open(&path).unwrap();
             barrier.wait();
             store
-                .close_approval("r1", "pending", "phone", "owner@example.com")
+                .close_approval("r1", "pending", "scope", "phone", "owner@example.com")
                 .unwrap()
         })
     };
@@ -660,12 +660,164 @@ fn approval_close_reaches_all_owner_devices_without_policy_or_runtime_work() {
 fn approval_close_keeps_a_failure_while_its_policy_change_waits_on_the_host() {
     let mut a = approval_sample();
     a.state = "failed".into();
-    let why = approvals::close_blocked(&a, |_| true).unwrap();
+    let why = approvals::close_blocked(&a, true).unwrap();
     assert!(why.contains("enclos policy apply lab"), "{why}");
-    assert!(approvals::close_blocked(&a, |_| false).is_none());
+    assert!(approvals::close_blocked(&a, false).is_none());
     // A pending request has no policy work left behind: it closes.
     a.state = "pending".into();
-    assert!(approvals::close_blocked(&a, |_| true).is_none());
+    assert!(approvals::close_blocked(&a, true).is_none());
+}
+
+/// A hub of the host's person beside an enclos with sandbox `home`, and
+/// its paired phone.
+fn sandbox_approval_hub() -> (
+    tempfile::TempDir,
+    crate::engine::Engine,
+    crate::model::sandbox::SandboxName,
+    Arc<Hub>,
+    Store,
+    Device,
+) {
+    let (dir, engine, name) = crate::engine::tests::policy::with_sandbox();
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
+    let store = hub.store().unwrap();
+    let device = avatar_device("phone", "owner@example.com");
+    store.add_device(&device).unwrap();
+    (dir, engine, name, hub, store, device)
+}
+
+fn allow(engine: &crate::engine::Engine, name: &crate::model::sandbox::SandboxName, to: &str) {
+    let by = crate::model::audit::Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    engine
+        .policy_allow(&by, name, to, crate::model::plan::Confirm::Yes)
+        .unwrap();
+}
+
+#[test]
+fn approval_closed_after_a_policy_change_stays_closed_under_that_policy() {
+    let (_dir, engine, name, hub, store, device) = sandbox_approval_hub();
+    let owner = "owner@example.com";
+    let agent = format!("{name}/main");
+    let ask =
+        |who: &str| hub.request_access(&store, who, None, network("api.example.com"), "Fetch");
+    ask(&agent).unwrap();
+    let request = store.approvals().unwrap().remove(0).request;
+    // Asked under one policy, closed under the next, as when another
+    // request was approved in between.
+    allow(&engine, &name, "other.example.com");
+    hub.close_access(&store, &device, owner, &request).unwrap();
+    let told = ask(&agent).unwrap_err();
+    assert!(told.contains("already closed"), "{told}");
+    ask(name.as_str()).unwrap();
+    assert_eq!(store.approvals().unwrap().len(), 1);
+    // A later policy may ask again.
+    allow(&engine, &name, "third.example.com");
+    ask(&agent).unwrap();
+    let requests = store.approvals().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.iter().filter(|a| a.state == "pending").count(), 1);
+}
+
+#[test]
+fn approval_close_marks_a_diagnostic_probe_as_one_instead() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.add_device(&device).unwrap();
+    let mut a = approval_sample();
+    a.agent.clear();
+    a.access.target = crate::probes::POLICY_PROBE_HOST.into();
+    store.create_approval(&a).unwrap();
+    let why = hub.close_access(&store, &device, owner, "r1").unwrap_err();
+    assert!(why.contains("diagnostic probe"), "{why}");
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "diagnostic");
+    assert!(store.log_lines(20).unwrap().is_empty());
+}
+
+#[test]
+fn approval_close_of_a_decided_request_is_refused_not_acknowledged() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.add_device(&device).unwrap();
+    let (tx, rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("phone".into(), (owner.into(), tx, 0));
+    for state in ["approved", "denied", "diagnostic"] {
+        let mut a = approval_sample();
+        a.request = state.into();
+        a.state = state.into();
+        store.create_approval(&a).unwrap();
+        let why = hub.close_access(&store, &device, owner, state).unwrap_err();
+        assert!(why.contains(state), "{why}");
+        // The device still learns the request's real state.
+        assert!(matches!(rx.try_recv().unwrap(), ToDevice::Approval(a) if a.state == state));
+        assert_eq!(store.approval(state).unwrap().unwrap().state, state);
+    }
+    assert!(store.log_lines(20).unwrap().is_empty());
+}
+
+fn failed_request(store: &Store, name: &crate::model::sandbox::SandboxName) {
+    let mut a = approval_sample();
+    a.sandbox = name.to_string();
+    a.state = "failed".into();
+    store.create_approval(&a).unwrap();
+}
+
+#[test]
+fn approval_close_keeps_a_failure_whose_pending_change_cannot_be_read() {
+    let (dir, _engine, name, hub, store, device) = sandbox_approval_hub();
+    failed_request(&store, &name);
+    let layout = crate::layout::Layout::at(dir.path().join("enclos"));
+    rusqlite::Connection::open(layout.state_db())
+        .unwrap()
+        .pragma_update(None, "user_version", 9999)
+        .unwrap();
+    let why = hub
+        .close_access(&store, &device, "owner@example.com", "r1")
+        .unwrap_err();
+    assert!(why.contains("could not check home"), "{why}");
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+    assert!(store.log_lines(20).unwrap().is_empty());
+}
+
+#[test]
+fn approval_close_checks_and_closes_a_failure_under_the_state_lock() {
+    use crate::state::StateStore;
+    let (dir, _engine, name, hub, store, device) = sandbox_approval_hub();
+    failed_request(&store, &name);
+    let layout = crate::layout::Layout::at(dir.path().join("enclos"));
+    let state = crate::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let lock = state.lock().unwrap();
+    let closing = {
+        let hub = hub.clone();
+        let path = hub.store_path.clone();
+        std::thread::spawn(move || {
+            let store = Store::open(&path).unwrap();
+            hub.close_access(&store, &device, "owner@example.com", "r1")
+        })
+    };
+    // While a command holds the lock, a pending change could appear: the
+    // request is neither checked nor closed until the lock is released.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+    drop(lock);
+    closing.join().unwrap().unwrap();
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "closed");
 }
 
 #[test]

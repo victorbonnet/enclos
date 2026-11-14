@@ -1368,7 +1368,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
-        capabilities: vec!["approval.close".into()],
+        capabilities: vec![enclos_protocol::device::APPROVAL_CLOSE.into()],
     })?;
     // Authenticated: no longer among the callers that are few at once
     drop(waiting);
