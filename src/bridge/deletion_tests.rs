@@ -391,33 +391,61 @@ fn next_line(lines: &mut BufReader<UnixStream>) -> Option<FromBridge> {
     }
 }
 
+/// Whether the bridge ended the connection: the plugin reads its end
+/// within 5 seconds, and nothing before it.
+fn ended(lines: &mut BufReader<UnixStream>) -> bool {
+    lines
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    matches!(lines.read_line(&mut String::new()), Ok(0))
+}
+
+/// The plugin for `lab/<name>`, connected again once the bridge let its
+/// last connection go.
+fn reconnected(hub: &Arc<Hub>, dir: &Path, name: &str) -> (UnixStream, BufReader<UnixStream>) {
+    let agent = format!("lab/{name}");
+    let started = std::time::Instant::now();
+    while hub.plugins.lock().unwrap().contains_key(&agent) {
+        assert!(started.elapsed() < Duration::from_secs(5), "never let go");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(dir.join(format!("{name}.sock"))).unwrap();
+    connected(hub, dir, name)
+}
+
+/// What a plugin's outbox holds for `conversation`, as message `out-1`.
+fn kept_message(conversation: &str) -> Vec<u8> {
+    encode_line(&Envelope::new(
+        MessageId::new("out-1").unwrap(),
+        FromPlugin::MessageOut {
+            conversation: ConversationId::new(conversation).unwrap(),
+            text: "kept".into(),
+            kind: OutKind::Reply,
+            reply_to: None,
+            attachments: vec![],
+        },
+    ))
+}
+
 #[test]
-fn an_agents_message_is_not_acknowledged_while_the_store_cannot_say_whether_its_chat_is_going() {
+fn an_agents_message_is_not_acknowledged_while_the_store_cannot_say_whether_its_conversation_is_going()
+ {
     let (dir, hub, store) = fixture(&["main"]);
     store.conversation("c-1", "lab", "main", "alice").unwrap();
     let (mut out, mut lines) = connected(&hub, dir.path(), "main");
-    let reply = || {
-        encode_line(&Envelope::new(
-            MessageId::new("out-1").unwrap(),
-            FromPlugin::MessageOut {
-                conversation: ConversationId::new("c-1").unwrap(),
-                text: "kept".into(),
-                kind: OutKind::Reply,
-                reply_to: None,
-                attachments: vec![],
-            },
-        ))
-    };
     // The deletions can no longer be read
     let raw = rusqlite::Connection::open(&hub.store_path).unwrap();
     raw.execute_batch("ALTER TABLE conversation_deletions RENAME TO unreadable")
         .unwrap();
-    out.write_all(&reply()).unwrap();
-    assert_eq!(next_line(&mut lines), None, "acknowledged, so dropped");
+    out.write_all(&kept_message("c-1")).unwrap();
+    // Not acknowledged, and the connection ends, so the plugin sends it
+    // again soon, after the next connection's hello
+    assert!(ended(&mut lines), "acknowledged, or left open");
     raw.execute_batch("ALTER TABLE unreadable RENAME TO conversation_deletions")
         .unwrap();
-    // The plugin sends it again, after its next hello
-    out.write_all(&reply()).unwrap();
+    let (mut out, mut lines) = reconnected(&hub, dir.path(), "main");
+    out.write_all(&kept_message("c-1")).unwrap();
     assert_eq!(
         next_line(&mut lines),
         Some(FromBridge::Ack {
@@ -430,6 +458,39 @@ fn an_agents_message_is_not_acknowledged_while_the_store_cannot_say_whether_its_
 }
 
 #[test]
+fn a_members_message_is_not_acknowledged_or_sent_home_while_the_store_cannot_say_whether_it_is_a_group()
+ {
+    let (dir, hub, store) = fixture(&["main", "coder"]);
+    let members = ["main".to_owned(), "coder".to_owned()];
+    store.group("g-1", "lab", &members, "alice").unwrap();
+    let (mut out, mut lines) = connected(&hub, dir.path(), "main");
+    // The group's members can no longer be read
+    let raw = rusqlite::Connection::open(&hub.store_path).unwrap();
+    raw.execute_batch("ALTER TABLE members RENAME TO unreadable")
+        .unwrap();
+    out.write_all(&kept_message("g-1")).unwrap();
+    assert!(ended(&mut lines), "acknowledged, or left open");
+    raw.execute_batch("ALTER TABLE unreadable RENAME TO members")
+        .unwrap();
+    let (mut out, mut lines) = reconnected(&hub, dir.path(), "main");
+    out.write_all(&kept_message("g-1")).unwrap();
+    assert_eq!(
+        next_line(&mut lines),
+        Some(FromBridge::Ack {
+            of: MessageId::new("out-1").unwrap()
+        })
+    );
+    // In the group, as main's, and not in its Home
+    let said = store.messages_after("g-1", 0).unwrap();
+    assert_eq!(said.len(), 1);
+    assert_eq!(
+        (&said[0].from, said[0].text.as_str()),
+        (&From::Member("main".into()), "kept")
+    );
+    assert!(store.conversation_info("home.lab.main").unwrap().is_none());
+}
+
+#[test]
 fn a_message_goes_nowhere_while_the_store_cannot_say_where() {
     let (_dir, _hub, store) = fixture(&[]);
     store.conversation("c-1", "lab", "main", "alice").unwrap();
@@ -438,6 +499,18 @@ fn a_message_goes_nowhere_while_the_store_cannot_say_where() {
         super::destination(&store, Some("alice"), "lab/main", id()).unwrap(),
         Some(id())
     );
+    // Its Home cannot be made: the message would be stored where no
+    // device sees it
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER refuse BEFORE INSERT ON conversations
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+    let unknown = ConversationId::new("c-unknown").unwrap();
+    assert!(super::destination(&store, Some("alice"), "lab/main", unknown).is_err());
+    store.db.execute_batch("DROP TRIGGER refuse").unwrap();
     store
         .db
         .execute_batch("ALTER TABLE conversations RENAME TO unreadable")

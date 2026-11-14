@@ -16,7 +16,7 @@ impl Hub {
         if store.deletion_started(id).unwrap_or(true) {
             return;
         }
-        let Some((_, handles)) = group_of(store, id) else {
+        let Ok(Some((_, handles))) = group_of(store, id) else {
             return;
         };
         {
@@ -38,7 +38,7 @@ impl Hub {
         if store.deletion_started(id).unwrap_or(true) {
             return;
         }
-        let Some((sandbox, handles)) = group_of(store, id) else {
+        let Ok(Some((sandbox, handles))) = group_of(store, id) else {
             return;
         };
         let owner = store.owner(id).ok().flatten().unwrap_or_default();
@@ -167,11 +167,8 @@ impl Hub {
             .is_some_and(|r| r.turn == turn)
     }
 
-    /// A message of `member`'s to group `id`, with `files` when it carries
-    /// any: `Some(true)` for the reply that ends its running turn, to keep,
-    /// then go on; `Some(false)` for one to keep (what it says before its
-    /// reply, or on its own); `None` for one to drop (a pass, or the reply
-    /// to a turn that was stopped).
+    /// [`Hub::member_said`], with group `id`'s members read from the store.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn group_reply(
         self: &Arc<Hub>,
@@ -183,7 +180,30 @@ impl Hub {
         files: bool,
         kind: &str,
     ) -> Option<bool> {
-        let (_, handles) = group_of(store, id)?;
+        let (_, handles) = group_of(store, id).ok()??;
+        self.member_said(store, id, &handles, member, reply_to, text, files, kind)
+    }
+
+    /// A message of `member`'s to group `id`, with `files` when it carries
+    /// any: `Some(true)` for the reply that ends its running turn, to keep,
+    /// then go on; `Some(false)` for one to keep (what it says before its
+    /// reply, or on its own); `None` for one to drop (a pass, or the reply
+    /// to a turn that was stopped).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn member_said(
+        self: &Arc<Hub>,
+        store: &Store,
+        id: &str,
+        members: &[String],
+        member: &str,
+        reply_to: Option<&str>,
+        text: &str,
+        files: bool,
+        kind: &str,
+    ) -> Option<bool> {
+        // The group's members, as the caller read them: not read again,
+        // where a failing store would read as no group
+        let handles = members.to_vec();
         let mut groups = self.groups.lock().expect("not poisoned");
         if let Some(d) = groups.get_mut(id)
             && let Some(run) = &d.running
@@ -237,7 +257,7 @@ impl Hub {
     /// The person stopped group `id`'s discussion: what is queued is
     /// cancelled, and the running member is sent `/stop`.
     pub(super) fn group_stop(self: &Arc<Hub>, store: &Store, id: &str) {
-        let Some((sandbox, _)) = group_of(store, id) else {
+        let Ok(Some((sandbox, _))) = group_of(store, id) else {
             return;
         };
         let running = self
@@ -318,7 +338,7 @@ impl Hub {
                 if run.member != member || sent.is_some_and(|s| s != run.sent) {
                     return None;
                 }
-                if !matches!(group_of(store, id), Some((s, _)) if s == sandbox) {
+                if !matches!(group_of(store, id), Ok(Some((s, _))) if s == sandbox) {
                     return None;
                 }
                 let turn = run.turn.clone();
@@ -345,7 +365,7 @@ impl Hub {
 
     /// Where group `id`'s discussion is; settled, with no turns, before the first.
     pub(super) fn group_state(&self, store: &Store, id: &str) -> Option<GroupState> {
-        let (sandbox, handles) = group_of(store, id)?;
+        let (sandbox, handles) = group_of(store, id).ok()??;
         let groups = self.groups.lock().expect("not poisoned");
         let d = groups.get(id);
         Some(GroupState {
@@ -459,7 +479,9 @@ pub(super) fn new_group(
         let same = owner == person
             && agent.is_empty()
             && s == sandbox
-            && group_of(store, id).is_some_and(|(_, handles)| handles == names);
+            && group_of(store, id)
+                .map_err(|e| e.to_string())?
+                .is_some_and(|(_, handles)| handles == names);
         if !same {
             return Ok(Err(format!("conversation {id} exists already")));
         }

@@ -2658,3 +2658,27 @@ fn review_imported_presentation_reaches_connected_paired_devices_without_relisti
     };
     assert!(photo.image.is_none());
 }
+
+#[test]
+fn a_connection_ended_on_an_unstored_message_is_opened_again_later_each_time_in_a_row() {
+    let waits: Vec<u64> = (1..=8).map(|n| reopen_after(n).as_secs()).collect();
+    assert_eq!(waits, [0, 3, 6, 12, 24, 48, 60, 60]);
+    let folder = tempfile::tempdir().unwrap();
+    let hub = Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        folder.path().join("app.db"),
+        crate::layout::Layout::at(folder.path().join("enclos")),
+        vec![],
+        vec![],
+        None,
+        SILENCE,
+    );
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    // The first time: at once, so the message comes again within seconds.
+    assert!(hub.may_reopen("lab/main"));
+    hub.ended_unstored("lab/main");
+    assert!(!hub.may_reopen("lab/main"));
+    assert!(hub.may_reopen("lab/other"));
+}

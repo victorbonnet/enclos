@@ -184,6 +184,10 @@ struct Hub {
     /// How fast each agent may have its messages stored, kept across its
     /// plugin's connections.
     paces: Mutex<HashMap<String, Pace>>,
+    /// The agents whose plugin connection the bridge ended on a message it
+    /// could not store: how many times in a row, and when last. The
+    /// background pass opens theirs again only after [`reopen_after`].
+    unstored: Mutex<HashMap<String, (u32, std::time::Instant)>>,
     generations: AtomicU64,
     /// Connected devices: who they speak for, where to send, and which
     /// connection that is (a phone that reconnects has two for a while).
@@ -395,6 +399,7 @@ impl Hub {
             questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
+            unstored: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             stops: Mutex::new(HashSet::new()),
             generations: AtomicU64::new(0),
@@ -743,8 +748,8 @@ impl Hub {
                                 continue;
                             }
                             Err(e) => {
-                                kept_by_plugin(&agent, &e.to_string());
-                                continue;
+                                hub.kept_by_plugin(&agent, &acks, &e.to_string());
+                                break;
                             }
                         }
                         // Every runtime may send on its own: past a burst,
@@ -762,16 +767,24 @@ impl Hub {
                             .split_once('/')
                             .map(|(_, n)| n.to_owned())
                             .unwrap_or_default();
-                        let group =
-                            group_of(&store, conversation.as_str()).filter(|(sandbox, handles)| {
+                        let group = match group_of(&store, conversation.as_str()) {
+                            Ok(group) => group.filter(|(sandbox, handles)| {
                                 agent.starts_with(&format!("{sandbox}/"))
                                     && handles.contains(&member)
-                            });
+                            }),
+                            // Not "no group": its turn would wait, and the
+                            // message would go to Home
+                            Err(e) => {
+                                hub.kept_by_plugin(&agent, &acks, &e.to_string());
+                                break;
+                            }
+                        };
                         let mut ends_turn = false;
-                        if group.is_some() {
-                            match hub.group_reply(
+                        if let Some((_, handles)) = &group {
+                            match hub.member_said(
                                 &store,
                                 conversation.as_str(),
+                                handles,
                                 &member,
                                 reply_to.as_ref().map(|r| r.as_str()),
                                 &text,
@@ -795,8 +808,8 @@ impl Hub {
                             match destination(&store, host.as_deref(), &agent, conversation) {
                                 Ok(conversation) => conversation,
                                 Err(e) => {
-                                    kept_by_plugin(&agent, &e);
-                                    continue;
+                                    hub.kept_by_plugin(&agent, &acks, &e);
+                                    break;
                                 }
                             }
                         };
@@ -1237,7 +1250,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.
                 for agent in &hub.agents {
-                    let _ = hub.plugin(&agent.name);
+                    if hub.may_reopen(&agent.name) {
+                        let _ = hub.plugin(&agent.name);
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(3));
             }
@@ -2484,6 +2499,59 @@ fn read(
     Ok(())
 }
 
+/// How long the background pass waits before it opens again an agent's
+/// plugin connection that ended `failures` times in a row on a message the
+/// bridge could not store: not at all the first time, so the message comes
+/// again within seconds, then 3 seconds, doubled each time, up to a minute.
+/// While the database keeps failing (a full disk), each connection would
+/// end within seconds, and each `hello` sends the agent's commands to
+/// every device again.
+fn reopen_after(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::ZERO,
+        n => (Duration::from_secs(3) * (1 << (n - 2).min(5))).min(Duration::from_secs(60)),
+    }
+}
+
+impl Hub {
+    /// Ends `agent`'s plugin connection, through `acks` so that it ends
+    /// for every clone of it, on a message of its the bridge could not
+    /// store (`why`: its database failed). Unacknowledged, the plugin keeps
+    /// the message and sends it again after the `hello` of the next
+    /// connection, which the background pass opens within seconds, or
+    /// later when this happened just before ([`reopen_after`]).
+    fn kept_by_plugin(&self, agent: &str, acks: &PluginWriter, why: &str) {
+        eprintln!(
+            "enclos app: {agent}: a message could not be stored ({why}); its app channel is closed, so the message comes again when it is opened"
+        );
+        self.ended_unstored(agent);
+        acks.shutdown();
+    }
+
+    /// Counts one more connection of `agent`'s ended on a message the
+    /// bridge could not store.
+    fn ended_unstored(&self, agent: &str) {
+        let now = std::time::Instant::now();
+        let mut unstored = self.unstored.lock().expect("not poisoned");
+        let failures = match unstored.get(agent) {
+            // In a row: within the longest wait, and the pass after it
+            Some((n, at)) if now.duration_since(*at) <= Duration::from_secs(120) => n + 1,
+            _ => 1,
+        };
+        unstored.insert(agent.to_owned(), (failures, now));
+    }
+
+    /// Whether the background pass may open `agent`'s plugin connection
+    /// again ([`reopen_after`]).
+    fn may_reopen(&self, agent: &str) -> bool {
+        self.unstored
+            .lock()
+            .expect("not poisoned")
+            .get(agent)
+            .is_none_or(|(n, at)| at.elapsed() >= reopen_after(*n))
+    }
+}
+
 /// Where `agent`'s message for `conversation` is kept: there, when it is
 /// one of `agent`'s own; else (a conversation the bridge does not know, or
 /// another agent's: the runtime's home channel as it was, or a chat gone)
@@ -2517,17 +2585,12 @@ fn destination(
     }) else {
         return Ok(None);
     };
-    let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
+    // A Home not made would hide the message from every device
+    // (`Store::since` reads it through its conversation).
+    store
+        .ensure_home(agent, host.unwrap_or(""), host.is_some())
+        .map_err(|e| e.to_string())?;
     Ok(Some(home))
-}
-
-/// An agent's message the bridge could not place, as its store failed: it
-/// is not acknowledged, so the plugin keeps it and sends it again after
-/// its next `hello`.
-fn kept_by_plugin(agent: &str, why: &str) {
-    eprintln!(
-        "enclos app: {agent}: a message is left with its plugin, to come again: the store failed: {why}"
-    );
 }
 
 /// A conversation for a device: `None` for an id the protocol refuses.
@@ -2624,14 +2687,19 @@ fn archive_conversation(
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a
-/// conversation that is not a group.
-fn group_of(store: &Store, id: &str) -> Option<(String, Vec<String>)> {
-    let members = store.members(id).ok()?;
+/// conversation that is not a group; an error when the store cannot say.
+fn group_of(store: &Store, id: &str) -> rusqlite::Result<Option<(String, Vec<String>)>> {
+    let members = store.members(id)?;
     if members.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (sandbox, _, _) = store.conversation_of(id).ok()??;
-    Some((sandbox, members.into_iter().map(|(a, _)| a).collect()))
+    let Some((sandbox, _, _)) = store.conversation_of(id)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        sandbox,
+        members.into_iter().map(|(a, _)| a).collect(),
+    )))
 }
 
 /// A message's `agent` for a device: the conversation's agent, a group
@@ -2749,7 +2817,9 @@ fn send(
                 .into(),
         })));
     }
-    let group = group_of(store, conversation.as_str()).is_some();
+    let group = group_of(store, conversation.as_str())
+        .map_err(|e| e.to_string())?
+        .is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
         question: None,

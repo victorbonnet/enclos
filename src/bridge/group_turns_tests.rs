@@ -239,7 +239,10 @@ fn a_group_is_two_to_six_known_agents_of_one_sandbox_each_once() {
             .unwrap()
             .is_err()
     );
-    assert_eq!(group_of(&store, "g-1").unwrap().1, ["main", "coder"]);
+    assert_eq!(
+        group_of(&store, "g-1").unwrap().unwrap().1,
+        ["main", "coder"]
+    );
 }
 
 /// Group `g-1` with `main`'s turn running, sent as `s-1`.
