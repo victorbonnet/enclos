@@ -58,14 +58,15 @@ fn plain(value: &str) -> bool {
 pub const MAX_HOST_NAME: usize = 63;
 
 /// Whether `host` is a host name a link may carry: what `enclos app pair`
-/// writes, the first label of the bridge's address. Never a `/` or a `:`,
-/// so a host's name cannot pass for a host and a sandbox together where an
-/// app joins them into one address.
+/// writes, the first label of the bridge's address: 1 to [`MAX_HOST_NAME`]
+/// letters, digits, `-` or `_`. Never a `/` or a `:`, so a host's name
+/// cannot pass for a host and a sandbox together where an app joins them
+/// into one address, and never a `.`, which no label holds.
 pub fn host_name(host: &str) -> bool {
     (1..=MAX_HOST_NAME).contains(&host.len())
         && host
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
 impl PairLink {
@@ -274,9 +275,23 @@ mod tests {
         ] {
             assert!(PairLink::parse(&bad).is_err(), "{bad}");
         }
-        let mut slashed = link();
-        slashed.host = "mac/work".into();
-        assert!(slashed.to_link().is_err());
+        // Writing one is refused the same way
+        for bad in [
+            "mac/work",
+            "mac:8443",
+            "mac.tail",
+            "",
+            &"m".repeat(MAX_HOST_NAME + 1),
+        ] {
+            let mut written = link();
+            written.host = bad.into();
+            assert!(written.to_link().is_err(), "{bad:?}");
+        }
+        // A label at the bound is taken
+        let mut longest = link();
+        longest.host = "m".repeat(MAX_HOST_NAME);
+        let text = longest.to_link().unwrap();
+        assert_eq!(PairLink::parse(&text).unwrap(), longest);
         let mut long_code = link();
         long_code.code = vec![1; 17];
         assert!(PairLink::parse(&long_code.to_link().unwrap()).is_err());

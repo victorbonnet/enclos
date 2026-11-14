@@ -182,6 +182,22 @@ fn terminal_qr(drawn: &str) -> String {
         .join("\n")
 }
 
+/// The host name a pairing link carries when the bridge's address starts
+/// with none a link can hold.
+const FALLBACK_HOST: &str = "host";
+
+/// The host name a pairing link carries for the bridge at `url`: the first
+/// label of its address, without the port or path that may follow, when it
+/// is one a link can hold (`pairing::host_name`), else [`FALLBACK_HOST`].
+fn link_host(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .split(['.', ':', '/'])
+        .next()
+        .filter(|label| enclos_protocol::pairing::host_name(label))
+        .unwrap_or(FALLBACK_HOST)
+        .to_owned()
+}
+
 fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) -> Result<u8> {
     let url = url.or_else(|| transport.address()).ok_or_else(|| {
         failed(format!(
@@ -198,15 +214,12 @@ fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) 
     store
         .add_pairing(&code, expires)
         .map_err(|e| failed(format!("cannot record the code: {e}")))?;
-    // The address's first label: never a port, which a link's host name
-    // cannot hold (`pairing::host_name`)
-    let host = url
-        .trim_start_matches("https://")
-        .split(['.', ':', '/'])
-        .next()
-        .filter(|label| enclos_protocol::pairing::host_name(label))
-        .unwrap_or("host")
-        .to_owned();
+    let host = link_host(&url);
+    if host == FALLBACK_HOST {
+        eprintln!(
+            "The bridge's address {url} starts with no name a pairing link can carry: the app will call this host `{FALLBACK_HOST}`."
+        );
+    }
     let link = PairLink {
         host,
         url: url.clone(),
@@ -774,6 +787,25 @@ fn writer_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link's host name is the address's first label, never its port or
+    /// path, and one a link can carry, else the fallback.
+    #[test]
+    fn a_links_host_is_the_addresss_first_label() {
+        for (url, host) in [
+            ("https://mac.tail1234.ts.net", "mac"),
+            ("https://mac:8443", "mac"),
+            ("https://mac/x", "mac"),
+            ("https://", FALLBACK_HOST),
+            ("https://my_mac-2.tail.ts.net", "my_mac-2"),
+        ] {
+            assert_eq!(link_host(url), host, "{url}");
+        }
+        let long = format!("https://{}.tail.ts.net", "m".repeat(64));
+        assert_eq!(link_host(&long), FALLBACK_HOST);
+        let longest = format!("https://{}.tail.ts.net", "m".repeat(63));
+        assert_eq!(link_host(&longest), "m".repeat(63));
+    }
 
     /// A stand-in plugin: answers the hello, sends `messages`, and closes
     /// once each is acknowledged; the acknowledged ids come back.
