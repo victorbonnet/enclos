@@ -975,24 +975,35 @@ impl Hub {
         };
         let pieces = pieces(id, &measured)?;
         let conversation = whole.conversation.as_str();
-        let Some(seqs) = store
-            .add_pieces(&pieces, conversation, from, &whole.kind)
-            .map_err(|e| e.to_string())?
-        else {
+        // Sent again (its `ack` lost, or the bridge stopped before it): its
+        // files were stored with it, and the plugin's copies, if the bridge
+        // stopped before removing them, are removed now.
+        if store.has_message(id.as_str()).map_err(|e| e.to_string())? {
+            release_attachments(home, attachments);
             return Ok(None);
+        }
+        // Its files copied first, then stored with the message in one
+        // transaction, and only then removed from the plugin's folder: a
+        // message the bridge cannot store, which the plugin sends again,
+        // still has them, and a stored one never lacks them.
+        let media = self.media();
+        let taken = take_attachments(home, &media, &whole.agent, conversation, attachments);
+        let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
+        let added = store.add_pieces(&pieces, conversation, from, &whole.kind, &stored);
+        let seqs = match added {
+            Ok(Some(seqs)) => seqs,
+            Ok(None) | Err(_) => {
+                for t in &taken {
+                    let _ = std::fs::remove_file(media.join(&t.stored.id));
+                }
+                return added.map(|_| None).map_err(|e| e.to_string());
+            }
         };
+        for t in &taken {
+            t.release();
+        }
         let last = seqs.last().copied();
-        // A message stored once: its files taken once too, with its first
-        // piece, whose id is the plugin's
-        let mut files = take_attachments(
-            store,
-            home,
-            &self.media(),
-            &whole.agent,
-            conversation,
-            id.as_str(),
-            attachments,
-        );
+        let mut files: Vec<Attachment> = stored.into_iter().map(attachment_info).collect();
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
                 self.deliver(
@@ -2236,19 +2247,17 @@ fn open_inbox(home: &Path) -> Result<OwnedFd, String> {
     Ok(dir)
 }
 
-/// The files of an agent's message, once it is stored: each taken from the
-/// plugin's `media` folder under `home` ([`take_attachment`]) and recorded
-/// with the message, at most [`MAX_ATTACHMENTS`]. One that cannot be is
-/// left out, said on stderr, and leaves no file in `media`.
+/// The files of an agent's message, before it is stored: each copied from
+/// the plugin's `media` folder under `home` ([`take_attachment`]), at most
+/// [`MAX_ATTACHMENTS`]. One that cannot be is left out, said on stderr, and
+/// leaves no file in `media`.
 fn take_attachments(
-    store: &Store,
     home: &Path,
     media: &Path,
     agent: &str,
     conversation: &str,
-    message: &str,
     attachments: &[OutAttachment],
-) -> Vec<Attachment> {
+) -> Vec<Taken> {
     if attachments.len() > MAX_ATTACHMENTS {
         eprintln!(
             "enclos app: {agent}: a message carries {} files, the first {MAX_ATTACHMENTS} are taken",
@@ -2259,17 +2268,60 @@ fn take_attachments(
         .iter()
         .take(MAX_ATTACHMENTS)
         .filter_map(|a| {
-            let taken = take_attachment(home, media, conversation, a)
+            take_attachment(home, media, conversation, a)
                 .inspect_err(|e| eprintln!("enclos app: {agent}: an attachment is left out: {e}"))
-                .ok()?;
-            if let Err(e) = store.add_attachment(&taken, message) {
-                eprintln!("enclos app: {agent}: an attachment is left out: cannot record it: {e}");
-                let _ = std::fs::remove_file(media.join(&taken.id));
-                return None;
-            }
-            Some(attachment_info(taken))
+                .ok()
         })
         .collect()
+}
+
+/// Removes the plugin's copies of a stored message's files, which it sent
+/// again: the bridge stored them with it before, and may have stopped
+/// before removing these. A name that is not a plain one of the folder is
+/// left alone, as [`take_attachment`] leaves it.
+fn release_attachments(home: &Path, attachments: &[OutAttachment]) {
+    let Ok(inbox) = open_inbox(home) else { return };
+    for a in attachments.iter().take(MAX_ATTACHMENTS) {
+        if plain_file_name(&a.file) {
+            let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
+/// A file of an agent's message copied into the bridge's media folder. The
+/// plugin's copy stays until the message is stored with it: [`Taken::release`].
+struct Taken {
+    stored: StoredAttachment,
+    /// The plugin's `media` folder, as it was opened.
+    inbox: OwnedFd,
+    /// The file's name there, and what it was when read.
+    file: String,
+    read: rustix::fs::Stat,
+}
+
+impl Taken {
+    /// Removes the plugin's copy, through the folder it was read from, and
+    /// only while its name is still the file that was read.
+    fn release(&self) {
+        use rustix::fs::AtFlags;
+        if let Ok(now) =
+            rustix::fs::statat(&self.inbox, self.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            && (now.st_dev, now.st_ino) == (self.read.st_dev, self.read.st_ino)
+        {
+            let _ = rustix::fs::unlinkat(&self.inbox, self.file.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+/// Whether `file` is a plain name of the plugin's `media` folder: no
+/// folder, no leading dot, only ASCII letters, digits, `.`, `-` and `_`.
+fn plain_file_name(file: &str) -> bool {
+    !file.is_empty()
+        && file.len() <= 200
+        && !file.starts_with('.')
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Copies `source` into the new file `to`, and its size: no more than `max`
@@ -2305,22 +2357,17 @@ fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, 
 /// following a link and without waiting (a named pipe would block), and
 /// only a regular file with no other link to it, of at most
 /// [`MAX_ATTACHMENT_BYTES`], copied no further than that limit even while
-/// it grows. The plugin's copy is then removed through the same folder.
+/// it grows. The plugin's copy stays until [`Taken::release`], once the
+/// message is stored with the file.
 fn take_attachment(
     home: &Path,
     media: &Path,
     conversation: &str,
     a: &OutAttachment,
-) -> Result<StoredAttachment, String> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+) -> Result<Taken, String> {
+    use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::DirBuilderExt;
-    let plain = !a.file.is_empty()
-        && a.file.len() <= 200
-        && !a.file.starts_with('.')
-        && a.file
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if !plain {
+    if !plain_file_name(&a.file) {
         return Err(format!(
             "{:?} is not a file name of the media folder",
             a.file
@@ -2356,13 +2403,6 @@ fn take_attachment(
     // The sandbox may write on while the bridge reads.
     let size = copy_at_most(source, &media.join(&id), MAX_ATTACHMENT_BYTES)
         .map_err(|e| format!("{from}: {e}"))?;
-    // The plugin's copy, through the same folder, and only while its name
-    // is still the file that was read.
-    if let Ok(now) = rustix::fs::statat(&inbox, a.file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-        && (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino)
-    {
-        let _ = rustix::fs::unlinkat(&inbox, a.file.as_str(), AtFlags::empty());
-    }
     let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
         !t.is_empty()
             && !s.is_empty()
@@ -2378,7 +2418,7 @@ fn take_attachment(
         false,
     );
     let name = name.trim();
-    Ok(StoredAttachment {
+    let stored = StoredAttachment {
         id,
         conversation: conversation.to_owned(),
         mime: if typed {
@@ -2392,6 +2432,12 @@ fn take_attachment(
             name.chars().take(120).collect()
         },
         size: size as i64,
+    };
+    Ok(Taken {
+        stored,
+        inbox,
+        file: a.file.clone(),
+        read: opened,
     })
 }
 
