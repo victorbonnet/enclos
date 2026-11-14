@@ -1318,6 +1318,14 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         let waiting = Waiting(Arc::clone(&hub));
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
+            // The first-message deadline runs from connecting, the pairing
+            // page's request included: a caller that sends it a byte at a
+            // time is shut at it too, and gives its place back.
+            let deadline = std::time::Instant::now() + HANDSHAKE;
+            let first_message_due = match close_at(&stream, deadline) {
+                Ok(guard) => guard,
+                Err(e) => return eprintln!("enclos app: {e}"),
+            };
             // The pairing page, for a browser; anything else is a device's
             // WebSocket. A caller that sends nothing gives up the thread.
             if stream
@@ -1330,7 +1338,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 let _ = super::page::serve(stream);
                 return;
             }
-            match connection(&hub, stream, waiting) {
+            match connection(&hub, stream, waiting, deadline, first_message_due) {
                 // The device hung up, or went away (a phone that locks, sleeps
                 // or changes network rarely says goodbye): how connections
                 // end, not an error. `enclos app log` has who, when and how.
@@ -1454,14 +1462,24 @@ fn past(deadline: std::time::Instant) -> Option<String> {
 /// frame to its end, so a caller that sends a byte every few seconds would
 /// keep one read going, and its place among the [`MAX_WAITING`], for days.
 fn close_at(stream: &TcpStream, deadline: std::time::Instant) -> Result<Sender<()>, String> {
-    let watched = stream.try_clone().map_err(|e| e.to_string())?;
+    let watched = stream
+        .try_clone()
+        .map_err(|e| format!("cannot watch the connection's first-message deadline: {e}"))?;
     let (guard, dropped) = channel::<()>();
-    std::thread::spawn(move || {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if dropped.recv_timeout(left) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            let _ = watched.shutdown(std::net::Shutdown::Both);
-        }
-    });
+    std::thread::Builder::new()
+        .name("enclos-app-deadline".to_owned())
+        .spawn(move || {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if dropped.recv_timeout(left) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                match watched.shutdown(std::net::Shutdown::Both) {
+                    // Gone already: nothing to shut
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {}
+                    Err(e) => eprintln!("enclos app: a connection past its deadline: {e}"),
+                    Ok(()) => {}
+                }
+            }
+        })
+        .map_err(|e| format!("cannot watch the connection's first-message deadline: {e}"))?;
     Ok(guard)
 }
 
@@ -1497,8 +1515,15 @@ impl Hub {
 // The handshake callback's error is tungstenite's `ErrorResponse`, a whole
 // HTTP response: its size is set by the `Callback` trait, not by us.
 #[allow(clippy::result_large_err)]
-fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + HANDSHAKE;
+/// A device's WebSocket, from its upgrade on. `deadline` is its first
+/// message's, which `first_message_due` ([`close_at`]) holds until dropped.
+fn connection(
+    hub: &Arc<Hub>,
+    stream: TcpStream,
+    waiting: Waiting,
+    deadline: std::time::Instant,
+    first_message_due: Sender<()>,
+) -> Result<(), String> {
     let store = hub.store()?;
     let mut login: Option<String> = None;
     let mut address: Option<String> = None;
@@ -1506,11 +1531,10 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     // past it, the connection is shut whatever a read is doing
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("cannot time the connection's reads: {e}"))?;
     stream
         .set_write_timeout(Some(WRITE_WAIT))
-        .map_err(|e| e.to_string())?;
-    let first_message_due = close_at(&stream, deadline)?;
+        .map_err(|e| format!("cannot time the connection's writes: {e}"))?;
     // No device-leg message is larger than one Noise message
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_NOISE_MESSAGE))
@@ -3762,24 +3786,17 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
     /// read's wait, is still closed at the deadline: tungstenite reads a
     /// frame to its end, so the deadline was once never looked at and one
     /// caller could hold a place among the few for days.
-    #[test]
-    fn a_caller_that_trickles_its_first_frame_is_closed_at_the_deadline() {
+    /// Sends `stream` a byte every half second until the bridge closes it,
+    /// for at most the deadline and 5 s, and checks it closed at the
+    /// deadline, not before, counted from `started`.
+    fn trickle_until_closed(stream: &mut TcpStream, started: std::time::Instant) {
         use std::io::{Read, Write};
-        let folder = tempfile::tempdir().unwrap();
-        let bridge = bridge(folder.path());
-        let started = std::time::Instant::now();
-        let mut socket = websocket(&bridge, PERSON);
-        let stream = socket.get_mut();
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        // A masked binary frame said to hold 60,000 bytes
-        stream
-            .write_all(&[0x82, 0xFE, 0xEA, 0x60, 1, 2, 3, 4])
-            .unwrap();
         let mut closed = false;
         while started.elapsed() < HANDSHAKE + Duration::from_secs(5) {
-            if stream.write_all(&[0]).is_err() {
+            if stream.write_all(b"a").is_err() {
                 closed = true;
                 break;
             }
@@ -3807,16 +3824,47 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             started.elapsed()
         );
         assert!(started.elapsed() >= HANDSHAKE, "closed before the deadline");
-        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_caller_that_trickles_its_first_frame_is_closed_at_the_deadline() {
+        use std::io::Write;
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let started = std::time::Instant::now();
+        let mut socket = websocket(&bridge, PERSON);
+        // A masked binary frame said to hold 60,000 bytes
+        socket
+            .get_mut()
+            .write_all(&[0x82, 0xFE, 0xEA, 0x60, 1, 2, 3, 4])
+            .unwrap();
+        trickle_until_closed(socket.get_mut(), started);
         assert!(
-            Store::open(&bridge.store)
+            eventually(|| Store::open(&bridge.store)
                 .unwrap()
                 .log_lines(100)
                 .unwrap()
                 .iter()
-                .any(|l| l.event == "refused" && l.reason.as_deref() == Some(TOO_SLOW)),
+                .any(|l| l.event == "refused" && l.reason.as_deref() == Some(TOO_SLOW))),
             "the refusal is logged as too slow"
         );
+    }
+
+    /// The pairing page's request runs under the same deadline: a caller
+    /// that asks for it and then sends its request's head a byte at a time
+    /// is closed at the deadline: it once held a place among the few for
+    /// as long as it kept each read within 30 s.
+    #[test]
+    fn a_caller_that_trickles_the_pairing_pages_request_is_closed_at_the_deadline() {
+        use std::io::Write;
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let started = std::time::Instant::now();
+        let mut stream = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
+        stream
+            .write_all(format!("GET {} HTTP/1.1\r\nX-Slow: ", super::super::page::PATH).as_bytes())
+            .unwrap();
+        trickle_until_closed(&mut stream, started);
     }
 
     #[test]
