@@ -262,7 +262,7 @@ Only the host's person, authenticated on a still-paired device, may use these me
 | `sandbox.created` | bridge | `of`, `sandbox` | Creation completed |
 | `runtime.installed` | bridge | `of`, `sandbox`, `runtime`, `login` | Installation completed; `login` is the remaining host setup command, e.g. `enclos connect lab -- hermes setup` |
 
-The bridge sends completion or an `error` with the request's `of`, then a fresh `sandboxes.list` to the host's person's connected devices. Only one provisioning operation per sandbox runs at once (`busy` otherwise). Operations continue if the phone disconnects; they are not replayed on reconnect. A new `sandboxes` request reads the resulting host state. Requests with invalid names, runtimes or templates get `bad_message`; engine and installer failures get `operation_failed`, in their own words. No installed runtime is recorded until its installer succeeds. Existing engine checks still refuse pending policies, another installed runtime, and unrelated policy edits that require host review. Runtime login, app channel setup and service startup remain host operations, and the app says so. Existing mobile policy review and editing are unchanged.
+The bridge sends completion or an `error` with the request's `of`, then a fresh `sandboxes.list` to the host's person's connected devices. Only one provisioning operation per sandbox runs at once (`busy` otherwise). Operations continue if the phone disconnects; they are not replayed on reconnect. A new `sandboxes` request reads the resulting host state. Requests with invalid names, runtimes or templates get `bad_message`; engine and installer failures get `operation_failed`, in their own words, on one line and cut to 2,000 characters so the error fits one device-leg message. No installed runtime is recorded until its installer succeeds. Existing engine checks still refuse pending policies, another installed runtime, and unrelated policy edits that require host review. Runtime login, app channel setup and service startup remain host operations, and the app says so. Existing mobile policy review and editing are unchanged.
 
 Each request and its completion is logged with its device and person in `enclos app log`. The engine audit records creation by the authenticated person and runtime installation by the local host user running the CLI child. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. After completing a new agent's app channel setup on the host, restart the bridge to list it.
 
@@ -324,9 +324,9 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 | `unconfirmed` | A question answer may have reached the agent, but its outcome was not confirmed (a timeout, or a disconnect after sending); check the question after the next sync before answering again |
 | `conflict` | What the request changes changed since the revision it names, or a request id was reused; nothing was changed. Refresh before deciding whether to retry |
 | `busy` | Another provisioning operation is running in this sandbox; nothing was changed. Try again once it ends |
-| `operation_failed` | The engine or installer refused or failed; the message says why. Check the sandbox on the host before retrying |
+| `operation_failed` | The engine or installer refused or failed; the message says why, and whether a policy edit was saved anyway. Check the sandbox on the host before retrying |
 | `internal` | The receiver failed on its side; nothing was changed, and trying again later may work |
-| `unsupported` | The runtime does not offer this routine control, delivery or question control; nothing was changed |
+| `unsupported` | The runtime does not offer this routine control, delivery or question control, or the answer would be too large for one device-leg message; nothing was changed |
 | `not_found` | No such routine or question for this agent (one removed included); nothing was changed |
 | `unknown` | A runtime could not confirm a routine control it received, or the bridge could not check the runtime's answer to one, and the outcome is not known; a later sync shows it, and an idempotent request may be retried. Also what a receiver reads for a code it does not know |
 
@@ -354,7 +354,7 @@ An edit adds, replaces or removes one entry or replaces one scalar. The host val
 
 Edits are audited with the owner and device. Network-only changes go live; launch-time changes explicitly require Save & restart and use the existing restart path. After an application attempt, the owner gets the current policy and every capable agent plugin gets active policy context. Nothing is automatically replayed after interruption. Cached policy data on the phone is read-only until a fresh host response; clear cache and forgetting a host remove it.
 
-A `sandbox.policy` or `sandbox.policy.preview` that would not fit one device-leg message is not sent: the request is answered with an `error` (`unsupported`, its `of`) naming the host command that shows the policy or makes the change, and a broadcast of it is left out. `sandboxes.list` is bounded the same way.
+A `sandbox.policy` or `sandbox.policy.preview` that would not fit one device-leg message is not sent: the request is answered with an `error` (`unsupported`, its `of`) naming the host command that shows the policy or makes the change, and a broadcast of it is left out. `sandboxes.list` is bounded the same way. A `sandbox.policy.apply` is measured before it is applied: when the policy it would make might not fit (the policy it was reviewed on, with the added value and room for a source label and a reason), it is refused with `unsupported`, naming `enclos policy edit`, and nothing is changed. An apply that was saved but whose policy cannot then be sent or read back is answered with `operation_failed`, its message saying the edit was saved.
 
 ### Diagnostic probe notifications
 

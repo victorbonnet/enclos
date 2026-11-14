@@ -2706,3 +2706,94 @@ fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
     assert_eq!(received[0].try_recv().ok(), Some(policy(10)));
     assert!(received[0].try_recv().is_err());
 }
+
+#[test]
+fn a_long_provisioning_failure_still_fits_one_message() {
+    let of = MessageId::new("install-1").unwrap();
+    let long = format!("installer refused: {}", "line of output\n".repeat(5_000));
+    let failed = operation_failed(of.clone(), &long);
+    assert!(agent_names::agent_message_fits(&failed).unwrap());
+    let ToDevice::Error(error) = failed else {
+        panic!("not an error");
+    };
+    assert_eq!(error.of, Some(of.clone()));
+    assert_eq!(error.code, ErrorCode::OperationFailed);
+    assert!(
+        error
+            .message
+            .starts_with("installer refused: line of output line")
+    );
+    // A short one goes as it is
+    let ToDevice::Error(error) = operation_failed(of, "installer refused the operation") else {
+        panic!("not an error");
+    };
+    assert_eq!(error.message, "installer refused the operation");
+}
+
+#[test]
+fn an_edit_is_measured_against_the_policy_it_would_make() {
+    use enclos_protocol::policy::{PolicyChange, PolicyField, PolicyState, PolicyValue};
+    let of = MessageId::new("apply-1").unwrap();
+    let state = |reason: usize| PolicyState {
+        sandbox: "lab".into(),
+        version: 1,
+        base: "b".into(),
+        editable: true,
+        reason: Some("x".repeat(reason)),
+        fields: vec![PolicyField {
+            key: "allow".into(),
+            label: "Allowed destinations".into(),
+            multiple: true,
+            editable: true,
+            choices: Vec::new(),
+            values: vec![PolicyValue {
+                value: "example.com".into(),
+                source: "Sandbox".into(),
+                locked: false,
+            }],
+        }],
+        of: String::new(),
+    };
+    let fits = |reason: usize| {
+        let mut s = state(reason);
+        s.of = of.to_string();
+        agent_names::agent_message_fits(&ToDevice::SandboxPolicy(s)).unwrap()
+    };
+    // The longest reason that still lets the policy reach the phone
+    let (mut low, mut high) = (0, 70_000);
+    while low + 1 < high {
+        let middle = (low + high) / 2;
+        if fits(middle) {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    let change = |after: Option<usize>| PolicyChange {
+        field: "allow".into(),
+        before: None,
+        after: after.map(|n| format!("{}.example.com", "a".repeat(n))),
+    };
+    // At the limit, an added entry would not reach it
+    assert!(!policy::fits_once_applied(
+        &state(low),
+        &change(Some(1)),
+        &of
+    ));
+    // With room, it would; a removal never grows it
+    assert!(policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(200)),
+        &of
+    ));
+    assert!(!policy::fits_once_applied(
+        &state(low - 2_000),
+        &change(Some(2_000)),
+        &of
+    ));
+    assert!(policy::fits_once_applied(
+        &state(low - 1_000),
+        &change(None),
+        &of
+    ));
+}
