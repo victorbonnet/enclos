@@ -258,6 +258,7 @@ impl Hub {
             },
         );
         let hub = Arc::clone(self);
+        let by = authority::device_actor(person, &device.id, None);
         let person = person.to_owned();
         let device = device.id.clone();
         std::thread::spawn(move || {
@@ -273,7 +274,7 @@ impl Hub {
                 .provisioning
                 .as_ref()
                 .expect("provisioning request checked")
-                .execute(&operation, &person);
+                .execute(&operation, &by);
             let failed = result.as_ref().err().cloned();
             let response = match result {
                 Ok(Completed::Created) => ToDevice::SandboxCreated {
@@ -2170,10 +2171,7 @@ fn run_session(
 /// written, the device stays paired and the request fails.
 fn forget(hub: &Hub, store: &Store, device: &Device, person: &str) -> Result<(), String> {
     let engine = crate::engine::Engine::open(hub.layout.clone(), crate::state::Wait::Background);
-    let by = crate::model::audit::Actor {
-        user: person.to_owned(),
-        host: device.name.clone(),
-    };
+    let by = authority::device_actor(person, &device.id, None);
     engine
         .app_access(
             &by,
@@ -2841,10 +2839,6 @@ mod connection_end_tests {
             silence,
             Host::new(
                 crate::layout::Layout::at(folder.join("enclos")),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
                 "/unused/enclos".into(),
             ),
         )
@@ -3160,6 +3154,7 @@ mod connection_end_tests {
         let layout = provisioning_state(folder.path());
         let executable = folder.path().join("fake-enclos");
         std::fs::write(&executable, r#"#!/bin/sh
+printf '%s' "$8" > "$ENCLOS_HOME/requested-by"
 while [ ! -f "$ENCLOS_HOME/release" ]; do sleep 0.01; done
 if [ -f "$ENCLOS_HOME/fail" ]; then
   printf '%s\n' '{"error":{"message":"installer refused the operation"}}'
@@ -3171,14 +3166,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let bridge = bridge_serving(
             folder.path(),
             SILENCE,
-            Host::new(
-                layout.clone(),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
-                executable,
-            ),
+            Host::new(layout.clone(), executable),
         );
         let phone = paired(&bridge, "n-pixel");
         Store::open(&bridge.store)
@@ -3201,6 +3189,11 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         std::fs::write(layout.data().join("release"), "").unwrap();
         assert!(
             matches!(device.receive(), Some(ToDevice::RuntimeInstalled { of, sandbox, runtime, login }) if of.as_str() == "install-one" && sandbox == "lab" && runtime == "hermes" && login.contains("hermes setup"))
+        );
+        // The install's audit entry names the person and device that asked
+        assert_eq!(
+            std::fs::read_to_string(layout.data().join("requested-by")).unwrap(),
+            format!("{PERSON} (device {})", phone.id)
         );
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "lab"))
@@ -3244,14 +3237,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let bridge = bridge_serving(
             folder.path(),
             SILENCE,
-            Host::new(
-                layout.clone(),
-                crate::model::audit::Actor {
-                    user: "host".into(),
-                    host: "test".into(),
-                },
-                "/unused/enclos".into(),
-            ),
+            Host::new(layout.clone(), "/unused/enclos".into()),
         );
         let phone = paired(&bridge, "n-pixel");
         Store::open(&bridge.store)
@@ -3274,6 +3260,12 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         );
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
+        );
+        let audit = std::fs::read_to_string(layout.audit_log()).unwrap();
+        assert!(
+            audit.lines().any(|line| line.contains("sandbox create")
+                && line.contains(&format!("{PERSON} (device {})", phone.id))),
+            "{audit}"
         );
     }
 

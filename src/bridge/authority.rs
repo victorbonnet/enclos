@@ -1,6 +1,18 @@
 //! Authority shared by operations reserved for the host's person.
 use super::{Device, Hub, Store};
+use crate::model::audit::Actor;
 use enclos_protocol::plugin::ErrorCode;
+
+/// Who a paired device's request is in the engine's audit log, the same on
+/// every bridge path: its person and device, and the request when the entry
+/// answers one, on this host.
+pub(super) fn device_actor(person: &str, device: &str, request: Option<&str>) -> Actor {
+    let user = match request {
+        Some(request) => format!("{person} (device {device}, request {request})"),
+        None => format!("{person} (device {device})"),
+    };
+    Actor::on_this_host(user)
+}
 
 impl Hub {
     /// Append each supported feature here so authentication has one capability list.
@@ -48,5 +60,26 @@ impl Hub {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_is_audited_as_its_person_and_device_on_this_host() {
+        let here = Actor::on_this_host(String::new()).host;
+        assert_eq!(
+            device_actor("alice@example.com", "d-1", None),
+            Actor {
+                user: "alice@example.com (device d-1)".into(),
+                host: here.clone(),
+            }
+        );
+        assert_eq!(
+            device_actor("alice@example.com", "d-1", Some("r-1")).user,
+            "alice@example.com (device d-1, request r-1)"
+        );
     }
 }

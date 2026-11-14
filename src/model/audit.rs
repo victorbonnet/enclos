@@ -14,6 +14,17 @@ pub struct Actor {
     pub host: String,
 }
 
+impl Actor {
+    /// `user` on this host, by the host's name (`unknown` when it cannot be
+    /// read).
+    pub fn on_this_host(user: String) -> Actor {
+        Actor {
+            user,
+            host: whoami::hostname().unwrap_or_else(|_| "unknown".to_owned()),
+        }
+    }
+}
+
 /// What a state-changing command is about to do, recorded before it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Intent {

@@ -30,6 +30,11 @@ enum RuntimeVerb {
         runtime: RuntimeKind,
         #[arg(long)]
         sandbox: SandboxName,
+        /// Who asked for the install, as the audit log names them: the
+        /// mobile app's bridge, which runs this command for a paired
+        /// device, names its person and device.
+        #[arg(long, hide = true, value_name = "WHO")]
+        requested_by: Option<String>,
     },
     /// Set an agent up with the runtime's own commands: it reads the
     /// secrets the policy grants it under [secrets.agents.<agent>], then
@@ -62,8 +67,12 @@ enum RuntimeVerb {
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
-    let (runtime, sandbox) = match args.verb {
-        RuntimeVerb::Install { runtime, sandbox } => (runtime, sandbox),
+    let (runtime, sandbox, requested_by) = match args.verb {
+        RuntimeVerb::Install {
+            runtime,
+            sandbox,
+            requested_by,
+        } => (runtime, sandbox, requested_by),
         RuntimeVerb::Configure {
             target,
             set,
@@ -79,6 +88,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             return configure(engine, by, confirm, target, channel, &set);
         }
     };
+    let by = &requester(by, requested_by);
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
         Planned::DryRun(plan) => {
             output::show_plan(&plan);
@@ -139,6 +149,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         end.policy, end.login
     );
     Ok(exit::OK)
+}
+
+/// Who the audit log names for an install: the user running enclos, or
+/// the one `--requested-by` names, on this host.
+fn requester(by: &Actor, requested_by: Option<String>) -> Actor {
+    match requested_by {
+        Some(user) => Actor {
+            user,
+            host: by.host.clone(),
+        },
+        None => by.clone(),
+    }
 }
 
 /// What `runtime configure` sets up: the bot of the sandbox's built-in
@@ -250,6 +272,22 @@ fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_install_is_audited_as_who_asked_for_it_on_this_host() {
+        let by = Actor {
+            user: "victor".into(),
+            host: "mac".into(),
+        };
+        assert_eq!(requester(&by, None), by);
+        assert_eq!(
+            requester(&by, Some("alice@example.com (device d-1)".into())),
+            Actor {
+                user: "alice@example.com (device d-1)".into(),
+                host: "mac".into(),
+            }
+        );
+    }
 
     #[test]
     fn a_target_is_a_sandbox_or_one_of_its_agents() {

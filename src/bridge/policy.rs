@@ -1,7 +1,7 @@
 //! Policy management is available only to the host's person on a still-paired device.
 use super::*;
 use crate::engine::Engine;
-use crate::model::{audit::Actor, sandbox::SandboxName};
+use crate::model::sandbox::SandboxName;
 use enclos_protocol::policy::{PolicyApply, PolicyState};
 
 /// Whether policy entry `value` of list `field` is what an approved
@@ -84,10 +84,7 @@ impl Hub {
     ) -> Result<PolicyState, String> {
         // Authorization is rechecked for every operation, not retained from a page opening.
         self.policy_authority(store, device, person, name.as_str())?;
-        let actor = Actor {
-            user: format!("{person} (device {})", device.id),
-            host: self.layout.data().display().to_string(),
-        };
+        let actor = super::authority::device_actor(person, &device.id, None);
         let result = Engine::open(self.layout.clone(), crate::state::Wait::Background)
             .mobile_policy_apply(&actor, name, &edit.base, &edit.revision, &edit.change);
         self.refresh_access_context(name.as_str());

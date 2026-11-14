@@ -1,10 +1,7 @@
 //! Approval requests cross the trust boundary as data. Only the host's person decides.
 use super::*;
 use crate::model::net::DeniedDestination;
-use crate::{
-    engine::Engine,
-    model::{audit::Actor, sandbox::SandboxName},
-};
+use crate::{engine::Engine, model::sandbox::SandboxName};
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 use std::collections::HashMap;
 
@@ -429,10 +426,7 @@ impl Hub {
         }
         a.state = "applying".into();
         self.deliver(person, ToDevice::Approval(a.clone()));
-        let by = Actor {
-            user: format!("{person} (device {}, request {id})", device.id),
-            host: self.layout.data().display().to_string(),
-        };
+        let by = super::authority::device_actor(person, &device.id, Some(id));
         let name = a
             .sandbox
             .parse::<SandboxName>()
