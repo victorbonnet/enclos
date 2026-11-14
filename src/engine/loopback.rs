@@ -45,7 +45,7 @@ fn free_after(addr: SocketAddr, wait: Duration, between: impl FnOnce()) -> bool 
 
 /// Whether `stream` reached another socket than its own; one that reached
 /// itself is reset as it closes.
-fn reached_another(stream: TcpStream) -> bool {
+pub(super) fn reached_another(stream: TcpStream) -> bool {
     let itself = stream.local_addr().ok() == stream.peer_addr().ok();
     if itself {
         // A linger of zero makes the close a reset, which skips TIME-WAIT.

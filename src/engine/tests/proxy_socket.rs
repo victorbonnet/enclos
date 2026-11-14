@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 
 use super::policy::with_sandbox;
 use super::*;
+use crate::engine::loopback::reached_another;
 use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::net::{Reason, Verdict};
 
@@ -128,10 +129,27 @@ impl ProxyChild {
     fn end(mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
-        let refused = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port)).unwrap_err();
-        assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
-        // `[::1]` may not be configured: any error says nothing answers.
-        assert!(TcpStream::connect((Ipv6Addr::LOCALHOST, self.port)).is_err());
+        assert_nothing_listens(self.port);
+    }
+}
+
+/// Asserts that nothing listens on `port`, on either loopback: a connection
+/// to it is refused, or reaches itself. Linux can give a connection the port
+/// it connects to as its own, since its ephemeral range holds the proxy
+/// range; with nothing listening, the connection then reaches itself. It is
+/// reset as it closes, so that it leaves the port free for the next proxy
+/// (see `loopback`).
+fn assert_nothing_listens(port: u16) {
+    match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+        Err(refused) => assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}"),
+        Ok(conn) => assert!(
+            !reached_another(conn),
+            "something listens on 127.0.0.1:{port}"
+        ),
+    }
+    // `[::1]` may not be configured: any error says nothing answers.
+    if let Ok(conn) = TcpStream::connect((Ipv6Addr::LOCALHOST, port)) {
+        assert!(!reached_another(conn), "something listens on [::1]:{port}");
     }
 }
 
@@ -319,8 +337,7 @@ fn a_proxy_goes_by_its_sandboxs_backend_when_its_socket_cannot_be_opened() {
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
     assert!(!engine.proxy_runs(&name).unwrap());
     // Nothing holds its port.
-    let refused = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap_err();
-    assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
+    assert_nothing_listens(port);
 
     let (_dir, engine, name) = on_backend(BackendKind::Seatbelt);
     block_the_socket(&engine, &name);
@@ -356,16 +373,11 @@ fn a_proxy_whose_sessions_reach_it_over_its_socket_leaves_its_port_free() {
         let mut proxy = ProxyChild::start(&engine, &name, false);
         // The socket opens last, so every listener is up once it answers.
         proxy.connect(&engine.layout.proxy_socket(name.as_str()));
-        let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port));
         match backend.reaches_proxy_over_socket() {
-            true => {
-                let refused = tcp.unwrap_err();
-                assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
-                // `[::1]` may not be configured: any error says nothing answers.
-                assert!(TcpStream::connect((Ipv6Addr::LOCALHOST, proxy.port)).is_err());
-            }
+            true => assert_nothing_listens(proxy.port),
             false => {
-                tcp.unwrap();
+                let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port)).unwrap();
+                assert!(reached_another(tcp), "the proxy does not listen");
             }
         }
         proxy.end();
