@@ -92,9 +92,11 @@ const RETRY: Duration = Duration::from_secs(10);
 /// (`auth` or `pair.request`). Shorter in tests, which wait it out.
 const HANDSHAKE: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 30 });
 
-/// How long a write to a device may wait: one that stopped reading would
-/// otherwise hold its session's thread, and its queue would grow.
-const WRITE_WAIT: Duration = Duration::from_secs(30);
+/// How long a write to a device may make no progress (`SO_SNDTIMEO`, which
+/// times each system call, not each message) before its session ends
+/// ([`STALLED`]): a device that stopped reading would otherwise hold its
+/// session's thread, and its queue would grow. Shorter in tests.
+const WRITE_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 30 });
 
 /// Connections not yet authenticated at once: any login of the tailnet
 /// gets that far, so they are few, and a caller past them is closed.
@@ -1348,7 +1350,9 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 // The device hung up, or went away (a phone that locks, sleeps
                 // or changes network rarely says goodbye): how connections
                 // end, not an error. `enclos app log` has who, when and how.
-                Err(e) if e == CLOSED || e == GONE || e == SILENT || e == UNPAIRED => {}
+                Err(e)
+                    if e == CLOSED || e == GONE || e == SILENT || e == STALLED || e == UNPAIRED => {
+                }
                 Err(e) => eprintln!("enclos app: a connection ended: {e}"),
                 Ok(()) => {}
             }
@@ -1364,6 +1368,9 @@ const GONE: &str = "went away without closing the connection";
 const UNPAIRED: &str = "unpaired";
 /// Nothing came from the device, not even a ping, for [`SILENCE`].
 const SILENT: &str = "silent for too long";
+/// A write to the device made no progress for [`WRITE_WAIT`]: it stopped
+/// reading.
+const STALLED: &str = "took nothing the bridge sent for too long";
 /// The caller sent no first message within [`HANDSHAKE`].
 const TOO_SLOW: &str = "no first message in time";
 
@@ -1403,7 +1410,17 @@ impl Link {
         let sealed = self.session.encrypt(&plain).map_err(|e| e.to_string())?;
         self.socket
             .send(Message::Binary(sealed.into()))
-            .map_err(ended)
+            .map_err(|e| match e {
+                tungstenite::Error::Io(io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    STALLED.to_owned()
+                }
+                e => ended(e),
+            })
     }
 
     /// The next message, `None` while nothing came in time.
@@ -3426,6 +3443,81 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert!(
             matches!(device.receive(), Some(ToDevice::SandboxesList { sandboxes }) if sandboxes.iter().any(|s| s.sandbox == "new-home" && s.runtime.is_none()))
         );
+    }
+
+    /// The first-message deadline is the first message's alone: a session
+    /// that authenticated in time goes on past it. Dropping its watchdog
+    /// later, or not at all, would cut every session at the deadline.
+    #[test]
+    fn an_authenticated_session_outlives_the_first_message_deadline() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        std::thread::sleep(HANDSHAKE + Duration::from_secs(1));
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the session ended at the first-message deadline"),
+            }
+        }
+    }
+
+    /// A device that stops reading ends its own session once a write to it
+    /// makes no progress for [`WRITE_WAIT`], said as such in the log, and
+    /// the person's other device keeps getting what the agent says.
+    #[test]
+    fn a_device_that_stops_reading_ends_its_session_alone() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let stuck_phone = paired(&bridge, "n-pixel");
+        let phone = paired(&bridge, "n-pixel");
+        let (stuck, _) = connect(&bridge, &stuck_phone);
+        // It never reads again, and holds little while it does not
+        rustix::net::sockopt::set_socket_recv_buffer_size(stuck.socket.get_ref(), 4096).unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        let store = Store::open(&bridge.store).unwrap();
+        let stalled = || {
+            store.log_lines(1000).unwrap().iter().any(|l| {
+                l.event == "disconnected"
+                    && l.device.as_deref() == Some(stuck_phone.id.as_str())
+                    && l.reason.as_deref() == Some(STALLED)
+            })
+        };
+        // Replies of 150,000 characters each, which both devices are sent,
+        // until the one that does not read is let go; the other reads every
+        // piece of each
+        let reply = |device: &mut PhoneLink, n: usize| {
+            say(device, &format!("long-{n}"), "long");
+            let mut chars = 0;
+            while chars < 150_000 {
+                if let Some(ToDevice::Message(m)) = device.receive()
+                    && m.from == "agent"
+                {
+                    chars += m.text.chars().count();
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        while !stalled() {
+            assert!(n < 100, "still connected after {n} replies");
+            reply(&mut device, n);
+            n += 1;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        // The other device is still there, and still answered
+        reply(&mut device, n);
+        drop(stuck);
     }
 
     /// A stored message too large for a device (as an earlier bridge could
