@@ -1216,6 +1216,14 @@ impl Store {
         rows.collect()
     }
 
+    /// The newest `seq` of any stored message, 0 when there is none.
+    pub fn newest_seq(&self) -> rusqlite::Result<i64> {
+        self.db
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |row| {
+                row.get(0)
+            })
+    }
+
     /// The messages of conversation `id` after `since`, in order.
     pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(

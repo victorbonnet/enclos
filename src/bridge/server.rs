@@ -1734,7 +1734,7 @@ fn run_session(
     person: &str,
     outbox: &Receiver<ToDevice>,
 ) -> Result<(), String> {
-    // The newest `seq` of the person's messages this session sent, once
+    // The newest `seq` of the person's messages this connection sent, once
     // its device synced; none before.
     let mut sent: Option<i64> = None;
     loop {
@@ -2090,11 +2090,21 @@ fn run_session(
                         link.send(ToDevice::GroupState(state))?;
                     }
                 }
+                // Read before the history: a message stored after it has a
+                // higher `seq`
+                let newest = store.newest_seq().map_err(|e| e.to_string())?;
                 let last = send_history(hub, store, link, person, since)?;
                 link.send(ToDevice::Synced { seq: last })?;
                 // What was stored meanwhile is in the history above, or
-                // comes after it.
-                sent = Some(sent.map_or(last, |s| s.max(last)));
+                // comes after it. A `since` past every stored message (an
+                // `app.db` restored from an older copy) is not taken as sent,
+                // or the messages up to it would never reach the device.
+                let shown = if last > since {
+                    last
+                } else {
+                    since.min(newest)
+                };
+                sent = Some(sent.map_or(shown, |s| s.max(shown)));
             }
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
@@ -2130,10 +2140,10 @@ fn run_session(
     }
 }
 
-/// Sends what the session's outbox holds. A message of the person's goes
+/// Sends what the connection's outbox holds. A message of the person's goes
 /// to the device only once it synced (`sent` is the newest `seq` the
-/// session sent then), and with every message of the person's stored
-/// before it that the session has not sent, read from the store in `seq`
+/// connection sent then), and with every message of the person's stored
+/// before it that the connection has not sent, read from the store in `seq`
 /// order: two messages stored at once may reach the outbox in the other
 /// order. So the newest `seq` a device holds always comes with every one
 /// before it, and a device that syncs from it misses none, whenever the
@@ -4084,6 +4094,36 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_eq!(next[0].text, "stored first");
         assert_eq!(next[1].text, "and now");
         assert!(last < next[0].seq && next[0].seq < next[1].seq);
+    }
+
+    #[test]
+    fn a_sync_from_past_every_stored_message_still_gets_the_next_one() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        store
+            .add("a-1", "c-1", &From::Agent, "before", "reply")
+            .unwrap();
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        // The device holds a `seq` this database never reached, as after
+        // `app.db` was restored from an older copy
+        let (messages, _) = synced(&mut device, 500);
+        assert!(messages.is_empty());
+        // The next message is not taken as one the connection sent
+        say(&mut device, "m-1", "after");
+        loop {
+            match device.receive() {
+                Some(ToDevice::Message(m)) => {
+                    assert_eq!(m.text, "after");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("closed"),
+            }
+        }
     }
 
     #[test]
