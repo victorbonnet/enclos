@@ -134,7 +134,8 @@ impl ProxyChild {
 }
 
 /// Asserts that nothing listens on `port`, on either loopback: a connection
-/// to it is refused, or reaches itself. Linux can give a connection the port
+/// to 127.0.0.1 is refused or reaches itself, and one to `[::1]`, which may
+/// not be configured, fails or reaches itself. Linux can give a connection the port
 /// it connects to as its own, since its ephemeral range holds the proxy
 /// range; with nothing listening, the connection then reaches itself. It is
 /// reset as it closes, so that it leaves the port free for the next proxy
