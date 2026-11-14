@@ -38,7 +38,7 @@ Use these; the user's docs and enclos's messages do.
 | Session | A run of programs inside a sandbox: a `connect`, an `exec`, or a service. |
 | Secret | A value kept in the host's secret store (Keychain on macOS), granted to a sandbox or to one agent by its policy. |
 | Channel, bot | Where an agent talks, such as Telegram; a bot is an agent's account on one. |
-| Bridge, paired device | The host's service for the enclos mobile app, and a phone allowed to reach it. |
+| Bridge, paired device | The part of enclos on the host that serves the enclos mobile app (`enclos app serve`, in the foreground), and a phone allowed to reach it. |
 
 ## Driving the CLI
 

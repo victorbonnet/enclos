@@ -979,7 +979,7 @@ impl Store {
         )?;
         // A database whose devices were paired before the host's person
         // was kept: the first of them names it, as it would have, so the
-        // next device paired, a guest's perhaps, does not (ADR 0044)
+        // next device paired, another person's perhaps, does not (ADR 0044)
         db.execute(
             "INSERT OR IGNORE INTO settings (name, value)
              SELECT ?1, person FROM devices ORDER BY paired, rowid LIMIT 1",
@@ -1228,15 +1228,17 @@ impl Store {
         Ok((added == 1).then(|| self.db.last_insert_rowid()))
     }
 
-    /// Stores the pieces of one text, each with its id, all or none: when
-    /// the first id is known already the whole text is a duplicate, and
-    /// `None` comes back; else each piece's `seq`.
+    /// Stores the pieces of one text, each with its id, and its `files`
+    /// with the first piece, all or none: when the first id is known
+    /// already the whole text is a duplicate, and `None` comes back; else
+    /// each piece's `seq`.
     pub fn add_pieces(
         &self,
         pieces: &[(String, String)],
         conversation: &str,
         from: &From,
         kind: &str,
+        files: &[StoredAttachment],
     ) -> rusqlite::Result<Option<Vec<i64>>> {
         let transaction = self.db.unchecked_transaction()?;
         let mut seqs = Vec::new();
@@ -1247,8 +1249,31 @@ impl Store {
                 None => return Err(rusqlite::Error::StatementChangedRows(0)),
             }
         }
+        if let Some((first, _)) = pieces.first() {
+            for file in files {
+                self.add_attachment(file, first)?;
+            }
+        }
         transaction.commit()?;
         Ok(Some(seqs))
+    }
+
+    /// Whether a file with this id is recorded.
+    pub fn has_attachment(&self, id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM attachments WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Whether a message with this id is stored.
+    pub fn has_message(&self, id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )
     }
 
     /// Stores a person's message from a device, as pending for the agent,
@@ -1364,6 +1389,14 @@ impl Store {
         )?;
         let rows = query.query_map(params![owner, since], message_row)?;
         rows.collect()
+    }
+
+    /// The newest `seq` of any stored message, 0 when there is none.
+    pub fn newest_seq(&self) -> rusqlite::Result<i64> {
+        self.db
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM messages", [], |row| {
+                row.get(0)
+            })
     }
 
     /// The messages of conversation `id` after `since`, in order.
@@ -2535,7 +2568,7 @@ mod tests {
             ("a-2".to_owned(), "two".to_owned()),
         ];
         let seqs = store
-            .add_pieces(&pieces, "c-1", &From::Agent, "reply")
+            .add_pieces(&pieces, "c-1", &From::Agent, "reply", &[])
             .unwrap()
             .unwrap();
         assert_eq!(seqs.len(), 2);
@@ -2547,7 +2580,7 @@ mod tests {
         ];
         assert_eq!(
             store
-                .add_pieces(&again, "c-1", &From::Agent, "reply")
+                .add_pieces(&again, "c-1", &From::Agent, "reply", &[])
                 .unwrap(),
             None
         );

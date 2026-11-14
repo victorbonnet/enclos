@@ -4,21 +4,26 @@
 <rect width="1140" height="640" rx="12" fill="#0d1117"/>
 <text x="40" y="38" font-size="18" font-weight="600" fill="#e6edf3" text-anchor="start">Every client goes through one core; each sandbox runs as its own services</text>
 <text x="40" y="62" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="start">No daemon: the CLI writes state and audit, and the service manager keeps each sandbox's proxy and gateway running</text>
-<rect x="40" y="84" width="300" height="80" rx="9" fill="#121d2f" stroke="#4493f8" stroke-width="2.5"/>
-<text x="190.0" y="110.0" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">enclos (CLI)</text>
-<text x="190.0" y="130.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">every operation</text>
-<text x="190.0" y="148.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">milestone 1</text>
-<line x1="190" y1="164" x2="190" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
-<rect x="420" y="84" width="300" height="80" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5" stroke-dasharray="6 5"/>
-<text x="570.0" y="110.0" font-size="16" font-weight="600" fill="#6e7681" text-anchor="middle">enclos ui</text>
-<text x="570.0" y="130.0" font-size="13.5" font-weight="normal" fill="#6e7681" text-anchor="middle">local web UI</text>
-<text x="570.0" y="148.0" font-size="13.5" font-weight="normal" fill="#6e7681" text-anchor="middle">same audit log; later</text>
-<line x1="570" y1="164" x2="570" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
-<rect x="800" y="84" width="300" height="80" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
-<text x="950.0" y="110.0" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">Host assistants</text>
-<text x="950.0" y="130.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">Claude Code, Codex: run the CLI</text>
-<text x="950.0" y="148.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">with the enclos plugin</text>
-<line x1="950" y1="164" x2="950" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
+<rect x="40" y="84" width="247" height="80" rx="9" fill="#121d2f" stroke="#4493f8" stroke-width="2.5"/>
+<text x="163.5" y="110.0" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">enclos (CLI)</text>
+<text x="163.5" y="130.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">every operation</text>
+<text x="163.5" y="148.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">milestone 1</text>
+<line x1="163.5" y1="164" x2="163.5" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
+<rect x="311" y="84" width="247" height="80" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="434.5" y="110.0" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">Host assistants</text>
+<text x="434.5" y="130.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">Claude Code, Codex: run the CLI</text>
+<text x="434.5" y="148.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">with the enclos plugin</text>
+<line x1="434.5" y1="164" x2="434.5" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
+<rect x="582" y="84" width="247" height="80" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>
+<text x="705.5" y="110.0" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">Bridge</text>
+<text x="705.5" y="130.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">the mobile app's way in:</text>
+<text x="705.5" y="148.0" font-size="13.5" font-weight="normal" fill="#9198a1" text-anchor="middle">enclos app serve, milestone 4</text>
+<line x1="705.5" y1="164" x2="705.5" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
+<rect x="853" y="84" width="247" height="80" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5" stroke-dasharray="6 5"/>
+<text x="976.5" y="110.0" font-size="16" font-weight="600" fill="#6e7681" text-anchor="middle">enclos ui</text>
+<text x="976.5" y="130.0" font-size="13.5" font-weight="normal" fill="#6e7681" text-anchor="middle">local web UI</text>
+<text x="976.5" y="148.0" font-size="13.5" font-weight="normal" fill="#6e7681" text-anchor="middle">same audit log; later</text>
+<line x1="976.5" y1="164" x2="976.5" y2="190" stroke="#9198a1" stroke-width="1.5" marker-end="url(#head)"/>
 <rect x="40" y="192" width="1060" height="124" rx="11" fill="#161b22" stroke="#3d444d" stroke-width="1.5"/>
 <text x="60" y="216" font-size="15" font-weight="600" fill="#e6edf3" text-anchor="start">Core library</text>
 <rect x="60" y="228" width="234" height="68" rx="9" fill="#0d1117" stroke="#3d444d" stroke-width="1.5"/>

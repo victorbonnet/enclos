@@ -16,7 +16,9 @@ Decision (proposed):
 - **Only paired devices.** A device pairs once per host by scanning a QR code that `enclos app pair` prints, and the user confirms it at the terminal. Its key stays in the phone's hardware. Every connection is a Noise handshake with the keys from pairing, and the bridge also checks with Tailscale that the caller is the device's own person and node. Pairing, unpairing and sharing are audit entries; connections and refusals go in the bridge's own log, as connections go in the network log.
 - **Push without the content.** The bridge sends notifications through FCM, from the host, with the preview encrypted for the device; the phone fetches the message over the tailnet.
 
-Proposed [0062](0062-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person.
+Not built yet: the bridge as a service of the host's service manager. It runs in the foreground, `enclos app serve`, until Ctrl-C, and the user puts it on the tailnet with `tailscale serve` (design §4).
+
+Proposed [0064](0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person.
 
 Reason: one listener per host is the least that reaches the phone, and dialing in keeps the sandbox's routes as they are. Every runtime then needs only its own plugin, and the app works with every agent.
 
@@ -30,6 +32,6 @@ Reason: one listener per host is the least that reaches the phone, and dialing i
 
 - The threat model ([0014](0014-threat-model-accidental-damage.md)) gains actors: someone other than the user trying to reach the agents (another device of the tailnet, a stolen phone, another program of the host), and, with sharing ([0043](0043-sharing-an-agent-is-not-hosting-it.md)), people the user trusts in part.
 - Chat history the bridge keeps sits on the host, outside every sandbox; it needs a retention setting.
-- The phone may read enclos's state (who has access, which devices are connected) but otherwise changes nothing in it. [ADR 0046](0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md), proposed, amends this for exact-scope sandbox policy requests approved by the host's person. Other remote control stays a non-goal (§2).
+- The phone may read enclos's state (who has access, which devices are connected) but otherwise changes nothing in it. Proposed ADRs amend this for the host's person: [0046](0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md) for exact-scope sandbox policy requests, [0047](0047-the-hosts-person-manages-sandbox-policy-from-the-phone.md) for policy edits, and [0064](0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) for creating a sandbox and installing its runtime. Other remote control stays a non-goal (§2).
 - That a gateway can bind a socket in the sandbox home and the host can connect to it was shown on a Mac (`prototype/m4/README.md`); on Linux it is to verify (§14).
 

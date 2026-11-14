@@ -411,6 +411,15 @@ impl Engine {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
+                // A start (or a restart) that took the lock between the
+                // removal above and now installed the services again,
+                // under the lock: the sandbox runs, and is not marked
+                // stopped, nor are its sessions stopped behind them.
+                if self.has_services(name)? {
+                    return Err(Error::StartedWhileStopping {
+                        name: name.to_string(),
+                    });
+                }
                 let mut report = StopReport {
                     services: services.clone(),
                     stopped: Vec::new(),

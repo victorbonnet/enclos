@@ -92,7 +92,7 @@ impl PhotoError {
 }
 
 /// A storage failure: the database's own words go to the host's log, and
-/// the device, a guest's included, gets a fixed message.
+/// the device, another person's included, gets a fixed message.
 fn internal(e: impl std::fmt::Display) -> PhotoError {
     eprintln!("enclos app: an agent photo request failed: {e}");
     PhotoError::Internal("The agent photo could not be read or saved. Try again later.".into())

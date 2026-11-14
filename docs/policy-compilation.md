@@ -116,10 +116,14 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | --- | --- | --- | --- |
 | `write` | a list of paths | `["{home}"]`; `autonomous` is `["/"]` | Replaces the folders the sandbox may write. The home stays writable either way. `/` grants the whole filesystem but `/dev` (proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md)), with enclos's own files and program, the deny list, `read_only` and every link on the way to them still kept after it. Only Seatbelt builds that: bubblewrap cannot keep a path unchanged inside a folder the sandbox writes yet, so it refuses `/`, and a grant that holds enclos's program, for now. |
 | `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders, and a folder inside the home or another workspace. Malformed: a folder at or inside a deny-list path. |
+| `write_remove` | a list of paths | none | Takes these entries out of the list the layers below set (the template's or the built-in defaults'), and leaves the rest inherited. Each is compared as written; one the list does not hold removes nothing. The phone's policy page writes it when the host's person removes an inherited folder ([ADR 0047](adr/0047-the-hosts-person-manages-sandbox-policy-from-the-phone.md), proposed). |
 | `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
 | `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
+| `read_deny_remove` | a list of paths | none | Takes entries out of the list, as `write_remove` does. A built-in entry cannot go: the policy is then refused, as a `read_deny` that leaves one out is, and the phone shows built-in entries locked. |
 | `read_only` | a list of paths | none; `autonomous` lists the shell's startup and logout files | Replaces the paths the sandbox may read but never change, remove, rename or create, although a write grant covers them, proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md). Malformed: one holding a write grant, which could then change nothing. On bubblewrap, one inside a folder the sandbox writes is refused for now. |
 | `read_only_add` | a list of paths | none | Adds to that list. |
+
+There is no `read_only_remove`: a `read_only` entry the template sets goes only by replacing the list.
 
 There is no `read` list ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are open except `read_deny`, since agents and the tools they install read paths nobody can list upfront. Writes are closed except `write`, and a `read_deny` path refuses writes too; `read_only` keeps paths unchanged inside a grant as broad as `autonomous`'s ([ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md), proposed).
 
@@ -131,8 +135,10 @@ There is no `read` list ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Rea
 | `public_ports` | `web`, `any` | `web`; `autonomous` is `any` | The ports `public` mode opens to any public address, proposed in [ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md): `web`, 80 and 443, or `any`. Loopback, link-local and metadata addresses stay closed either way, and private ones open only per host through `private`. Outside `public` mode it opens nothing, and is stored as `web`. A runtime adapter may not set it. The proxy holds it, on either backend. |
 | `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
 | `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
+| `allow_remove` | a list of destinations | none | Takes destinations out of the list the layers below set, the template's or the runtime adapter's, compared as written, before the list is normalized, and leaves the rest inherited. The phone's policy page writes it when the host's person removes an inherited destination (ADR 0047, proposed). |
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
 | `private_add` | a list of hosts | none | Adds to that list. |
+| `private_remove` | a list of hosts | none | Takes hosts out of that list, as `allow_remove` does. |
 | `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
 | `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. On bubblewrap, `false` is declared, not held: a listener in one session is reached by the sandbox's other sessions, never by your host's network, and each session's start says so ([ADR 0041](adr/0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md), [ADR 0057](adr/0057-landlocks-tcp-bind-right-is-not-built.md)). |
 
@@ -170,12 +176,12 @@ A variable granted to the whole sandbox cannot also be granted to an agent. An `
 
 **How a layer applies** (`PolicyFile::apply`):
 
-- A list written `name = [...]` replaces what the layers below set; `name_add = [...]` adds to it. If one layer writes both, the replacement comes first, then the additions. The lists are `filesystem.write`, `filesystem.read_deny`, `network.allow` and `network.private`.
+- A list written `name = [...]` replaces what the layers below set; `name_remove = [...]` takes the entries it names out of it, compared as written; `name_add = [...]` adds to it. If one layer writes several, the replacement comes first, then the removals, then the additions. The lists are `filesystem.write`, `filesystem.read_deny`, `filesystem.read_only`, `network.allow` and `network.private`; `filesystem.read_only` has no `_remove`. A runtime adapter's layer may not remove anything.
 - `secrets.env` replaces the secrets the layers below grant, and `secrets.env_add` adds to them, by variable; `secrets.agents.<agent>.env` and `.env_add` do the same for what one agent is granted (ADR 0036). An adapter's layer may not grant any. Each grant must read `secret:<sandbox>/<name>`, or the file is refused as it is read.
 - A single value (`network.mode`, `network.log`, `network.listen`, each of `[resources]`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`. An adapter's layer may not set `[resources]`; `cpu_seconds`, `memory`, `cpu` and `file_size` are refused on Seatbelt, `cpu_seconds` and `file_size` on bubblewrap, and every limit on a backend not built yet.
 - Unknown keys and sections are errors (`deny_unknown_fields`). That is how enclos refuses `[exec]`, which it cannot enforce yet ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), and how it catches a misspelling such as `alow`.
 
-**Normalizing.** After the last layer, `normalize` puts the policy in one canonical form, so the same grants always give the same snapshot: each `network.allow` entry is rewritten in its canonical form (lowercase, default port dropped), each `network.private` entry the same way, and the four lists are sorted with repeats removed.
+**Normalizing.** After the last layer, `normalize` puts the policy in one canonical form, so the same grants always give the same snapshot: each `network.allow` entry is rewritten in its canonical form (lowercase, default port dropped), each `network.private` entry the same way, and the five lists are sorted with repeats removed.
 
 **The snapshot.** The result is a `PolicySnapshot`: the resolved `Policy`, the `PolicyInputs` it came from (enclos version, SHA-256 of the built-in defaults, the template's name and hash, the adapter's runtime, version and hash, and the hash of `policy.toml`), and an id, the SHA-256 of the JSON of both. Identical inputs and policy give the same id, so storing a policy equal to the active one records no new version.
 

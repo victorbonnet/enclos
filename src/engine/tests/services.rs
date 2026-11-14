@@ -1380,3 +1380,31 @@ fn the_logs_are_the_log_files_of_the_sandbox_the_proxy_first() {
         .collect();
     assert_eq!(files, ["proxy.log", "gateway.log", "mail.log"]);
 }
+
+#[test]
+fn a_start_while_the_services_are_removed_leaves_the_sandbox_running_not_stopped() {
+    let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+    let [proxy, gateway] =
+        [Unit::Proxy, Unit::Runtime(GATEWAY)].map(|u| engine.label(&name, u).unwrap());
+    engine.start_sandbox(&alice(), &name).unwrap();
+    // Once the proxy, removed last, is gone, and before `sandbox stop`
+    // takes the lock, a start installs the services again.
+    let services = Rc::clone(&fake);
+    let (removed, again) = (proxy.clone(), gateway.as_str().to_owned());
+    *fake.on_stop.borrow_mut() = Some(Box::new(move |label: &ServiceLabel| {
+        if *label == removed {
+            services.seed(&again);
+        }
+    }));
+    let err = engine
+        .stop_sandbox(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::StartedWhileStopping { .. }), "{err:?}");
+    fake.on_stop.borrow_mut().take();
+    assert_eq!(state_of(&engine, &name), SandboxState::Running);
+    assert!(engine.has_services(&name).unwrap());
+    // Stopped again, it stops.
+    done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+    assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
+    assert!(engine.verify_audit().unwrap().intact());
+}

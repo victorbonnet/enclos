@@ -1061,13 +1061,16 @@ fn an_idle_tunnel_is_closed_and_frees_its_place() {
 }
 
 fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
-    // Twenty bytes, one every 50 ms: a second in all, over three idle limits.
-    let port = ticker(20, Duration::from_millis(50));
+    // Thirty bytes, one every 100 ms: three seconds in all, three idle
+    // limits. A gap of a whole limit between two bytes is the machine
+    // stalling, not the proxy's clock: with a limit of 300 ms, the macOS
+    // runners stalled that long now and then.
+    let port = ticker(30, Duration::from_millis(100));
     let proxy = start_with(
         &[format!("stream.example.com:{port}")],
         Box::new(FakeResolver(LOCAL)),
         loopback_is_global,
-        |p| p.idle_timeout = Duration::from_millis(300),
+        |p| p.idle_timeout = Duration::from_secs(1),
     );
     let (mut conn, reply) = send(
         proxy.addr.clone(),
@@ -1077,14 +1080,14 @@ fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
     // The client sends nothing: bytes coming down are enough.
     let mut answer = Vec::new();
     conn.read_to_end(&mut answer).unwrap();
-    assert_eq!(answer, b"....................");
+    assert_eq!(answer, [b'.'; 30]);
     drop(conn);
     let events = proxy
         .log
         .wait_until(|e| e.len() == 1 && e[0].bytes_down > 0);
     assert_eq!(
         (events[0].reason, events[0].bytes_down),
-        (None, 20),
+        (None, 30),
         "{events:?}"
     );
 }

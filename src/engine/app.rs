@@ -58,18 +58,43 @@ impl Engine {
 
     /// Whether a removed agent has neither a native identity nor remaining data.
     /// Retained profile data makes this return false, including after --keep-data.
+    /// A sandbox removed with its folder holds nothing of the agent's: true.
+    /// One removed with `sandbox rm --keep-data` no longer records its
+    /// runtime, so every runtime looks for the agent in the home it left.
+    /// An error when enclos cannot tell, never a guess either way.
     pub(crate) fn app_agent_data_absent(
         &self,
         name: &SandboxName,
         agent: &crate::model::agent::AgentName,
     ) -> Result<bool> {
-        let runtime = crate::runtime::adapter(self.runtime_of(name)?);
+        let kinds = if self.state.get(name)?.is_some() {
+            vec![self.runtime_of(name)?]
+        } else {
+            let folder = self.layout.sandbox_dir(name.as_str());
+            match std::fs::symlink_metadata(&folder) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => {
+                    return Err(Error::Session {
+                        what: format!("cannot read {}: {e}", folder.display()),
+                    });
+                }
+                Ok(_) => crate::model::runtime::RuntimeKind::ALL.to_vec(),
+            }
+        };
         let home = self.sandbox_home(name);
-        super::agent_rm::leftover(runtime.as_ref(), &home, agent)
-            .map(|left| left == super::agent_rm::Leftover::Nothing)
-            .map_err(|error| Error::Session {
-                what: error.to_string(),
-            })
+        for kind in kinds {
+            let runtime = crate::runtime::adapter(kind);
+            let left =
+                super::agent_rm::leftover(runtime.as_ref(), &home, agent).map_err(|error| {
+                    Error::Session {
+                        what: error.to_string(),
+                    }
+                })?;
+            if left != super::agent_rm::Leftover::Nothing {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Every agent of every sandbox whose active policy grants it an app

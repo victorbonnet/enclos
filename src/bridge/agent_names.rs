@@ -6,7 +6,8 @@ use enclos_protocol::plugin::{ErrorBody, ErrorCode};
 /// Leave room in one Noise frame even for the longest legal envelope id.
 pub(super) const AGENT_MESSAGE_BUDGET: usize = 60 * 1024;
 
-fn agent_message_fits(message: &ToDevice) -> Result<bool, String> {
+/// Whether `message` fits one device-leg message, whatever its id.
+pub(super) fn agent_message_fits(message: &ToDevice) -> Result<bool, String> {
     let envelope = enclos_protocol::Envelope::new(
         MessageId::new("m".repeat(128)).expect("a bounded message id"),
         message,

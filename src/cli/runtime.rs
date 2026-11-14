@@ -3,6 +3,7 @@
 //! `enclos connect` (ADR 0024).
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -30,6 +31,16 @@ enum RuntimeVerb {
         runtime: RuntimeKind,
         #[arg(long)]
         sandbox: SandboxName,
+        /// Stop the installer, and every process it started, once it has
+        /// run this many seconds, and fail the install: for the mobile
+        /// app's bridge, which runs this command with nobody watching.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        time_limit: Option<u64>,
+        /// Who asked for the install, as the audit log names them: the
+        /// mobile app's bridge, which runs this command for a paired
+        /// device, names its person and device.
+        #[arg(long, hide = true, value_name = "WHO")]
+        requested_by: Option<String>,
     },
     /// Set an agent up with the runtime's own commands: it reads the
     /// secrets the policy grants it under [secrets.agents.<agent>], then
@@ -62,8 +73,18 @@ enum RuntimeVerb {
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
-    let (runtime, sandbox) = match args.verb {
-        RuntimeVerb::Install { runtime, sandbox } => (runtime, sandbox),
+    let (runtime, sandbox, limit, requested_by) = match args.verb {
+        RuntimeVerb::Install {
+            runtime,
+            sandbox,
+            time_limit,
+            requested_by,
+        } => (
+            runtime,
+            sandbox,
+            time_limit.map(Duration::from_secs),
+            requested_by,
+        ),
         RuntimeVerb::Configure {
             target,
             set,
@@ -79,7 +100,12 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             return configure(engine, by, confirm, target, channel, &set);
         }
     };
-    let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
+    let by = &requester(by, requested_by);
+    let installed = match limit {
+        None => engine.install_runtime(by, &sandbox, runtime, confirm)?,
+        Some(limit) => engine.install_runtime_within(by, &sandbox, runtime, confirm, limit)?,
+    };
+    let end = match installed {
         Planned::DryRun(plan) => {
             output::show_plan(&plan);
             return Ok(exit::OK);
@@ -89,10 +115,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     let shown = runtime.display_name();
     // How the installer ended, and what that leaves recorded: the same in
     // text and in JSON, since a policy left wider must be said.
-    let ended = match end.end.signal {
-        Some(signal) => format!("was ended by signal {signal}"),
-        None => format!("exited with {}", end.end.exit),
-    };
+    let ended = end.ended();
     let after = match end.recorded {
         Some(kept) => format!(
             "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
@@ -139,6 +162,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         end.policy, end.login
     );
     Ok(exit::OK)
+}
+
+/// Who the audit log names for an install: the user running enclos, or
+/// the one `--requested-by` names, on this host.
+fn requester(by: &Actor, requested_by: Option<String>) -> Actor {
+    match requested_by {
+        Some(user) => Actor {
+            user,
+            host: by.host.clone(),
+        },
+        None => by.clone(),
+    }
 }
 
 /// What `runtime configure` sets up: the bot of the sandbox's built-in
@@ -250,6 +285,69 @@ fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_install_is_audited_as_who_asked_for_it_on_this_host() {
+        let by = Actor {
+            user: "victor".into(),
+            host: "mac".into(),
+        };
+        assert_eq!(requester(&by, None), by);
+        assert_eq!(
+            requester(&by, Some("alice@example.com (device d-1)".into())),
+            Actor {
+                user: "alice@example.com (device d-1)".into(),
+                host: "mac".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn who_asked_may_start_with_a_dash_when_given_with_an_equals_sign() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let parsed = Cli::try_parse_from([
+            "enclos",
+            "install",
+            "hermes",
+            "--sandbox",
+            "lab",
+            "--requested-by=-alice (device d-1)",
+        ])
+        .unwrap();
+        let RuntimeVerb::Install { requested_by, .. } = parsed.args.verb else {
+            panic!("not an install");
+        };
+        assert_eq!(requested_by.as_deref(), Some("-alice (device d-1)"));
+    }
+
+    #[test]
+    fn an_install_may_be_given_a_time_limit_in_seconds() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let limit = |args: &[&str]| {
+            let parsed = Cli::try_parse_from(
+                ["enclos", "install", "hermes", "--sandbox", "lab"]
+                    .iter()
+                    .chain(args),
+            )
+            .unwrap();
+            let RuntimeVerb::Install { time_limit, .. } = parsed.args.verb else {
+                panic!("not an install");
+            };
+            time_limit
+        };
+        assert_eq!(limit(&[]), None);
+        assert_eq!(limit(&["--time-limit=3600"]), Some(3600));
+    }
 
     #[test]
     fn a_target_is_a_sandbox_or_one_of_its_agents() {

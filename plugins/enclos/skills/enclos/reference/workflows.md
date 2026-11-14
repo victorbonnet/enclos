@@ -106,7 +106,7 @@ enclos policy rollback lab --to 3   # an earlier version again, as a new version
 enclos policy refresh lab           # what this enclos's templates and adapter would change; --yes applies it
 ```
 
-**Editing `policy.toml`.** It is in the sandbox's folder: `enclos policy show lab` prints its path as `file`. It holds only the sandbox's own changes on top of its template (`extends`): a list written `name = [...]` replaces the template's, and `name_add = [...]` extends it. Every setting is in [policy.md](policy.md). To change it:
+**Editing `policy.toml`.** It is in the sandbox's folder: `enclos policy show lab` prints its path as `file`. It holds only the sandbox's own changes on top of its template (`extends`): a list written `name = [...]` replaces the template's, `name_add = [...]` extends it, and `name_remove = [...]`, which `write`, `read_deny`, `allow` and `private` have and the phone's policy page writes, takes inherited entries out. Every setting is in [policy.md](policy.md). To change it:
 
 1. Read that file, and write the whole new version to a file outside the sandbox, such as `$TMPDIR/lab-policy.toml`.
 2. `VISUAL="cp $TMPDIR/lab-policy.toml" enclos --dry-run policy edit lab`: enclos validates it and shows the change. A refused edit applies nothing and is kept; `enclos policy discard lab` drops it.
@@ -164,7 +164,7 @@ Agents of one sandbox share its files, so a secret granted to one agent is kept 
 
 ## The mobile app
 
-In development: present only when `enclos app --help` works. The enclos app (Android first) talks to every agent from a phone, through the **bridge**, a service on this host, reached over the user's tailnet with Tailscale.
+In development: present only when `enclos app --help` works. The enclos app (Android first) talks to every agent from a phone, through the **bridge**, which `enclos app serve` runs on this host in the foreground, reached over the user's tailnet with Tailscale.
 
 1. Each agent the app should reach gets the app channel: `enclos runtime configure lab/main --channel app`, then `enclos sandbox restart lab` if it runs.
 2. The bridge listens on the host's loopback (port 47100 by default). Tailscale puts it on the tailnet: `tailscale serve --bg 47100`. That changes what the user's tailnet can reach, so ask before running it.
