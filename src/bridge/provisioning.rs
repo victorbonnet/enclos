@@ -168,9 +168,12 @@ impl Host {
         // Installer output may contain secrets, so it is never sent to a
         // phone or added to the bridge's log.
         let output = std::thread::spawn(move || read_bounded(stdout, 65_536));
-        let status = child
-            .wait()
-            .map_err(|e| format!("cannot wait for the installer: {e}"))?;
+        let Some(status) = wait_at_most(&mut child, INSTALL_TIMEOUT, INSTALL_STOP_GRACE)? else {
+            return Err(format!(
+                "the installer did not finish within {} minutes and was stopped; check the sandbox on the host",
+                INSTALL_TIMEOUT.as_secs() / 60
+            ));
+        };
         let bytes = output
             .join()
             .map_err(|_| "cannot read the install result")??;
@@ -193,6 +196,55 @@ impl Host {
             login: result["login"].as_str().unwrap_or_default().to_owned(),
         })
     }
+}
+
+/// How long a runtime install asked from the phone may run. Nobody watches
+/// it at a terminal, and the sandbox stays busy for the phone while it
+/// runs: one that hangs (a download that never ends, a prompt nobody
+/// answers) is stopped rather than held for good. An hour leaves a slow
+/// host and network room.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How long the installer has to end its session once told to (TERM),
+/// before its process group is killed.
+const INSTALL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits for `child`, which leads a process group of its own, at most
+/// `limit`: its exit status, or `None` when it ran longer and was stopped.
+/// Its group is then sent TERM, which the CLI ends its session on, and,
+/// still there after `grace`, KILL; the child is reaped either way.
+fn wait_at_most(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    grace: std::time::Duration,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    let poll = std::time::Duration::from_millis(200);
+    let wait = |child: &mut std::process::Child| {
+        child
+            .try_wait()
+            .map_err(|e| format!("cannot wait for the installer: {e}"))
+    };
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
+        if let Some(status) = wait(child)? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(poll.min(limit.saturating_sub(started.elapsed())));
+    }
+    let group = Pid::from_raw(child.id() as i32).ok_or("the installer has no process id")?;
+    let _ = kill_process_group(group, Signal::TERM);
+    let told = std::time::Instant::now();
+    while told.elapsed() < grace {
+        if wait(child)?.is_some() {
+            return Ok(None);
+        }
+        std::thread::sleep(poll);
+    }
+    let _ = kill_process_group(group, Signal::KILL);
+    child
+        .wait()
+        .map_err(|e| format!("cannot wait for the installer: {e}"))?;
+    Ok(None)
 }
 
 fn read_bounded(mut stream: impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -282,6 +334,54 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let host = Host::new(Layout::at(dir.path().join("data")), actor(), executable);
         (dir, host)
+    }
+
+    /// `script` run by `sh`, leading a process group of its own, as the
+    /// installer is.
+    fn group_child(script: &str) -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_installer_that_ends_in_time_gives_its_status() {
+        use std::time::Duration;
+        let mut child = group_child("exit 3");
+        let status = wait_at_most(&mut child, Duration::from_secs(10), Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn an_installer_past_its_time_is_stopped_then_killed() {
+        use std::time::{Duration, Instant};
+        // Ends on TERM: stopped within its grace.
+        let mut child = group_child("sleep 30");
+        let started = Instant::now();
+        let waited = wait_at_most(
+            &mut child,
+            Duration::from_millis(300),
+            Duration::from_secs(10),
+        );
+        assert_eq!(waited, Ok(None));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "reaped");
+        // Ignores TERM (and so does its `sleep`): killed after the grace.
+        let mut child = group_child("trap '' TERM; sleep 30");
+        let started = Instant::now();
+        let waited = wait_at_most(
+            &mut child,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        );
+        assert_eq!(waited, Ok(None));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
