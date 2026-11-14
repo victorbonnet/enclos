@@ -734,16 +734,22 @@ impl Hub {
                         attachments,
                         reply_to,
                     } => {
+                        match store.deletion_started(conversation.as_str()) {
+                            Ok(false) => {}
+                            // Its conversation is going: dropped, and
+                            // acknowledged so the plugin does not send it again
+                            Ok(true) => {
+                                let _ = acks.ack(&message.id);
+                                continue;
+                            }
+                            Err(e) => {
+                                kept_by_plugin(&agent, &e.to_string());
+                                continue;
+                            }
+                        }
                         // Every runtime may send on its own: past a burst,
                         // at a pace, so that a loop fills neither the
                         // database nor the devices' queues.
-                        if store
-                            .deletion_started(conversation.as_str())
-                            .unwrap_or(true)
-                        {
-                            let _ = acks.ack(&message.id);
-                            continue;
-                        }
                         hub.pace(&agent);
                         let kind = match kind {
                             OutKind::Reply => "reply",
@@ -786,7 +792,13 @@ impl Hub {
                             Some(conversation)
                         } else {
                             let host = hub.known_host();
-                            destination(&store, host.as_deref(), &agent, conversation)
+                            match destination(&store, host.as_deref(), &agent, conversation) {
+                                Ok(conversation) => conversation,
+                                Err(e) => {
+                                    kept_by_plugin(&agent, &e);
+                                    continue;
+                                }
+                            }
                         };
                         let Some(conversation) = conversation else {
                             // Not stored, and acknowledged all the same: sent
@@ -2475,36 +2487,47 @@ fn read(
 /// Where `agent`'s message for `conversation` is kept: there, when it is
 /// one of `agent`'s own; else (a conversation the bridge does not know, or
 /// another agent's: the runtime's home channel as it was, or a chat gone)
-/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None`, said on
-/// stderr, when Home's id is not one the protocol takes.
+/// `agent`'s Home, made if need be (ADR 0044), not nowhere. `None` when the
+/// conversation is being deleted, or, said on stderr, when Home's id is not
+/// one the protocol takes. An error when the store cannot say which: the
+/// message is then not acknowledged, and its plugin sends it again.
 fn destination(
     store: &Store,
     host: Option<&str>,
     agent: &str,
     conversation: ConversationId,
-) -> Option<ConversationId> {
+) -> Result<Option<ConversationId>, String> {
     if store
         .deletion_started(conversation.as_str())
-        .unwrap_or(true)
+        .map_err(|e| e.to_string())?
     {
-        return None;
+        return Ok(None);
     }
     let own = matches!(
-        store.conversation_of(conversation.as_str()),
-        Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+        store.conversation_of(conversation.as_str()).map_err(|e| e.to_string())?,
+        Some((sandbox, name, _)) if format!("{sandbox}/{name}") == agent
     );
     if own {
-        return Some(conversation);
+        return Ok(Some(conversation));
     }
-    let home = ConversationId::new(home_id(agent))
-        .inspect_err(|e| {
-            eprintln!(
-                "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
-            );
-        })
-        .ok()?;
+    let Ok(home) = ConversationId::new(home_id(agent)).inspect_err(|e| {
+        eprintln!(
+            "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
+        );
+    }) else {
+        return Ok(None);
+    };
     let _ = store.ensure_home(agent, host.unwrap_or(""), host.is_some());
-    Some(home)
+    Ok(Some(home))
+}
+
+/// An agent's message the bridge could not place, as its store failed: it
+/// is not acknowledged, so the plugin keeps it and sends it again after
+/// its next `hello`.
+fn kept_by_plugin(agent: &str, why: &str) {
+    eprintln!(
+        "enclos app: {agent}: a message is left with its plugin, to come again: the store failed: {why}"
+    );
 }
 
 /// A conversation for a device: `None` for an id the protocol refuses.

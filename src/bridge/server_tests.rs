@@ -2386,14 +2386,14 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     let id = |s: &str| ConversationId::new(s).unwrap();
     assert_eq!(
         destination(&store, host, "lab/a", id("c-a")),
-        Some(id("c-a"))
+        Ok(Some(id("c-a")))
     );
     // Another agent's conversation, or one the bridge does not know: Home,
     // the host's person's.
     for other in ["c-b", "c-unknown"] {
         assert_eq!(
             destination(&store, host, "lab/a", id(other)),
-            Some(id("home.lab.a"))
+            Ok(Some(id("home.lab.a")))
         );
     }
     assert_eq!(
@@ -2403,7 +2403,7 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     // An agent whose Home's id the protocol refuses (longer than an id may
     // be): nothing, which the caller acknowledges.
     let long = format!("lab/{}", "a".repeat(130));
-    assert_eq!(destination(&store, host, &long, id("c-unknown")), None);
+    assert_eq!(destination(&store, host, &long, id("c-unknown")), Ok(None));
     assert_eq!(store.conversation_info(&home_id(&long)).unwrap(), None);
 }
 

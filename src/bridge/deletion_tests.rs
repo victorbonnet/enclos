@@ -1,7 +1,7 @@
 use super::*;
 use enclos_protocol::plugin::decode_from_bridge;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 type NativeRequest = (MessageId, ConversationId, Sender<Result<(), ErrorCode>>);
 
@@ -170,6 +170,7 @@ fn native_confirmation_precedes_removal_and_only_the_owners_devices_learn_it() {
             "lab/main",
             ConversationId::new("c-delete").unwrap()
         )
+        .unwrap()
         .is_none(),
         "late native output is not redirected to Home"
     );
@@ -339,6 +340,164 @@ fn removed_agent_finishes_deletion_but_kept_native_data_requires_its_channel() {
     // A reservation from an earlier failed attempt also completes when its
     // native target is now demonstrably gone.
     store.begin_deletion("c-kept", "alice").unwrap();
+    hub.delete_conversation(
+        &store,
+        "alice",
+        &ConversationId::new("c-kept").unwrap(),
+        "phone",
+    )
+    .unwrap();
+    assert!(store.conversation_info("c-kept").unwrap().is_none());
+}
+
+/// A plugin for `lab/<name>` that has answered the bridge's hello: its
+/// connection, to send on and read from.
+fn connected(hub: &Arc<Hub>, dir: &Path, name: &str) -> (UnixStream, BufReader<UnixStream>) {
+    let listener = UnixListener::bind(dir.join(format!("{name}.sock"))).unwrap();
+    let (send, receive) = channel();
+    let agent = name.to_owned();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut lines = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        lines.read_line(&mut line).unwrap();
+        stream
+            .write_all(&encode_line(&Envelope::new(
+                MessageId::new("hello").unwrap(),
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent,
+                    capabilities: vec![],
+                },
+            )))
+            .unwrap();
+        send.send((stream, lines)).unwrap();
+    });
+    hub.plugin(&format!("lab/{name}")).unwrap();
+    receive.recv_timeout(Duration::from_secs(5)).unwrap()
+}
+
+/// The bridge's next line to the plugin, `None` when nothing comes in
+/// half a second.
+fn next_line(lines: &mut BufReader<UnixStream>) -> Option<FromBridge> {
+    lines
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut line = String::new();
+    match lines.read_line(&mut line) {
+        Ok(n) if n > 0 => Some(decode_from_bridge(line.as_bytes()).unwrap().body),
+        _ => None,
+    }
+}
+
+#[test]
+fn an_agents_message_is_not_acknowledged_while_the_store_cannot_say_whether_its_chat_is_going() {
+    let (dir, hub, store) = fixture(&["main"]);
+    store.conversation("c-1", "lab", "main", "alice").unwrap();
+    let (mut out, mut lines) = connected(&hub, dir.path(), "main");
+    let reply = || {
+        encode_line(&Envelope::new(
+            MessageId::new("out-1").unwrap(),
+            FromPlugin::MessageOut {
+                conversation: ConversationId::new("c-1").unwrap(),
+                text: "kept".into(),
+                kind: OutKind::Reply,
+                reply_to: None,
+                attachments: vec![],
+            },
+        ))
+    };
+    // The deletions can no longer be read
+    let raw = rusqlite::Connection::open(&hub.store_path).unwrap();
+    raw.execute_batch("ALTER TABLE conversation_deletions RENAME TO unreadable")
+        .unwrap();
+    out.write_all(&reply()).unwrap();
+    assert_eq!(next_line(&mut lines), None, "acknowledged, so dropped");
+    raw.execute_batch("ALTER TABLE unreadable RENAME TO conversation_deletions")
+        .unwrap();
+    // The plugin sends it again, after its next hello
+    out.write_all(&reply()).unwrap();
+    assert_eq!(
+        next_line(&mut lines),
+        Some(FromBridge::Ack {
+            of: MessageId::new("out-1").unwrap()
+        })
+    );
+    let kept = store.since("alice", 0).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].text, "kept");
+}
+
+#[test]
+fn a_message_goes_nowhere_while_the_store_cannot_say_where() {
+    let (_dir, _hub, store) = fixture(&[]);
+    store.conversation("c-1", "lab", "main", "alice").unwrap();
+    let id = || ConversationId::new("c-1").unwrap();
+    assert_eq!(
+        super::destination(&store, Some("alice"), "lab/main", id()).unwrap(),
+        Some(id())
+    );
+    store
+        .db
+        .execute_batch("ALTER TABLE conversations RENAME TO unreadable")
+        .unwrap();
+    assert!(super::destination(&store, Some("alice"), "lab/main", id()).is_err());
+}
+
+#[test]
+fn a_removed_sandbox_leaves_nothing_to_delete_unless_its_data_was_kept() {
+    let (_dir, hub, store) = fixture(&[]);
+    // No state database: enclos cannot tell, so the agent is not absent
+    assert!(!hub.deletion_target_absent("gone/main"));
+    std::fs::create_dir_all(hub.layout.data()).unwrap();
+    let state = crate::state::sqlite::SqliteStateStore::new(
+        hub.layout.state_db(),
+        hub.layout.state_lock(),
+        crate::state::Wait::Command,
+    );
+    {
+        use crate::state::StateStore;
+        let lock = state.lock().unwrap();
+        state.migrate(&lock).unwrap();
+    }
+    // Removed with its folder: nothing of the agent is left anywhere
+    store
+        .conversation("c-gone", "gone", "main", "alice")
+        .unwrap();
+    hub.delete_conversation(
+        &store,
+        "alice",
+        &ConversationId::new("c-gone").unwrap(),
+        "phone",
+    )
+    .unwrap();
+    assert!(store.conversation_info("c-gone").unwrap().is_none());
+    assert!(store.deletion_started("c-gone").unwrap());
+    // Removed with `--keep-data`: the agent's profile is still in its home
+    let profile = hub
+        .layout
+        .sandbox_home("kept")
+        .join(".hermes/profiles/main");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "model: auto\n").unwrap();
+    store
+        .conversation("c-kept", "kept", "main", "alice")
+        .unwrap();
+    assert_eq!(
+        hub.delete_conversation(
+            &store,
+            "alice",
+            &ConversationId::new("c-kept").unwrap(),
+            "phone",
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::AgentUnavailable
+    );
+    assert!(store.conversation_info("c-kept").unwrap().is_some());
+    // Its home kept, the agent's data gone: nothing left to delete
+    std::fs::remove_dir_all(&profile).unwrap();
     hub.delete_conversation(
         &store,
         "alice",
