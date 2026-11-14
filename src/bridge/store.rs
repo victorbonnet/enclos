@@ -1134,6 +1134,15 @@ impl Store {
         Ok(Some(seqs))
     }
 
+    /// Whether a file with this id is recorded.
+    pub fn has_attachment(&self, id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM attachments WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )
+    }
+
     /// Whether a message with this id is stored.
     pub fn has_message(&self, id: &str) -> rusqlite::Result<bool> {
         self.db.query_row(

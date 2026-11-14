@@ -982,24 +982,43 @@ impl Hub {
             release_attachments(home, attachments);
             return Ok(None);
         }
-        // Its files copied first, then stored with the message in one
-        // transaction, and only then removed from the plugin's folder: a
-        // message the bridge cannot store, which the plugin sends again,
-        // still has them, and a stored one never lacks them.
+        // Its files copied first, into the bridge's `.incoming` folder,
+        // then recorded with the message in one transaction, then moved
+        // into its media folder, and only then removed from the plugin's
+        // folder. A message the bridge cannot store, its database or its
+        // own copy failing, is not acknowledged: the plugin sends it again,
+        // with its files still there. Only a file the sandbox made unusable
+        // (`NotTaken::Refused`) is left out of a stored message.
         let media = self.media();
-        let taken = take_attachments(home, &media, &whole.agent, conversation, attachments);
+        let taken = take_attachments(home, &media, &whole.agent, conversation, attachments)?;
         let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
-        let added = store.add_pieces(&pieces, conversation, from, &whole.kind, &stored);
-        let seqs = match added {
+        let seqs = match store.add_pieces(&pieces, conversation, from, &whole.kind, &stored) {
             Ok(Some(seqs)) => seqs,
-            Ok(None) | Err(_) => {
+            // Stored meanwhile, with copies of its own: the plugin's are
+            // no longer needed either.
+            Ok(None) => {
                 for t in &taken {
-                    let _ = std::fs::remove_file(media.join(&t.stored.id));
+                    t.discard();
+                    t.release();
                 }
-                return added.map(|_| None).map_err(|e| e.to_string());
+                return Ok(None);
+            }
+            Err(e) => {
+                for t in &taken {
+                    t.discard();
+                }
+                return Err(e.to_string());
             }
         };
         for t in &taken {
+            // One not moved stays in `.incoming`, recorded: moved when the
+            // bridge starts again (`sweep_incoming`).
+            if let Err(e) = t.keep(&media) {
+                eprintln!(
+                    "enclos app: {}: a file stays in .incoming: {e}",
+                    whole.agent
+                );
+            }
             t.release();
         }
         let last = seqs.last().copied();
@@ -1180,6 +1199,11 @@ pub fn serve(
 /// Tries every `retry` to give agents the messages pending for them, and
 /// serves `listener`'s connections; returns once the listener fails.
 fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
+    // Files copied for a message the bridge was storing when it stopped,
+    // before any plugin connection copies more.
+    if let Ok(store) = hub.store() {
+        sweep_incoming(&store, &hub.media());
+    }
     let retrying = Arc::clone(&hub);
     std::thread::spawn(move || {
         loop {
@@ -2215,6 +2239,10 @@ const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// The most files the bridge takes from one message.
 const MAX_ATTACHMENTS: usize = 10;
 
+/// Where, in the bridge's media folder, it copies a message's files before
+/// the message is stored with them ([`sweep_incoming`]).
+const INCOMING: &str = ".incoming";
+
 /// Where the plugin puts the files the agent sends, under the sandbox
 /// home: `.enclos-app/media`, beside its socket
 /// (`Layout::agent_app_socket`).
@@ -2249,30 +2277,90 @@ fn open_inbox(home: &Path) -> Result<OwnedFd, String> {
 
 /// The files of an agent's message, before it is stored: each copied from
 /// the plugin's `media` folder under `home` ([`take_attachment`]), at most
-/// [`MAX_ATTACHMENTS`]. One that cannot be is left out, said on stderr, and
-/// leaves no file in `media`.
+/// [`MAX_ATTACHMENTS`]. One the sandbox made unusable is left out, said on
+/// stderr. An error, with no copy left, when the bridge's own side fails:
+/// the message is then not stored.
 fn take_attachments(
     home: &Path,
     media: &Path,
     agent: &str,
     conversation: &str,
     attachments: &[OutAttachment],
-) -> Vec<Taken> {
+) -> Result<Vec<Taken>, String> {
     if attachments.len() > MAX_ATTACHMENTS {
         eprintln!(
             "enclos app: {agent}: a message carries {} files, the first {MAX_ATTACHMENTS} are taken",
             attachments.len()
         );
     }
-    attachments
-        .iter()
-        .take(MAX_ATTACHMENTS)
-        .filter_map(|a| {
-            take_attachment(home, media, conversation, a)
-                .inspect_err(|e| eprintln!("enclos app: {agent}: an attachment is left out: {e}"))
-                .ok()
-        })
-        .collect()
+    let mut taken: Vec<Taken> = Vec::new();
+    for a in attachments.iter().take(MAX_ATTACHMENTS) {
+        match take_attachment(home, media, conversation, a) {
+            Ok(t) => taken.push(t),
+            Err(NotTaken::Refused(why)) => {
+                eprintln!("enclos app: {agent}: an attachment is left out: {why}");
+            }
+            Err(NotTaken::Failed(why)) => {
+                for t in &taken {
+                    t.discard();
+                }
+                return Err(format!("cannot take a file of the message: {why}"));
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// The bridge's copies of files whose message it was storing when it
+/// stopped, left in its media folder's `.incoming`: each moved into the
+/// media folder when the message was stored with it, else removed (the
+/// plugin sends that message again, with its files). Run as the bridge
+/// starts, before any plugin connection.
+fn sweep_incoming(store: &Store, media: &Path) {
+    let Ok(entries) = std::fs::read_dir(media.join(INCOMING)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let recorded = match entry.file_name().to_str() {
+            Some(id) => store
+                .has_attachment(id)
+                .map(|has| has.then(|| media.join(id))),
+            None => Ok(None),
+        };
+        let done = match recorded {
+            Ok(Some(kept)) => std::fs::rename(&path, kept),
+            Ok(None) => std::fs::remove_file(&path),
+            // Left for the next start
+            Err(e) => Err(std::io::Error::other(e)),
+        };
+        if let Err(e) = done {
+            eprintln!("enclos app: {}: {e}", path.display());
+        }
+    }
+}
+
+/// Why a file of an agent's message was not taken.
+#[derive(Debug, PartialEq, Eq)]
+enum NotTaken {
+    /// The sandbox's doing: a name that is not plain, no such file, a link,
+    /// not a regular file, another link to it, more than 25 MiB, a read
+    /// that fails. The file is left out, and the message stored without
+    /// it: sent again, it would carry the same file.
+    Refused(String),
+    /// The bridge's own side failed: its media folder, its disk, a new id.
+    /// The message is not stored, and the plugin sends it again.
+    Failed(String),
+}
+
+impl NotTaken {
+    /// The same, said of `what`.
+    fn of(self, what: &str) -> NotTaken {
+        match self {
+            NotTaken::Refused(why) => NotTaken::Refused(format!("{what}: {why}")),
+            NotTaken::Failed(why) => NotTaken::Failed(format!("{what}: {why}")),
+        }
+    }
 }
 
 /// Removes the plugin's copies of a stored message's files, which it sent
@@ -2288,10 +2376,14 @@ fn release_attachments(home: &Path, attachments: &[OutAttachment]) {
     }
 }
 
-/// A file of an agent's message copied into the bridge's media folder. The
-/// plugin's copy stays until the message is stored with it: [`Taken::release`].
+/// A file of an agent's message copied into the bridge's `.incoming`
+/// folder: moved into its media folder once the message is stored with it
+/// ([`Taken::keep`]), else removed ([`Taken::discard`]). The plugin's copy
+/// stays until the message is stored with it: [`Taken::release`].
 struct Taken {
     stored: StoredAttachment,
+    /// The bridge's copy, in `.incoming`.
+    copy: PathBuf,
     /// The plugin's `media` folder, as it was opened.
     inbox: OwnedFd,
     /// The file's name there, and what it was when read.
@@ -2300,6 +2392,16 @@ struct Taken {
 }
 
 impl Taken {
+    /// Moves the bridge's copy into `media`, its message stored with it.
+    fn keep(&self, media: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.copy, media.join(&self.stored.id))
+    }
+
+    /// Removes the bridge's copy, its message not stored with it.
+    fn discard(&self) {
+        let _ = std::fs::remove_file(&self.copy);
+    }
+
     /// Removes the plugin's copy, through the folder it was read from, and
     /// only while its name is still the file that was read.
     fn release(&self) {
@@ -2325,29 +2427,40 @@ fn plain_file_name(file: &str) -> bool {
 }
 
 /// Copies `source` into the new file `to`, and its size: no more than `max`
-/// bytes are copied, and a source found longer leaves no file and is an
-/// error, as is any failure.
-fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, String> {
+/// bytes are copied, and a source found longer leaves no file and is
+/// refused, as is a source that cannot be read; writing failing is the
+/// bridge's own failure. Either leaves no file.
+fn copy_at_most(mut source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, NotTaken> {
+    use std::io::{ErrorKind, Write};
     use std::os::unix::fs::OpenOptionsExt;
     let mut target = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(to)
-        .map_err(|e| e.to_string())?;
-    let copied = std::io::copy(&mut source.take(max + 1), &mut target);
+        .map_err(|e| NotTaken::Failed(e.to_string()))?;
+    let mut buffer = vec![0; 64 * 1024];
+    let mut size = 0u64;
+    let copied = loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break Ok(size),
+            Ok(read) => read,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(NotTaken::Refused(e.to_string())),
+        };
+        size += read as u64;
+        if size > max {
+            break Err(NotTaken::Refused(format!("longer than {max} bytes")));
+        }
+        if let Err(e) = target.write_all(&buffer[..read]) {
+            break Err(NotTaken::Failed(e.to_string()));
+        }
+    };
     drop(target);
-    match copied {
-        Ok(size) if size <= max => Ok(size),
-        Ok(_) => {
-            let _ = std::fs::remove_file(to);
-            Err(format!("longer than {max} bytes"))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(to);
-            Err(e.to_string())
-        }
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
     }
+    copied
 }
 
 /// Moves a file the agent sends from the plugin's `media` folder (in the
@@ -2357,23 +2470,25 @@ fn copy_at_most(source: impl std::io::Read, to: &Path, max: u64) -> Result<u64, 
 /// following a link and without waiting (a named pipe would block), and
 /// only a regular file with no other link to it, of at most
 /// [`MAX_ATTACHMENT_BYTES`], copied no further than that limit even while
-/// it grows. The plugin's copy stays until [`Taken::release`], once the
-/// message is stored with the file.
+/// it grows. It is copied into `media`'s `.incoming`, and the plugin's
+/// copy stays until [`Taken::release`], once the message is stored with
+/// the file. What the sandbox did is [`NotTaken::Refused`], what failed on
+/// the bridge's side [`NotTaken::Failed`].
 fn take_attachment(
     home: &Path,
     media: &Path,
     conversation: &str,
     a: &OutAttachment,
-) -> Result<Taken, String> {
+) -> Result<Taken, NotTaken> {
     use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::DirBuilderExt;
     if !plain_file_name(&a.file) {
-        return Err(format!(
+        return Err(NotTaken::Refused(format!(
             "{:?} is not a file name of the media folder",
             a.file
-        ));
+        )));
     }
-    let inbox = open_inbox(home)?;
+    let inbox = open_inbox(home).map_err(NotTaken::Refused)?;
     let from = format!("~/{}/{}", INBOX.join("/"), a.file);
     let fd = rustix::fs::openat(
         &inbox,
@@ -2381,28 +2496,29 @@ fn take_attachment(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| format!("{from}: {e}"))?;
-    let opened = rustix::fs::fstat(&fd).map_err(|e| format!("{from}: {e}"))?;
+    .map_err(|e| NotTaken::Refused(format!("{from}: {e}")))?;
+    let opened = rustix::fs::fstat(&fd).map_err(|e| NotTaken::Refused(format!("{from}: {e}")))?;
     if !rustix::fs::FileType::from_raw_mode(opened.st_mode).is_file() {
-        return Err(format!("{from} is not a file"));
+        return Err(NotTaken::Refused(format!("{from} is not a file")));
     }
     // A second link may be one to a host file the sandbox could not read.
     if opened.st_nlink != 1 {
-        return Err(format!("{from} has other links to it"));
+        return Err(NotTaken::Refused(format!("{from} has other links to it")));
     }
     if opened.st_size < 0 || opened.st_size as u64 > MAX_ATTACHMENT_BYTES {
-        return Err(format!("{from} is larger than 25 MiB"));
+        return Err(NotTaken::Refused(format!("{from} is larger than 25 MiB")));
     }
     let source = std::fs::File::from(fd);
-    let id = new_id().map_err(|e| e.to_string())?;
+    let id = new_id().map_err(|e| NotTaken::Failed(e.to_string()))?;
+    let incoming = media.join(INCOMING);
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(media)
-        .map_err(|e| e.to_string())?;
+        .create(&incoming)
+        .map_err(|e| NotTaken::Failed(format!("{}: {e}", incoming.display())))?;
+    let copy = incoming.join(&id);
     // The sandbox may write on while the bridge reads.
-    let size = copy_at_most(source, &media.join(&id), MAX_ATTACHMENT_BYTES)
-        .map_err(|e| format!("{from}: {e}"))?;
+    let size = copy_at_most(source, &copy, MAX_ATTACHMENT_BYTES).map_err(|e| e.of(&from))?;
     let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
         !t.is_empty()
             && !s.is_empty()
@@ -2435,6 +2551,7 @@ fn take_attachment(
     };
     Ok(Taken {
         stored,
+        copy,
         inbox,
         file: a.file.clone(),
         read: opened,

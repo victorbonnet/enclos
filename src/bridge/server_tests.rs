@@ -29,6 +29,19 @@ fn the_sandbox_home_is_two_folders_above_the_app_socket() {
     );
 }
 
+/// The bridge's copies of files: in its media folder, and in `.incoming`.
+fn copies(media: &Path) -> usize {
+    let files = |folder: &Path| {
+        std::fs::read_dir(folder).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .count()
+        })
+    };
+    files(media) + files(&media.join(".incoming"))
+}
+
 #[test]
 fn a_file_of_the_media_folder_is_moved_into_the_bridges() {
     let (_dir, home, inbox, media) = folders();
@@ -39,7 +52,11 @@ fn a_file_of_the_media_folder_is_moved_into_the_bridges() {
         (stored.size, stored.name.as_str(), stored.mime.as_str()),
         (4, "unicorn.png", "image/png")
     );
+    // Copied aside until its message is stored, then kept.
+    assert!(!media.join(&stored.id).exists());
+    taken.keep(&media).unwrap();
     assert_eq!(std::fs::read(media.join(&stored.id)).unwrap(), b"\x89PNG");
+    assert_eq!(copies(&media), 1);
     // The plugin's copy stays until the message is stored with it.
     assert!(inbox.join("a1.png").exists());
     taken.release();
@@ -69,7 +86,9 @@ fn an_html_artefact_keeps_its_bytes_and_type_as_an_attachment() {
         name: "report.html".into(),
         size: html.len() as u64,
     };
-    let taken = take_attachment(&home, &media, "c-1", &a).unwrap().stored;
+    let taken = take_attachment(&home, &media, "c-1", &a).unwrap();
+    taken.keep(&media).unwrap();
+    let taken = taken.stored;
     assert_eq!(std::fs::read(media.join(&taken.id)).unwrap(), html);
     assert_eq!(taken.conversation, "c-1");
     let info = attachment_info(taken);
@@ -2548,7 +2567,7 @@ fn a_message_whose_files_cannot_be_recorded_is_not_stored_and_keeps_them() {
     assert!(stored.is_err());
     assert!(!store.has_message("m-1").unwrap());
     assert!(inbox.join("a6.png").exists());
-    assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0, "no orphan");
+    assert_eq!(copies(&media), 0, "no orphan");
 }
 
 #[test]
@@ -2579,7 +2598,7 @@ fn a_message_sent_again_is_stored_once_and_its_files_left_behind_are_removed() {
     assert_eq!(say().unwrap(), None);
     assert!(!inbox.join("a7.png").exists());
     assert_eq!(store.attachments_of("m-1").unwrap().len(), 1);
-    assert_eq!(std::fs::read_dir(&media).unwrap().count(), 1);
+    assert_eq!(copies(&media), 1);
 }
 
 #[test]
@@ -2740,4 +2759,80 @@ fn review_imported_presentation_reaches_connected_paired_devices_without_relisti
         panic!("missing clear")
     };
     assert!(photo.image.is_none());
+}
+
+#[test]
+fn a_file_the_bridge_cannot_copy_fails_its_message_and_one_the_sandbox_spoiled_is_left_out() {
+    let (dir, home, inbox, media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    std::fs::write(inbox.join("a8.png"), b"x").unwrap();
+    std::fs::write(inbox.join("a9.png"), b"y").unwrap();
+    // The bridge's media folder cannot be made, as on a full disk.
+    std::fs::write(&media, b"not a folder").unwrap();
+    let say = |id: &str, files: &[OutAttachment]| {
+        hub.store_agent_text(
+            &store,
+            &MessageId::new(id).unwrap(),
+            agent_says("a chart"),
+            files,
+            &home,
+            &From::Agent,
+        )
+    };
+    // Not stored, so not acknowledged: the plugin sends it again, its
+    // files still there.
+    assert!(say("m-1", &[out("a8.png"), out("a9.png")]).is_err());
+    assert!(!store.has_message("m-1").unwrap());
+    assert!(inbox.join("a8.png").exists() && inbox.join("a9.png").exists());
+    // Room again: stored with both.
+    std::fs::remove_file(&media).unwrap();
+    assert!(
+        say("m-1", &[out("a8.png"), out("a9.png")])
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.attachments_of("m-1").unwrap().len(), 2);
+    assert_eq!(copies(&media), 2);
+    assert!(!inbox.join("a8.png").exists());
+    // A file the sandbox spoiled (here a link) is left out, and the
+    // message stored without it: sent again, it would carry it again.
+    std::os::unix::fs::symlink(dir.path().join("secret"), inbox.join("link.png")).unwrap();
+    assert!(say("m-2", &[out("link.png")]).unwrap().is_some());
+    assert!(store.attachments_of("m-2").unwrap().is_empty());
+}
+
+#[test]
+fn files_copied_for_a_message_the_bridge_had_not_stored_when_it_stopped_are_removed_at_start() {
+    let (dir, home, inbox, media) = folders();
+    let (hub, _) = hub_with(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    std::fs::write(inbox.join("b1.png"), b"x").unwrap();
+    std::fs::write(inbox.join("b2.png"), b"y").unwrap();
+    // The bridge stopped after copying b1, before storing its message.
+    let lost = take_attachment(&home, &media, "c-1", &out("b1.png")).unwrap();
+    // And after storing b2's, before moving its copy into place.
+    let kept = take_attachment(&home, &media, "c-1", &out("b2.png")).unwrap();
+    let pieces = [("m-2".to_owned(), "a chart".to_owned())];
+    store
+        .add_pieces(
+            &pieces,
+            "c-1",
+            &From::Agent,
+            "reply",
+            std::slice::from_ref(&kept.stored),
+        )
+        .unwrap()
+        .unwrap();
+    sweep_incoming(&store, &media);
+    assert!(!lost.copy.exists());
+    assert!(!media.join(&lost.stored.id).exists());
+    assert_eq!(std::fs::read(media.join(&kept.stored.id)).unwrap(), b"y");
+    assert_eq!(copies(&media), 1);
 }
