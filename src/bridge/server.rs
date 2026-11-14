@@ -60,7 +60,7 @@ use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
 };
-use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
+use enclos_protocol::{ConversationId, DecodeError, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
@@ -1297,6 +1297,21 @@ fn ended(e: tungstenite::Error) -> String {
     }
 }
 
+/// Why [`Link::receive`] gave no message: one to answer, after which the
+/// connection goes on, or the end of the connection.
+#[derive(Debug)]
+enum Unread {
+    /// A message the bridge cannot use (`docs/protocol.md`, Messages): not
+    /// JSON, of an unknown `type`, a field missing or wrong, or in a text
+    /// frame. The caller sends this answer and reads on: one bad message
+    /// never ends the connection.
+    Refused(ErrorBody),
+    /// The connection ended: the device closed it or went away, a frame did
+    /// not decrypt, or it spoke a `v` this bridge does not (answered
+    /// `version` here, before closing).
+    Ended(String),
+}
+
 /// What a device's connection is once the handshake is done.
 struct Link {
     socket: WebSocket<TcpStream>,
@@ -1316,19 +1331,40 @@ impl Link {
     }
 
     /// The next message, `None` while nothing came in time.
-    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, String> {
+    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, Unread> {
         let read = self.socket.read();
         if read.is_ok() {
             self.heard = std::time::Instant::now();
         }
         match read {
             Ok(Message::Binary(bytes)) => {
-                let plain = self.session.decrypt(&bytes).map_err(|e| e.to_string())?;
-                decode_from_device(&plain)
-                    .map(Some)
-                    .map_err(|e| e.to_string())
+                let plain = self
+                    .session
+                    .decrypt(&bytes)
+                    .map_err(|e| Unread::Ended(e.to_string()))?;
+                match decode_from_device(&plain) {
+                    Ok(message) => Ok(Some(message)),
+                    Err(DecodeError::Version { id, v }) => {
+                        let _ = self.send(ToDevice::Error(ErrorBody {
+                            of: id.and_then(|id| MessageId::new(id).ok()),
+                            code: ErrorCode::Version,
+                            message: "this bridge speaks version 1".to_owned(),
+                        }));
+                        let _ = self.socket.close(None);
+                        let _ = self.socket.flush();
+                        Err(Unread::Ended(format!("version {v} is not spoken here")))
+                    }
+                    Err(e) => Err(Unread::Refused(unusable(e))),
+                }
             }
-            Ok(Message::Close(_)) => Err(CLOSED.to_owned()),
+            Ok(Message::Close(_)) => Err(Unread::Ended(CLOSED.to_owned())),
+            // One message per binary frame (`docs/protocol.md`, Messages)
+            Ok(Message::Text(_)) => Err(Unread::Refused(ErrorBody {
+                of: None,
+                code: ErrorCode::BadMessage,
+                message: "a message comes in a binary frame".to_owned(),
+            })),
+            // Pings and pongs, which tungstenite answers itself
             Ok(_) => Ok(None),
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -1338,8 +1374,36 @@ impl Link {
             {
                 Ok(None)
             }
-            Err(e) => Err(ended(e)),
+            Err(e) => Err(Unread::Ended(ended(e))),
         }
+    }
+}
+
+/// The answer to a message whose `field` does not hold what it must, such as
+/// base64 that does not decode.
+fn bad_field(of: &MessageId, e: impl std::fmt::Display) -> ErrorBody {
+    ErrorBody {
+        of: Some(of.clone()),
+        code: ErrorCode::BadMessage,
+        message: plain(&e.to_string(), 200, "bad message"),
+    }
+}
+
+/// The answer to a message the bridge cannot use, other than one of a `v`
+/// it does not speak: `unknown_type` or `bad_message`, naming the message
+/// when its id could be read.
+fn unusable(e: DecodeError) -> ErrorBody {
+    let (id, code) = match &e {
+        DecodeError::UnknownType { id, .. } => (id.clone(), ErrorCode::UnknownType),
+        DecodeError::Bad { id, .. } | DecodeError::Version { id, .. } => {
+            (id.clone(), ErrorCode::BadMessage)
+        }
+        DecodeError::NotJson(_) | DecodeError::TooBig => (None, ErrorCode::BadMessage),
+    };
+    ErrorBody {
+        of: id.and_then(|id| MessageId::new(id).ok()),
+        code,
+        message: plain(&e.to_string(), 200, "bad message"),
     }
 }
 
@@ -1471,17 +1535,31 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let known = store
         .device_by_noise_key(&noise_key)
         .map_err(|e| e.to_string())?;
+    // Before `authenticated` the device sends `auth` or `pair.request` and
+    // nothing else: one the bridge cannot use is answered, then refused
+    let unusable_first = |link: &mut Link, device: Option<&str>, error: ErrorBody| {
+        let why = format!(
+            "the first message is not one the bridge can use: {}",
+            error.message
+        );
+        let _ = link.send(ToDevice::Error(error));
+        refuse(device, Some(&person), &why)
+    };
     let first = loop {
         if std::time::Instant::now() > deadline {
             return Err(refuse(None, Some(&person), TOO_SLOW));
         }
-        if let Some(message) = link.receive()? {
-            break message;
+        match link.receive() {
+            Ok(Some(message)) => break message,
+            Ok(None) => {}
+            Err(Unread::Refused(error)) => return Err(unusable_first(&mut link, None, error)),
+            Err(Unread::Ended(why)) => return Err(why),
         }
     };
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
-            let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
+            let sig = decode("sig", &sig)
+                .map_err(|e| unusable_first(&mut link, Some(&known.id), bad_field(&first.id, e)))?;
             if check_signature(
                 &known.device_key,
                 Signed::Auth,
@@ -1538,6 +1616,10 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
             },
             None,
         ) => {
+            let decoded = decode("device_key", &device_key)
+                .and_then(|key| Ok((key, decode("proof", &proof)?, decode("sig", &sig)?)));
+            let (device_key, proof, sig) =
+                decoded.map_err(|e| unusable_first(&mut link, None, bad_field(&first.id, e)))?;
             let device = pair(
                 &store, &mut link, &caller, &noise_key, name, device_key, proof, sig, push,
             )?;
@@ -1596,9 +1678,9 @@ fn pair(
     caller: &Caller,
     noise_key: &[u8],
     name: String,
-    device_key: String,
-    proof: String,
-    sig: String,
+    device_key: Vec<u8>,
+    proof: Vec<u8>,
+    sig: Vec<u8>,
     push: Option<enclos_protocol::device::PushToken>,
 ) -> Result<Device, String> {
     let person = caller.login.as_str();
@@ -1611,8 +1693,6 @@ fn pair(
         let _ = store.log(None, Some(person), "refused", Some(why));
         why.to_owned()
     };
-    let proof = decode("proof", &proof).map_err(|e| e.to_string())?;
-    let device_key = decode("device_key", &device_key).map_err(|e| e.to_string())?;
     let codes = store.open_pairings().map_err(|e| e.to_string())?;
     let hash = link.session.handshake_hash().to_vec();
     let Some(code) = codes
@@ -1623,7 +1703,6 @@ fn pair(
     };
     // The device holds the key it asks to pair: checked before the code is
     // used, so a request that fails here leaves it for the real device
-    let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
     if check_signature(&device_key, Signed::Pair, &hash, &sig).is_err() {
         return Err(refused(link, "bad_signature"));
     }
@@ -1751,8 +1830,14 @@ fn run_session(
         while let Ok(message) = outbox.try_recv() {
             link.send(message)?;
         }
-        let Some(message) = link.receive()? else {
-            continue;
+        let message = match link.receive() {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
+            Err(Unread::Refused(error)) => {
+                link.send(ToDevice::Error(error))?;
+                continue;
+            }
+            Err(Unread::Ended(why)) => return Err(why),
         };
         match message.body {
             FromDevice::Audit { before } => {
@@ -2943,6 +3028,13 @@ mod connection_end_tests {
         fn send(&mut self, id: &str, body: FromDevice) {
             let plain = encode_line(&Envelope::new(MessageId::new(id).unwrap(), body));
             let sealed = self.session.encrypt(&plain).unwrap();
+            self.socket.send(Message::Binary(sealed.into())).unwrap();
+        }
+
+        /// `bytes`, sealed as they are: a message the bridge may not be
+        /// able to read.
+        fn send_raw(&mut self, bytes: &[u8]) {
+            let sealed = self.session.encrypt(bytes).unwrap();
             self.socket.send(Message::Binary(sealed.into())).unwrap();
         }
 
@@ -4177,6 +4269,133 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_ne!(other, GONE);
         assert_ne!(other, CLOSED);
     }
+    /// The code and `of` of an `error`, or a panic naming what came.
+    fn error_of(message: Option<ToDevice>) -> (ErrorCode, Option<String>) {
+        match message {
+            Some(ToDevice::Error(error)) => (error.code, error.of.map(|of| of.as_str().to_owned())),
+            other => panic!("not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_the_bridge_cannot_use_is_answered_and_the_connection_goes_on() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        // A type of a newer app: answered, and otherwise ignored
+        device.send_raw(br#"{"v":1,"type":"something.newer","id":"newer-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::UnknownType, Some("newer-1".to_owned()))
+        );
+        // A known type with a field missing
+        device.send_raw(br#"{"v":1,"type":"message.send","id":"bad-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("bad-1".to_owned()))
+        );
+        // Not JSON: no id to name
+        device.send_raw(b"not json");
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // A text frame: a message comes in a binary frame
+        device
+            .socket
+            .send(Message::Text(
+                r#"{"v":1,"type":"runtimes","id":"text-1"}"#.into(),
+            ))
+            .unwrap();
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // The connection goes on
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+        // A version the bridge does not speak is answered, then ends it
+        device.send_raw(br#"{"v":2,"type":"auth","id":"v-2"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::Version, Some("v-2".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+    }
+
+    #[test]
+    fn a_first_message_the_bridge_cannot_use_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send_raw(br#"{"v":1,"type":"auth","id":"auth-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        assert!(
+            refusal(&bridge).starts_with("the first message is not one the bridge can use"),
+            "{}",
+            refusal(&bridge)
+        );
+    }
+
+    #[test]
+    fn a_first_message_with_a_key_or_signature_that_is_not_base64_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // An `auth` from a known device, its `sig` not base64
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send(
+            "auth-1",
+            FromDevice::Auth {
+                device: phone.id.clone(),
+                sig: "not base64!".to_owned(),
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(
+            why.starts_with("the first message is not one the bridge can use"),
+            "{why}"
+        );
+        assert!(why.contains("sig"), "{why}");
+        // A `pair.request`, its `proof` not base64
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let noise = generate_keypair().unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).expect("no handshake");
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(b"key"),
+                proof: "not base64!".to_owned(),
+                sig: encode(b"sig"),
+                push: None,
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("pair-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(why.contains("proof"), "{why}");
+        // The code is still there for its device
+        assert_eq!(store.open_pairings().unwrap(), [b"code-1".to_vec()]);
+    }
+
     #[test]
     fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
         let folder = tempfile::tempdir().unwrap();
