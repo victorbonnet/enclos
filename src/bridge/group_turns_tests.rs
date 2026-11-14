@@ -387,8 +387,11 @@ fn a_members_messages_after_the_reply_that_ended_its_turn_are_kept() {
         ),
         Some(false)
     );
-    let turn = store.turn_sent("s-1", "g-1", "main").unwrap().unwrap();
-    assert_eq!(turn.1, "replied");
+    // Its turn ended once, with the first.
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
     // The note's mention asks coder for a turn in the next round, as the
     // reply's own would.
     assert_eq!(hub.groups.lock().unwrap()["g-1"].next, ["coder"]);
