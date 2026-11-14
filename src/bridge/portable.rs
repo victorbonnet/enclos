@@ -1,10 +1,12 @@
 //! Logical agent-owned history. Import allocates destination-local identifiers
 //! and sequences, and never recreates a pending action or a paired identity.
 use super::ids::new_id;
-use super::server::{MAX_ATTACHMENT_NAME_CHARS, MAX_MIME_BYTES};
-use super::store::{Store, home_id, is_home};
+use super::server::{
+    MAX_ATTACHMENT_NAME_CHARS, MAX_MIME_BYTES, conversation_frame, fits_device, message_frame,
+};
+use super::store::{Store, conversation_title, home_id, is_home};
 use crate::model::secret::SecretValue;
-use enclos_protocol::device::MAX_DEVICE_MESSAGE;
+use enclos_protocol::device::{MAX_DEVICE_MESSAGE, ToDevice};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,6 +96,18 @@ pub struct Attachment {
 /// far above any the bridge writes (a kind, a tailnet login, an agent).
 const MAX_LABEL_BYTES: usize = 512;
 
+/// `Ok` when `frame` fits one device message as a sync sends it.
+fn reaches_a_device(frame: &ToDevice) -> io::Result<()> {
+    if fits_device(frame) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "imported app history holds what no device message can carry",
+        ))
+    }
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -135,7 +149,15 @@ impl History {
             return Err(invalid());
         }
         for c in &self.conversations {
-            if !id(&c.id) {
+            // A name as the bridge keeps every name it is given
+            if !id(&c.id)
+                || c.title
+                    .as_ref()
+                    .is_some_and(|t| conversation_title(t) != *t)
+                || c.titled_by
+                    .as_ref()
+                    .is_some_and(|t| t.len() > MAX_LABEL_BYTES)
+            {
                 return Err(invalid());
             }
         }
@@ -411,6 +433,7 @@ impl Store {
                 a.state = "closed".into();
                 a.available = false;
                 a.reason = Some("Imported history; no access grant was restored".into());
+                reaches_a_device(&ToDevice::Approval(a.clone()))?;
                 tx.execute(
                     "INSERT INTO approvals(id,body,state) VALUES (?1,?2,'closed')",
                     params![a.request, serde_json::to_string(&a)?],
@@ -429,6 +452,26 @@ impl Store {
                 let bytes = enclos_protocol::pairing::decode("attachment", &a.data)?;
                 file.write_all(&bytes)?;
                 tx.execute("INSERT INTO attachments(id,message,conversation,mime,name,size) VALUES (?1,?2,?3,?4,?5,?6)",params![aid,ids[&a.message],conversations[&a.conversation],a.mime,a.name,bytes.len() as i64])?;
+            }
+            // Everything a sync will send of it, as it will send it (its
+            // destination's ids, escaped, with its files' details), must
+            // reach a device: the transaction is this connection's, so the
+            // rows read back are the ones about to be committed. An archive
+            // that cannot is refused whole, as one no sync could deliver.
+            for c in &h.conversations {
+                let dest = &conversations[&c.id];
+                if let Some(frame) = conversation_frame(self, dest).map_err(io::Error::other)? {
+                    reaches_a_device(&frame)?;
+                }
+                for m in self.messages_after(dest, 0)? {
+                    reaches_a_device(&message_frame(self, m).map_err(io::Error::other)?)?;
+                }
+            }
+            for q in questions.values() {
+                let id = enclos_protocol::QuestionId::new(q.clone())?;
+                if let Some(q) = self.question(&id)? {
+                    reaches_a_device(&ToDevice::Question { question: q.info })?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -604,6 +647,54 @@ mod tests {
         history.attachments[0].id = "../escape".into();
         assert!(history.validate().is_err());
     }
+    /// What a sync would send of an import must fit a device message as
+    /// sent, escaped: a text of short raw length can double once escaped,
+    /// and one that does not fit is refused whole rather than imported and
+    /// then passed over at every sync, so the phone never has it.
+    #[test]
+    fn an_import_whose_frames_do_not_reach_a_device_is_refused_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, text) in [
+            "\n".repeat(40_000),
+            "x".repeat(MAX_DEVICE_MESSAGE),
+            "\u{1}".repeat(15_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let each = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&each).unwrap();
+            let (_source, mut history) = source(&each);
+            history.messages[0].text = text;
+            history.validate().unwrap();
+            let dest = Store::open(&each.join("dest.db")).unwrap();
+            dest.set_host("destination-person").unwrap();
+            let map = history.conversation_map("new/renamed").unwrap();
+            let media = each.join("dest-media");
+            assert!(
+                dest.import_history(&history, "new/renamed", &map, &media)
+                    .is_err(),
+                "text {n}"
+            );
+            // Nothing of it was committed, and no file was left
+            let home = home_id("new/renamed");
+            assert!(
+                dest.messages_after(&home, 0).unwrap().is_empty(),
+                "text {n}"
+            );
+            assert!(
+                std::fs::read_dir(&media).map_or(true, |mut d| d.next().is_none()),
+                "text {n}"
+            );
+        }
+        // The same history with a text that fits imports
+        let (_source, history) = source(dir.path());
+        let dest = Store::open(&dir.path().join("dest.db")).unwrap();
+        dest.set_host("destination-person").unwrap();
+        let map = history.conversation_map("new/renamed").unwrap();
+        dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
+            .unwrap();
+    }
     /// An archive can be edited by hand: a row the bridge would never store,
     /// one no device message could carry, is refused rather than imported
     /// to end every sync at it.
@@ -613,7 +704,12 @@ mod tests {
         let (_source, history) = source(dir.path());
         history.validate().unwrap();
         type Edit = fn(&mut History);
-        let edits: [Edit; 5] = [
+        let edits: [Edit; 8] = [
+            // A name no device message could carry, and names the bridge
+            // would have kept otherwise
+            |h| h.conversations[0].title = Some("t".repeat(70_000)),
+            |h| h.conversations[0].title = Some("two\nlines".into()),
+            |h| h.conversations[0].titled_by = Some("p".repeat(MAX_LABEL_BYTES + 1)),
             |h| h.messages[0].text = "x".repeat(MAX_DEVICE_MESSAGE + 1),
             |h| h.messages[0].kind = "k".repeat(MAX_LABEL_BYTES + 1),
             |h| h.attachments[0].mime = format!("a/{}", "b".repeat(MAX_MIME_BYTES)),

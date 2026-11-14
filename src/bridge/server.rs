@@ -1092,9 +1092,55 @@ pub fn pieces(
 
 /// Whether `body` fits one device-leg message once sealed, with an id as
 /// long as [`new_id`] makes.
-fn fits_device(body: &ToDevice) -> bool {
+pub(super) fn fits_device(body: &ToDevice) -> bool {
     let id = MessageId::new("f".repeat(36)).expect("a valid id");
     encode_line(&Envelope::new(id, body.clone())).len() <= MAX_DEVICE_MESSAGE
+}
+
+/// Says in the bridge's log that a sync passed over `what`, too large for a
+/// device.
+fn log_too_large(store: &Store, device: &str, person: &str, what: &str) {
+    let _ = store.log(
+        Some(device),
+        Some(person),
+        "skipped",
+        Some(&format!("{what} is too large for a device")),
+    );
+}
+
+/// Stored message `m` as a sync sends it, with its files' details.
+pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<ToDevice, String> {
+    let agent = message_agent(store, &m.conversation, &m.from);
+    let attachments = store
+        .attachments_of(&m.id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(attachment_info)
+        .collect();
+    Ok(ToDevice::Message(ConversationMessage {
+        question: m.question,
+        conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
+        agent,
+        from: match m.from {
+            From::Agent | From::Member(_) => "agent".to_owned(),
+            From::Person(p) => p,
+        },
+        text: m.text,
+        kind: m.kind,
+        // When it was said, not when it is synced.
+        time: m.at,
+        seq: m.seq,
+        attachments,
+    }))
+}
+
+/// Conversation `id`'s details as a sync sends them, if it has any.
+pub(super) fn conversation_frame(store: &Store, id: &str) -> Result<Option<ToDevice>, String> {
+    Ok(store
+        .conversation_info(id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| conversation_info(store, c))
+        .map(ToDevice::Conversation))
 }
 
 /// An agent's message as its first piece carries it, to measure: with the
@@ -2132,14 +2178,24 @@ fn run_session(
                         eprintln!("enclos app approvals: {e}");
                     }
                     for a in store.approvals().map_err(|e| e.to_string())? {
-                        link.send(ToDevice::Approval(a))?;
+                        let body = ToDevice::Approval(a);
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, "a policy request");
+                        }
                     }
                 }
                 // Every conversation first, archived or active, named or empty,
                 // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
-                        link.send(ToDevice::Conversation(info))?;
+                        let body = ToDevice::Conversation(info);
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, "a conversation's details");
+                        }
                     }
                 }
                 // Pending cards must refresh even when their introduction predates `since`.
@@ -2161,14 +2217,7 @@ fn run_session(
                     }
                 }
                 for m in store.since(person, since).map_err(|e| e.to_string())? {
-                    let agent = message_agent(store, &m.conversation, &m.from);
                     last = m.seq;
-                    let attachments = store
-                        .attachments_of(&m.id)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(attachment_info)
-                        .collect();
                     if let Some(question) = &m.question
                         && let Some(current) =
                             store.question(question).map_err(|e| e.to_string())?
@@ -2179,32 +2228,12 @@ fn run_session(
                             question: current.info,
                         })?;
                     }
-                    let body = ToDevice::Message(ConversationMessage {
-                        question: m.question,
-                        conversation: ConversationId::new(m.conversation)
-                            .map_err(|e| e.to_string())?,
-                        agent,
-                        from: match m.from {
-                            From::Agent | From::Member(_) => "agent".to_owned(),
-                            From::Person(p) => p,
-                        },
-                        text: m.text,
-                        kind: m.kind,
-                        // When it was said, not when it is synced.
-                        time: m.at,
-                        seq: m.seq,
-                        attachments,
-                    });
-                    // One stored before its details were bounded, or
-                    // imported, is passed over rather than ending every
-                    // sync at it.
+                    let id = m.id.clone();
+                    let body = message_frame(store, m)?;
+                    // One stored before its details were bounded is passed
+                    // over rather than ending every sync at it.
                     if !fits_device(&body) {
-                        let _ = store.log(
-                            Some(&device.id),
-                            Some(person),
-                            "skipped",
-                            Some(&format!("message {} is too large for a device", m.id)),
-                        );
+                        log_too_large(store, &device.id, person, &format!("message {id}"));
                         continue;
                     }
                     link.send(body)?;
