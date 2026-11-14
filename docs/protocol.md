@@ -253,7 +253,7 @@ Only the host's person, authenticated on a still-paired device, may use these me
 | `sandboxes.list` | bridge | `sandboxes`: `[{"sandbox":"lab","runtime":null,"state":"created"}]` | Runtime is its identifier or `null`; state is `created`, `running`, `stopped` or `failed` |
 | `runtimes` | device | (none) | List runtimes this host knows how to install |
 | `runtimes.list` | bridge | `runtimes`: `[{"runtime":"hermes","name":"Hermes","description":"…"}]` | The runtime catalog; currently Hermes |
-| `sandbox.create` | device | `sandbox`, `template` (required: `minimal` or `assistant`) | Create using the host's configured default backend and existing engine checks |
+| `sandbox.create` | device | `sandbox`, `template` (required: `minimal` or `assistant`) | Create with the backend `sandbox create` takes when none is named (the configured default, else the first available) and the existing engine checks |
 | `runtime.install` | device | `sandbox`, `runtime` | Install using the runtime's own noninteractive installer, inside the sandbox |
 | `operation.progress` | bridge | `of`, `operation` (`sandbox.create` or `runtime.install`), `sandbox`, `message` | The request identified by `of` is running; milestones only, no raw installer output |
 | `sandbox.created` | bridge | `of`, `sandbox` | Creation completed |
@@ -261,7 +261,7 @@ Only the host's person, authenticated on a still-paired device, may use these me
 
 The bridge sends completion or an `error` with the request's `of`, then a fresh `sandboxes.list` to the host's person's connected devices. Only one provisioning operation per sandbox runs at once (`busy` otherwise). Operations continue if the phone disconnects; they are not replayed on reconnect. A new `sandboxes` request reads the resulting host state. Requests with invalid names, runtimes or templates get `bad_message`; engine and installer failures get `operation_failed`, in their own words, on one line and cut to 2,000 characters so the error fits one device-leg message. No installed runtime is recorded until its installer succeeds. Existing engine checks still refuse pending policies, another installed runtime, and unrelated policy edits that require host review. Runtime login, app channel setup and service startup remain host operations, and the app says so. Existing mobile policy review and editing are unchanged.
 
-Each request and its completion is logged with its device and person in `enclos app log`. The engine audit records creation by the authenticated person and runtime installation by the host's user, who runs the CLI child. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. After completing a new agent's app channel setup on the host, restart the bridge to list it.
+Each request and its completion is logged with its device and person in `enclos app log`. The engine's audit log names the person and device behind each creation and installation, as every audit entry the bridge causes does: `<person> (device <id>)`, on the host's name (a policy request's decision adds `, request <id>`). The installation's CLI child is told whom with `runtime install --requested-by=<who>`, a hidden option, so its entry does not name the host's user, who runs the bridge. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. After completing a new agent's app channel setup on the host, restart the bridge to list it.
 
 ### Host audit
 

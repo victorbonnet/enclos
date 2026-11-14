@@ -1,7 +1,7 @@
 //! Policy management is available only to the host's person on a still-paired device.
 use super::*;
 use crate::engine::Engine;
-use crate::model::{audit::Actor, sandbox::SandboxName};
+use crate::model::sandbox::SandboxName;
 use enclos_protocol::policy::{PolicyApply, PolicyChange, PolicyField, PolicyState, PolicyValue};
 
 /// Whether policy entry `value` of list `field` is what an approved
@@ -177,10 +177,7 @@ impl Hub {
                 ),
             ));
         }
-        let actor = Actor {
-            user: format!("{person} (device {})", device.id),
-            host: self.layout.data().display().to_string(),
-        };
+        let actor = super::authority::device_actor(person, &device.id, None);
         let result = Engine::open(self.layout.clone(), crate::state::Wait::Background)
             .mobile_policy_apply(&actor, name, &edit.base, &edit.revision, &edit.change);
         self.refresh_access_context(name.as_str());
