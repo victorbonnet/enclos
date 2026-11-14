@@ -1,4 +1,4 @@
-//! The bridge's service (ADR 0042, proposed; `docs/protocol.md`, The
+//! The bridge's device leg (ADR 0042, proposed; `docs/protocol.md`, The
 //! device leg): a WebSocket listener on the host's loopback, which its
 //! transport puts on the person's network (`tailscale serve`, the only one
 //! for now). Each connection is a Noise session with a paired device, or
@@ -60,7 +60,7 @@ use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
 };
-use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
+use enclos_protocol::{ConversationId, DecodeError, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
@@ -287,11 +287,7 @@ impl Hub {
                     runtime,
                     login,
                 },
-                Err(message) => ToDevice::Error(ErrorBody {
-                    of: Some(of),
-                    code: ErrorCode::OperationFailed,
-                    message,
-                }),
+                Err(message) => operation_failed(of, &message),
             };
             // Release before completing: a next request may follow at once.
             hub.provisioning_busy
@@ -305,7 +301,7 @@ impl Hub {
                 .expect("provisioning request checked")
                 .sandboxes()
             {
-                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+                hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
                 let _ = store.log(
@@ -1277,6 +1273,22 @@ const SILENT: &str = "silent for too long";
 /// The caller sent no first message within [`HANDSHAKE`].
 const TOO_SLOW: &str = "no first message in time";
 
+/// The answer to provisioning operation `of` that failed, in the engine's
+/// or the installer's words, cut so it fits one device-leg message: an
+/// installer's message is read from up to 64 KiB of its output, and one
+/// that could not be sealed would end the device's connection.
+fn operation_failed(of: MessageId, message: &str) -> ToDevice {
+    ToDevice::Error(ErrorBody {
+        of: Some(of),
+        code: ErrorCode::OperationFailed,
+        message: plain(
+            message,
+            2_000,
+            "the operation failed; check the sandbox on the host",
+        ),
+    })
+}
+
 /// Why reading or writing a device's connection failed: [`GONE`] when the
 /// device is simply no longer there, else the error itself.
 fn ended(e: tungstenite::Error) -> String {
@@ -1298,6 +1310,21 @@ fn ended(e: tungstenite::Error) -> String {
     }
 }
 
+/// Why [`Link::receive`] gave no message: one to answer, after which the
+/// connection goes on, or the end of the connection.
+#[derive(Debug)]
+enum Unread {
+    /// A message the bridge cannot use (`docs/protocol.md`, Messages): not
+    /// JSON, of an unknown `type`, a field missing or wrong, or in a text
+    /// frame. The caller sends this answer and reads on: one bad message
+    /// never ends the connection.
+    Refused(ErrorBody),
+    /// The connection ended: the device closed it or went away, a frame did
+    /// not decrypt, or it spoke a `v` this bridge does not (answered
+    /// `version` here, before closing).
+    Ended(String),
+}
+
 /// What a device's connection is once the handshake is done.
 struct Link {
     socket: WebSocket<TcpStream>,
@@ -1317,19 +1344,40 @@ impl Link {
     }
 
     /// The next message, `None` while nothing came in time.
-    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, String> {
+    fn receive(&mut self) -> Result<Option<Envelope<FromDevice>>, Unread> {
         let read = self.socket.read();
         if read.is_ok() {
             self.heard = std::time::Instant::now();
         }
         match read {
             Ok(Message::Binary(bytes)) => {
-                let plain = self.session.decrypt(&bytes).map_err(|e| e.to_string())?;
-                decode_from_device(&plain)
-                    .map(Some)
-                    .map_err(|e| e.to_string())
+                let plain = self
+                    .session
+                    .decrypt(&bytes)
+                    .map_err(|e| Unread::Ended(e.to_string()))?;
+                match decode_from_device(&plain) {
+                    Ok(message) => Ok(Some(message)),
+                    Err(DecodeError::Version { id, v }) => {
+                        let _ = self.send(ToDevice::Error(ErrorBody {
+                            of: id.and_then(|id| MessageId::new(id).ok()),
+                            code: ErrorCode::Version,
+                            message: "this bridge speaks version 1".to_owned(),
+                        }));
+                        let _ = self.socket.close(None);
+                        let _ = self.socket.flush();
+                        Err(Unread::Ended(format!("version {v} is not spoken here")))
+                    }
+                    Err(e) => Err(Unread::Refused(unusable(e))),
+                }
             }
-            Ok(Message::Close(_)) => Err(CLOSED.to_owned()),
+            Ok(Message::Close(_)) => Err(Unread::Ended(CLOSED.to_owned())),
+            // One message per binary frame (`docs/protocol.md`, Messages)
+            Ok(Message::Text(_)) => Err(Unread::Refused(ErrorBody {
+                of: None,
+                code: ErrorCode::BadMessage,
+                message: "a message comes in a binary frame".to_owned(),
+            })),
+            // Pings and pongs, which tungstenite answers itself
             Ok(_) => Ok(None),
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -1339,8 +1387,36 @@ impl Link {
             {
                 Ok(None)
             }
-            Err(e) => Err(ended(e)),
+            Err(e) => Err(Unread::Ended(ended(e))),
         }
+    }
+}
+
+/// The answer to a message whose `field` does not hold what it must, such as
+/// base64 that does not decode.
+fn bad_field(of: &MessageId, e: impl std::fmt::Display) -> ErrorBody {
+    ErrorBody {
+        of: Some(of.clone()),
+        code: ErrorCode::BadMessage,
+        message: plain(&e.to_string(), 200, "bad message"),
+    }
+}
+
+/// The answer to a message the bridge cannot use, other than one of a `v`
+/// it does not speak: `unknown_type` or `bad_message`, naming the message
+/// when its id could be read.
+fn unusable(e: DecodeError) -> ErrorBody {
+    let (id, code) = match &e {
+        DecodeError::UnknownType { id, .. } => (id.clone(), ErrorCode::UnknownType),
+        DecodeError::Bad { id, .. } | DecodeError::Version { id, .. } => {
+            (id.clone(), ErrorCode::BadMessage)
+        }
+        DecodeError::NotJson(_) | DecodeError::TooBig => (None, ErrorCode::BadMessage),
+    };
+    ErrorBody {
+        of: id.and_then(|id| MessageId::new(id).ok()),
+        code,
+        message: plain(&e.to_string(), 200, "bad message"),
     }
 }
 
@@ -1472,17 +1548,31 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
     let known = store
         .device_by_noise_key(&noise_key)
         .map_err(|e| e.to_string())?;
+    // Before `authenticated` the device sends `auth` or `pair.request` and
+    // nothing else: one the bridge cannot use is answered, then refused
+    let unusable_first = |link: &mut Link, device: Option<&str>, error: ErrorBody| {
+        let why = format!(
+            "the first message is not one the bridge can use: {}",
+            error.message
+        );
+        let _ = link.send(ToDevice::Error(error));
+        refuse(device, Some(&person), &why)
+    };
     let first = loop {
         if std::time::Instant::now() > deadline {
             return Err(refuse(None, Some(&person), TOO_SLOW));
         }
-        if let Some(message) = link.receive()? {
-            break message;
+        match link.receive() {
+            Ok(Some(message)) => break message,
+            Ok(None) => {}
+            Err(Unread::Refused(error)) => return Err(unusable_first(&mut link, None, error)),
+            Err(Unread::Ended(why)) => return Err(why),
         }
     };
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
-            let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
+            let sig = decode("sig", &sig)
+                .map_err(|e| unusable_first(&mut link, Some(&known.id), bad_field(&first.id, e)))?;
             if check_signature(
                 &known.device_key,
                 Signed::Auth,
@@ -1539,6 +1629,10 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
             },
             None,
         ) => {
+            let decoded = decode("device_key", &device_key)
+                .and_then(|key| Ok((key, decode("proof", &proof)?, decode("sig", &sig)?)));
+            let (device_key, proof, sig) =
+                decoded.map_err(|e| unusable_first(&mut link, None, bad_field(&first.id, e)))?;
             let device = pair(
                 &store, &mut link, &caller, &noise_key, name, device_key, proof, sig, push,
             )?;
@@ -1597,9 +1691,9 @@ fn pair(
     caller: &Caller,
     noise_key: &[u8],
     name: String,
-    device_key: String,
-    proof: String,
-    sig: String,
+    device_key: Vec<u8>,
+    proof: Vec<u8>,
+    sig: Vec<u8>,
     push: Option<enclos_protocol::device::PushToken>,
 ) -> Result<Device, String> {
     let person = caller.login.as_str();
@@ -1612,8 +1706,6 @@ fn pair(
         let _ = store.log(None, Some(person), "refused", Some(why));
         why.to_owned()
     };
-    let proof = decode("proof", &proof).map_err(|e| e.to_string())?;
-    let device_key = decode("device_key", &device_key).map_err(|e| e.to_string())?;
     let codes = store.open_pairings().map_err(|e| e.to_string())?;
     let hash = link.session.handshake_hash().to_vec();
     let Some(code) = codes
@@ -1624,7 +1716,6 @@ fn pair(
     };
     // The device holds the key it asks to pair: checked before the code is
     // used, so a request that fails here leaves it for the real device
-    let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
     if check_signature(&device_key, Signed::Pair, &hash, &sig).is_err() {
         return Err(refused(link, "bad_signature"));
     }
@@ -1752,8 +1843,14 @@ fn run_session(
         while let Ok(message) = outbox.try_recv() {
             link.send(message)?;
         }
-        let Some(message) = link.receive()? else {
-            continue;
+        let message = match link.receive() {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
+            Err(Unread::Refused(error)) => {
+                link.send(ToDevice::Error(error))?;
+                continue;
+            }
+            Err(Unread::Ended(why)) => return Err(why),
         };
         match message.body {
             FromDevice::Audit { before } => {
@@ -1825,7 +1922,7 @@ fn run_session(
                 match result {
                     Ok(mut state) => {
                         state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
+                        link.send(policy::fitting(ToDevice::SandboxPolicy(state), &message.id))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1852,7 +1949,10 @@ fn run_session(
                 match result {
                     Ok(mut preview) => {
                         preview.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                        link.send(policy::fitting(
+                            ToDevice::SandboxPolicyPreview(preview),
+                            &message.id,
+                        ))?;
                     }
                     Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
                         of: Some(message.id),
@@ -1864,17 +1964,17 @@ fn run_session(
             FromDevice::SandboxPolicyApply { sandbox, edit } => {
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
-                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
-                match result {
-                    Ok(mut state) => {
-                        state.of = message.id.to_string();
-                        link.send(ToDevice::SandboxPolicy(state))?;
-                    }
-                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                        of: Some(message.id),
-                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                    .map_err(|e| ErrorBody {
+                        of: Some(message.id.clone()),
+                        code: ErrorCode::NotAllowed,
                         message: e,
-                    }))?,
+                    })
+                    .and_then(|name| {
+                        hub.apply_managed_policy(store, device, person, &name, &edit, &message.id)
+                    });
+                match result {
+                    Ok(state) => link.send(ToDevice::SandboxPolicy(state))?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
                 }
             }
             FromDevice::ApprovalDecide {
@@ -1921,12 +2021,11 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
-                            Err(why) => link.send(ToDevice::Error(ErrorBody {
-                                of: Some(message.id),
-                                code: ErrorCode::OperationFailed,
-                                message: why,
-                            }))?,
+                            Ok(sandboxes) => link.send(policy::fitting(
+                                ToDevice::SandboxesList { sandboxes },
+                                &message.id,
+                            ))?,
+                            Err(why) => link.send(operation_failed(message.id, &why))?,
                         }
                         continue;
                     }
@@ -2945,6 +3044,13 @@ mod connection_end_tests {
             self.socket.send(Message::Binary(sealed.into())).unwrap();
         }
 
+        /// `bytes`, sealed as they are: a message the bridge may not be
+        /// able to read.
+        fn send_raw(&mut self, bytes: &[u8]) {
+            let sealed = self.session.encrypt(bytes).unwrap();
+            self.socket.send(Message::Binary(sealed.into())).unwrap();
+        }
+
         /// The next message, `None` once the bridge closed the connection.
         /// A conversation's details (`conversation`, sent when one starts
         /// or is named) are passed over: these tests are about messages.
@@ -3114,16 +3220,13 @@ mod connection_end_tests {
         );
     }
 
-    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+    /// An engine on `layout` with a stand-in Seatbelt backend.
+    fn fake_engine(layout: &crate::layout::Layout) -> crate::engine::Engine {
         use crate::{
-            audit::jsonl::JsonlAuditLog,
-            backend::fake::FakeBackend,
-            engine::{Engine, SandboxSpec},
-            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
-            state::sqlite::SqliteStateStore,
+            audit::jsonl::JsonlAuditLog, backend::fake::FakeBackend, engine::Engine,
+            model::sandbox::BackendKind, state::sqlite::SqliteStateStore,
         };
-        let layout = crate::layout::Layout::at(folder.join("enclos"));
-        let engine = Engine::new(
+        Engine::new(
             layout.clone(),
             Box::new(SqliteStateStore::new(
                 layout.state_db(),
@@ -3132,7 +3235,16 @@ mod connection_end_tests {
             )),
             Box::new(JsonlAuditLog::new(layout.audit_log())),
             vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
-        );
+        )
+    }
+
+    fn provisioning_state(folder: &Path) -> crate::layout::Layout {
+        use crate::{
+            engine::SandboxSpec,
+            model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+        };
+        let layout = crate::layout::Layout::at(folder.join("enclos"));
+        let engine = fake_engine(&layout);
         let actor = Actor {
             user: PERSON.into(),
             host: "test".into(),
@@ -3150,6 +3262,129 @@ mod connection_end_tests {
             )
             .unwrap();
         layout
+    }
+
+    /// Sandbox `lab`'s policy with `destinations` more allowed
+    /// destinations, of `bytes` bytes each, through the host's own edit.
+    fn allow_many(layout: &crate::layout::Layout, destinations: usize, bytes: usize) {
+        use crate::model::{audit::Actor, plan::Confirm};
+        let engine = fake_engine(layout);
+        let before = layout.read_policy("lab").unwrap();
+        let list: Vec<String> = (0..destinations)
+            .map(|n| format!("\"{n:05}{}.example.com\"", "a".repeat(bytes - 17)))
+            .collect();
+        let after = before.replace(
+            "allow_add = []",
+            &format!("allow_add = [{}]", list.join(", ")),
+        );
+        assert_ne!(before, after);
+        let actor = Actor {
+            user: PERSON.into(),
+            host: "test".into(),
+        };
+        engine
+            .policy_edit(
+                &actor,
+                &"lab".parse().unwrap(),
+                &before,
+                &after,
+                Confirm::Yes,
+            )
+            .unwrap();
+    }
+
+    /// A bridge serving `layout`'s sandboxes to the host's person, and that
+    /// person's device, connected.
+    fn host_device(folder: &Path, layout: &crate::layout::Layout) -> (Bridge, PhoneLink) {
+        let bridge = bridge_serving(
+            folder,
+            SILENCE,
+            Host::new(layout.clone(), "/unused/enclos".into()),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        (bridge, device)
+    }
+
+    /// The device's connection still answers: a `runtimes` round trip.
+    fn still_answers(device: &mut PhoneLink) {
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+    }
+
+    #[test]
+    fn a_policy_too_large_for_one_message_is_answered_left_unchanged_and_the_connection_goes_on() {
+        use enclos_protocol::policy::{PolicyApply, PolicyChange};
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        allow_many(&layout, 1_500, 60);
+        let (_bridge, mut device) = host_device(folder.path(), &layout);
+        // An edit, reviewed on a policy the phone kept from before: refused
+        // before it is applied, since the policy it makes could not be sent
+        let engine = fake_engine(&layout);
+        let name = "lab".parse().unwrap();
+        let base = engine.mobile_policy(&name).unwrap().base;
+        let change = PolicyChange {
+            field: "allow".into(),
+            before: None,
+            after: Some("one-more.example.com".into()),
+        };
+        let revision = engine
+            .mobile_policy_preview(&name, &base, &change)
+            .unwrap()
+            .revision;
+        let before = layout.read_policy("lab").unwrap();
+        device.send(
+            "apply-1",
+            FromDevice::SandboxPolicyApply {
+                sandbox: "lab".into(),
+                edit: PolicyApply {
+                    base,
+                    revision,
+                    change,
+                },
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "apply-1");
+                assert!(message.contains("enclos policy edit lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        // `unsupported`: nothing was changed
+        assert_eq!(layout.read_policy("lab").unwrap(), before);
+        still_answers(&mut device);
+        device.send(
+            "get-1",
+            FromDevice::SandboxPolicyGet {
+                sandbox: "lab".into(),
+            },
+        );
+        match device.receive() {
+            Some(ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unsupported,
+                message,
+            })) => {
+                assert_eq!(of.as_str(), "get-1");
+                assert!(message.contains("enclos policy show lab"), "{message}");
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        still_answers(&mut device);
     }
 
     #[test]
@@ -4176,6 +4411,133 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_ne!(other, GONE);
         assert_ne!(other, CLOSED);
     }
+    /// The code and `of` of an `error`, or a panic naming what came.
+    fn error_of(message: Option<ToDevice>) -> (ErrorCode, Option<String>) {
+        match message {
+            Some(ToDevice::Error(error)) => (error.code, error.of.map(|of| of.as_str().to_owned())),
+            other => panic!("not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_the_bridge_cannot_use_is_answered_and_the_connection_goes_on() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        // A type of a newer app: answered, and otherwise ignored
+        device.send_raw(br#"{"v":1,"type":"something.newer","id":"newer-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::UnknownType, Some("newer-1".to_owned()))
+        );
+        // A known type with a field missing
+        device.send_raw(br#"{"v":1,"type":"message.send","id":"bad-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("bad-1".to_owned()))
+        );
+        // Not JSON: no id to name
+        device.send_raw(b"not json");
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // A text frame: a message comes in a binary frame
+        device
+            .socket
+            .send(Message::Text(
+                r#"{"v":1,"type":"runtimes","id":"text-1"}"#.into(),
+            ))
+            .unwrap();
+        assert_eq!(error_of(device.receive()), (ErrorCode::BadMessage, None));
+        // The connection goes on
+        device.send("catalog", FromDevice::Runtimes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::RuntimesList { .. })
+        ));
+        // A version the bridge does not speak is answered, then ends it
+        device.send_raw(br#"{"v":2,"type":"auth","id":"v-2"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::Version, Some("v-2".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+    }
+
+    #[test]
+    fn a_first_message_the_bridge_cannot_use_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send_raw(br#"{"v":1,"type":"auth","id":"auth-1"}"#);
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        assert!(
+            refusal(&bridge).starts_with("the first message is not one the bridge can use"),
+            "{}",
+            refusal(&bridge)
+        );
+    }
+
+    #[test]
+    fn a_first_message_with_a_key_or_signature_that_is_not_base64_is_answered_and_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        // An `auth` from a known device, its `sig` not base64
+        let mut device = handshake(&bridge, &phone.noise_private, PERSON).expect("no handshake");
+        device.send(
+            "auth-1",
+            FromDevice::Auth {
+                device: phone.id.clone(),
+                sig: "not base64!".to_owned(),
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("auth-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(
+            why.starts_with("the first message is not one the bridge can use"),
+            "{why}"
+        );
+        assert!(why.contains("sig"), "{why}");
+        // A `pair.request`, its `proof` not base64
+        let store = Store::open(&bridge.store).unwrap();
+        store.add_pairing(b"code-1", now() + 300).unwrap();
+        let noise = generate_keypair().unwrap();
+        let mut device = handshake(&bridge, &noise.private, PERSON).expect("no handshake");
+        device.send(
+            "pair-1",
+            FromDevice::PairRequest {
+                name: "Pixel".to_owned(),
+                device_key: encode(b"key"),
+                proof: "not base64!".to_owned(),
+                sig: encode(b"sig"),
+                push: None,
+            },
+        );
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::BadMessage, Some("pair-1".to_owned()))
+        );
+        assert_eq!(device.receive(), None);
+        let why = refusal(&bridge);
+        assert!(why.contains("proof"), "{why}");
+        // The code is still there for its device
+        assert_eq!(store.open_pairings().unwrap(), [b"code-1".to_vec()]);
+    }
+
     #[test]
     fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
         let folder = tempfile::tempdir().unwrap();

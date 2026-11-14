@@ -410,10 +410,10 @@ enclos --json logs lab | head -3
 enclos --json exec lab -- /bin/sh -c 'echo hi; exit 3'; echo "exit $?"
 ```
 
-- [ ] Piped, each command prints one JSON document with `"schema_version": 1`; `--text` keeps it readable; `--json` gives JSON in a terminal.
+- [ ] Piped, each command prints one JSON document with `"schema_version": 2`; `--text` keeps it readable; `--json` gives JSON in a terminal.
 - [ ] An unknown sandbox: `{"error": {"exit_code": 1, "kind": "error", "message": "there is no sandbox named …"}}`, exit 1. With two names, one unknown, the same error and nothing started.
 - [ ] `| head -1` ends quietly, with no panic message.
-- [ ] `logs --json` prints a `{"line": …}` object per line; `exec --json` prints `hi`, then `{"schema_version":1,"session":{"exit":3,…}}` on stderr, and exits 3.
+- [ ] `logs --json` prints a `{"line": …}` object per line; `exec --json` prints `hi`, then `{"schema_version":2,"session":{"exit":3,…}}` on stderr, and exits 3.
 
 ## 14. Isolation spot checks
 
