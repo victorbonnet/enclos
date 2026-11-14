@@ -460,6 +460,22 @@ fn a_protected_file_behind_a_link_is_probed_at_its_real_path_for_bubblewrap_alon
     }
 }
 
+/// Every hidden folder gets one read probe: the bridge's message files
+/// once among the hidden paths, and `run/` not among them, since the probes
+/// add it themselves.
+#[test]
+fn each_hidden_folder_is_probed_once() {
+    let (_dir, engine, name, _real) = behind_a_link_on(BackendKind::Seatbelt);
+    let ctx = engine.sandbox_context(&name, 41001);
+    let inputs = engine
+        .probe_inputs(&name, &ctx, None, None, Default::default())
+        .unwrap();
+    let count = |path: &std::path::Path| inputs.hidden_files.iter().filter(|p| *p == path).count();
+    assert_eq!(count(&engine.layout.app_media()), 1);
+    assert_eq!(count(&engine.layout.probe_sources()), 1);
+    assert_eq!(count(&engine.layout.run_dir()), 0);
+}
+
 /// An `autonomous` sandbox (ADR 0058), as the engine builds what its probes
 /// and compiler start from: enclos's program by every path that leads to
 /// it, the whole filesystem granted, every port open, and what the policy

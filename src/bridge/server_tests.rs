@@ -1,4 +1,132 @@
 use super::*;
+use crate::bridge::store::MAX_MIME_BYTES;
+
+/// An agent's text in its own conversation, as the bridge stores it.
+fn agent_text(text: &str) -> ConversationMessage {
+    ConversationMessage {
+        conversation: ConversationId::new("c-1").unwrap(),
+        agent: "lab/main".to_owned(),
+        from: "agent".to_owned(),
+        text: text.to_owned(),
+        kind: "reply".to_owned(),
+        time: 0,
+        seq: 0,
+        question: None,
+        attachments: Vec::new(),
+    }
+}
+
+/// Whether every piece of `message` fits the device leg as it is sent.
+fn every_piece_fits(message: &ConversationMessage) -> bool {
+    let id = MessageId::new("m-1").unwrap();
+    pieces(&id, message).unwrap().into_iter().all(|(_, text)| {
+        fits_device(&ToDevice::Message(ConversationMessage {
+            text,
+            seq: i64::MAX,
+            ..message.clone()
+        }))
+    })
+}
+
+/// What a plugin may send is bounded before it is measured or stored: a
+/// media type too long to be one is a plain file's, a name is cut.
+#[test]
+fn an_attachments_details_are_bounded_whatever_the_plugin_sends() {
+    let long = OutAttachment {
+        file: "a1.bin".to_owned(),
+        mime: format!("a/{}", "b".repeat(70_000)),
+        name: "n".repeat(70_000),
+        size: 1,
+    };
+    let (mime, name) = stored_details(&long);
+    assert_eq!(mime, "application/octet-stream");
+    assert_eq!(name.chars().count(), MAX_ATTACHMENT_NAME_CHARS);
+    // A plain one is kept as it was.
+    assert_eq!(
+        stored_details(&out("a1.png")),
+        ("image/png".to_owned(), "unicorn.png".to_owned())
+    );
+    // At the bounds: 255 bytes of media type and 120 characters of name
+    // are kept, one more is not.
+    let at = |mime_bytes: usize, name_chars: usize| {
+        stored_details(&OutAttachment {
+            file: "a1.bin".to_owned(),
+            mime: format!("a/{}", "b".repeat(mime_bytes - 2)),
+            name: "n".repeat(name_chars),
+            size: 1,
+        })
+    };
+    let (mime, name) = at(MAX_MIME_BYTES, MAX_ATTACHMENT_NAME_CHARS);
+    assert_eq!((mime.len(), name.chars().count()), (255, 120));
+    let (mime, name) = at(MAX_MIME_BYTES + 1, MAX_ATTACHMENT_NAME_CHARS + 1);
+    assert_eq!(
+        (mime.as_str(), name.chars().count()),
+        ("application/octet-stream", 120)
+    );
+}
+
+/// A name whose cut leaves a joiner last, where it is hidden (Persian
+/// names, long emoji sequences, or an agent on purpose), is taken with
+/// the joiner gone: the name the bridge keeps is its own result again,
+/// with no hidden character, so nothing downstream refuses it.
+#[test]
+fn a_name_cut_before_a_joiner_is_kept_without_it() {
+    let (_dir, home, inbox, media) = folders();
+    std::fs::write(inbox.join("a5.txt"), b"text").unwrap();
+    let a = OutAttachment {
+        name: "é\u{200D}".repeat(61) + "é",
+        ..out("a5.txt")
+    };
+    let taken = take_attachment(&home, &media, "c-1", &a).unwrap().stored;
+    assert!(!taken.name.ends_with('\u{200D}'), "{:?}", taken.name);
+    assert_eq!(
+        enclos_protocol::visible::stripped(&taken.name, false),
+        taken.name
+    );
+    assert_eq!(attachment_name(&taken.name, ""), taken.name);
+    assert!(taken.name.chars().count() <= MAX_ATTACHMENT_NAME_CHARS);
+}
+
+/// One message from a plugin, whatever its files' details, is stored in
+/// pieces that each reach a device, and in few of them: a long media type
+/// once made a message no device could be sent, and a long name split a
+/// text into a piece per character.
+#[test]
+fn a_message_with_hostile_attachment_details_still_fits_a_device() {
+    let hostile: Vec<OutAttachment> = (0..50)
+        .map(|n| OutAttachment {
+            file: format!("a{n}.bin"),
+            mime: format!("a/{}", "b".repeat(70_000)),
+            name: "\u{202e}".repeat(20_000) + &"n".repeat(70_000),
+            size: 1,
+        })
+        .collect();
+    let text = "x".repeat(1024 * 1024);
+    let message = measured(&agent_text(&text), &hostile);
+    assert_eq!(message.attachments.len(), MAX_ATTACHMENTS);
+    assert!(every_piece_fits(&message));
+    let count = pieces(&MessageId::new("m-1").unwrap(), &message)
+        .unwrap()
+        .len();
+    assert!(count < 30, "{count} pieces for 1 MiB");
+}
+
+/// Details that leave no room for any text are refused, not split one
+/// character a piece.
+#[test]
+fn details_that_leave_no_room_are_refused() {
+    let mut message = agent_text("hello");
+    message.attachments = vec![Attachment {
+        id: "f".repeat(36),
+        mime: "a/".to_owned() + &"b".repeat(70_000),
+        name: "n".to_owned(),
+        size: 1,
+    }];
+    assert_eq!(
+        pieces(&MessageId::new("m-1").unwrap(), &message),
+        Err(NO_ROOM.to_owned())
+    );
+}
 
 fn out(file: &str) -> OutAttachment {
     OutAttachment {

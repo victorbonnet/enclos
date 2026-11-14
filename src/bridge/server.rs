@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    GroupState, MemberTurn, ToDevice, commands_for_devices, decode_from_device, split_text,
+    GroupState, MAX_DEVICE_MESSAGE, MemberTurn, ToDevice, commands_for_devices, decode_from_device,
+    split_text,
 };
 use enclos_protocol::noise::{MAX_NOISE_MESSAGE, Responder, Session};
 use enclos_protocol::pairing::{Signed, check_proof, check_signature, decode, encode};
@@ -73,8 +74,9 @@ use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
 use super::store::{
-    Added, BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store,
-    StoredAttachment, conversation_title, home_id, is_home, now,
+    Acked, Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
+    PairingRequest, Store, StoredAttachment, attachment_mime, attachment_name, conversation_title,
+    home_id, is_home, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
@@ -87,8 +89,15 @@ const PAIRING_WAIT: Duration = Duration::from_secs(120);
 const RETRY: Duration = Duration::from_secs(10);
 
 /// How long a caller has, from connecting, to send its first message
-/// (`auth` or `pair.request`).
-const HANDSHAKE: Duration = Duration::from_secs(30);
+/// (`auth` or `pair.request`). Shorter in tests, which wait it out, but
+/// long enough that a slow machine sets up its 16 waiting callers within it.
+const HANDSHAKE: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 30 });
+
+/// How long a write to a device may make no progress (`SO_SNDTIMEO`, which
+/// times each system call, not each message) before its session ends
+/// ([`STALLED`]): a device that stopped reading would otherwise hold its
+/// session's thread, and its queue would grow. Shorter in tests.
+const WRITE_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 30 });
 
 /// Connections not yet authenticated at once: any login of the tailnet
 /// gets that far, so they are few, and a caller past them is closed.
@@ -454,7 +463,7 @@ impl Hub {
     /// Where the bridge keeps the files of messages, by attachment id:
     /// beside its database.
     fn media(&self) -> std::path::PathBuf {
-        self.store_path.with_file_name("app-media")
+        self.store_path.with_file_name(crate::layout::APP_MEDIA_DIR)
     }
 
     /// Sends `message` to every connected device of `person`.
@@ -846,8 +855,24 @@ impl Hub {
                             &home,
                             &from,
                         );
-                        if stored.is_ok() {
-                            let _ = acks.ack(&message.id);
+                        match &stored {
+                            Ok(_) => {
+                                let _ = acks.ack(&message.id);
+                            }
+                            // Sent again, it would be refused again: answered
+                            // and acknowledged, and the connection goes on
+                            Err(e) if e == NO_ROOM => {
+                                eprintln!("enclos app: {agent}: a message is refused: {e}");
+                                let _ = acks.send(FromBridge::Error(
+                                    enclos_protocol::plugin::ErrorBody {
+                                        of: Some(message.id.clone()),
+                                        code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                                        message: NO_ROOM.into(),
+                                    },
+                                ));
+                                let _ = acks.ack(&message.id);
+                            }
+                            Err(_) => {}
                         }
                         // The member's reply ended its turn: the next turn
                         // starts. Its position stays at the last message it
@@ -870,7 +895,9 @@ impl Hub {
                         }
                         // Not stored, so not acknowledged: the connection
                         // ends, and the plugin sends it again within seconds.
-                        if let Err(e) = &stored {
+                        if let Err(e) = &stored
+                            && e != NO_ROOM
+                        {
                             hub.kept_by_plugin(&agent, &acks, e);
                             break;
                         }
@@ -879,7 +906,20 @@ impl Hub {
                         if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
                             continue;
                         }
-                        let _ = store.delivered(of.as_str());
+                        match store.delivered(of.as_str(), &agent) {
+                            Ok(Acked::Delivered | Acked::Nothing) => {}
+                            Ok(Acked::NotItsOwn) => {
+                                let why = format!(
+                                    "{agent}'s plugin acknowledged message {}, not one of its own",
+                                    of.as_str()
+                                );
+                                eprintln!("enclos app: {why}");
+                                if let Err(e) = store.log(None, None, "refused", Some(&why)) {
+                                    eprintln!("enclos app: cannot log that: {e}");
+                                }
+                            }
+                            Err(e) => eprintln!("enclos app: {agent}: cannot record an ack: {e}"),
+                        }
                     }
                     FromPlugin::Typing { conversation, on } => {
                         // Only in this agent's own conversations
@@ -999,20 +1039,7 @@ impl Hub {
         home: &Path,
         from: &From,
     ) -> Result<Option<i64>, String> {
-        // Measured with its files' details, which the first piece carries
-        let measured = ConversationMessage {
-            attachments: attachments
-                .iter()
-                .map(|a| Attachment {
-                    id: "f".repeat(36),
-                    mime: a.mime.clone(),
-                    name: a.name.clone(),
-                    size: a.size,
-                })
-                .collect(),
-            ..whole.clone()
-        };
-        let pieces = pieces(id, &measured)?;
+        let pieces = pieces(id, &measured(&whole, attachments))?;
         let conversation = whole.conversation.as_str();
         // Sent again (its `ack` lost, or the bridge stopped before it): its
         // files were stored with it, and the plugin's copies, if the bridge
@@ -1144,6 +1171,16 @@ pub fn pieces(
     id: &MessageId,
     message: &ConversationMessage,
 ) -> Result<Vec<(String, String)>, String> {
+    // Every piece carries the rest of the message: when that alone leaves
+    // no room, no split fits, and the text would go one character a piece.
+    let bare = ToDevice::Message(ConversationMessage {
+        text: "x".to_owned(),
+        seq: i64::MAX,
+        ..message.clone()
+    });
+    if !fits_device(&bare) {
+        return Err(NO_ROOM.to_owned());
+    }
     split_text(message)
         .into_iter()
         .enumerate()
@@ -1155,6 +1192,91 @@ pub fn pieces(
             Ok((piece_id, text))
         })
         .collect()
+}
+
+/// Why [`pieces`] refuses a message: its other fields leave no room for
+/// text in a device message. The plugin is told (`bad_message`), and the
+/// message acknowledged, so it is not sent again at every connection.
+const NO_ROOM: &str = "the message's details leave no room for its text in a device message";
+
+/// Whether `body` fits one device-leg message once sealed, with an id as
+/// long as [`new_id`] makes.
+pub(super) fn fits_device(body: &ToDevice) -> bool {
+    let id = MessageId::new("f".repeat(36)).expect("a valid id");
+    encode_line(&Envelope::new(id, body.clone())).len() <= MAX_DEVICE_MESSAGE
+}
+
+/// Says on stderr and in the bridge's log (`enclos app log`) that the
+/// bridge passed over `what`, at a sync or after it, whose frame `body` is
+/// too large for a device: the device never gets it. A last resort: what
+/// the bridge stores and imports is kept within bounds before.
+fn log_too_large(store: &Store, device: &str, person: &str, what: &str, body: &ToDevice) {
+    let size = encode_line(&Envelope::new(
+        MessageId::new("f".repeat(36)).expect("a valid id"),
+        body.clone(),
+    ))
+    .len();
+    let why = format!("{what} is {size} bytes, too large for a device: not sent");
+    eprintln!("enclos app: to {person}'s device: {why}");
+    if let Err(e) = store.log(Some(device), Some(person), "skipped", Some(&why)) {
+        eprintln!("enclos app: cannot log that: {e}");
+    }
+}
+
+/// Stored message `m` as a sync sends it, with its files' details.
+pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<ToDevice, String> {
+    let agent = message_agent(store, &m.conversation, &m.from);
+    let attachments = store
+        .attachments_of(&m.id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(attachment_info)
+        .collect();
+    Ok(ToDevice::Message(ConversationMessage {
+        question: m.question,
+        conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
+        agent,
+        from: match m.from {
+            From::Agent | From::Member(_) => "agent".to_owned(),
+            From::Person(p) => p,
+        },
+        text: m.text,
+        kind: m.kind,
+        // When it was said, not when it is synced.
+        time: m.at,
+        seq: m.seq,
+        attachments,
+    }))
+}
+
+/// Conversation `id`'s details as a sync sends them, if it has any.
+pub(super) fn conversation_frame(store: &Store, id: &str) -> Result<Option<ToDevice>, String> {
+    Ok(store
+        .conversation_info(id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| conversation_info(store, c))
+        .map(ToDevice::Conversation))
+}
+
+/// An agent's message as its first piece carries it, to measure: with the
+/// details of the files the bridge will take, as it will store them.
+fn measured(whole: &ConversationMessage, attachments: &[OutAttachment]) -> ConversationMessage {
+    ConversationMessage {
+        attachments: attachments
+            .iter()
+            .take(MAX_ATTACHMENTS)
+            .map(|a| {
+                let (mime, name) = stored_details(a);
+                Attachment {
+                    id: "f".repeat(36),
+                    mime,
+                    name,
+                    size: a.size,
+                }
+            })
+            .collect(),
+        ..whole.clone()
+    }
 }
 
 /// The longest tool label passed on, in characters, before its hidden
@@ -1317,6 +1439,14 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         let waiting = Waiting(Arc::clone(&hub));
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
+            // The first-message deadline runs from connecting, the pairing
+            // page's request included: a caller that sends it a byte at a
+            // time is shut at it too, and gives its place back.
+            let deadline = std::time::Instant::now() + HANDSHAKE;
+            let first_message_due = match close_at(&stream, deadline) {
+                Ok(guard) => guard,
+                Err(e) => return eprintln!("enclos app: {e}"),
+            };
             // The pairing page, for a browser; anything else is a device's
             // WebSocket. A caller that sends nothing gives up the thread.
             if stream
@@ -1329,11 +1459,13 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 let _ = super::page::serve(stream);
                 return;
             }
-            match connection(&hub, stream, waiting) {
+            match connection(&hub, stream, waiting, deadline, first_message_due) {
                 // The device hung up, or went away (a phone that locks, sleeps
                 // or changes network rarely says goodbye): how connections
                 // end, not an error. `enclos app log` has who, when and how.
-                Err(e) if e == CLOSED || e == GONE || e == SILENT || e == UNPAIRED => {}
+                Err(e)
+                    if e == CLOSED || e == GONE || e == SILENT || e == STALLED || e == UNPAIRED => {
+                }
                 Err(e) => eprintln!("enclos app: a connection ended: {e}"),
                 Ok(()) => {}
             }
@@ -1349,6 +1481,9 @@ const GONE: &str = "went away without closing the connection";
 const UNPAIRED: &str = "unpaired";
 /// Nothing came from the device, not even a ping, for [`SILENCE`].
 const SILENT: &str = "silent for too long";
+/// A write to the device made no progress for [`WRITE_WAIT`]: it stopped
+/// reading.
+const STALLED: &str = "took nothing the bridge sent for too long";
 /// The caller sent no first message within [`HANDSHAKE`].
 const TOO_SLOW: &str = "no first message in time";
 
@@ -1419,7 +1554,17 @@ impl Link {
         let sealed = self.session.encrypt(&plain).map_err(|e| e.to_string())?;
         self.socket
             .send(Message::Binary(sealed.into()))
-            .map_err(ended)
+            .map_err(|e| match e {
+                tungstenite::Error::Io(io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    STALLED.to_owned()
+                }
+                e => ended(e),
+            })
     }
 
     /// The next message, `None` while nothing came in time.
@@ -1517,9 +1662,47 @@ fn binary(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(e) => return Err(ended(e)),
+            Err(e) => return Err(past(deadline, ended(e))),
         }
     }
+}
+
+/// `why` a connection ended, or [`TOO_SLOW`] when it went away ([`GONE`])
+/// once `deadline` had passed: a connection [`close_at`] shut ends as one
+/// that went away, which this names for what it is. Any other reason, an
+/// undecryptable frame say, is kept.
+fn past(deadline: std::time::Instant, why: String) -> String {
+    if why == GONE && std::time::Instant::now() > deadline {
+        TOO_SLOW.to_owned()
+    } else {
+        why
+    }
+}
+
+/// Shuts `stream` down at `deadline` unless the guard it returns is dropped
+/// first. A read timeout cannot hold a deadline alone: tungstenite reads a
+/// frame to its end, so a caller that sends a byte every few seconds would
+/// keep one read going, and its place among the [`MAX_WAITING`], for days.
+fn close_at(stream: &TcpStream, deadline: std::time::Instant) -> Result<Sender<()>, String> {
+    let watched = stream
+        .try_clone()
+        .map_err(|e| format!("cannot watch the connection's first-message deadline: {e}"))?;
+    let (guard, dropped) = channel::<()>();
+    std::thread::Builder::new()
+        .name("enclos-app-deadline".to_owned())
+        .spawn(move || {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if dropped.recv_timeout(left) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                match watched.shutdown(std::net::Shutdown::Both) {
+                    // Gone already: nothing to shut
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {}
+                    Err(e) => eprintln!("enclos app: a connection past its deadline: {e}"),
+                    Ok(()) => {}
+                }
+            }
+        })
+        .map_err(|e| format!("cannot watch the connection's first-message deadline: {e}"))?;
+    Ok(guard)
 }
 
 impl Hub {
@@ -1554,15 +1737,26 @@ impl Hub {
 // The handshake callback's error is tungstenite's `ErrorResponse`, a whole
 // HTTP response: its size is set by the `Callback` trait, not by us.
 #[allow(clippy::result_large_err)]
-fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + HANDSHAKE;
+/// A device's WebSocket, from its upgrade on. `deadline` is its first
+/// message's, which `first_message_due` ([`close_at`]) holds until dropped.
+fn connection(
+    hub: &Arc<Hub>,
+    stream: TcpStream,
+    waiting: Waiting,
+    deadline: std::time::Instant,
+    first_message_due: Sender<()>,
+) -> Result<(), String> {
     let store = hub.store()?;
     let mut login: Option<String> = None;
     let mut address: Option<String> = None;
-    // Each read waits at most this long, so the deadline is looked at
+    // Each read waits at most this long, so the deadline is looked at; and
+    // past it, the connection is shut whatever a read is doing
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("cannot time the connection's reads: {e}"))?;
+    stream
+        .set_write_timeout(Some(WRITE_WAIT))
+        .map_err(|e| format!("cannot time the connection's writes: {e}"))?;
     // No device-leg message is larger than one Noise message
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_NOISE_MESSAGE))
@@ -1645,9 +1839,15 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, waiting: Waiting) -> Result<(),
             Ok(Some(message)) => break message,
             Ok(None) => {}
             Err(Unread::Refused(error)) => return Err(unusable_first(&mut link, None, error)),
+            Err(Unread::Ended(why)) if past(deadline, why.clone()) == TOO_SLOW => {
+                return Err(refuse(None, Some(&person), TOO_SLOW));
+            }
             Err(Unread::Ended(why)) => return Err(why),
         }
     };
+    // In time: what follows is under its own bounds, not this deadline (a
+    // pairing the person confirms waits at most PAIRING_WAIT)
+    drop(first_message_due);
     let device = match (first.body, known) {
         (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
             let sig = decode("sig", &sig)
@@ -1922,7 +2122,7 @@ fn run_session(
             let _ = link.socket.flush();
             return Err(UNPAIRED.to_owned());
         }
-        drain(hub, store, link, person, outbox, &mut sent)?;
+        drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
         let message = match link.receive() {
             Ok(Some(message)) => message,
             Ok(None) => continue,
@@ -2169,11 +2369,15 @@ fn run_session(
                 if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
                     continue;
                 }
-                store
+                let (_, _, owner) = store
                     .conversation(conversation.as_str(), sandbox, name, person)
                     .map_err(|e| e.to_string())?;
-                // The person's other devices learn of it too.
-                hub.deliver_conversation(store, person, conversation.as_str());
+                // The person's other devices learn of it too. An id that is
+                // someone else's conversation already stays theirs, and
+                // nothing of it is told.
+                if owner == person {
+                    hub.deliver_conversation(store, person, conversation.as_str());
+                }
             }
             FromDevice::GroupNew {
                 conversation,
@@ -2202,7 +2406,7 @@ fn run_session(
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
                     // After the echo, which the outbox holds
-                    drain(hub, store, link, person, outbox, &mut sent)?;
+                    drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
                     link.send(answer)?;
                 }
             }
@@ -2242,14 +2446,26 @@ fn run_session(
                         eprintln!("enclos app approvals: {e}");
                     }
                     for a in store.approvals().map_err(|e| e.to_string())? {
-                        link.send(ToDevice::Approval(a))?;
+                        let what = format!("policy request {}", a.request);
+                        let body = ToDevice::Approval(a);
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, &what, &body);
+                        }
                     }
                 }
                 // Every conversation first, archived or active, named or empty,
                 // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
-                        link.send(ToDevice::Conversation(info))?;
+                        let what = format!("conversation {}'s details", info.conversation.as_str());
+                        let body = ToDevice::Conversation(info);
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, &what, &body);
+                        }
                     }
                 }
                 // Pending cards must refresh even when their introduction predates `since`.
@@ -2272,7 +2488,7 @@ fn run_session(
                 // Read before the history: a message stored after it has a
                 // higher `seq`
                 let newest = store.newest_seq().map_err(|e| e.to_string())?;
-                let last = send_history(hub, store, link, person, since)?;
+                let last = send_history(hub, store, link, &device.id, person, since)?;
                 link.send(ToDevice::Synced { seq: last })?;
                 // What was stored meanwhile is in the history above, or
                 // comes after it. A `since` past every stored message (an
@@ -2332,6 +2548,7 @@ fn drain(
     hub: &Hub,
     store: &Store,
     link: &mut Link,
+    device: &str,
     person: &str,
     outbox: &Receiver<ToDevice>,
     sent: &mut Option<i64>,
@@ -2342,7 +2559,7 @@ fn drain(
                 if let Some(after) = *sent
                     && m.seq > after
                 {
-                    *sent = Some(send_history(hub, store, link, person, after)?);
+                    *sent = Some(send_history(hub, store, link, device, person, after)?);
                 }
             }
             other => link.send(other)?,
@@ -2353,24 +2570,21 @@ fn drain(
 
 /// Sends the messages of `person`'s conversations after `since`, in `seq`
 /// order, each after its question's current metadata; the newest `seq`
-/// sent, or `since` when none.
+/// passed, or `since` when none. A message whose frame is too large for a
+/// device is passed over, said on stderr and in `enclos app log`, and
+/// counted as passed, so neither this connection nor the device's next
+/// sync stops at it.
 fn send_history(
     hub: &Hub,
     store: &Store,
     link: &mut Link,
+    device: &str,
     person: &str,
     since: i64,
 ) -> Result<i64, String> {
     let mut last = since;
     for m in store.since(person, since).map_err(|e| e.to_string())? {
-        let agent = message_agent(store, &m.conversation, &m.from);
         last = m.seq;
-        let attachments = store
-            .attachments_of(&m.id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(attachment_info)
-            .collect();
         if let Some(question) = &m.question
             && let Some(current) = store.question(question).map_err(|e| e.to_string())?
             && current.owner == person
@@ -2380,21 +2594,13 @@ fn send_history(
                 question: current.info,
             })?;
         }
-        link.send(ToDevice::Message(ConversationMessage {
-            question: m.question,
-            conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
-            agent,
-            from: match m.from {
-                From::Agent | From::Member(_) => "agent".to_owned(),
-                From::Person(p) => p,
-            },
-            text: m.text,
-            kind: m.kind,
-            // When it was said, not when it is synced.
-            time: m.at,
-            seq: m.seq,
-            attachments,
-        }))?;
+        let what = format!("message {} of conversation {}", m.id, m.conversation);
+        let body = message_frame(store, m)?;
+        if !fits_device(&body) {
+            log_too_large(store, device, person, &what, &body);
+            continue;
+        }
+        link.send(body)?;
     }
     Ok(last)
 }
@@ -2721,34 +2927,27 @@ fn take_attachment(
     let copy = incoming.join(&id);
     // The sandbox may write on while the bridge reads.
     let size = copy_at_most(source, &copy, MAX_ATTACHMENT_BYTES).map_err(|e| e.of(&from))?;
-    let typed = a.mime.split_once('/').is_some_and(|(t, s)| {
-        !t.is_empty()
-            && !s.is_empty()
-            && a.mime
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c))
-    });
-    // The name titles the artefact card, the viewer and the Share sheet: a
-    // bidirectional override or a line break in it would make the file read
-    // as another type or another line, so hidden characters are dropped.
-    let name = enclos_protocol::visible::stripped(
-        a.name.rsplit(['/', '\\']).next().unwrap_or_default(),
-        false,
-    );
-    let name = name.trim();
+    let (mime, name) = stored_details(a);
+    if mime != a.mime.to_ascii_lowercase() {
+        eprintln!(
+            "enclos app: {}: its media type ({} bytes) is not a plain one, kept as {mime}",
+            a.file,
+            a.mime.len()
+        );
+    }
+    if name.chars().count() == MAX_ATTACHMENT_NAME_CHARS
+        && a.name.chars().count() > name.chars().count()
+    {
+        eprintln!(
+            "enclos app: {}: its name is cut to {MAX_ATTACHMENT_NAME_CHARS} characters",
+            a.file
+        );
+    }
     let stored = StoredAttachment {
         id,
         conversation: conversation.to_owned(),
-        mime: if typed {
-            a.mime.to_ascii_lowercase()
-        } else {
-            "application/octet-stream".to_owned()
-        },
-        name: if name.is_empty() {
-            a.file.clone()
-        } else {
-            name.chars().take(120).collect()
-        },
+        mime,
+        name,
         size: size as i64,
     };
     Ok(Taken {
@@ -2758,6 +2957,14 @@ fn take_attachment(
         file: a.file.clone(),
         read: opened,
     })
+}
+
+/// The media type and name an agent's file is stored and shown with, so
+/// that its details stay small whatever the plugin sends
+/// ([`attachment_mime`], [`attachment_name`]; its file's name when it gives
+/// no name left once kept).
+fn stored_details(a: &OutAttachment) -> (String, String) {
+    (attachment_mime(&a.mime), attachment_name(&a.name, &a.file))
 }
 
 /// The bytes of an attachment from `offset`, at most [`ATTACHMENT_CHUNK`],
@@ -3385,13 +3592,20 @@ mod connection_end_tests {
         /// or is named) are passed over: these tests are about messages.
         fn receive(&mut self) -> Option<ToDevice> {
             loop {
+                match self.receive_any()? {
+                    ToDevice::Conversation(_) => continue,
+                    body => return Some(body),
+                }
+            }
+        }
+
+        /// The next message, conversations' details included.
+        fn receive_any(&mut self) -> Option<ToDevice> {
+            loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
                         let plain = self.session.decrypt(&bytes).unwrap();
-                        match decode_to_device(&plain).unwrap().body {
-                            ToDevice::Conversation(_) => continue,
-                            body => return Some(body),
-                        }
+                        return Some(decode_to_device(&plain).unwrap().body);
                     }
                     Ok(Message::Close(_)) => return None,
                     Ok(_) => {}
@@ -3846,6 +4060,185 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         );
     }
 
+    /// The first-message deadline is the first message's alone: a session
+    /// that authenticated in time goes on past it. Dropping its watchdog
+    /// later, or not at all, would cut every session at the deadline.
+    #[test]
+    fn an_authenticated_session_outlives_the_first_message_deadline() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, first) = connect(&bridge, &phone);
+        assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+        std::thread::sleep(HANDSHAKE + Duration::from_secs(1));
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the session ended at the first-message deadline"),
+            }
+        }
+    }
+
+    /// A device that stops reading ends its own session once a write to it
+    /// makes no progress for [`WRITE_WAIT`], said as such in the log, and
+    /// the person's other device keeps getting what the agent says.
+    #[test]
+    fn a_device_that_stops_reading_ends_its_session_alone() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let stuck_phone = paired(&bridge, "n-pixel");
+        let phone = paired(&bridge, "n-pixel");
+        // Each syncs once connected, as the app does: a device is sent
+        // messages only after its first sync
+        let (mut stuck, _) = connect(&bridge, &stuck_phone);
+        synced(&mut stuck, 0);
+        // It never reads again, and holds little while it does not
+        rustix::net::sockopt::set_socket_recv_buffer_size(stuck.socket.get_ref(), 4096).unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        synced(&mut device, 0);
+        start_conversation(&mut device);
+        let store = Store::open(&bridge.store).unwrap();
+        let stalled = || {
+            store.log_lines(1000).unwrap().iter().any(|l| {
+                l.event == "disconnected"
+                    && l.device.as_deref() == Some(stuck_phone.id.as_str())
+                    && l.reason.as_deref() == Some(STALLED)
+            })
+        };
+        // Replies of 150,000 characters each, which both devices are sent,
+        // until the one that does not read is let go; the other reads every
+        // piece of each
+        let reply = |device: &mut PhoneLink, n: usize| {
+            say(device, &format!("long-{n}"), "long");
+            let mut chars = 0;
+            while chars < 150_000 {
+                if let Some(ToDevice::Message(m)) = device.receive()
+                    && m.from == "agent"
+                {
+                    chars += m.text.chars().count();
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        while !stalled() {
+            assert!(n < 100, "still connected after {n} replies");
+            reply(&mut device, n);
+            n += 1;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        // The other device is still there, and still answered
+        reply(&mut device, n);
+        drop(stuck);
+    }
+
+    /// A stored message too large for a device (as an earlier bridge could
+    /// store one) is passed over at sync, said in the log, and nothing else
+    /// is: the message after it arrives, `synced` names the newest, and the
+    /// session goes on. It once ended every sync at it.
+    #[test]
+    fn a_sync_passes_over_a_message_too_large_for_a_device() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(eventually(|| store.owner("c-1").unwrap().is_some()));
+        store
+            .add("too-large", "c-1", &From::Agent, "a file", "reply")
+            .unwrap()
+            .unwrap();
+        store
+            .add_attachment(
+                &StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    mime: format!("a/{}", "b".repeat(70_000)),
+                    name: "a.bin".into(),
+                    size: 1,
+                },
+                "too-large",
+            )
+            .unwrap();
+        let after = store
+            .add("after", "c-1", &From::Agent, "and then", "reply")
+            .unwrap()
+            .unwrap();
+        device.send("s-1", FromDevice::Sync { since: 0 });
+        let mut texts = Vec::new();
+        let synced = loop {
+            match device.receive() {
+                Some(ToDevice::Message(m)) => texts.push(m.text),
+                Some(ToDevice::Synced { seq }) => break seq,
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        };
+        assert_eq!(texts, ["and then"]);
+        assert_eq!(synced, after);
+        assert!(
+            store
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .any(|l| l.event == "skipped"
+                    && l.reason.as_deref().is_some_and(|r| r.contains("too-large")))
+        );
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(_) => {}
+                None => panic!("the session ended after the sync"),
+            }
+        }
+    }
+
+    /// A person who names another person's conversation as a new one of
+    /// their own learns nothing of it, and it stays the other's.
+    #[test]
+    fn a_new_conversation_with_anothers_id_tells_nothing_of_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let _got = plugin(&bridge.socket);
+        Store::open(&bridge.store)
+            .unwrap()
+            .conversation("c-1", "lab", "main", "bob@example.com")
+            .unwrap();
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        start_conversation(&mut device);
+        // A request answered after it: what came before is all it told
+        device.send("a-1", FromDevice::Agents);
+        loop {
+            match device.receive_any() {
+                Some(ToDevice::AgentsList { .. }) => break,
+                Some(ToDevice::Conversation(c)) => {
+                    assert_ne!(c.conversation.as_str(), "c-1", "told of bob's");
+                }
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        }
+        assert_eq!(
+            Store::open(&bridge.store)
+                .unwrap()
+                .owner("c-1")
+                .unwrap()
+                .as_deref(),
+            Some("bob@example.com")
+        );
+    }
+
     fn start_conversation(device: &mut PhoneLink) {
         device.send(
             "new-1",
@@ -4185,6 +4578,91 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             (REFUSALS_PER_MINUTE as usize..=REFUSALS_PER_MINUTE as usize * 2).contains(&refused),
             "{refused}"
         );
+    }
+
+    /// A caller that sends its first frame a byte at a time, each within a
+    /// read's wait, is still closed at the deadline: tungstenite reads a
+    /// frame to its end, so the deadline was once never looked at and one
+    /// caller could hold a place among the few for days.
+    /// Sends `stream` a byte every half second until the bridge closes it,
+    /// for at most the deadline and 5 s, and checks it closed at the
+    /// deadline, not before, counted from `started`.
+    fn trickle_until_closed(stream: &mut TcpStream, started: std::time::Instant) {
+        use std::io::{Read, Write};
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut closed = false;
+        while started.elapsed() < HANDSHAKE + Duration::from_secs(5) {
+            if stream.write_all(b"a").is_err() {
+                closed = true;
+                break;
+            }
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                _ => {
+                    closed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(
+            closed,
+            "still open {:?} after connecting",
+            started.elapsed()
+        );
+        assert!(started.elapsed() >= HANDSHAKE, "closed before the deadline");
+    }
+
+    #[test]
+    fn a_caller_that_trickles_its_first_frame_is_closed_at_the_deadline() {
+        use std::io::Write;
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let started = std::time::Instant::now();
+        let mut socket = websocket(&bridge, PERSON);
+        // A masked binary frame said to hold 60,000 bytes
+        socket
+            .get_mut()
+            .write_all(&[0x82, 0xFE, 0xEA, 0x60, 1, 2, 3, 4])
+            .unwrap();
+        trickle_until_closed(socket.get_mut(), started);
+        assert!(
+            eventually(|| Store::open(&bridge.store)
+                .unwrap()
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .any(|l| l.event == "refused" && l.reason.as_deref() == Some(TOO_SLOW))),
+            "the refusal is logged as too slow"
+        );
+    }
+
+    /// The pairing page's request runs under the same deadline: a caller
+    /// that asks for it and then sends its request's head a byte at a time
+    /// is closed at the deadline: it once held a place among the few for
+    /// as long as it kept each read within 30 s.
+    #[test]
+    fn a_caller_that_trickles_the_pairing_pages_request_is_closed_at_the_deadline() {
+        use std::io::Write;
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let started = std::time::Instant::now();
+        let mut stream = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
+        stream
+            .write_all(format!("GET {} HTTP/1.1\r\nX-Slow: ", super::super::page::PATH).as_bytes())
+            .unwrap();
+        trickle_until_closed(&mut stream, started);
     }
 
     #[test]

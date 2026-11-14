@@ -1,8 +1,10 @@
 //! Logical agent-owned history. Import allocates destination-local identifiers
 //! and sequences, and never recreates a pending action or a paired identity.
 use super::ids::new_id;
-use super::store::{Store, home_id, is_home};
+use super::server::{conversation_frame, fits_device, message_frame};
+use super::store::{Store, attachment_mime, attachment_name, conversation_title, home_id, is_home};
 use crate::model::secret::SecretValue;
+use enclos_protocol::device::{MAX_DEVICE_MESSAGE, ToDevice};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +90,32 @@ pub struct Attachment {
     pub data: String,
 }
 
+/// The longest message kind, person or speaker an import takes, in bytes:
+/// far above any the bridge writes (a kind, a tailnet login, an agent).
+const MAX_LABEL_BYTES: usize = 512;
+
+/// `Ok` when `frame`, of row `row`, fits one device message as a sync
+/// sends it.
+fn reaches_a_device(row: &str, frame: &ToDevice) -> io::Result<()> {
+    if fits_device(frame) {
+        Ok(())
+    } else {
+        Err(refused(
+            row,
+            "what a sync sends of it",
+            "larger than one device message",
+        ))
+    }
+}
+
+/// History refused for `row`'s `field`, which breaks `rule`.
+fn refused(row: &str, field: &str, rule: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid agent-owned Enclos data: {row}: {field} is {rule}"),
+    )
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -128,9 +156,18 @@ impl History {
         {
             return Err(invalid());
         }
+        // A conversation's title and an attachment's details are brought
+        // within the bridge's rules as they are imported, as the bridge
+        // brings what a plugin sends; what cannot be is refused here.
         for c in &self.conversations {
             if !id(&c.id) {
                 return Err(invalid());
+            }
+            if c.titled_by
+                .as_ref()
+                .is_some_and(|t| t.len() > MAX_LABEL_BYTES)
+            {
+                return Err(refused(&c.id, "who named it", "over 512 bytes"));
             }
         }
         let mut last = 0;
@@ -141,6 +178,20 @@ impl History {
                 || m.question.as_ref().is_some_and(|q| !qs.contains(q))
             {
                 return Err(invalid());
+            }
+            // What the bridge stores always fits a device message: a text
+            // longer could only have been made by hand.
+            if m.text.len() > MAX_DEVICE_MESSAGE {
+                return Err(refused(&m.id, "its text", "longer than one device message"));
+            }
+            for (field, value) in [
+                ("its kind", Some(&m.kind)),
+                ("its person", m.person.as_ref()),
+                ("its speaker", m.speaker.as_ref()),
+            ] {
+                if value.is_some_and(|v| v.len() > MAX_LABEL_BYTES) {
+                    return Err(refused(&m.id, field, "over 512 bytes"));
+                }
             }
             last = m.seq;
         }
@@ -290,12 +341,15 @@ impl Store {
                     if bytes.len() as i64 != size {
                         return Err(invalid().into());
                     }
+                    // Within the bridge's rules, as an import will keep them:
+                    // a row stored by an earlier bridge never fails the
+                    // export of a whole agent
                     h.attachments.push(Attachment {
                         id: aid,
                         message,
                         conversation,
-                        mime,
-                        name,
+                        mime: attachment_mime(&mime),
+                        name: attachment_name(&name, ""),
                         data: enclos_protocol::pairing::encode(&bytes),
                     });
                 }
@@ -359,7 +413,9 @@ impl Store {
                 {
                     return Err(io::Error::other("destination app history already exists").into());
                 }
-                tx.execute("INSERT INTO conversations(id,sandbox,agent,owner,created,title,titled_by,archived,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1) ON CONFLICT(id) DO UPDATE SET title=excluded.title,titled_by=excluded.titled_by,archived=excluded.archived,revision=conversations.revision+1",params![dest,sandbox,agent,owner,c.created,c.title,c.titled_by,c.archived && !is_home(dest)])?;
+                // Its title as the bridge keeps every title it is given
+                let title = c.title.as_deref().map(conversation_title);
+                tx.execute("INSERT INTO conversations(id,sandbox,agent,owner,created,title,titled_by,archived,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1) ON CONFLICT(id) DO UPDATE SET title=excluded.title,titled_by=excluded.titled_by,archived=excluded.archived,revision=conversations.revision+1",params![dest,sandbox,agent,owner,c.created,title,c.titled_by,c.archived && !is_home(dest)])?;
             }
             let mut sequences = BTreeMap::new();
             for m in &h.messages {
@@ -394,6 +450,7 @@ impl Store {
                 a.state = "closed".into();
                 a.available = false;
                 a.reason = Some("Imported history; no access grant was restored".into());
+                reaches_a_device(&a.request, &ToDevice::Approval(a.clone()))?;
                 tx.execute(
                     "INSERT INTO approvals(id,body,state) VALUES (?1,?2,'closed')",
                     params![a.request, serde_json::to_string(&a)?],
@@ -411,7 +468,31 @@ impl Store {
                 created.push(path);
                 let bytes = enclos_protocol::pairing::decode("attachment", &a.data)?;
                 file.write_all(&bytes)?;
-                tx.execute("INSERT INTO attachments(id,message,conversation,mime,name,size) VALUES (?1,?2,?3,?4,?5,?6)",params![aid,ids[&a.message],conversations[&a.conversation],a.mime,a.name,bytes.len() as i64])?;
+                // Its details as the bridge keeps them, whatever bridge or
+                // hand wrote the archive
+                let (mime, name) = (attachment_mime(&a.mime), attachment_name(&a.name, ""));
+                tx.execute("INSERT INTO attachments(id,message,conversation,mime,name,size) VALUES (?1,?2,?3,?4,?5,?6)",params![aid,ids[&a.message],conversations[&a.conversation],mime,name,bytes.len() as i64])?;
+            }
+            // Everything a sync will send of it, as it will send it (its
+            // destination's ids, escaped, with its files' details), must
+            // reach a device: the transaction is this connection's, so the
+            // rows read back are the ones about to be committed. An archive
+            // that cannot is refused whole, as one no sync could deliver.
+            for c in &h.conversations {
+                let dest = &conversations[&c.id];
+                if let Some(frame) = conversation_frame(self, dest).map_err(io::Error::other)? {
+                    reaches_a_device(&c.id, &frame)?;
+                }
+                for m in self.messages_after(dest, 0)? {
+                    let row = m.id.clone();
+                    reaches_a_device(&row, &message_frame(self, m).map_err(io::Error::other)?)?;
+                }
+            }
+            for (source, q) in &questions {
+                let id = enclos_protocol::QuestionId::new(q.clone())?;
+                if let Some(q) = self.question(&id)? {
+                    reaches_a_device(source, &ToDevice::Question { question: q.info })?;
+                }
             }
             tx.commit()?;
             Ok(())
@@ -423,8 +504,10 @@ impl Store {
                 let _ = std::fs::remove_file(p);
             }
         }
-        result.map_err(|_| {
-            io::Error::other("cannot restore app history; no history transaction committed")
+        result.map_err(|e| {
+            io::Error::other(format!(
+                "cannot restore app history ({e}); no history transaction committed"
+            ))
         })
     }
 }
@@ -586,6 +669,186 @@ mod tests {
         );
         history.attachments[0].id = "../escape".into();
         assert!(history.validate().is_err());
+    }
+    /// What a sync would send of an import must fit a device message as
+    /// sent, escaped: a text of short raw length can double once escaped,
+    /// and one that does not fit is refused whole rather than imported and
+    /// then passed over at every sync, so the phone never has it.
+    #[test]
+    fn an_import_whose_frames_do_not_reach_a_device_is_refused_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, text) in [
+            "\n".repeat(40_000),
+            "x".repeat(MAX_DEVICE_MESSAGE),
+            "\u{1}".repeat(15_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let each = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&each).unwrap();
+            let (_source, mut history) = source(&each);
+            history.messages[0].text = text;
+            history.validate().unwrap();
+            let dest = Store::open(&each.join("dest.db")).unwrap();
+            dest.set_host("destination-person").unwrap();
+            let map = history.conversation_map("new/renamed").unwrap();
+            let media = each.join("dest-media");
+            assert!(
+                dest.import_history(&history, "new/renamed", &map, &media)
+                    .is_err(),
+                "text {n}"
+            );
+            // Nothing of it was committed, and no file was left
+            let home = home_id("new/renamed");
+            assert!(
+                dest.messages_after(&home, 0).unwrap().is_empty(),
+                "text {n}"
+            );
+            assert!(
+                std::fs::read_dir(&media).map_or(true, |mut d| d.next().is_none()),
+                "text {n}"
+            );
+        }
+        // The same history with a text that fits imports
+        let (_source, history) = source(dir.path());
+        let dest = Store::open(&dir.path().join("dest.db")).unwrap();
+        dest.set_host("destination-person").unwrap();
+        let map = history.conversation_map("new/renamed").unwrap();
+        dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
+            .unwrap();
+    }
+    /// An archive can be edited by hand: what the bridge cannot keep, a
+    /// text longer than any it stores or a label far longer than any it
+    /// writes, is refused, and the refusal names the row and the rule.
+    #[test]
+    fn an_import_refuses_what_the_bridge_cannot_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        type Edit = fn(&mut History);
+        let edits: [Edit; 3] = [
+            |h| h.conversations[0].titled_by = Some("p".repeat(MAX_LABEL_BYTES + 1)),
+            |h| h.messages[0].text = "x".repeat(MAX_DEVICE_MESSAGE + 1),
+            |h| h.messages[0].kind = "k".repeat(MAX_LABEL_BYTES + 1),
+        ];
+        for (n, edit) in edits.into_iter().enumerate() {
+            let each = dir.path().join(n.to_string());
+            std::fs::create_dir_all(&each).unwrap();
+            let (_source, mut history) = source(&each);
+            history.validate().unwrap();
+            edit(&mut history);
+            let refused = history.validate().unwrap_err().to_string();
+            assert!(
+                refused.contains(": its ") || refused.contains(": who "),
+                "{refused}"
+            );
+        }
+    }
+
+    /// What the bridge can keep is kept as it keeps it: a title, a media
+    /// type and a name from an archive, of an earlier bridge or edited by
+    /// hand, are imported within the rules a plugin's are, never refused.
+    #[test]
+    fn an_import_keeps_titles_and_attachment_details_within_the_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_source, mut history) = source(dir.path());
+        history.conversations[0].title = Some(format!("two\nlines {}", "t".repeat(70_000)));
+        history.attachments[0].mime = format!("a/{}", "b".repeat(70_000));
+        history.attachments[0].name = format!("report\u{202e}{}.html", "n".repeat(300));
+        history.validate().unwrap();
+        let dest = Store::open(&dir.path().join("dest.db")).unwrap();
+        dest.set_host("destination-person").unwrap();
+        let map = history.conversation_map("new/renamed").unwrap();
+        dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
+            .unwrap();
+        let home = home_id("new/renamed");
+        let title = dest
+            .conversation_info(&home)
+            .unwrap()
+            .unwrap()
+            .title
+            .unwrap();
+        assert_eq!(title, conversation_title(&title));
+        assert!(title.starts_with("two lines t"));
+        let (mime, name): (String, String) = dest
+            .db
+            .query_row("SELECT mime, name FROM attachments", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(mime, "application/octet-stream");
+        assert_eq!(
+            name.chars().count(),
+            crate::bridge::store::MAX_ATTACHMENT_NAME_CHARS
+        );
+        assert!(!name.contains('\u{202e}'));
+    }
+
+    /// A name the bridge keeps survives export and import unchanged, even
+    /// one whose cut once left a joiner last, hidden there: such a name
+    /// made the export of the whole agent fail.
+    #[test]
+    fn a_kept_name_with_joiners_goes_through_export_and_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _) = source(dir.path());
+        let kept = attachment_name(&("é\u{200D}".repeat(61) + "é"), "");
+        assert_eq!(attachment_name(&kept, ""), kept, "its own result again");
+        source
+            .db
+            .execute("UPDATE attachments SET name = ?1", [&kept])
+            .unwrap();
+        let history = source
+            .export_history("old", "main", &dir.path().join("source-media"))
+            .unwrap();
+        assert_eq!(history.attachments[0].name, kept);
+        let dest = Store::open(&dir.path().join("dest.db")).unwrap();
+        dest.set_host("destination-person").unwrap();
+        let map = history.conversation_map("new/renamed").unwrap();
+        dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
+            .unwrap();
+        let name: String = dest
+            .db
+            .query_row("SELECT name FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, kept);
+    }
+
+    /// A row stored before attachment details were bounded (a media type
+    /// too long to reach a device, the advisory's own case, and a name of
+    /// 200 characters) is brought within the rules once the database is
+    /// opened again, and the agent exports.
+    #[test]
+    fn a_row_stored_before_the_bounds_is_kept_within_them_and_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _) = source(dir.path());
+        source
+            .db
+            .execute(
+                "UPDATE attachments SET mime = ?1, name = ?2",
+                [format!("a/{}", "b".repeat(70_000)), "n".repeat(200)],
+            )
+            .unwrap();
+        // As a database from before this build: the step has not run
+        source
+            .db
+            .execute(
+                "DELETE FROM settings WHERE name = 'attachment_details_kept'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let source = Store::open(&dir.path().join("source.db")).unwrap();
+        let (mime, name): (String, String) = source
+            .db
+            .query_row("SELECT mime, name FROM attachments", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(mime, "application/octet-stream");
+        assert_eq!(name, "n".repeat(120));
+        let history = source
+            .export_history("old", "main", &dir.path().join("source-media"))
+            .unwrap();
+        assert_eq!(history.attachments[0].mime, "application/octet-stream");
     }
     #[test]
     fn credentials_reject_reserved_variables_and_debug_redacts_values() {

@@ -423,7 +423,10 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
+        // Every hidden folder gets a read probe too; `run/` has its own.
+        let run = self.layout.run_dir();
         let mut hidden_files = self.layout.hidden_files();
+        hidden_files.extend(self.layout.hidden_dirs().into_iter().filter(|d| *d != run));
         if record.backend.binds_the_hosts_root() {
             hidden_files = with_real_paths(&hidden_files, &self.layout.run_dir());
         }
