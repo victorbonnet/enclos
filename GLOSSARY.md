@@ -83,6 +83,10 @@ _Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
 _Avoid_: main agent, root profile, default profile
 
+**Removed agent**:
+An agent that enclos has confirmed is gone from its host, with no runtime identity or data left, as after its sandbox was removed with its folder. The person's conversations with it remain until they are deleted.
+_Avoid_: deleted agent, orphan agent
+
 **Agent display name**:
 The human-readable name shown for an agent, shared by the people who can reach it and independent of the identifier used to address it.
 _Avoid_: nickname, alias, profile name
