@@ -622,7 +622,7 @@ fn approval_close_races_with_claim_and_exactly_one_wins() {
 #[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
-    let mut hub = Arc::new(Hub::new(
+    let hub = Arc::new(Hub::new(
         Transport::Tailscale,
         no_whois(),
         dir.path().join("app.db"),
@@ -666,12 +666,12 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
             .contains("no longer paired")
     );
     store.add_device(&device).unwrap();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    hub.add_served([AgentEndpoint {
         name: "lab/coder".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("unused.sock"),
         token: "fixture".into(),
-    });
+    }]);
     assert!(
         hub.policy_authority(&store, &device, "owner@example.com", "lab")
             .is_ok()
@@ -1909,13 +1909,13 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
 
 #[test]
 fn who_sees_an_agent_is_one_rule_for_its_list_its_name_and_its_name_changes() {
-    let (dir, mut hub, _store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    let (dir, hub, _store) = diagnostic_approval_hub();
+    hub.add_served([AgentEndpoint {
         name: "lab/main".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("not-connected.sock"),
         token: "fixture".into(),
-    });
+    }]);
     for person in ["owner@example.com", "guest@example.com"] {
         assert!(hub.sees_agent(person, "lab/main"), "{person}");
         assert!(!hub.sees_agent(person, "lab/unlisted"), "{person}");
@@ -1925,17 +1925,14 @@ fn who_sees_an_agent_is_one_rule_for_its_list_its_name_and_its_name_changes() {
 #[test]
 fn a_name_that_an_agent_added_later_reads_as_is_not_shown() {
     use enclos_protocol::agent_name::NameSet;
-    let (dir, mut hub, store) = diagnostic_approval_hub();
+    let (dir, hub, store) = diagnostic_approval_hub();
     let endpoint = |name: &str| AgentEndpoint {
         name: name.into(),
         runtime: "hermes".into(),
         socket: dir.path().join("not-connected.sock"),
         token: "fixture".into(),
     };
-    Arc::get_mut(&mut hub)
-        .unwrap()
-        .agents
-        .push(endpoint("lab/main"));
+    hub.add_served([endpoint("lab/main")]);
     let owner = avatar_device("phone", "owner@example.com");
     store.add_device(&owner).unwrap();
     let edit = NameSet {
@@ -1946,10 +1943,7 @@ fn a_name_that_an_agent_added_later_reads_as_is_not_shown() {
     hub.set_agent_name(&store, &owner, &owner.person, &edit, "set".into())
         .unwrap();
     // An agent with that handle is listed after the name was set.
-    Arc::get_mut(&mut hub)
-        .unwrap()
-        .agents
-        .push(endpoint("lab/gege"));
+    hub.add_served([endpoint("lab/gege")]);
     let ToDevice::AgentName(shown) = hub
         .get_agent_name(&store, &owner, &owner.person, "lab/main", "read".into())
         .unwrap()
@@ -1975,8 +1969,8 @@ fn a_name_that_an_agent_added_later_reads_as_is_not_shown() {
 fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices() {
     use enclos_protocol::agent_name::NameSet;
     use enclos_protocol::plugin::ErrorCode;
-    let (dir, mut hub, store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.extend(
+    let (dir, hub, store) = diagnostic_approval_hub();
+    hub.add_served(
         ["lab/comptoir-dev", "other/comptoir-dev", "lab/Geg"].map(|name| AgentEndpoint {
             name: name.into(),
             runtime: "hermes".into(),
@@ -2137,7 +2131,7 @@ fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices()
         None,
         "a display name never addresses another agent"
     );
-    assert_eq!(hub.agents[0].name, "lab/comptoir-dev");
+    assert_eq!(hub.agents()[0].name, "lab/comptoir-dev");
     assert!(hub.plugins.lock().unwrap().is_empty());
     r1.try_recv().unwrap();
     r2.try_recv().unwrap();
@@ -2256,13 +2250,13 @@ fn avatar_edit_waits_for_another_connections_write() {
 #[test]
 fn avatar_storage_failure_keeps_the_databases_words_from_the_device() {
     use enclos_protocol::plugin::ErrorCode;
-    let (dir, mut hub, store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    let (dir, hub, store) = diagnostic_approval_hub();
+    hub.add_served([AgentEndpoint {
         name: "lab/coder".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("unused.sock"),
         token: "fixture".into(),
-    });
+    }]);
     let guest = avatar_device("tablet", "guest@example.com");
     store.add_device(&guest).unwrap();
     rusqlite::Connection::open(dir.path().join("app.db"))
@@ -2283,13 +2277,13 @@ fn avatar_storage_failure_keeps_the_databases_words_from_the_device() {
 fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devices_cannot_write() {
     use enclos_protocol::avatar::AvatarSet;
     use enclos_protocol::plugin::ErrorCode;
-    let (dir, mut hub, store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    let (dir, hub, store) = diagnostic_approval_hub();
+    hub.add_served([AgentEndpoint {
         name: "lab/coder".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("unused.sock"),
         token: "fixture".into(),
-    });
+    }]);
     let owner = avatar_device("phone", "owner@example.com");
     let other = avatar_device("laptop", "owner@example.com");
     let guest = avatar_device("tablet", "guest@example.com");
@@ -2394,13 +2388,13 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
 }
 
 fn photo_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
-    let (dir, mut hub, store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    let (dir, hub, store) = diagnostic_approval_hub();
+    hub.add_served([AgentEndpoint {
         name: "lab/coder".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("unused.sock"),
         token: "fixture".into(),
-    });
+    }]);
     (dir, hub, store)
 }
 
@@ -3264,20 +3258,20 @@ fn a_message_sent_again_is_stored_once_and_its_files_left_behind_are_removed() {
 #[test]
 fn a_name_whose_devices_cannot_be_read_answers_internal() {
     use enclos_protocol::plugin::ErrorCode;
-    let (dir, mut hub, store) = diagnostic_approval_hub();
-    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+    let (dir, hub, store) = diagnostic_approval_hub();
+    hub.add_served([AgentEndpoint {
         name: "lab/main".into(),
         runtime: "hermes".into(),
         socket: dir.path().join("not-connected.sock"),
         token: "fixture".into(),
-    });
+    }]);
     let owner = avatar_device("phone", "owner@example.com");
     store.add_device(&owner).unwrap();
     rusqlite::Connection::open(&hub.store_path)
         .unwrap()
         .execute_batch("DROP TABLE devices; CREATE TABLE devices (broken INTEGER);")
         .unwrap();
-    let agent = hub.agents[0].name.clone();
+    let agent = hub.agents()[0].name.clone();
     let error = hub
         .get_agent_name(&store, &owner, &owner.person, &agent, "get".into())
         .unwrap_err();

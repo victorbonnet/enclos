@@ -16,6 +16,15 @@ pub struct AppEndpoint {
     pub token: SecretValue,
 }
 
+/// The agents given an app channel, as [`Engine::app_agents`] reads them.
+#[derive(Default)]
+pub struct AppAgents {
+    /// `(sandbox, agent, runtime)`.
+    pub agents: Vec<(SandboxName, String, String)>,
+    /// Each sandbox whose policy could not be read, and why.
+    pub unreadable: Vec<(SandboxName, String)>,
+}
+
 impl Engine {
     pub fn app_layout(&self) -> crate::layout::Layout {
         self.layout.clone()
@@ -98,15 +107,23 @@ impl Engine {
     }
 
     /// Every agent of every sandbox whose active policy grants it an app
-    /// channel token, as `(sandbox, agent, runtime)`.
-    pub fn app_agents(&self) -> Result<Vec<(SandboxName, String, String)>> {
+    /// channel token, and each sandbox whose policy could not be read, with
+    /// why: its agents are not known, not shown to have none.
+    pub fn app_agents(&self) -> Result<AppAgents> {
         let variable = Channel::App.token_variable();
-        let mut agents = Vec::new();
+        let mut found = AppAgents::default();
         for view in self.list_sandboxes()? {
             let name = view.record.name.clone();
-            let Ok(policy) = self.policy(&name) else {
-                continue;
+            let policy = match self.policy(&name) {
+                Ok(policy) => policy,
+                // Removed since it was listed: it has none.
+                Err(Error::NoSuchSandbox { .. }) => continue,
+                Err(e) => {
+                    found.unreadable.push((name, e.to_string()));
+                    continue;
+                }
             };
+            let agents = &mut found.agents;
             let runtime = self
                 .runtime_of(&name)
                 .map(|k| k.to_string())
@@ -117,7 +134,7 @@ impl Engine {
                 }
             }
         }
-        Ok(agents)
+        Ok(found)
     }
 
     /// The bridge's static key pair's file.

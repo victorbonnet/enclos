@@ -255,7 +255,7 @@ fn configure(
     match &done.channel {
         None => {}
         Some(ChannelSet::App { token, socket }) => println!(
-            "Its app channel is set up: it listens at {}, for enclos's bridge, which presents ${token}.",
+            "Its app channel is set up: it listens at {}, for enclos's bridge, which presents ${token}. A bridge that runs serves it within seconds, with no restart.",
             socket.display()
         ),
         Some(ChannelSet::Bot {

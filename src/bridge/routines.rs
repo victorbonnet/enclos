@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn live_routine_rpc_preserves_stable_id_and_uses_only_bridge_authorized_targets() {
         let (_dir, hub, store, device, rx) = fixture();
-        let listener = UnixListener::bind(&hub.agents[0].socket).unwrap();
+        let listener = UnixListener::bind(&hub.agents()[0].socket).unwrap();
         let (capture_tx, capture_rx) = channel();
         let plugin = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();

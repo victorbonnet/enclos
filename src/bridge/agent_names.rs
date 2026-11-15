@@ -90,7 +90,7 @@ impl Hub {
     /// with an emoji selector is "main"), a leading `@`, and whatever comes
     /// before a last `/`, so neither "lab/main" nor "prod/main" may name
     /// another agent than `main`.
-    pub(super) fn handle_taken(&self, agent: &str, name: &str) -> Option<&str> {
+    pub(super) fn handle_taken(&self, agent: &str, name: &str) -> Option<String> {
         let bare = enclos_protocol::visible::bare(name);
         let read = bare
             .rsplit('/')
@@ -98,11 +98,12 @@ impl Hub {
             .unwrap_or(&bare)
             .trim()
             .trim_start_matches('@');
-        self.agents
+        self.agents()
             .iter()
             .filter(|a| a.name != agent)
             .map(|a| a.name.rsplit('/').next().unwrap_or(&a.name))
             .find(|handle| handle.eq_ignore_ascii_case(read))
+            .map(str::to_owned)
     }
 
     /// `metadata` as `person` is shown it: a saved name that reads as an
@@ -227,7 +228,7 @@ impl Hub {
         let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
         let paired = store.devices().map_err(|e| e.to_string())?;
         let mut known = self.presentation_revisions.lock().expect("not poisoned");
-        for agent in &self.agents {
+        for agent in self.agents().iter() {
             let name = names.get(&agent.name).cloned().unwrap_or_default();
             let photo = photos.get(&agent.name).cloned().unwrap_or_default();
             let previous = known.get(&agent.name).copied().unwrap_or_default();

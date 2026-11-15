@@ -324,8 +324,8 @@ impl Hub {
         self.dismiss_probe_requests(store)?;
         let since = store.refusals_since().map_err(|e| e.to_string())?;
         let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
-        let sandboxes: std::collections::HashSet<_> = self
-            .agents
+        let agents = self.agents();
+        let sandboxes: std::collections::HashSet<_> = agents
             .iter()
             .filter_map(|a| a.name.split_once('/').map(|(s, _)| s))
             .collect();

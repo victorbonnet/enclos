@@ -44,6 +44,8 @@ mod policy;
 mod questions;
 #[path = "routines.rs"]
 mod routines;
+#[path = "served.rs"]
+mod served;
 #[path = "tasks.rs"]
 mod tasks;
 
@@ -53,7 +55,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use enclos_protocol::device::{
@@ -127,8 +129,10 @@ const NAME_CHARS: usize = 64;
 /// Who is at an address, as the transport says.
 type Whois = Arc<dyn Fn(&str) -> Result<Caller, String> + Send + Sync>;
 
+pub use served::{AgentSource, AgentWatch, LeftOut, Served};
+
 /// One agent the bridge serves, with what opens its app channel.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentEndpoint {
     /// `<sandbox>/<agent>`.
     pub name: String,
@@ -145,6 +149,10 @@ struct Plugin {
     /// Its writing side, locked apart from the other plugins: a plugin
     /// that does not read holds only those writing to it.
     out: Arc<Mutex<PluginOut>>,
+    /// Ends the connection without waiting for `out`, which a write to a
+    /// plugin that does not read holds: when the agent is no longer served
+    /// as it was opened ([`Hub::serve_agents`]).
+    closer: PluginWriter,
 }
 
 /// What the bridge writes to a plugin, and what it gave it already.
@@ -173,7 +181,12 @@ struct Hub {
     /// unpaired as `enclos app unpair` does, and applies policy decisions.
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
-    agents: Vec<AgentEndpoint>,
+    /// The agents served now: replaced whole when enclos's state changes
+    /// ([`Hub::refresh_agents`]), so read through [`Hub::agents`].
+    agents: RwLock<Arc<Vec<AgentEndpoint>>>,
+    /// Where the agents are read again while the bridge runs; none in
+    /// tests that give the hub its agents once.
+    watch: Option<AgentWatch>,
     provisioning: Option<Host>,
     provisioning_busy: Mutex<HashSet<String>>,
     /// Open plugin connections, by agent.
@@ -187,8 +200,9 @@ struct Hub {
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
-    /// callers that need that agent, not the bridge.
-    opening: HashMap<String, Mutex<()>>,
+    /// callers that need that agent, not the bridge. Made for an agent the
+    /// first time it is opened, as agents come and go.
+    opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Whether a pass of [`Hub::open_plugins`] runs: one at a time.
     opening_all: AtomicBool,
     /// The commands each agent's plugin last listed, as devices get them:
@@ -425,17 +439,14 @@ impl Hub {
         // Held while the bridge runs: `enclos status` shows the activity
         // recorded only while a bridge holds it.
         let live = super::store::hold_live(&store_path);
-        let opening = agents
-            .iter()
-            .map(|a| (a.name.clone(), Mutex::new(())))
-            .collect();
         Hub {
             transport,
             whois,
             store_path,
             layout,
             bridge_private,
-            agents,
+            agents: RwLock::new(Arc::new(agents)),
+            watch: None,
             provisioning: None,
             provisioning_busy: Mutex::new(HashSet::new()),
             plugins: Mutex::new(HashMap::new()),
@@ -443,7 +454,7 @@ impl Hub {
             deletions: Mutex::new(HashMap::new()),
             deletion_locks: Mutex::new(HashMap::new()),
             deletion_jobs: Mutex::new(HashSet::new()),
-            opening,
+            opening: Mutex::new(HashMap::new()),
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
             held_tasks: Mutex::new(Default::default()),
@@ -472,6 +483,27 @@ impl Hub {
         }
     }
 
+    /// The agents served now: a snapshot, which a change of enclos's
+    /// state replaces rather than alters.
+    fn agents(&self) -> Arc<Vec<AgentEndpoint>> {
+        Arc::clone(&self.agents.read().expect("not poisoned"))
+    }
+
+    /// Whether `agent` (`<sandbox>/<agent>`) is served now.
+    fn serves(&self, agent: &str) -> bool {
+        self.agents().iter().any(|a| a.name == agent)
+    }
+
+    /// Serves `more` too, with nothing else of a change of the served
+    /// agents ([`Hub::serve_agents`]): a test's fixture.
+    #[cfg(test)]
+    fn add_served(&self, more: impl IntoIterator<Item = AgentEndpoint>) {
+        let mut agents = self.agents.write().expect("not poisoned");
+        let mut list = agents.as_ref().clone();
+        list.extend(more);
+        *agents = Arc::new(list);
+    }
+
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
@@ -491,7 +523,7 @@ impl Hub {
         let Ok(Some(host)) = store.host_person() else {
             return;
         };
-        for agent in &self.agents {
+        for agent in self.agents().iter() {
             if let Ok(true) = store.ensure_home(&agent.name, &host, true) {
                 eprintln!(
                     "enclos app: {}'s Home is {host}'s, the host's person",
@@ -581,7 +613,7 @@ impl Hub {
         }
         let done = Done(Arc::clone(self));
         std::thread::spawn(move || {
-            for agent in &done.0.agents {
+            for agent in done.0.agents().iter() {
                 let _ = done.0.plugin(&agent.name);
             }
         });
@@ -633,17 +665,22 @@ impl Hub {
         }
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let endpoint = self
-            .agents
+            .agents()
             .iter()
             .find(|a| a.name == agent)
+            .cloned()
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
         // One opening at a time for this agent, and none with the map of
         // connections locked: the plugin listens in the sandbox, and may
         // take its time over the `hello`.
-        let _opening = self
-            .opening
-            .get(agent)
-            .map(|m| m.lock().expect("not poisoned"));
+        let opening = Arc::clone(
+            self.opening
+                .lock()
+                .expect("not poisoned")
+                .entry(agent.to_owned())
+                .or_default(),
+        );
+        let _opening = opening.lock().expect("not poisoned");
         if open(self) {
             return Ok(());
         }
@@ -669,6 +706,7 @@ impl Hub {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let closer = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
         let origin = questions::Origin {
             agent,
@@ -707,6 +745,15 @@ impl Hub {
                 writer.shutdown();
                 return Ok(());
             }
+            // Checked with `plugins` locked, which a change of the served
+            // agents takes after replacing them: either it finds this
+            // connection and ends it, or this sees the change.
+            if !self.agents().contains(&endpoint) {
+                writer.shutdown();
+                return Err(format!(
+                    "{agent}'s app channel changed while it was being opened"
+                ));
+            }
             plugins.insert(
                 agent.to_owned(),
                 Plugin {
@@ -716,6 +763,7 @@ impl Hub {
                         writer,
                         sent: HashSet::new(),
                     })),
+                    closer,
                 },
             );
         }
@@ -1558,7 +1606,8 @@ fn call_usage(
     )))
 }
 
-/// Serves on `127.0.0.1:port` until the process ends.
+/// Serves on `127.0.0.1:port` until the process ends: `agents` first,
+/// then as `watch` reads them again.
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     transport: Transport,
@@ -1568,6 +1617,7 @@ pub fn serve(
     bridge_private: Vec<u8>,
     approval_key: enclos_protocol::decision::DecisionKey,
     agents: Vec<AgentEndpoint>,
+    watch: AgentWatch,
     provisioning: Host,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -1590,6 +1640,7 @@ pub fn serve(
             SILENCE,
         )
         .with_approval_key(approval_key)
+        .with_agent_watch(watch)
         .with_provisioning(provisioning),
     );
     serve_on(listener, hub, RETRY);
@@ -1617,6 +1668,18 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
             }
         }
     });
+    // Agents given or losing an app channel, or a new token (issue #303):
+    // on a thread of their own, as a secret store that does not answer may
+    // hold a reading up for long.
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            loop {
+                hub.refresh_agents();
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+    }
     // Routine requests the runtime leaves unanswered end after a while.
     {
         let hub = Arc::clone(&hub);
@@ -1659,7 +1722,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
                 }
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.
-                for agent in &hub.agents {
+                for agent in hub.agents().iter() {
                     if hub.may_reopen(&agent.name) {
                         let _ = hub.plugin(&agent.name);
                     }
@@ -2723,7 +2786,7 @@ fn run_session(
                     continue;
                 };
                 // A Home is the bridge's to make, for the host's person.
-                if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
+                if !hub.serves(&agent) || is_home(conversation.as_str()) {
                     continue;
                 }
                 let (_, _, owner) = store
@@ -3908,6 +3971,23 @@ mod connection_end_tests {
     }
 
     fn bridge_serving(folder: &Path, silence: Duration, provisioning: Host) -> Bridge {
+        let main = vec![AgentEndpoint {
+            name: "lab/main".to_owned(),
+            runtime: "hermes".to_owned(),
+            socket: folder.join("main.sock"),
+            token: TOKEN.to_owned(),
+        }];
+        bridge_built(folder, silence, provisioning, main, None)
+    }
+
+    /// A bridge serving `agents`, then as `watch` reads them again.
+    fn bridge_built(
+        folder: &Path,
+        silence: Duration,
+        provisioning: Host,
+        agents: Vec<AgentEndpoint>,
+        watch: Option<AgentWatch>,
+    ) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
         let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
@@ -3922,24 +4002,21 @@ mod connection_end_tests {
         });
         let socket = folder.join("main.sock");
         let store = folder.join("app.db");
-        let hub = Arc::new(
-            Hub::new(
-                Transport::Tailscale,
-                whois,
-                store.clone(),
-                crate::layout::Layout::at(folder.join("enclos")),
-                keys.private.to_vec(),
-                vec![AgentEndpoint {
-                    name: "lab/main".to_owned(),
-                    runtime: "hermes".to_owned(),
-                    socket: socket.clone(),
-                    token: TOKEN.to_owned(),
-                }],
-                None,
-                silence,
-            )
-            .with_provisioning(provisioning),
-        );
+        let mut hub = Hub::new(
+            Transport::Tailscale,
+            whois,
+            store.clone(),
+            crate::layout::Layout::at(folder.join("enclos")),
+            keys.private.to_vec(),
+            agents,
+            None,
+            silence,
+        )
+        .with_provisioning(provisioning);
+        if let Some(watch) = watch {
+            hub = hub.with_agent_watch(watch);
+        }
+        let hub = Arc::new(hub);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
@@ -5179,6 +5256,84 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             .socket
             .send(Message::Binary(vec![0; MAX_NOISE_MESSAGE + 1].into()));
         assert_eq!(device.receive(), None);
+    }
+
+    /// An agent given an app channel, or losing it, while the bridge runs
+    /// reaches a connected device without its asking (issue #303); a device
+    /// that asks while a reading is held up is answered at once.
+    #[test]
+    fn a_connected_device_is_sent_the_agents_as_enclos_state_changes() {
+        let folder = tempfile::tempdir().unwrap();
+        let changes = folder.path().join("audit.jsonl");
+        std::fs::write(&changes, "").unwrap();
+        let endpoint = |name: &str| AgentEndpoint {
+            name: format!("lab/{name}"),
+            runtime: "hermes".to_owned(),
+            socket: folder.path().join(format!("{name}.sock")),
+            token: TOKEN.to_owned(),
+        };
+        let state = Arc::new(Mutex::new(vec![endpoint("main")]));
+        let read = Arc::clone(&state);
+        // Held, a reading waits: a secret store that does not answer.
+        let gate = Arc::new(Mutex::new(()));
+        let waits = Arc::clone(&gate);
+        let (watch, agents) = AgentWatch::start(AgentSource::new(changes.clone(), move || {
+            let _open = waits.lock().unwrap();
+            Ok(Served {
+                agents: read.lock().unwrap().clone(),
+                left_out: Vec::new(),
+            })
+        }))
+        .unwrap();
+        let bridge = bridge_built(
+            folder.path(),
+            SILENCE,
+            Host::new(
+                crate::layout::Layout::at(folder.path().join("enclos")),
+                "/unused/enclos".into(),
+            ),
+            agents,
+            Some(watch),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        let listed = |device: &mut PhoneLink| loop {
+            match device.receive() {
+                Some(ToDevice::AgentsList { agents }) => {
+                    return agents.into_iter().map(|a| a.agent).collect::<Vec<_>>();
+                }
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        };
+        let changed = || {
+            use std::io::Write as _;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&changes)
+                .unwrap();
+            writeln!(log, "{{}}").unwrap();
+        };
+        device.send("a-1", FromDevice::Agents);
+        assert_eq!(listed(&mut device), ["lab/main"]);
+        // Given an app channel: sent unasked, by the background pass.
+        state.lock().unwrap().push(endpoint("helper"));
+        changed();
+        assert_eq!(listed(&mut device), ["lab/helper", "lab/main"]);
+        // Losing it: likewise.
+        state.lock().unwrap().retain(|a| a.name != "lab/main");
+        changed();
+        assert_eq!(listed(&mut device), ["lab/helper"]);
+        // A reading held up holds up no device: asked meanwhile, the
+        // bridge answers with the agents served, then sends the new list.
+        let held = gate.lock().unwrap();
+        state.lock().unwrap().push(endpoint("main"));
+        changed();
+        std::thread::sleep(Duration::from_secs(4));
+        device.send("a-2", FromDevice::Agents);
+        assert_eq!(listed(&mut device), ["lab/helper"]);
+        drop(held);
+        assert_eq!(listed(&mut device), ["lab/helper", "lab/main"]);
     }
 
     #[test]

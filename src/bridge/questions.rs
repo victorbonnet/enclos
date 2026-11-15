@@ -899,7 +899,7 @@ impl Hub {
         };
         let cutoff = now() - UNCONNECTED_LIFETIME_SECONDS;
         for (agent, id, asked) in store.pending_questions_by_age().unwrap_or_default() {
-            let served = self.agents.iter().any(|a| a.name == agent);
+            let served = self.serves(&agent);
             if !served || (!connected.contains(&agent) && asked < cutoff) {
                 self.expire_question(store, &agent, &id);
             }

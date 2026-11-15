@@ -145,7 +145,7 @@ The hardware key signs two things only, each a fixed label then the handshake ha
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
 | `agents` | device | (none) | List what this person may reach |
-| `agents.list` | bridge | `agents`: `[{"agent":"lab/main","runtime":"hermes","capabilities":[…],"abilities":["read","chat"]}]` | The list, filtered to what is shared with the person |
+| `agents.list` | bridge | `agents`: `[{"agent":"lab/main","runtime":"hermes","capabilities":[…],"abilities":["read","chat"]}]` | The list, filtered to what is shared with the person. Also sent unasked, with what follows an answer to `agents`, whenever the agents the bridge serves change while it runs: an agent given or losing its app channel, or its token changed; the device replaces its list with it |
 | `agent.name.get` | device | `agent` | Fetch an agent's shared display name; see [Agent display names](#agent-display-names) |
 | `agent.name.set` | device | `agent`, `revision`, required nullable `display_name` | Set or clear its shared display name |
 | `agent.name` | bridge | `agent`, `revision`, `display_name`, `of` | Canonical shared-name metadata, correlated or broadcast |
