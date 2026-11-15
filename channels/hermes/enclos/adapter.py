@@ -724,13 +724,22 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
     `post_auxiliary_call` (a title, a summary of a long context: background).
     A call outside such a turn, as a background call made off the turn's
     thread may be, has no conversation, and is not sent: `enclos usage`
-    still counts it, from Hermes's records."""
+    still counts it, from Hermes's records. A failed call carries no usage.
+
+    It never fails the turn: what goes wrong is logged, as a warning the
+    first time, so that a Hermes whose hooks changed says so once."""
+    if not _USAGE_HOOKS:
+        return None
     try:
         from gateway.session_context import get_session_env
         if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
             return None
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        if not chat_id or not isinstance(usage, dict) or not _ADAPTERS:
+        if not chat_id or usage is None or not _ADAPTERS:
+            return None
+        if not isinstance(usage, dict):
+            _warn_once("usage", "[enclos] Hermes passed a model call's usage as %s, not a dict: "
+                       "the app gets no usage", type(usage).__name__)
             return None
         # Hermes's normalized buckets (`agent/usage_pricing.CanonicalUsage`).
         tokens = {name: usage.get(name + "_tokens") for name in protocol.USAGE_TOKENS}
@@ -742,22 +751,48 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
             if getattr(adapter, "_bridge_usage", False):
                 adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
     except Exception:
-        logger.debug("[enclos] A model call's usage was not passed on", exc_info=True)
+        _warn_once("failed", "[enclos] A model call's usage was not passed on", exc_info=True)
     return None
 
 
-# Whether this Hermes took the usage hooks: an older one may not know them.
+_WARNED: set = set()
+
+
+def _warn_once(key: str, message: str, *args: Any, exc_info: bool = False) -> None:
+    """Warns the first time, then logs at debug: a hook runs at every call."""
+    if key in _WARNED:
+        logger.debug(message, *args, exc_info=exc_info)
+    else:
+        _WARNED.add(key)
+        logger.warning(message, *args, exc_info=exc_info)
+
+
+# Whether this Hermes calls the plugin with the agent's model calls
+# (`post_api_request`), so that its `hello` names `usage`.
 _USAGE_HOOKS = False
 
 
 def _register_usage_hooks(ctx) -> None:
+    """Registers each hook this Hermes has. Hermes takes a hook name it does
+    not know with only a warning (`track_hook`), so its list is read first:
+    a Hermes without `post_api_request` registers nothing, and its plugin
+    does not name `usage`."""
     global _USAGE_HOOKS
     try:
-        ctx.register_hook("post_api_request", lambda **kwargs: _usage(False, **kwargs))
-        ctx.register_hook("post_auxiliary_call", lambda **kwargs: _usage(True, **kwargs))
-        _USAGE_HOOKS = True
+        from hermes_cli.plugins import VALID_HOOKS
     except Exception:
+        logger.info("[enclos] This Hermes does not list its hooks: the app gets no usage")
+        return
+    if "post_api_request" not in VALID_HOOKS:
         logger.info("[enclos] This Hermes has no model call hooks: the app gets no usage")
+        return
+    try:
+        ctx.register_hook("post_api_request", lambda **kwargs: _usage(False, **kwargs))
+        _USAGE_HOOKS = True
+        if "post_auxiliary_call" in VALID_HOOKS:
+            ctx.register_hook("post_auxiliary_call", lambda **kwargs: _usage(True, **kwargs))
+    except Exception:
+        logger.warning("[enclos] The model call hooks could not be registered", exc_info=True)
 
 
 def _env_enablement() -> dict | None:

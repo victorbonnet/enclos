@@ -237,17 +237,24 @@ fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {
     })
 }
 
-/// One usage bucket's counts, read from columns `at` on of `row`.
+/// One usage bucket's counts, read from columns `at` on of `row`. A
+/// negative one, which the table's checks refuse, is an error, never 0.
 fn usage_row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<UsageTotal> {
-    let count = |n: Option<i64>| n.map(|n| u64::try_from(n).unwrap_or(0));
+    let count = |i: usize| -> rusqlite::Result<Option<u64>> {
+        row.get::<_, Option<i64>>(at + i)?
+            .map(|n| {
+                u64::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(at + i, n))
+            })
+            .transpose()
+    };
     Ok(UsageTotal {
-        calls: count(Some(row.get(at)?)).unwrap_or(0),
+        calls: count(0)?.unwrap_or(0),
         tokens: UsageTokens {
-            input: count(row.get(at + 1)?),
-            output: count(row.get(at + 2)?),
-            cache_read: count(row.get(at + 3)?),
-            cache_write: count(row.get(at + 4)?),
-            reasoning: count(row.get(at + 5)?),
+            input: count(1)?,
+            output: count(2)?,
+            cache_read: count(3)?,
+            cache_write: count(4)?,
+            reasoning: count(5)?,
         },
     })
 }

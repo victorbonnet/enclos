@@ -319,12 +319,14 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
 
         async def next_usage(reader):
             while True:
-                try:
-                    message = json.loads(await asyncio.wait_for(reader.readline(), 0.5))
-                except asyncio.TimeoutError:
-                    return None
+                message = json.loads(await asyncio.wait_for(reader.readline(), 5))
                 if message["type"] == "usage":
                     return message
+
+        def marker():
+            # Sent last: if it comes next, nothing was sent before it.
+            env.update({"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "marker"})
+            module._usage(False, usage={"input_tokens": 1}, model="m")
 
         with patch.dict(sys.modules, {"gateway.session_context": session}), \
                 patch.object(module, "_USAGE_HOOKS", True):
@@ -339,21 +341,71 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message["model"], "gpt-6.1-sol")
             self.assertEqual(message["tokens"], {"input": 2104, "output": 96, "cache_read": 31744})
             self.assertNotIn("background", message)
-            # Another platform's turn is not an app conversation's.
+            # Another platform's turn is not an app conversation's, and a
+            # failed call carries no usage.
             env["HERMES_SESSION_PLATFORM"] = "telegram"
             module._usage(True, usage=call, model="m")
-            self.assertIsNone(await next_usage(reader))
+            env["HERMES_SESSION_PLATFORM"] = "enclos"
+            module._usage(True, usage=None, model="m")
+            marker()
+            self.assertEqual((await next_usage(reader))["conversation"], "marker")
             writer.close()
+            # The bridge gone, the next one must say again that it takes usage.
+            for _ in range(50):
+                if not self.adapter._bridge_usage:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertFalse(self.adapter._bridge_usage)
 
             # A bridge that does not name `usage` gets none.
-            env["HERMES_SESSION_PLATFORM"] = "enclos"
             reader, writer = await self.bridge()
             writer.write(line("hello", token=TOKEN))
             await writer.drain()
             await asyncio.wait_for(reader.readline(), 5)
             module._usage(False, usage=call, model="m")
-            self.assertIsNone(await next_usage(reader))
+            self.adapter._bridge_usage = True
+            marker()
+            self.assertEqual((await next_usage(reader))["conversation"], "marker")
             writer.close()
+
+    async def test_usage_is_not_sent_by_a_plugin_whose_hermes_lacks_the_hooks(self):
+        module = sys.modules[type(self.adapter).__module__]
+        with patch.object(module, "_USAGE_HOOKS", False), patch.object(module, "_ADAPTERS", {self.adapter}):
+            self.adapter._bridge_usage = True
+            with patch.object(self.adapter, "_write") as write:
+                module._usage(False, usage={"input_tokens": 1}, model="m")
+                write.assert_not_called()
+
+
+class UsageHooks(unittest.TestCase):
+    """Which hooks the plugin registers, by the hooks Hermes lists."""
+
+    def register(self, hooks):
+        module = sys.modules["enclos.adapter"]
+        recorded = []
+        ctx = types.SimpleNamespace(register_hook=lambda name, callback: recorded.append(name))
+        listing = {}
+        if hooks is not None:
+            plugins = types.ModuleType("hermes_cli.plugins")
+            plugins.VALID_HOOKS = set(hooks)
+            listing = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.plugins": plugins}
+        with patch.dict(sys.modules, listing), patch.object(module, "_USAGE_HOOKS", False):
+            if hooks is None:
+                sys.modules["hermes_cli"] = None
+            module._register_usage_hooks(ctx)
+            return recorded, module._USAGE_HOOKS
+
+    def test_both_hooks_where_hermes_has_both(self):
+        self.assertEqual(self.register({"post_api_request", "post_auxiliary_call", "pre_tool_call"}),
+                         (["post_api_request", "post_auxiliary_call"], True))
+
+    def test_the_agents_calls_alone_where_hermes_has_no_background_hook(self):
+        self.assertEqual(self.register({"post_api_request"}), (["post_api_request"], True))
+
+    def test_none_and_no_usage_where_hermes_lacks_the_hook_or_lists_none(self):
+        # Hermes would take an unknown name with a warning: it is not tried.
+        self.assertEqual(self.register({"post_auxiliary_call"}), ([], False))
+        self.assertEqual(self.register(None), ([], False))
 
 
 if __name__ == "__main__":

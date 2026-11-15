@@ -14,33 +14,53 @@ pub const BURST: f64 = 120.0;
 /// How many more it may have stored each minute, past the burst.
 pub const PER_MINUTE: f64 = 60.0;
 
+/// The usage reports (`usage`) an agent's plugin may send at once, and
+/// each minute past that: one per model call, so far more than messages;
+/// still bounded, so a plugin in a loop fills neither the database nor
+/// the devices' queues.
+pub const USAGE_BURST: f64 = 1_000.0;
+pub const USAGE_PER_MINUTE: f64 = 600.0;
+
 /// One agent's room for messages: a token bucket of [`BURST`], filled at
-/// [`PER_MINUTE`].
+/// [`PER_MINUTE`]; or another of its own size.
 #[derive(Debug, Clone)]
 pub struct Pace {
     room: f64,
     at: Instant,
+    burst: f64,
+    per_minute: f64,
 }
 
 impl Pace {
     pub fn new(now: Instant) -> Pace {
+        Pace::of(now, BURST, PER_MINUTE)
+    }
+
+    /// The bucket for an agent's usage reports.
+    pub fn usage(now: Instant) -> Pace {
+        Pace::of(now, USAGE_BURST, USAGE_PER_MINUTE)
+    }
+
+    fn of(now: Instant, burst: f64, per_minute: f64) -> Pace {
         Pace {
-            room: BURST,
+            room: burst,
             at: now,
+            burst,
+            per_minute,
         }
     }
 
     /// Takes room for one message at `now`; else how long until there is.
     pub fn take(&mut self, now: Instant) -> Result<(), Duration> {
         let since = now.saturating_duration_since(self.at).as_secs_f64();
-        self.room = (self.room + since * PER_MINUTE / 60.0).min(BURST);
+        self.room = (self.room + since * self.per_minute / 60.0).min(self.burst);
         self.at = now;
         if self.room >= 1.0 {
             self.room -= 1.0;
             Ok(())
         } else {
             Err(Duration::from_secs_f64(
-                (1.0 - self.room) * 60.0 / PER_MINUTE,
+                (1.0 - self.room) * 60.0 / self.per_minute,
             ))
         }
     }
@@ -49,6 +69,17 @@ impl Pace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_reports_have_a_bucket_of_their_own_size() {
+        let start = Instant::now();
+        let mut pace = Pace::usage(start);
+        for _ in 0..1_000 {
+            assert_eq!(pace.take(start), Ok(()));
+        }
+        // then 600 a minute: one every 100 ms
+        assert_eq!(pace.take(start).unwrap_err(), Duration::from_millis(100));
+    }
 
     #[test]
     fn a_burst_is_stored_then_one_message_at_the_pace() {

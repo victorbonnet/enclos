@@ -127,6 +127,8 @@ fn native(hub: &Arc<Hub>, capabilities: Vec<Capability>) -> Native {
         assert_eq!(token, "secret");
         assert!(bridge_caps.contains(&Capability::Questions));
         assert!(bridge_caps.contains(&Capability::RuntimeApprovals));
+        // Without it, a plugin sends no usage (docs/protocol.md, Usage).
+        assert!(bridge_caps.contains(&Capability::Usage));
         stream
             .write_all(&encode_line(&Envelope::new(
                 MessageId::new("hello").unwrap(),
@@ -185,6 +187,51 @@ fn ask_with(
     assert!(
         matches!(next(rx), ToDevice::Message(message) if message.question.as_ref() == Some(&definition.id) && message.kind == if definition.approval.is_some() { "runtime_approval" } else { "question" })
     );
+}
+
+fn usage(conversation: &str, input: u64) -> FromPlugin {
+    FromPlugin::Usage(enclos_protocol::usage::CallUsage {
+        conversation: ConversationId::new(conversation).unwrap(),
+        model: Some("gpt".into()),
+        background: false,
+        calls: 1,
+        tokens: enclos_protocol::usage::UsageTokens {
+            input: Some(input),
+            ..Default::default()
+        },
+    })
+}
+
+#[test]
+fn usage_from_a_plugin_reaches_its_conversations_owner_alone_and_counts_for_a_group_member() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let (_guest, guest) = phone(&hub, &store, "guest-phone", "guest@example.com");
+    let mut native = native(&hub, vec![Capability::Usage]);
+    native.send("u1", usage("owned", 10));
+    let ToDevice::Usage(update) = next(&rx) else {
+        panic!("usage")
+    };
+    assert_eq!(update.call.conversation.as_str(), "owned");
+    assert_eq!(update.total.tokens.input, Some(10));
+    // The agent's conversation of another person goes to that person.
+    native.send("u2", usage("foreign", 5));
+    assert!(
+        matches!(next(&guest), ToDevice::Usage(u) if u.call.conversation.as_str() == "foreign")
+    );
+    // Another agent's conversation takes nothing from this one's plugin,
+    // and a group counts its member's calls under the member: what reaches
+    // the owner next is the group's.
+    native.send("u3", usage("other-agent", 99));
+    native.send("u4", usage("group", 7));
+    assert!(
+        matches!(next(&rx), ToDevice::Usage(u) if u.call.conversation.as_str() == "group" && u.total.tokens.input == Some(7))
+    );
+    assert_eq!(store.usage("other-agent").unwrap(), None);
+    let window = store.usage_since(OWNER, 0).unwrap();
+    assert_eq!(window.len(), 1, "{window:?}");
+    assert_eq!(window[0].0, "lab/coder");
+    assert_eq!(window[0].1.tokens.input, Some(17));
+    assert!(rx.try_recv().is_err() && guest.try_recv().is_err());
 }
 
 #[test]
