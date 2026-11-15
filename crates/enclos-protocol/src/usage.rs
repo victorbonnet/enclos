@@ -102,6 +102,28 @@ pub struct CallUsage {
     pub tokens: UsageTokens,
 }
 
+/// The most characters of a call's source passed on.
+pub const MAX_SOURCE_CHARS: usize = 32;
+
+/// A plugin's report of model calls of its agent outside any app
+/// conversation: a routine's run, a talk in the sandbox, another channel's
+/// chat. Plugin leg `usage.agent`, only to a bridge whose `hello` names
+/// [`crate::plugin::Capability::AgentUsage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCallUsage {
+    /// Where the call came from, in the runtime's words (Hermes: `cron`,
+    /// `cli`, `telegram`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub calls: u32,
+    pub tokens: UsageTokens,
+}
+
 /// What a conversation used, as the bridge summed its plugins' reports
 /// since it started keeping them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +142,37 @@ pub struct AgentUsage {
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub total: UsageTotal,
+}
+
+/// The bucket sizes a device may ask a series in: an hour, or a day.
+pub const BUCKETS: [u32; 2] = [3_600, 86_400];
+/// The most agents a `usage.report` with series lists totals of: the
+/// heaviest, so that they and the series fit one device message.
+pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 60;
+/// The most agents a `usage.report` gives a series of: the heaviest.
+pub const MAX_SERIES: usize = 8;
+/// The most buckets in one series: the latest.
+pub const MAX_POINTS: usize = 62;
+/// The furthest a device's offset from UTC may be, in seconds.
+pub const MAX_OFFSET: i32 = 14 * 3_600;
+
+/// What an agent used in one bucket of a series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsagePoint {
+    /// The bucket's start, Unix seconds.
+    pub at: u64,
+    pub calls: u64,
+    /// Every token sent or received ([`UsageTokens::total`]).
+    pub tokens: u64,
+}
+
+/// One agent's usage over time, in a `usage.report`: its buckets that saw
+/// a call, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSeries {
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    pub points: Vec<UsagePoint>,
 }
 
 /// The device leg's `usage`: a call, and the conversation's new total.

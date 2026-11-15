@@ -384,6 +384,22 @@ def usage(conversation: str, tokens: dict[str, Any], model: str | None = None,
     return _message("usage", **fields)
 
 
+MAX_SOURCE_CHARS = 32
+
+
+def agent_usage(tokens: dict[str, Any], model: str | None = None, background: bool = False,
+                source: str | None = None) -> dict[str, Any]:
+    """What a model call of the agent outside any app conversation used (a
+    routine's run, a talk in the sandbox, another channel's chat): `source`
+    says where it came from, in Hermes's words (`cron`, `cli`, `telegram`)."""
+    message = usage("", tokens, model=model, background=background)
+    del message["conversation"]
+    message["type"] = "usage.agent"
+    if source:
+        message["source"] = " ".join(str(source).split())[:MAX_SOURCE_CHARS]
+    return message
+
+
 def runtime_title(text: str) -> str:
     """A Hermes session title as the app should show it: without the ` #2`
     Hermes adds to keep its titles unique, which says nothing to the person."""

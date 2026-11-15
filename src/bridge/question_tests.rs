@@ -129,6 +129,7 @@ fn native(hub: &Arc<Hub>, capabilities: Vec<Capability>) -> Native {
         assert!(bridge_caps.contains(&Capability::RuntimeApprovals));
         // Without it, a plugin sends no usage (docs/protocol.md, Usage).
         assert!(bridge_caps.contains(&Capability::Usage));
+        assert!(bridge_caps.contains(&Capability::AgentUsage));
         stream
             .write_all(&encode_line(&Envelope::new(
                 MessageId::new("hello").unwrap(),
@@ -227,11 +228,41 @@ fn usage_from_a_plugin_reaches_its_conversations_owner_alone_and_counts_for_a_gr
         matches!(next(&rx), ToDevice::Usage(u) if u.call.conversation.as_str() == "group" && u.total.tokens.input == Some(7))
     );
     assert_eq!(store.usage("other-agent").unwrap(), None);
-    let window = store.usage_since(OWNER, 0).unwrap();
+    let window = store.usage_since(OWNER, 0, false).unwrap();
     assert_eq!(window.len(), 1, "{window:?}");
     assert_eq!(window[0].0, "lab/coder");
     assert_eq!(window[0].1.tokens.input, Some(17));
     assert!(rx.try_recv().is_err() && guest.try_recv().is_err());
+}
+
+#[test]
+fn an_agents_calls_outside_the_app_count_under_it_for_the_hosts_person() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::Usage, Capability::AgentUsage]);
+    native.send(
+        "a1",
+        FromPlugin::AgentUsage(enclos_protocol::usage::AgentCallUsage {
+            source: Some("cron".into()),
+            model: None,
+            background: false,
+            calls: 3,
+            tokens: enclos_protocol::usage::UsageTokens {
+                input: Some(1_000),
+                ..Default::default()
+            },
+        }),
+    );
+    // Read in order: once the next report reached the owner, this one is in.
+    native.send("u1", usage("owned", 10));
+    assert!(matches!(next(&rx), ToDevice::Usage(_)));
+    let host = store.usage_since(OWNER, 0, true).unwrap();
+    assert_eq!(host.len(), 1, "{host:?}");
+    assert_eq!(host[0].0, AGENT);
+    assert_eq!(host[0].1.calls, 4);
+    assert_eq!(host[0].1.tokens.input, Some(1_010));
+    // Without them, the conversations' alone.
+    let own = store.usage_since(OWNER, 0, false).unwrap();
+    assert_eq!(own[0].1.tokens.input, Some(10));
 }
 
 #[test]

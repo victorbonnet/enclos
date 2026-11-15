@@ -126,6 +126,10 @@ class ToTheBridge(unittest.TestCase):
             protocol.usage("c-42", {"input": 2104, "output": 96, "cache_read": 31744,
                                     "cache_write": 0, "reasoning": 32}, model="gpt-6.1-sol"),
             "from_plugin_usage.json")
+        self.assert_like_fixture(
+            protocol.agent_usage({"input": 5120, "output": 240, "cache_read": 0}, model="gpt-6.1-sol",
+                                 source="cron"),
+            "from_plugin_usage_agent.json")
 
     def test_hermes_uniqueness_suffix_is_dropped(self):
         self.assertEqual(protocol.runtime_title("Paris weather #2"), "Paris weather")

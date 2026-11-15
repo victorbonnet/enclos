@@ -113,6 +113,7 @@ fn connect_within(
             Capability::Activity,
             Capability::Tasks,
             Capability::Usage,
+            Capability::AgentUsage,
         ],
         home: ConversationId::new(home).ok(),
     })?;

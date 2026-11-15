@@ -85,7 +85,18 @@ pub enum FromDevice {
     /// (Unix seconds), from the hour that holds it: answered `usage.report`,
     /// by a bridge whose `authenticated` names [`USAGE`].
     #[serde(rename = "usage.get")]
-    UsageGet { since: u64 },
+    UsageGet {
+        since: u64,
+        /// A series per agent, in buckets of this many seconds (one of
+        /// [`crate::usage::BUCKETS`]), from a bridge that names
+        /// [`USAGE_SERIES`]; none without.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bucket: Option<u32>,
+        /// The device's offset from UTC in seconds, so that days start at
+        /// its midnight.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<i32>,
+    },
     #[serde(rename = "agents")]
     Agents,
     /// Asks which of the person's agents the host confirmed removed: the
@@ -175,6 +186,9 @@ pub enum FromDevice {
 pub const APPROVAL_CLOSE: &str = "approval.close";
 /// The host capability that says the bridge answers `usage.get`.
 pub const USAGE: &str = "usage";
+/// The host capability that says it answers with series over time
+/// (`usage.get`'s `bucket`).
+pub const USAGE_SERIES: &str = "usage.series";
 
 /// The host feature of forgetting a removed agent (ADR 0067, proposed):
 /// the message type a device sends to forget one, advertised in
@@ -272,6 +286,16 @@ pub enum ToDevice {
         of: MessageId,
         since: u64,
         agents: Vec<crate::usage::AgentUsage>,
+        /// Whether it counts the agents' calls outside app conversations
+        /// too (routines, talks in the sandbox): for the host's person.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        outside: bool,
+        /// The bucket asked for, and a series for each of the
+        /// [`crate::usage::MAX_SERIES`] agents that used the most.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bucket: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        series: Vec<crate::usage::UsageSeries>,
     },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
@@ -1205,12 +1229,17 @@ mod usage_tests {
         assert_eq!(
             ask.body,
             FromDevice::UsageGet {
-                since: 1_800_000_000
+                since: 1_800_000_000,
+                bucket: None,
+                offset: None,
             }
         );
         let report = ToDevice::UsageReport {
             of: MessageId::new("u1").unwrap(),
             since: 1_799_996_400,
+            outside: false,
+            bucket: None,
+            series: Vec::new(),
             agents: vec![AgentUsage {
                 agent: "lab/main".into(),
                 total: UsageTotal {
@@ -1229,11 +1258,55 @@ mod usage_tests {
     }
 
     #[test]
+    fn a_usage_window_may_ask_for_series_and_an_older_request_still_reads() {
+        let ask = decode_from_device(
+            br#"{"v":1,"id":"u1","type":"usage.get","since":0,"bucket":86400,"offset":-32400}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ask.body,
+            FromDevice::UsageGet {
+                since: 0,
+                bucket: Some(86_400),
+                offset: Some(-32_400)
+            }
+        );
+        let report = ToDevice::UsageReport {
+            of: MessageId::new("u1").unwrap(),
+            since: 0,
+            agents: Vec::new(),
+            outside: true,
+            bucket: Some(86_400),
+            series: vec![crate::usage::UsageSeries {
+                agent: "lab/main".into(),
+                points: vec![crate::usage::UsagePoint {
+                    at: 1_799_971_200,
+                    calls: 3,
+                    tokens: 1_234,
+                }],
+            }],
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report.clone()));
+        assert_eq!(decode_to_device(&wire).unwrap().body, report);
+        // A report of an older bridge has none of them.
+        let old = decode_to_device(
+            br#"{"v":1,"id":"r","type":"usage.report","of":"u1","since":0,"agents":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(old.body, ToDevice::UsageReport { outside: false, bucket: None, series, .. } if series.is_empty())
+        );
+    }
+
+    #[test]
     fn the_largest_usage_report_fits_one_device_message() {
         let big = Some(MAX_CALL_TOKENS * 1_000_000);
         let report = ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
+            outside: true,
+            bucket: None,
+            series: Vec::new(),
             agents: (0..MAX_REPORT_AGENTS)
                 .map(|i| AgentUsage {
                     // A sandbox and an agent name at their longest.
@@ -1248,6 +1321,51 @@ mod usage_tests {
                             reasoning: big,
                         },
                     },
+                })
+                .collect(),
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
+        assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
+    }
+
+    #[test]
+    fn the_largest_usage_report_with_series_fits_one_device_message() {
+        use crate::usage::{
+            MAX_POINTS, MAX_REPORT_AGENTS_WITH_SERIES, MAX_SERIES, UsagePoint, UsageSeries,
+        };
+        let big = Some(MAX_CALL_TOKENS * 1_000_000);
+        let name = |i: usize| format!("{:a<40}/{:b<64}", i, i);
+        let report = ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            agents: (0..MAX_REPORT_AGENTS_WITH_SERIES)
+                .map(|i| AgentUsage {
+                    agent: name(i),
+                    total: UsageTotal {
+                        calls: u64::MAX,
+                        tokens: UsageTokens {
+                            input: big,
+                            output: big,
+                            cache_read: big,
+                            cache_write: big,
+                            reasoning: big,
+                        },
+                    },
+                })
+                .collect(),
+            outside: true,
+            bucket: Some(86_400),
+            series: (0..MAX_SERIES)
+                .map(|i| UsageSeries {
+                    agent: name(i),
+                    points: vec![
+                        UsagePoint {
+                            at: u64::MAX,
+                            calls: u64::MAX,
+                            tokens: u64::MAX,
+                        };
+                        MAX_POINTS
+                    ],
                 })
                 .collect(),
         };

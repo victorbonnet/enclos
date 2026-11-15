@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use enclos_protocol::usage::{UsageTokens, UsageTotal};
+use enclos_protocol::usage::{
+    MAX_POINTS, MAX_SERIES, UsagePoint, UsageSeries, UsageTokens, UsageTotal,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[path = "deletion_store.rs"]
@@ -483,6 +485,18 @@ CREATE TABLE IF NOT EXISTS usage_hours (
     cache_write INTEGER CHECK(cache_write >= 0),
     reasoning INTEGER CHECK(reasoning >= 0),
     PRIMARY KEY (conversation, agent, hour)
+);
+CREATE TABLE IF NOT EXISTS agent_usage_hours (
+    agent TEXT NOT NULL,
+    source TEXT NOT NULL,
+    hour INTEGER NOT NULL CHECK(hour >= 0),
+    calls INTEGER NOT NULL CHECK(calls >= 0),
+    input INTEGER CHECK(input >= 0),
+    output INTEGER CHECK(output >= 0),
+    cache_read INTEGER CHECK(cache_read >= 0),
+    cache_write INTEGER CHECK(cache_write >= 0),
+    reasoning INTEGER CHECK(reasoning >= 0),
+    PRIMARY KEY (agent, source, hour)
 );
 CREATE TABLE IF NOT EXISTS log (
     at INTEGER NOT NULL,
@@ -1328,34 +1342,169 @@ impl Store {
         usage_in(&self.db, conversation)
     }
 
-    /// What each agent used in `owner`'s conversations from the hour that
-    /// holds `since` (Unix seconds) on, as `(<sandbox>/<agent>, total)`,
-    /// sorted by agent: the bridge keeps usage by the hour, so a window
-    /// starts on the hour.
+    /// Adds `agent`'s (`<sandbox>/<agent>`) report of `calls` model calls
+    /// outside any app conversation, from `source`, at `at` (Unix seconds),
+    /// to that hour's usage: in one write, bounded and saturating as
+    /// [`Store::add_usage`].
+    pub fn add_agent_usage(
+        &self,
+        agent: &str,
+        source: &str,
+        at: i64,
+        calls: u32,
+        tokens: UsageTokens,
+    ) -> rusqlite::Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let hour = at.max(0) / 3600;
+        let before = tx
+            .query_row(
+                "SELECT calls, input, output, cache_read, cache_write, reasoning
+                 FROM agent_usage_hours WHERE agent = ?1 AND source = ?2 AND hour = ?3",
+                params![agent, source, hour],
+                |row| usage_row(row, 0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let bucket = plus(
+            before,
+            UsageTotal {
+                calls: u64::from(calls),
+                tokens: tokens.bounded(),
+            },
+        );
+        let stored = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let t = bucket.tokens;
+        tx.execute(
+            "INSERT INTO agent_usage_hours
+                 (agent, source, hour, calls, input, output, cache_read, cache_write, reasoning)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(agent, source, hour) DO UPDATE SET calls = excluded.calls,
+                 input = excluded.input, output = excluded.output,
+                 cache_read = excluded.cache_read, cache_write = excluded.cache_write,
+                 reasoning = excluded.reasoning",
+            params![
+                agent,
+                source,
+                hour,
+                stored(Some(bucket.calls)),
+                stored(t.input),
+                stored(t.output),
+                stored(t.cache_read),
+                stored(t.cache_write),
+                stored(t.reasoning)
+            ],
+        )?;
+        tx.commit()
+    }
+
+    /// Every hour of usage from the hour that holds `since` (Unix seconds)
+    /// on, as `(<sandbox>/<agent>, hour, counts)`: in `owner`'s
+    /// conversations, and, with `outside`, the agents' calls outside any
+    /// app conversation, which only the host's person sees.
+    fn usage_hours(
+        &self,
+        owner: &str,
+        since: i64,
+        outside: bool,
+    ) -> rusqlite::Result<Vec<(String, i64, UsageTotal)>> {
+        let from = since.max(0) / 3600;
+        let mut query = self.db.prepare(
+            "SELECT c.sandbox || '/' || u.agent, u.hour, u.calls, u.input, u.output,
+                    u.cache_read, u.cache_write, u.reasoning
+             FROM usage_hours u JOIN conversations c ON c.id = u.conversation
+             WHERE c.owner = ?1 AND u.hour >= ?2",
+        )?;
+        let mut hours = query
+            .query_map(params![owner, from], |row| {
+                Ok((row.get(0)?, row.get(1)?, usage_row(row, 2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if outside {
+            let mut query = self.db.prepare(
+                "SELECT agent, hour, calls, input, output, cache_read, cache_write, reasoning
+                 FROM agent_usage_hours WHERE hour >= ?1",
+            )?;
+            let rows = query.query_map(params![from], |row| {
+                Ok((row.get(0)?, row.get(1)?, usage_row(row, 2)?))
+            })?;
+            for row in rows {
+                hours.push(row?);
+            }
+        }
+        Ok(hours)
+    }
+
+    /// What each agent used from the hour that holds `since` (Unix
+    /// seconds) on, as `(<sandbox>/<agent>, total)`, sorted by agent: in
+    /// `owner`'s conversations, and with `outside` its calls outside them
+    /// too. The bridge keeps usage by the hour, so a window starts on the
+    /// hour.
     pub fn usage_since(
         &self,
         owner: &str,
         since: i64,
+        outside: bool,
     ) -> rusqlite::Result<Vec<(String, UsageTotal)>> {
-        let mut query = self.db.prepare(
-            "SELECT c.sandbox, u.agent, u.calls, u.input, u.output, u.cache_read,
-                    u.cache_write, u.reasoning
-             FROM usage_hours u JOIN conversations c ON c.id = u.conversation
-             WHERE c.owner = ?1 AND u.hour >= ?2",
-        )?;
-        let rows = query.query_map(params![owner, since.max(0) / 3600], |row| {
-            Ok((
-                format!("{}/{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                usage_row(row, 2)?,
-            ))
-        })?;
         let mut by_agent = std::collections::BTreeMap::<String, UsageTotal>::new();
-        for row in rows {
-            let (agent, bucket) = row?;
+        for (agent, _, bucket) in self.usage_hours(owner, since, outside)? {
             let sum = by_agent.entry(agent).or_default();
             *sum = plus(*sum, bucket);
         }
         Ok(by_agent.into_iter().collect())
+    }
+
+    /// The same usage over time: for each of the [`MAX_SERIES`] agents
+    /// that used the most tokens, its buckets of `bucket` seconds that saw
+    /// a call, the latest [`MAX_POINTS`], oldest first. A bucket starts at
+    /// a multiple of `bucket` in the device's time, `offset` seconds from
+    /// UTC: a day at its midnight.
+    pub fn usage_series(
+        &self,
+        owner: &str,
+        since: i64,
+        outside: bool,
+        bucket: u32,
+        offset: i32,
+    ) -> rusqlite::Result<Vec<UsageSeries>> {
+        let bucket = i64::from(bucket.max(1));
+        let offset = i64::from(offset);
+        let mut by_agent =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<i64, UsageTotal>>::new(
+            );
+        for (agent, hour, counts) in self.usage_hours(owner, since, outside)? {
+            let at = (hour.saturating_mul(3600) + offset).div_euclid(bucket) * bucket - offset;
+            let sum = by_agent.entry(agent).or_default().entry(at).or_default();
+            *sum = plus(*sum, counts);
+        }
+        let mut series: Vec<(u64, UsageSeries)> = by_agent
+            .into_iter()
+            .map(|(agent, buckets)| {
+                let total = buckets
+                    .values()
+                    .fold(0u64, |a, b| a.saturating_add(b.tokens.total()));
+                let mut points: Vec<UsagePoint> = buckets
+                    .into_iter()
+                    .map(|(at, b)| UsagePoint {
+                        at: u64::try_from(at).unwrap_or(0),
+                        calls: b.calls,
+                        tokens: b.tokens.total(),
+                    })
+                    .collect();
+                let cut = points.len().saturating_sub(MAX_POINTS);
+                points.drain(..cut);
+                (total, UsageSeries { agent, points })
+            })
+            .collect();
+        // The heaviest first, then by name, so ties read the same each time.
+        series.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.agent.cmp(&b.1.agent)));
+        Ok(series
+            .into_iter()
+            .take(MAX_SERIES)
+            .map(|(_, s)| s)
+            .collect())
     }
 
     /// A known conversation, with its name.

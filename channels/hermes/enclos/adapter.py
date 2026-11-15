@@ -80,6 +80,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._bridge: Optional[asyncio.StreamWriter] = None
         # Whether the connected bridge takes `usage` (its hello says so).
         self._bridge_usage = False
+        self._bridge_agent_usage = False
         self._lock = asyncio.Lock()
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
@@ -150,6 +151,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._bridge.close()
             self._bridge = None
             self._bridge_usage = False
+            self._bridge_agent_usage = False
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -187,11 +189,12 @@ class EnclosAdapter(BasePlatformAdapter):
         self._reporter.bridge = frozenset(hello.get("capabilities", []))
         # An older bridge would answer each `usage` as an unknown type.
         self._bridge_usage = "usage" in hello.get("capabilities", [])
+        self._bridge_agent_usage = "agent_usage" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
             if _USAGE_HOOKS:
-                capabilities.append("usage")
+                capabilities.extend(["usage", "agent_usage"])
             if conversations.available(self):
                 capabilities.append("conversation_delete")
             if self._routines.available:
@@ -246,6 +249,7 @@ class EnclosAdapter(BasePlatformAdapter):
             if self._bridge is writer:
                 self._bridge = None
                 self._bridge_usage = False
+                self._bridge_agent_usage = False
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -748,7 +752,7 @@ def _board_changed(**_: Any) -> None:
     return None
 
 
-def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> None:
+def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any = None, **_: Any) -> None:
     """Passes on what a model call of a turn in an app conversation used,
     from Hermes's `post_api_request` (the agent's own calls) or
     `post_auxiliary_call` (a title, a summary of a long context: background).
@@ -762,10 +766,7 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
         return None
     try:
         from gateway.session_context import get_session_env
-        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
-            return None
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        if not chat_id or usage is None or not _ADAPTERS:
+        if usage is None or not _ADAPTERS:
             return None
         if not isinstance(usage, dict):
             _warn_once("usage", "[enclos] Hermes passed a model call's usage as %s, not a dict: "
@@ -773,16 +774,38 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
             return None
         # Hermes's normalized buckets (`agent/usage_pricing.CanonicalUsage`).
         tokens = {name: usage.get(name + "_tokens") for name in protocol.USAGE_TOKENS}
-        message = protocol.usage(chat_id, tokens, model=model if isinstance(model, str) else None,
-                                 background=background)
-        # Every connected adapter whose bridge takes them: the bridge keeps
-        # usage only for a conversation of its connection's agent.
+        model = model if isinstance(model, str) else None
+        platform = get_session_env("HERMES_SESSION_PLATFORM") or platform
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        if platform == PLATFORM and chat_id:
+            message = protocol.usage(chat_id, tokens, model=model, background=background)
+            # Every connected adapter whose bridge takes them: the bridge
+            # keeps usage only for a conversation of its connection's agent.
+            for adapter in list(_ADAPTERS):
+                if getattr(adapter, "_bridge_usage", False):
+                    adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
+            return None
+        # Outside any app conversation: the agent whose home Hermes runs
+        # this call in (one gateway serves every profile), to its own
+        # connection alone, as the bridge counts it under that agent.
+        agent = _current_agent()
+        if agent is None:
+            return None
+        message = protocol.agent_usage(tokens, model=model, background=background,
+                                       source=platform if isinstance(platform, str) else None)
         for adapter in list(_ADAPTERS):
-            if getattr(adapter, "_bridge_usage", False):
+            if adapter._agent == agent and getattr(adapter, "_bridge_agent_usage", False):
                 adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
     except Exception:
         _warn_once("failed", "[enclos] A model call's usage was not passed on", exc_info=True)
     return None
+
+
+def _current_agent() -> Optional[str]:
+    """The agent (Hermes profile) a call runs for: the profile owning the
+    home Hermes has for it, which a gateway serving several sets per turn."""
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    return profile_name_for_home(get_hermes_home())
 
 
 _WARNED: set = set()
