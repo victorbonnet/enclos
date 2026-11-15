@@ -1242,6 +1242,7 @@ mod usage_tests {
             series: Vec::new(),
             agents: vec![AgentUsage {
                 agent: "lab/main".into(),
+                outside: false,
                 total: UsageTotal {
                     calls: 26,
                     tokens: UsageTokens {
@@ -1282,7 +1283,7 @@ mod usage_tests {
                 points: vec![crate::usage::UsagePoint {
                     at: 1_799_971_200,
                     calls: 3,
-                    tokens: 1_234,
+                    tokens: Some(1_234),
                 }],
             }],
         };
@@ -1311,6 +1312,7 @@ mod usage_tests {
                 .map(|i| AgentUsage {
                     // A sandbox and an agent name at their longest.
                     agent: format!("{:a<40}/{:b<64}", i, i),
+                    outside: true,
                     total: UsageTotal {
                         calls: u64::MAX,
                         tokens: UsageTokens {
@@ -1341,6 +1343,7 @@ mod usage_tests {
             agents: (0..MAX_REPORT_AGENTS_WITH_SERIES)
                 .map(|i| AgentUsage {
                     agent: name(i),
+                    outside: true,
                     total: UsageTotal {
                         calls: u64::MAX,
                         tokens: UsageTokens {
@@ -1362,7 +1365,7 @@ mod usage_tests {
                         UsagePoint {
                             at: u64::MAX,
                             calls: u64::MAX,
-                            tokens: u64::MAX,
+                            tokens: Some(u64::MAX),
                         };
                         MAX_POINTS
                     ],

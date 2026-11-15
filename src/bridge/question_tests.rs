@@ -239,6 +239,8 @@ fn usage_from_a_plugin_reaches_its_conversations_owner_alone_and_counts_for_a_gr
 fn an_agents_calls_outside_the_app_count_under_it_for_the_hosts_person() {
     let (_dir, hub, store, _device, rx) = fixture();
     let mut native = native(&hub, vec![Capability::Usage, Capability::AgentUsage]);
+    // Its hello said it reports them: the bridge keeps that.
+    assert_eq!(store.outside_reporters().unwrap(), [AGENT]);
     native.send(
         "a1",
         FromPlugin::AgentUsage(enclos_protocol::usage::AgentCallUsage {

@@ -112,7 +112,7 @@ pub const MAX_SOURCE_CHARS: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCallUsage {
     /// Where the call came from, in the runtime's words (Hermes: `cron`,
-    /// `cli`, `telegram`).
+    /// `cli`, `telegram`). The bridge does not keep it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,7 +134,7 @@ pub struct UsageTotal {
 
 /// The most agents one `usage.report` lists: far more than a host runs,
 /// and few enough to fit one device message.
-pub const MAX_REPORT_AGENTS: usize = 200;
+pub const MAX_REPORT_AGENTS: usize = 190;
 
 /// What one agent used over a window, in a `usage.report`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,13 +142,19 @@ pub struct AgentUsage {
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub total: UsageTotal,
+    /// Whether its calls outside app conversations are counted too: in a
+    /// report for the host's person, for an agent whose plugin said it
+    /// reports them (`agent_usage`). Another agent's are not, which a
+    /// device says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
 }
 
 /// The bucket sizes a device may ask a series in: an hour, or a day.
 pub const BUCKETS: [u32; 2] = [3_600, 86_400];
 /// The most agents a `usage.report` with series lists totals of: the
 /// heaviest, so that they and the series fit one device message.
-pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 60;
+pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 50;
 /// The most agents a `usage.report` gives a series of: the heaviest.
 pub const MAX_SERIES: usize = 8;
 /// The most buckets in one series: the latest.
@@ -162,8 +168,10 @@ pub struct UsagePoint {
     /// The bucket's start, Unix seconds.
     pub at: u64,
     pub calls: u64,
-    /// Every token sent or received ([`UsageTokens::total`]).
-    pub tokens: u64,
+    /// Every token sent or received ([`UsageTokens::total`]); none when the
+    /// runtime counted no token, which is not 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
 }
 
 /// One agent's usage over time, in a `usage.report`: its buckets that saw

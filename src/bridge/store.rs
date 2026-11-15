@@ -247,6 +247,14 @@ fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {
     })
 }
 
+/// A window's usage: each agent's total (`<sandbox>/<agent>`, sorted), and
+/// the series of those that used the most.
+pub type UsageWindow = (Vec<(String, UsageTotal)>, Vec<UsageSeries>);
+
+/// How many days the agents' usage outside app conversations is kept: past
+/// the longest window a device asks for (30 days), with a margin.
+pub const AGENT_USAGE_DAYS: i64 = 35;
+
 /// One usage bucket's counts, read from columns `at` on of `row`. A
 /// negative one, which the table's checks refuse, is an error, never 0.
 fn usage_row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<UsageTotal> {
@@ -488,7 +496,6 @@ CREATE TABLE IF NOT EXISTS usage_hours (
 );
 CREATE TABLE IF NOT EXISTS agent_usage_hours (
     agent TEXT NOT NULL,
-    source TEXT NOT NULL,
     hour INTEGER NOT NULL CHECK(hour >= 0),
     calls INTEGER NOT NULL CHECK(calls >= 0),
     input INTEGER CHECK(input >= 0),
@@ -496,8 +503,9 @@ CREATE TABLE IF NOT EXISTS agent_usage_hours (
     cache_read INTEGER CHECK(cache_read >= 0),
     cache_write INTEGER CHECK(cache_write >= 0),
     reasoning INTEGER CHECK(reasoning >= 0),
-    PRIMARY KEY (agent, source, hour)
+    PRIMARY KEY (agent, hour)
 );
+CREATE TABLE IF NOT EXISTS agent_usage_reporters (agent TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS log (
     at INTEGER NOT NULL,
     device TEXT,
@@ -1343,13 +1351,14 @@ impl Store {
     }
 
     /// Adds `agent`'s (`<sandbox>/<agent>`) report of `calls` model calls
-    /// outside any app conversation, from `source`, at `at` (Unix seconds),
-    /// to that hour's usage: in one write, bounded and saturating as
-    /// [`Store::add_usage`].
+    /// outside any app conversation, at `at` (Unix seconds), to that hour's
+    /// usage: in one write, bounded and saturating as [`Store::add_usage`].
+    /// One row an agent an hour, whatever the plugin says the calls came
+    /// from, and none older than [`AGENT_USAGE_DAYS`]: what an agent sends
+    /// cannot grow the table past that.
     pub fn add_agent_usage(
         &self,
         agent: &str,
-        source: &str,
         at: i64,
         calls: u32,
         tokens: UsageTokens,
@@ -1362,8 +1371,8 @@ impl Store {
         let before = tx
             .query_row(
                 "SELECT calls, input, output, cache_read, cache_write, reasoning
-                 FROM agent_usage_hours WHERE agent = ?1 AND source = ?2 AND hour = ?3",
-                params![agent, source, hour],
+                 FROM agent_usage_hours WHERE agent = ?1 AND hour = ?2",
+                params![agent, hour],
                 |row| usage_row(row, 0),
             )
             .optional()?
@@ -1379,15 +1388,14 @@ impl Store {
         let t = bucket.tokens;
         tx.execute(
             "INSERT INTO agent_usage_hours
-                 (agent, source, hour, calls, input, output, cache_read, cache_write, reasoning)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(agent, source, hour) DO UPDATE SET calls = excluded.calls,
+                 (agent, hour, calls, input, output, cache_read, cache_write, reasoning)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(agent, hour) DO UPDATE SET calls = excluded.calls,
                  input = excluded.input, output = excluded.output,
                  cache_read = excluded.cache_read, cache_write = excluded.cache_write,
                  reasoning = excluded.reasoning",
             params![
                 agent,
-                source,
                 hour,
                 stored(Some(bucket.calls)),
                 stored(t.input),
@@ -1397,13 +1405,44 @@ impl Store {
                 stored(t.reasoning)
             ],
         )?;
+        tx.execute(
+            "DELETE FROM agent_usage_hours WHERE hour < ?1",
+            params![hour - AGENT_USAGE_DAYS * 24],
+        )?;
         tx.commit()
+    }
+
+    /// Records whether `agent`'s plugin reports its calls outside app
+    /// conversations (`agent_usage`), as its last `hello` said.
+    pub fn set_reports_outside(&self, agent: &str, reports: bool) -> rusqlite::Result<()> {
+        match reports {
+            true => self.db.execute(
+                "INSERT OR IGNORE INTO agent_usage_reporters (agent) VALUES (?1)",
+                params![agent],
+            ),
+            false => self.db.execute(
+                "DELETE FROM agent_usage_reporters WHERE agent = ?1",
+                params![agent],
+            ),
+        }
+        .map(|_| ())
+    }
+
+    /// The agents whose plugin last said it reports its calls outside app
+    /// conversations, sorted.
+    pub fn outside_reporters(&self) -> rusqlite::Result<Vec<String>> {
+        let mut query = self
+            .db
+            .prepare("SELECT agent FROM agent_usage_reporters ORDER BY agent")?;
+        let rows = query.query_map([], |row| row.get(0))?;
+        rows.collect()
     }
 
     /// Every hour of usage from the hour that holds `since` (Unix seconds)
     /// on, as `(<sandbox>/<agent>, hour, counts)`: in `owner`'s
     /// conversations, and, with `outside`, the agents' calls outside any
-    /// app conversation, which only the host's person sees.
+    /// app conversation, which only the host's person sees. Summed by agent
+    /// and hour in SQL; a sum past what SQLite holds is said, not wrapped.
     fn usage_hours(
         &self,
         owner: &str,
@@ -1411,30 +1450,23 @@ impl Store {
         outside: bool,
     ) -> rusqlite::Result<Vec<(String, i64, UsageTotal)>> {
         let from = since.max(0) / 3600;
-        let mut query = self.db.prepare(
-            "SELECT c.sandbox || '/' || u.agent, u.hour, u.calls, u.input, u.output,
-                    u.cache_read, u.cache_write, u.reasoning
-             FROM usage_hours u JOIN conversations c ON c.id = u.conversation
-             WHERE c.owner = ?1 AND u.hour >= ?2",
-        )?;
-        let mut hours = query
-            .query_map(params![owner, from], |row| {
-                Ok((row.get(0)?, row.get(1)?, usage_row(row, 2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if outside {
-            let mut query = self.db.prepare(
-                "SELECT agent, hour, calls, input, output, cache_read, cache_write, reasoning
-                 FROM agent_usage_hours WHERE hour >= ?1",
-            )?;
-            let rows = query.query_map(params![from], |row| {
-                Ok((row.get(0)?, row.get(1)?, usage_row(row, 2)?))
-            })?;
-            for row in rows {
-                hours.push(row?);
-            }
-        }
-        Ok(hours)
+        let sums = "SUM(calls), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write), SUM(reasoning)";
+        let mut query = self.db.prepare(&format!(
+            "SELECT agent, hour, {sums} FROM (
+                 SELECT c.sandbox || '/' || u.agent AS agent, u.hour AS hour, u.calls AS calls,
+                        u.input AS input, u.output AS output, u.cache_read AS cache_read,
+                        u.cache_write AS cache_write, u.reasoning AS reasoning
+                 FROM usage_hours u JOIN conversations c ON c.id = u.conversation
+                 WHERE c.owner = ?1 AND u.hour >= ?2
+                 UNION ALL
+                 SELECT agent, hour, calls, input, output, cache_read, cache_write, reasoning
+                 FROM agent_usage_hours WHERE ?3 AND hour >= ?2
+             ) GROUP BY agent, hour"
+        ))?;
+        let rows = query.query_map(params![owner, from, outside], |row| {
+            Ok((row.get(0)?, row.get(1)?, usage_row(row, 2)?))
+        })?;
+        rows.collect()
     }
 
     /// What each agent used from the hour that holds `since` (Unix
@@ -1448,33 +1480,40 @@ impl Store {
         since: i64,
         outside: bool,
     ) -> rusqlite::Result<Vec<(String, UsageTotal)>> {
-        let mut by_agent = std::collections::BTreeMap::<String, UsageTotal>::new();
-        for (agent, _, bucket) in self.usage_hours(owner, since, outside)? {
-            let sum = by_agent.entry(agent).or_default();
-            *sum = plus(*sum, bucket);
-        }
-        Ok(by_agent.into_iter().collect())
+        Ok(self.usage_window(owner, since, outside, None)?.0)
     }
 
-    /// The same usage over time: for each of the [`MAX_SERIES`] agents
-    /// that used the most tokens, its buckets of `bucket` seconds that saw
-    /// a call, the latest [`MAX_POINTS`], oldest first. A bucket starts at
-    /// a multiple of `bucket` in the device's time, `offset` seconds from
-    /// UTC: a day at its midnight.
-    pub fn usage_series(
+    /// [`Store::usage_since`] and, with `series` (a bucket in seconds and
+    /// the device's offset from UTC), the same usage over time, from one
+    /// read: for each of the [`MAX_SERIES`] agents that used the most
+    /// tokens, its buckets that saw a call, the latest [`MAX_POINTS`],
+    /// oldest first. A day starts at the device's midnight; an hour at the
+    /// hour, whatever the offset, as the bridge keeps usage by UTC hour.
+    pub fn usage_window(
         &self,
         owner: &str,
         since: i64,
         outside: bool,
-        bucket: u32,
-        offset: i32,
-    ) -> rusqlite::Result<Vec<UsageSeries>> {
+        series: Option<(u32, i32)>,
+    ) -> rusqlite::Result<UsageWindow> {
+        let hours = self.usage_hours(owner, since, outside)?;
+        let mut totals = std::collections::BTreeMap::<String, UsageTotal>::new();
+        for (agent, _, counts) in &hours {
+            let sum = totals.entry(agent.clone()).or_default();
+            *sum = plus(*sum, *counts);
+        }
+        let Some((bucket, offset)) = series else {
+            return Ok((totals.into_iter().collect(), Vec::new()));
+        };
         let bucket = i64::from(bucket.max(1));
-        let offset = i64::from(offset);
+        let offset = match bucket >= 86_400 {
+            true => i64::from(offset),
+            false => 0,
+        };
         let mut by_agent =
             std::collections::BTreeMap::<String, std::collections::BTreeMap<i64, UsageTotal>>::new(
             );
-        for (agent, hour, counts) in self.usage_hours(owner, since, outside)? {
+        for (agent, hour, counts) in hours {
             let at = (hour.saturating_mul(3600) + offset).div_euclid(bucket) * bucket - offset;
             let sum = by_agent.entry(agent).or_default().entry(at).or_default();
             *sum = plus(*sum, counts);
@@ -1490,7 +1529,16 @@ impl Store {
                     .map(|(at, b)| UsagePoint {
                         at: u64::try_from(at).unwrap_or(0),
                         calls: b.calls,
-                        tokens: b.tokens.total(),
+                        // None when the runtime counted no token at all.
+                        tokens: [
+                            b.tokens.input,
+                            b.tokens.output,
+                            b.tokens.cache_read,
+                            b.tokens.cache_write,
+                        ]
+                        .iter()
+                        .any(Option::is_some)
+                        .then(|| b.tokens.total()),
                     })
                     .collect();
                 let cut = points.len().saturating_sub(MAX_POINTS);
@@ -1500,11 +1548,27 @@ impl Store {
             .collect();
         // The heaviest first, then by name, so ties read the same each time.
         series.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.agent.cmp(&b.1.agent)));
-        Ok(series
+        let series = series
             .into_iter()
             .take(MAX_SERIES)
             .map(|(_, s)| s)
-            .collect())
+            .collect();
+        Ok((totals.into_iter().collect(), series))
+    }
+
+    /// [`Store::usage_window`]'s series alone.
+    #[cfg(test)]
+    pub fn usage_series(
+        &self,
+        owner: &str,
+        since: i64,
+        outside: bool,
+        bucket: u32,
+        offset: i32,
+    ) -> rusqlite::Result<Vec<UsageSeries>> {
+        Ok(self
+            .usage_window(owner, since, outside, Some((bucket, offset)))?
+            .1)
     }
 
     /// A known conversation, with its name.
