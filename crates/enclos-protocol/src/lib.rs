@@ -10,6 +10,7 @@
 //!   paired device.
 //! - [`decision`]: the runtime-approval decisions the bridge signs for a
 //!   plugin.
+//! - [`task`]: tasks and agent activity, as a runtime reports them.
 //! - [`visible`]: text checked for hidden characters before a person
 //!   reads it.
 
@@ -27,6 +28,7 @@ pub mod policy;
 pub mod preview;
 pub mod question;
 pub mod routine;
+pub mod task;
 pub mod usage;
 pub mod visible;
 

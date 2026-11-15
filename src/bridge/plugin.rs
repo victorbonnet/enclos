@@ -110,6 +110,8 @@ fn connect_within(
         capabilities: vec![
             Capability::Questions,
             Capability::RuntimeApprovals,
+            Capability::Activity,
+            Capability::Tasks,
             Capability::Usage,
         ],
         home: ConversationId::new(home).ok(),

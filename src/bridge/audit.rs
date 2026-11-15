@@ -193,10 +193,10 @@ mod tests {
         };
         store.add_device(&device).unwrap();
         let host = hub.capabilities("alice");
-        for capability in ["usage", "audit", "approval.close"] {
+        for capability in ["usage", "audit", "approval.close", "agent.forget"] {
             assert!(host.iter().any(|c| c == capability), "{host:?}");
         }
-        assert_eq!(host.len(), 3, "{host:?}");
+        assert_eq!(host.len(), 4, "{host:?}");
         // Every person reads the usage of their own conversations.
         assert_eq!(hub.capabilities("guest"), ["usage"]);
         let id = || MessageId::new("audit-request").unwrap();

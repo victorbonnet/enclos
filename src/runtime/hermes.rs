@@ -48,6 +48,7 @@ const APP_PLUGIN_RUNTIME_APPROVALS: &str =
     include_str!("../../channels/hermes/enclos/runtime_approvals.py");
 const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/decisions.py");
 const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
+const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
@@ -312,6 +313,7 @@ impl RuntimeAdapter for Hermes {
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
                 file("decisions.py", APP_PLUGIN_DECISIONS)?,
                 file("visible.py", APP_PLUGIN_VISIBLE)?,
+                file("tasks.py", APP_PLUGIN_TASKS)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
@@ -409,12 +411,17 @@ impl RuntimeAdapter for Hermes {
         report: &Path,
     ) -> Option<SandboxCommand> {
         // Hermes keeps each agent's sessions, with their token counts and
-        // cost, in its own `state.db` (`hermes_state.py`); its own Python
-        // reads them read-only inside the sandbox.
+        // cost, in its own `state.db` (`hermes_state.py`); its own Python,
+        // which its installer puts in `~/.hermes/tools/python-<version>/`
+        // (seen with the install of 2026-11), reads them read-only inside
+        // the sandbox, else the sandbox's `python3`. Isolated (`-I`), so no
+        // file the agent planted in its site folders or here runs; and its
+        // output goes nowhere, so nothing it prints reaches the host's
+        // terminal or JSON unescaped: what it has to say is in the report.
         let mut words: Vec<OsString> = vec![
             "/bin/sh".into(),
             "-c".into(),
-            "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; script=\"$1\"; shift; exec \"$python\" -c \"$script\" \"$@\"".into(),
+            "python=python3; for candidate in \"$HOME\"/.hermes/tools/python-*/bin/python3; do if [ -x \"$candidate\" ]; then python=\"$candidate\"; fi; done; script=\"$1\"; shift; exec \"$python\" -I -c \"$script\" \"$@\" </dev/null >/dev/null 2>&1".into(),
             "enclos-hermes-usage".into(),
             include_str!("hermes/usage.py").into(),
             report.as_os_str().to_owned(),
@@ -1233,6 +1240,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
                 ".hermes/profiles/main/plugins/enclos/decisions.py",
                 ".hermes/profiles/main/plugins/enclos/visible.py",
+                ".hermes/profiles/main/plugins/enclos/tasks.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );

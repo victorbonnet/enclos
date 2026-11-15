@@ -9,7 +9,7 @@
 //! count is `null` (not provided), never 0.
 //!
 //! The numbers come from inside the sandbox, which the agent can change:
-//! usage is advisory, for finding an agent that spends a lot, not an
+//! usage is advisory, for finding an agent that uses a lot, not an
 //! account of what a provider bills.
 
 use std::fs::OpenOptions;
@@ -71,23 +71,13 @@ impl Tokens {
     }
 
     /// The share of the prompt read from the cache, when the runtime
-    /// counts cache reads and something was sent.
+    /// counts both input and cache reads and something was sent: without
+    /// input, the share would leave out what was not cached.
     pub fn cache_hit(&self) -> Option<f64> {
+        self.input?;
         let read = self.cache_read?;
         let prompt = self.prompt();
         (prompt > 0).then(|| read as f64 / prompt as f64)
-    }
-
-    fn add(&mut self, other: &Tokens) {
-        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
-            (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
-        };
-        self.input = sum(self.input, other.input);
-        self.output = sum(self.output, other.output);
-        self.cache_read = sum(self.cache_read, other.cache_read);
-        self.cache_write = sum(self.cache_write, other.cache_write);
-        self.reasoning = sum(self.reasoning, other.reasoning);
     }
 }
 
@@ -113,23 +103,52 @@ pub struct Cost {
     pub kind: CostKind,
 }
 
+/// The counts a usage report names: requests, then each kind of token.
+pub const COUNTS: [&str; 6] = [
+    "calls",
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+];
+
 /// What one agent used with one model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelUsage {
     pub model: Option<String>,
+    /// The native chats that used it.
     pub chats: u64,
     /// Requests to the provider.
     pub calls: Option<u64>,
     pub tokens: Tokens,
     pub cost: Cost,
+    /// The counts (of [`COUNTS`]) that only some of the runtime's records
+    /// held: each is at least what is shown.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<&'static str>,
 }
 
 impl ModelUsage {
-    /// Tokens per request, which grows with the context.
+    /// Tokens per request, which grows with the context: when the runtime
+    /// counts requests, input and output, all of them.
     pub fn per_call(&self) -> Option<u64> {
+        if self.tokens.input.is_none()
+            || self.tokens.output.is_none()
+            || ["calls", "input", "output"]
+                .iter()
+                .any(|c| self.incomplete.contains(c))
+        {
+            return None;
+        }
         self.calls
             .filter(|&c| c > 0)
             .map(|c| self.tokens.total() / c)
+    }
+
+    /// Whether `count` (of [`COUNTS`]) is at least what is shown.
+    pub fn at_least(&self, count: &str) -> bool {
+        self.incomplete.contains(&count)
     }
 }
 
@@ -153,16 +172,6 @@ pub struct AgentRecords {
     pub models: Vec<ModelUsage>,
     /// Its native chats that used the most tokens, most first.
     pub top: Vec<ChatUsage>,
-}
-
-impl AgentRecords {
-    pub fn tokens(&self) -> Tokens {
-        let mut sum = Tokens::default();
-        for m in &self.models {
-            sum.add(&m.tokens);
-        }
-        sum
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -268,15 +277,22 @@ impl Engine {
         let _remove = Removed(report.clone());
         let ended = self.run_exec_in_sandbox(by, name, command, "usage session")?;
         if ended.exit != 0 {
+            let how = match ended.signal {
+                Some(signal) => format!("was ended by signal {signal}"),
+                None => format!("exited with {}", ended.exit),
+            };
             return Ok(Fact::CannotTell(format!(
-                "{}'s usage reader exited with {}",
-                kind.display_name(),
-                ended.exit
+                "{}'s usage reader {how}",
+                kind.display_name()
             )));
         }
         Ok(
             match read_report(&report, &home).and_then(|t| parse(&t, &agents)) {
-                Ok(agents) => Fact::Known(agents),
+                Ok(Parsed::Agents(agents)) => Fact::Known(agents),
+                Ok(Parsed::Unread(why)) => Fact::CannotTell(format!(
+                    "{}'s usage reader could not read: {why}",
+                    kind.display_name()
+                )),
                 Err(why) => Fact::CannotTell(format!("the usage report {why}")),
             },
         )
@@ -307,7 +323,12 @@ fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> 
         .map_err(|e| format!("cannot be opened: {e}"))?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     let home = home.canonicalize().map_err(|e| e.to_string())?;
-    if !meta.is_file() || !opened_path(&file).is_ok_and(|p| p.starts_with(&home)) {
+    // One name only: a hard link the sandbox made to another file would
+    // have the host read that file, and its path could be either name.
+    if !meta.is_file()
+        || std::os::unix::fs::MetadataExt::nlink(&meta) != 1
+        || !opened_path(&file).is_ok_and(|p| p.starts_with(&home))
+    {
         return Err("is not a plain file in the sandbox home".into());
     }
     let mut text = String::new();
@@ -327,6 +348,9 @@ fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> 
 struct Report {
     format: u32,
     agents: Vec<ReportAgent>,
+    /// Why the reader could not read at all.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +377,8 @@ struct ReportModel {
     calls: Option<u64>,
     tokens: Tokens,
     cost: ReportCost,
+    #[serde(default)]
+    incomplete: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -374,13 +400,23 @@ struct ReportChat {
     tokens: Tokens,
 }
 
+/// What a report says: each agent's usage, or why the reader could not
+/// read at all.
+enum Parsed {
+    Agents(Vec<AgentUsage>),
+    Unread(String),
+}
+
 /// The report, checked: format 1, each agent asked for at most once and
 /// nothing else, lists within their bounds, costs finite and not negative,
 /// and every text the sandbox wrote made printable.
-fn parse(text: &str, asked: &[RuntimeAgentName]) -> std::result::Result<Vec<AgentUsage>, String> {
+fn parse(text: &str, asked: &[RuntimeAgentName]) -> std::result::Result<Parsed, String> {
     let report: Report = serde_json::from_str(text).map_err(|e| format!("is not valid: {e}"))?;
     if report.format != REPORT_FORMAT {
         return Err(format!("has format {}, not {REPORT_FORMAT}", report.format));
+    }
+    if let Some(why) = report.error {
+        return Ok(Parsed::Unread(printable(&why)));
     }
     let mut seen = Vec::new();
     let mut agents = Vec::new();
@@ -423,7 +459,7 @@ fn parse(text: &str, asked: &[RuntimeAgentName]) -> std::result::Result<Vec<Agen
             usage: Fact::CannotTell("the runtime's usage reader left it out".into()),
         });
     }
-    Ok(agents)
+    Ok(Parsed::Agents(agents))
 }
 
 fn shown(text: Option<String>) -> Option<String> {
@@ -434,6 +470,15 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
     if m.cost.usd.is_some_and(|usd| !usd.is_finite() || usd < 0.0) {
         return Err("has a cost that is not a sum of money".into());
     }
+    let mut incomplete = Vec::new();
+    for name in &m.incomplete {
+        let Some(count) = COUNTS.iter().find(|c| *c == name) else {
+            return Err("names a count it does not have".into());
+        };
+        if !incomplete.contains(count) {
+            incomplete.push(*count);
+        }
+    }
     Ok(ModelUsage {
         model: shown(m.model),
         chats: m.chats,
@@ -443,13 +488,17 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
             usd: m.cost.usd,
             kind: m.cost.kind,
         },
+        incomplete,
     })
 }
 
 fn chat(s: ReportChat) -> std::result::Result<ChatUsage, String> {
     let started_at = match s.started_at {
         None => None,
-        Some(t) if t.is_finite() => Timestamp::from_second(t as i64).ok(),
+        Some(t) if t.is_finite() => Some(
+            Timestamp::from_second(t as i64)
+                .map_err(|_| "has a start time out of range".to_owned())?,
+        ),
         Some(_) => return Err("has a start time that is not a time".into()),
     };
     Ok(ChatUsage {
@@ -473,6 +522,20 @@ mod tests {
             .collect()
     }
 
+    fn agents(text: &str, asked: &[&str]) -> Vec<AgentUsage> {
+        match parse(text, &names(asked)).unwrap() {
+            Parsed::Agents(agents) => agents,
+            Parsed::Unread(why) => panic!("unread: {why}"),
+        }
+    }
+
+    fn refused(text: &str) -> String {
+        match parse(text, &names(&["default"])) {
+            Err(why) => why,
+            Ok(_) => panic!("taken: {text}"),
+        }
+    }
+
     const REPORT: &str = r#"{"format": 1, "agents": [
         {"agent": "default", "found": true, "models": [
             {"model": "gpt-6.1-sol", "chats": 1, "calls": 26,
@@ -484,9 +547,23 @@ mod tests {
         {"agent": "scout", "found": false, "models": [], "top": []}
     ]}"#;
 
+    /// One model row, with `fields` spliced in.
+    fn model_row(fields: &str) -> String {
+        format!(
+            r#"{{"model":"m","chats":1,"calls":1,"tokens":{{"input":1}},"cost":{{"usd":null,"kind":"unknown"}}{fields}}}"#
+        )
+    }
+
+    fn with_models(rows: &[String]) -> String {
+        format!(
+            r#"{{"format":1,"agents":[{{"agent":"default","found":true,"models":[{}],"top":[]}}]}}"#,
+            rows.join(",")
+        )
+    }
+
     #[test]
     fn a_report_becomes_each_agents_usage_with_what_the_runtime_does_not_count_left_unknown() {
-        let agents = parse(REPORT, &names(&["default", "scout", "writer"])).unwrap();
+        let agents = agents(REPORT, &["default", "scout", "writer"]);
         assert_eq!(agents.len(), 3);
         let Fact::Known(records) = &agents[0].usage else {
             panic!("{agents:?}")
@@ -510,42 +587,195 @@ mod tests {
     }
 
     #[test]
-    fn a_report_naming_an_agent_not_asked_for_or_twice_or_in_another_format_is_refused() {
-        let asked = names(&["default"]);
+    fn a_report_naming_an_agent_not_asked_for_is_refused() {
         let other = REPORT.replace("\"scout\"", "\"intruder\"");
-        assert!(parse(&other, &names(&["default", "scout"])).is_err());
+        let why = parse(&other, &names(&["default", "scout"])).err().unwrap();
+        assert!(why.contains("did not ask for"), "{why}");
+    }
+
+    #[test]
+    fn a_report_naming_an_agent_twice_is_refused() {
         let twice = r#"{"format":1,"agents":[{"agent":"default","found":false},{"agent":"default","found":false}]}"#;
-        assert!(parse(twice, &asked).unwrap_err().contains("twice"));
-        let format = r#"{"format":2,"agents":[]}"#;
-        assert!(parse(format, &asked).unwrap_err().contains("format 2"));
-        let extra = r#"{"format":1,"agents":[],"more":1}"#;
-        assert!(parse(extra, &asked).is_err());
-        let negative = r#"{"format":1,"agents":[{"agent":"default","models":[{"model":null,"chats":1,"calls":null,"tokens":{},"cost":{"usd":-1.0,"kind":"actual"}}]}]}"#;
-        assert!(parse(negative, &asked).unwrap_err().contains("cost"));
+        assert!(refused(twice).contains("twice"));
+    }
+
+    #[test]
+    fn a_report_in_another_format_or_with_a_field_it_does_not_have_is_refused() {
+        assert!(refused(r#"{"format":2,"agents":[]}"#).contains("format 2"));
+        let why = refused(r#"{"format":1,"agents":[],"more":1}"#);
+        assert!(why.contains("unknown field"), "{why}");
+    }
+
+    #[test]
+    fn a_cost_that_is_not_a_sum_of_money_is_refused() {
+        let negative = with_models(&[r#"{"model":null,"chats":1,"calls":null,"tokens":{},"cost":{"usd":-1.0,"kind":"actual"}}"#.into()]);
+        assert!(refused(&negative).contains("sum of money"));
+    }
+
+    #[test]
+    fn a_report_listing_more_than_it_may_is_refused() {
+        let models: Vec<String> = (0..=MAX_MODELS).map(|_| model_row("")).collect();
+        assert!(refused(&with_models(&models)).contains("too much"));
+        let chat = r#"{"chat":"c","source":null,"title":null,"started_at":null,"model":null,"calls":1,"tokens":{}}"#;
+        let top = [chat; MAX_TOP + 1].join(",");
+        let text = format!(
+            r#"{{"format":1,"agents":[{{"agent":"default","found":true,"models":[],"top":[{top}]}}]}}"#
+        );
+        assert!(refused(&text).contains("too much"));
+        let models: Vec<String> = (0..MAX_MODELS).map(|_| model_row("")).collect();
+        assert!(parse(&with_models(&models), &names(&["default"])).is_ok());
+    }
+
+    #[test]
+    fn an_agents_read_error_and_a_readers_own_error_say_why() {
         let error = r#"{"format":1,"agents":[{"agent":"default","error":"state.db: locked"}]}"#;
         assert_eq!(
-            parse(error, &asked).unwrap()[0].usage,
+            agents(error, &["default"])[0].usage,
             Fact::CannotTell("state.db: locked".into())
+        );
+        let whole = r#"{"format":1,"agents":[],"error":"Traceback\u001b[2J"}"#;
+        match parse(whole, &names(&["default"])).unwrap() {
+            Parsed::Unread(why) => assert_eq!(why, "Traceback\\u{1b}[2J"),
+            Parsed::Agents(a) => panic!("{a:?}"),
+        }
+    }
+
+    #[test]
+    fn a_count_some_records_lacked_is_at_least_what_is_shown_and_its_derived_columns_are_not_given()
+    {
+        let row = model_row(r#","incomplete":["input","calls","input"]"#);
+        let agents = agents(&with_models(&[row]), &["default"]);
+        let Fact::Known(records) = &agents[0].usage else {
+            panic!("{agents:?}")
+        };
+        let m = &records.models[0];
+        assert_eq!(m.incomplete, ["input", "calls"]);
+        assert!(m.at_least("input") && !m.at_least("output"));
+        assert_eq!(m.per_call(), None);
+        let unknown = model_row(r#","incomplete":["joules"]"#);
+        assert!(refused(&with_models(&[unknown])).contains("does not have"));
+    }
+
+    #[test]
+    fn without_input_neither_the_cache_share_nor_tokens_per_call_is_given() {
+        let tokens = Tokens {
+            cache_read: Some(90),
+            cache_write: Some(10),
+            output: Some(5),
+            ..Tokens::default()
+        };
+        assert_eq!(tokens.cache_hit(), None);
+        let m = ModelUsage {
+            model: None,
+            chats: 1,
+            calls: Some(2),
+            tokens,
+            cost: Cost {
+                usd: None,
+                kind: CostKind::Unknown,
+            },
+            incomplete: Vec::new(),
+        };
+        assert_eq!(m.per_call(), None);
+        assert_eq!(Tokens::default().cache_hit(), None);
+    }
+
+    #[test]
+    fn a_start_time_out_of_range_is_refused_not_dropped() {
+        let chat = r#"{"chat":"c","source":null,"title":null,"started_at":1e300,"model":null,"calls":1,"tokens":{}}"#;
+        let text = format!(
+            r#"{{"format":1,"agents":[{{"agent":"default","found":true,"models":[],"top":[{chat}]}}]}}"#
+        );
+        assert!(refused(&text).contains("out of range"));
+    }
+
+    fn home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        (dir, home)
+    }
+
+    #[test]
+    fn a_report_is_read_whole_up_to_its_bound() {
+        let (_dir, home) = home();
+        let at = home.join("report.json");
+        std::fs::write(&at, vec![b' '; MAX_REPORT_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_report(&at, &home).unwrap().len() as u64,
+            MAX_REPORT_BYTES
+        );
+        std::fs::write(&at, vec![b' '; MAX_REPORT_BYTES as usize + 1]).unwrap();
+        assert!(read_report(&at, &home).unwrap_err().contains("larger than"));
+    }
+
+    #[test]
+    fn a_report_that_is_a_link_or_not_a_plain_file_in_the_home_is_not_read() {
+        let (dir, home) = home();
+        let outside = dir.path().join("secret.json");
+        std::fs::write(&outside, "{}").unwrap();
+        // A link the sandbox put in the report's place.
+        let link = home.join("link.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(
+            read_report(&link, &home)
+                .unwrap_err()
+                .contains("cannot be opened")
+        );
+        // A second name for a file elsewhere.
+        let hard = home.join("hard.json");
+        std::fs::hard_link(&outside, &hard).unwrap();
+        assert!(
+            read_report(&hard, &home)
+                .unwrap_err()
+                .contains("not a plain file")
+        );
+        // A folder, and a FIFO, which must not hold the read up.
+        let folder = home.join("folder.json");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(
+            read_report(&folder, &home)
+                .unwrap_err()
+                .contains("not a plain file")
+        );
+        let fifo = home.join("fifo.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(
+            read_report(&fifo, &home)
+                .unwrap_err()
+                .contains("not a plain file")
+        );
+        // A plain file outside the home.
+        assert!(
+            read_report(&outside, &home)
+                .unwrap_err()
+                .contains("not a plain file in the sandbox home")
         );
     }
 
     #[test]
-    fn tokens_add_up_leaving_a_count_no_model_had_unknown() {
-        let mut sum = Tokens::default();
-        sum.add(&Tokens {
-            input: Some(1),
-            output: Some(2),
-            ..Tokens::default()
-        });
-        sum.add(&Tokens {
-            input: Some(10),
-            cache_read: Some(5),
-            ..Tokens::default()
-        });
-        assert_eq!(sum.input, Some(11));
-        assert_eq!(sum.output, Some(2));
-        assert_eq!(sum.cache_read, Some(5));
-        assert_eq!(sum.reasoning, None);
-        assert_eq!(Tokens::default().cache_hit(), None);
+    fn a_known_read_is_json_with_counts_not_kept_as_null() {
+        let agents = agents(REPORT, &["default", "scout"]);
+        let view = UsageView {
+            since: Timestamp::from_second(0).unwrap(),
+            sandboxes: vec![SandboxUsage {
+                name: "lab".parse().unwrap(),
+                runtime: Some("Hermes"),
+                agents: Fact::Known(agents),
+            }],
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        let sandbox = &json["sandboxes"][0];
+        assert_eq!(sandbox["name"], "lab");
+        let model = &sandbox["agents"]["known"][0]["usage"]["known"]["models"][0];
+        assert_eq!(model["tokens"]["reasoning"], serde_json::Value::Null);
+        assert_eq!(model["tokens"]["input"], 83087);
+        assert_eq!(model["cost"]["kind"], "included");
+        assert!(model.get("incomplete").is_none());
+        assert_eq!(sandbox["agents"]["known"][1]["usage"], "absent");
     }
 }

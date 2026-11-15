@@ -2247,6 +2247,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
         .ask_restart(
             &alice(),
             &service_session,
+            crate::engine::restart::ProgramAt::Root,
             crate::runtime::Signal::Usr1,
             &env,
         )
@@ -2263,6 +2264,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
@@ -2323,6 +2325,7 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
@@ -3814,6 +3817,47 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
 }
 
+/// An agent forgotten in the app and set up again gets a Home id never
+/// used (ADR 0067, proposed): `runtime configure` claims it in the
+/// bridge's database and gives it to the runtime; a dry run claims none.
+#[test]
+fn an_agent_forgotten_in_the_app_is_set_up_with_a_new_home() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let root = super::Root {
+        parent: "/tmp".into(),
+        leaf: "f".to_owned(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    grant_app_token(&lab, Confirm::Yes);
+    let bridge = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    bridge.claim_host("alice").unwrap();
+    bridge.ensure_home("home/default", "alice", true).unwrap();
+    let (forgotten, _) = bridge
+        .forget_agent("home/default", "alice", "phone")
+        .unwrap();
+    assert_eq!(forgotten, ["home.home.default"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let Planned::DryRun(_) = configure_app(&lab, &[], None, Confirm::DryRun).unwrap() else {
+        panic!("a dry run set the app channel up");
+    };
+    assert_eq!(bridge.home_of("home/default").unwrap(), None);
+    let Planned::Done(_) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
+        panic!("not a dry run");
+    };
+    assert!(
+        calls().contains("-p default config set MOBILE_APP_HOME_CHANNEL home.home.default.2\n"),
+        "{}",
+        calls()
+    );
+    assert_eq!(
+        bridge.home_of("home/default").unwrap().as_deref(),
+        Some("home.home.default.2")
+    );
+}
+
 /// The app channel's token granted only by the pending policy waits for
 /// it: nothing runs, and nothing is staged, before `policy apply`.
 #[test]
@@ -4751,6 +4795,12 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             .unwrap(),
     );
     let policy_before = lab.engine.policy(&other).unwrap().snapshot.policy;
+    // An agent of the destination's name was forgotten in the app: the
+    // import claims a new Home for it (ADR 0067, proposed).
+    let host = store.host_person().unwrap().unwrap();
+    store
+        .forget_agent("other/comptoir-dev", &host, "phone")
+        .unwrap();
     let manifest = done(
         lab.engine
             .import_agent_export(
@@ -4802,9 +4852,13 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     let app = lab.engine.app_endpoint(&other, "comptoir-dev").unwrap();
     assert_ne!(app.token.expose(), "old-bridge-token");
     assert!(app.socket.to_string_lossy().contains("comptoir-dev"));
-    let target_home = crate::bridge::store::home_id("other/comptoir-dev");
+    let target_home = "home.other.comptoir-dev.2";
     assert_eq!(
-        store.messages_after(&target_home, 0).unwrap()[0].text,
+        store.home_of("other/comptoir-dev").unwrap().as_deref(),
+        Some(target_home)
+    );
+    assert_eq!(
+        store.messages_after(target_home, 0).unwrap()[0].text,
         "history survives"
     );
     assert_eq!(
@@ -5184,4 +5238,107 @@ fn usage_reads_each_agents_records_inside_the_sandbox_and_removes_its_report() {
         });
     assert!(!left, "the report stayed in the home");
     assert!(lab.audit().contains("usage session"), "{}", lab.audit());
+}
+
+/// A stand-in for Hermes's own Python, where the usage reader looks for
+/// it: `body` runs with the reader's words (`-I -c <script> <report> ...`),
+/// the report's path in `$4`.
+fn usage_python(lab: &Lab, body: &str) {
+    let bin = lab.home.join(".hermes/tools/python-stub/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::test_scripts::write_script(&bin.join("python3"), body);
+}
+
+fn usage_of(lab: &Lab) -> Fact<Vec<crate::engine::AgentUsage>> {
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    view.sandboxes.into_iter().next().unwrap().agents
+}
+
+fn report_left(lab: &Lab) -> bool {
+    std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        })
+}
+
+#[test]
+fn a_usage_reader_that_fails_says_how_and_leaves_no_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // It exits non-zero without a word: how it ended.
+    usage_python(&lab, "exit 3");
+    assert_eq!(
+        usage_of(&lab),
+        Fact::CannotTell("Hermes's usage reader exited with 3".into())
+    );
+    // It wrote a report, then failed: the report goes all the same.
+    usage_python(&lab, "printf '{}' > \"$4\"; exit 1");
+    assert!(matches!(usage_of(&lab), Fact::CannotTell(why) if why.contains("exited with 1")));
+    assert!(!report_left(&lab));
+    // It wrote what is not a report.
+    usage_python(&lab, "printf 'not json' > \"$4\"");
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert!(why.starts_with("the usage report is not valid"), "{why}");
+    assert!(!report_left(&lab));
+    // It could not read at all, and said why, escaped.
+    usage_python(
+        &lab,
+        "printf '{\"format\":1,\"agents\":[],\"error\":\"OSError: \\\\u001b[2J gone\"}' > \"$4\"",
+    );
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert_eq!(
+        why,
+        "Hermes's usage reader could not read: OSError: \\u{1b}[2J gone"
+    );
+    // Nothing it prints reaches enclos's output: it goes nowhere.
+    usage_python(
+        &lab,
+        "echo printed; echo said >&2; printf '{\"format\":1,\"agents\":[]}' > \"$4\"",
+    );
+    assert!(matches!(usage_of(&lab), Fact::Known(_)));
+}
+
+#[test]
+fn usage_of_every_sandbox_leaves_one_not_running_unread_and_runs_nothing_in_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let sessions_before = lab.audit().matches("usage session").count();
+    lab.engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = lab.engine.state.get(&lab.name)?.unwrap();
+                record.state = crate::model::sandbox::SandboxState::Stopped;
+                lab.engine.state.put(lock, &record)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), None, since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert!(
+        matches!(&sandbox.agents, Fact::CannotTell(why) if why.starts_with("not running; `enclos usage home`")),
+        "{sandbox:?}"
+    );
+    assert_eq!(
+        lab.audit().matches("usage session").count(),
+        sessions_before
+    );
 }

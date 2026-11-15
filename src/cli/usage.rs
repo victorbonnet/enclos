@@ -1,6 +1,8 @@
 //! `enclos usage`: what each agent used of its model providers, as its
 //! runtime recorded it (issue #282).
 
+use std::io::Write;
+
 use clap::Args;
 
 use enclos::engine::{
@@ -36,7 +38,8 @@ pub fn run(engine: &Engine, by: &Actor, args: UsageArgs) -> Result<u8> {
         super::output::emit(&shown);
         return Ok(exit::OK);
     }
-    print(&view);
+    // A reader that left ends this by SIGPIPE, as for `status`.
+    let _ = print(&mut std::io::stdout().lock(), &view);
     Ok(exit::OK)
 }
 
@@ -55,37 +58,38 @@ const HEAD: [&str; 12] = [
     "COST",
 ];
 
-fn print(view: &UsageView) {
+fn print(out: &mut impl Write, view: &UsageView) -> std::io::Result<()> {
     if view.sandboxes.is_empty() {
-        println!("No sandboxes yet.");
-        return;
+        return writeln!(out, "No sandboxes yet.");
     }
-    let since = view.since.strftime("%Y-%m-%d %H:%M UTC");
+    let since = view.since.strftime("%Y-%m-%d %H:%M UTC").to_string();
     for (i, s) in view.sandboxes.iter().enumerate() {
         if i > 0 {
-            println!();
+            writeln!(out)?;
         }
-        print_sandbox(s, &since.to_string());
+        print_sandbox(out, s, &since)?;
     }
-    println!(
-        "\nTokens as each runtime recorded them, inside its sandbox: a guide to what an agent spends, not a bill."
-    );
+    writeln!(
+        out,
+        "\nTokens as each runtime recorded them, inside its sandbox: a guide to what an agent used, not a bill. ≥: some of its records lacked that count."
+    )
 }
 
-fn print_sandbox(s: &SandboxUsage, since: &str) {
+fn print_sandbox(out: &mut impl Write, s: &SandboxUsage, since: &str) -> std::io::Result<()> {
     let runtime = s.runtime.unwrap_or("no runtime");
     let agents = match &s.agents {
         Fact::Known(agents) => agents,
-        Fact::Absent => return println!("{}: no runtime", s.name),
+        Fact::Absent => return writeln!(out, "{}: no runtime", s.name),
         Fact::NotProvided => {
-            return println!("{}: {runtime} keeps no usage enclos can read", s.name);
+            return writeln!(out, "{}: {runtime} keeps no usage enclos can read", s.name);
         }
-        Fact::CannotTell(why) => return println!("{}: cannot tell ({why})", s.name),
+        Fact::CannotTell(why) => return writeln!(out, "{}: cannot tell ({why})", s.name),
     };
-    println!(
+    writeln!(
+        out,
         "{}: {runtime}, native chats active since {since}, each counted whole",
         s.name
-    );
+    )?;
     let mut rows = vec![HEAD.map(str::to_owned).to_vec()];
     let mut notes = Vec::new();
     for a in agents {
@@ -100,32 +104,38 @@ fn print_sandbox(s: &SandboxUsage, since: &str) {
         }
     }
     if rows.len() > 1 {
-        print_table(&rows);
+        print_table(out, &rows)?;
     }
     for note in notes {
-        println!("  {note}");
+        writeln!(out, "  {note}")?;
     }
     let top = top_chats(agents);
     if !top.is_empty() {
-        println!("  Native chats that used the most");
+        writeln!(out, "  Native chats that used the most")?;
         for line in top {
-            println!("    {line}");
+            writeln!(out, "    {line}")?;
         }
     }
+    Ok(())
 }
 
 fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
     let t = &m.tokens;
+    // A count some records lacked is at least what is shown.
+    let at_least = |name: &str, n: Option<u64>| match (m.at_least(name), n) {
+        (true, Some(_)) => format!("≥{}", count(n)),
+        _ => count(n),
+    };
     vec![
         agent.to_owned(),
         m.model.clone().unwrap_or_else(|| "?".into()),
         m.chats.to_string(),
-        count(m.calls),
-        count(t.input),
-        count(t.cache_read),
-        count(t.cache_write),
-        count(t.output),
-        count(t.reasoning),
+        at_least("calls", m.calls),
+        at_least("input", t.input),
+        at_least("cache_read", t.cache_read),
+        at_least("cache_write", t.cache_write),
+        at_least("output", t.output),
+        at_least("reasoning", t.reasoning),
         count(m.per_call()),
         t.cache_hit()
             .map(|h| format!("{:.0}%", h * 100.0))
@@ -134,15 +144,23 @@ fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
     ]
 }
 
-/// Counts read at a glance: 950, 83.1k, 1.2M; `-` when not counted.
+/// Counts read at a glance: 950, 83.1k, 1.2M; `-` when not counted. The
+/// unit is chosen after rounding, so 999,950 reads 1.0M, not 1000.0k.
 fn count(n: Option<u64>) -> String {
-    match n {
-        None => "-".into(),
-        Some(n) if n < 1_000 => n.to_string(),
-        Some(n) if n < 1_000_000 => format!("{:.1}k", n as f64 / 1e3),
-        Some(n) if n < 1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
-        Some(n) => format!("{:.1}G", n as f64 / 1e9),
+    let Some(n) = n else {
+        return "-".into();
+    };
+    if n < 1_000 {
+        return n.to_string();
     }
+    let mut value = n as f64;
+    for unit in ["k", "M", "G", "T"] {
+        value /= 1e3;
+        if (value * 10.0).round() < 10_000.0 || unit == "T" {
+            return format!("{value:.1}{unit}");
+        }
+    }
+    unreachable!("the last unit returns")
 }
 
 fn cost(m: &ModelUsage) -> String {
@@ -156,7 +174,7 @@ fn cost(m: &ModelUsage) -> String {
     }
 }
 
-fn print_table(rows: &[Vec<String>]) {
+fn print_table(out: &mut impl Write, rows: &[Vec<String>]) -> std::io::Result<()> {
     let widths: Vec<usize> = (0..rows[0].len())
         .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
         .collect();
@@ -170,8 +188,9 @@ fn print_table(rows: &[Vec<String>]) {
                 _ => format!("{cell:>w$}", w = widths[c]),
             })
             .collect();
-        println!("  {}", cells.join("  ").trim_end());
+        writeln!(out, "  {}", cells.join("  ").trim_end())?;
     }
+    Ok(())
 }
 
 /// The native chats that used the most tokens across the sandbox's agents.
@@ -206,7 +225,49 @@ fn top_chats(agents: &[AgentUsage]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enclos::engine::{Cost, Tokens};
+    use enclos::engine::{ChatUsage, Cost, Tokens};
+    use enclos::model::Timestamp;
+
+    fn model(name: &str, input: Option<u64>, incomplete: Vec<&'static str>) -> ModelUsage {
+        ModelUsage {
+            model: Some(name.into()),
+            chats: 1,
+            calls: Some(26),
+            tokens: Tokens {
+                input,
+                output: Some(6_084),
+                cache_read: Some(762_752),
+                cache_write: Some(0),
+                reasoning: None,
+            },
+            cost: Cost {
+                usd: Some(0.0),
+                kind: CostKind::Included,
+            },
+            incomplete,
+        }
+    }
+
+    fn chat(id: &str, input: u64) -> ChatUsage {
+        ChatUsage {
+            chat: Some(id.into()),
+            source: Some("enclos".into()),
+            title: Some("Weather".into()),
+            started_at: Some(Timestamp::from_second(1_794_588_220).unwrap()),
+            model: Some("gpt".into()),
+            calls: Some(3),
+            tokens: Tokens {
+                input: Some(input),
+                ..Tokens::default()
+            },
+        }
+    }
+
+    fn shown(view: &UsageView) -> String {
+        let mut out = Vec::new();
+        print(&mut out, view).unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     #[test]
     fn counts_read_at_a_glance_and_a_count_not_kept_is_a_dash() {
@@ -214,20 +275,112 @@ mod tests {
         assert_eq!(count(Some(950)), "950");
         assert_eq!(count(Some(83_087)), "83.1k");
         assert_eq!(count(Some(1_234_567)), "1.2M");
+        // Rounding up to the next unit takes that unit.
+        assert_eq!(count(Some(999_949)), "999.9k");
+        assert_eq!(count(Some(999_950)), "1.0M");
+        assert_eq!(count(Some(999_950_000)), "1.0G");
+        assert_eq!(count(Some(u64::MAX)), "18446744.1T");
     }
 
     #[test]
     fn a_subscription_shows_included_and_an_estimate_is_marked() {
         let m = |kind, usd| ModelUsage {
-            model: None,
-            chats: 1,
-            calls: None,
-            tokens: Tokens::default(),
             cost: Cost { usd, kind },
+            ..model("m", Some(1), Vec::new())
         };
         assert_eq!(cost(&m(CostKind::Included, Some(0.0))), "included");
         assert_eq!(cost(&m(CostKind::Estimated, Some(1.234))), "~$1.23");
         assert_eq!(cost(&m(CostKind::Actual, Some(2.0))), "$2.00");
         assert_eq!(cost(&m(CostKind::Unknown, None)), "?");
+    }
+
+    #[test]
+    fn a_sandbox_shows_each_model_a_row_each_other_agent_a_note_and_the_chats_that_used_the_most() {
+        let view = UsageView {
+            since: Timestamp::from_second(1_794_000_000).unwrap(),
+            sandboxes: vec![
+                SandboxUsage {
+                    name: "lab".parse().unwrap(),
+                    runtime: Some("Hermes"),
+                    agents: Fact::Known(vec![
+                        AgentUsage {
+                            agent: "default".into(),
+                            usage: Fact::Known(AgentRecords {
+                                models: vec![model("gpt", Some(83_087), vec!["input"])],
+                                top: vec![chat("small", 10), chat("big", 900_000)],
+                            }),
+                        },
+                        AgentUsage {
+                            agent: "scout".into(),
+                            usage: Fact::Known(AgentRecords {
+                                models: Vec::new(),
+                                top: vec![chat("middle", 5_000)],
+                            }),
+                        },
+                        AgentUsage {
+                            agent: "idle".into(),
+                            usage: Fact::Absent,
+                        },
+                        AgentUsage {
+                            agent: "broken".into(),
+                            usage: Fact::CannotTell("state.db: locked".into()),
+                        },
+                    ]),
+                },
+                SandboxUsage {
+                    name: "spare".parse().unwrap(),
+                    runtime: Some("Hermes"),
+                    agents: Fact::CannotTell("not running".into()),
+                },
+            ],
+        };
+        let text = shown(&view);
+        assert!(
+            text.contains("lab: Hermes, native chats active since 2026-11-06"),
+            "{text}"
+        );
+        let row = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("default"))
+            .unwrap();
+        // Input some records lacked is at least what is shown; reasoning not
+        // kept is a dash; no tokens per call with input incomplete.
+        assert!(row.contains("≥83.1k"), "{row}");
+        assert!(
+            row.contains("762.8k") && row.contains("6.1k") && row.contains("included"),
+            "{row}"
+        );
+        assert!(text.contains("  scout: no chats in this window"), "{text}");
+        assert!(text.contains("  idle: never used"), "{text}");
+        assert!(
+            text.contains("  broken: cannot tell (state.db: locked)"),
+            "{text}"
+        );
+        assert!(text.contains("spare: cannot tell (not running)"), "{text}");
+        // The chats across agents, the most first.
+        let top: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.contains("Native chats that used the most"))
+            .skip(1)
+            .take_while(|l| l.starts_with("    "))
+            .collect();
+        assert_eq!(top.len(), 3, "{text}");
+        assert!(
+            top[0].contains("(big)") && top[1].contains("scout") && top[2].contains("(small)"),
+            "{top:?}"
+        );
+        assert!(top[0].contains("900.0k tokens  3 calls"), "{top:?}");
+        // The header and the row line up column for column.
+        let header = text.lines().find(|l| l.contains("AGENT")).unwrap();
+        assert_eq!(header.chars().count(), row.chars().count(), "{text}");
+    }
+
+    #[test]
+    fn no_sandboxes_says_so() {
+        let view = UsageView {
+            since: Timestamp::from_second(0).unwrap(),
+            sandboxes: Vec::new(),
+        };
+        assert_eq!(shown(&view), "No sandboxes yet.\n");
     }
 }
