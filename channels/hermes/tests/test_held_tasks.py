@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -38,11 +39,26 @@ class Task:
     last_failure_error: Optional[str] = None
 
 
+# As Hermes writes its own SCHEMA_SQL: one column a line.
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, assignee TEXT,
-    status TEXT NOT NULL, created_by TEXT, created_at INTEGER, last_failure_error TEXT);
-CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
-    run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    assignee TEXT,
+    status TEXT NOT NULL,
+    created_by TEXT,
+    created_at INTEGER,
+    last_failure_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    kind       TEXT NOT NULL,
+    payload    TEXT,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -56,14 +72,19 @@ class FakeKanban:
     def __init__(self, root: Path):
         self.root = root
         self.dbs: dict[str, Path] = {}
+        # The databases Hermes's writer (`connect`) opened.
         self.opened: list[Path] = []
         self.unblock_result: Optional[bool] = None
         self.unblock_error: Optional[Exception] = None
+        self.raise_after_commit = False
+        self.listing_error: Optional[Exception] = None
         self.add_board("default", root / "kanban.db")
 
     # Hermes's functions
 
     def list_boards(self, *, include_archived=True):
+        if self.listing_error:
+            raise self.listing_error
         return [{"slug": slug, "db_path": str(path)} for slug, path in self.dbs.items()]
 
     def kanban_db_path(self, board=None):
@@ -90,6 +111,9 @@ class FakeKanban:
                                    "WHERE id = ? AND status = 'blocked'", (task_id,)).rowcount
             if changed:
                 self._event(conn, task_id, "unblocked", None)
+        if self.raise_after_commit:
+            # As Hermes's write_txn checks the file after its COMMIT.
+            raise RuntimeError("the database file shrank after commit")
         return changed == 1
 
     def connect(self, db_path):
@@ -115,7 +139,8 @@ class FakeKanban:
     @staticmethod
     def _event(conn, task_id, kind, payload, at=None):
         conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-                     (task_id, kind, json.dumps(payload) if payload is not None else None, at or int(time.time())))
+                     (task_id, kind, payload if isinstance(payload, str) else
+                      json.dumps(payload) if payload is not None else None, at or int(time.time())))
 
     def create(self, task_id, title="Write the weekly report", created_by="main", assignee=None,
                status="ready", board="default", at=1_000):
@@ -150,6 +175,23 @@ class FakeBoardCase(unittest.TestCase):
             return "e:%d" % conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
 
 
+def fake_hermes(**changes):
+    """`hermes_cli`'s kanban modules for `sys.modules`, from a FakeKanban, with `changes`."""
+    kb = types.ModuleType("hermes_cli.kanban_db")
+    fake = FakeKanban(Path(tempfile.mkdtemp()))
+    for name in ("list_tasks", "get_task", "unblock_task", "list_boards", "pin_first_board_resolution",
+                 "kanban_db_path"):
+        setattr(kb, name, getattr(fake, name))
+    kb.DEFAULT_BOARD, kb.SCHEMA_SQL, kb.Task = "default", SCHEMA, Task
+    for name, value in changes.items():
+        setattr(kb, name, value)
+    connect = types.ModuleType("hermes_cli.kanban_db_connect")
+    connect.connect = fake.connect
+    package = types.ModuleType("hermes_cli")
+    package.kanban_db, package.kanban_db_connect = kb, connect
+    return {"hermes_cli": package, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connect}
+
+
 class Availability(unittest.TestCase):
     def test_without_hermes_there_is_no_board_and_the_hello_says_nothing(self):
         hidden = {"hermes_cli": None, "hermes_cli.kanban_db": None, "hermes_cli.kanban_db_connect": None}
@@ -163,23 +205,8 @@ class Availability(unittest.TestCase):
         self.assertFalse(manager.native)
         self.assertFalse(manager.available)
 
-    def fake_hermes(self, **changes):
-        kb = types.ModuleType("hermes_cli.kanban_db")
-        fake = FakeKanban(Path(tempfile.mkdtemp()))
-        for name in ("list_tasks", "get_task", "unblock_task", "list_boards", "pin_first_board_resolution",
-                     "kanban_db_path"):
-            setattr(kb, name, getattr(fake, name))
-        kb.DEFAULT_BOARD, kb.SCHEMA_SQL, kb.Task = "default", SCHEMA, Task
-        for name, value in changes.items():
-            setattr(kb, name, value)
-        connect = types.ModuleType("hermes_cli.kanban_db_connect")
-        connect.connect = fake.connect
-        package = types.ModuleType("hermes_cli")
-        package.kanban_db, package.kanban_db_connect = kb, connect
-        return {"hermes_cli": package, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connect}
-
     def test_a_hermes_with_what_it_needs_has_a_board(self):
-        with patch.dict(sys.modules, self.fake_hermes()):
+        with patch.dict(sys.modules, fake_hermes()):
             self.assertIsInstance(held_tasks.native(), held_tasks.Board)
 
     def test_a_hermes_missing_a_part_says_which(self):
@@ -188,11 +215,15 @@ class Availability(unittest.TestCase):
             id: str
             title: str
 
+        without_payload = SCHEMA.replace("    payload    TEXT,\n", "")
         for changes, said in (({"unblock_task": None}, "unblock_task"),
                               ({"list_tasks": None, "get_task": None}, "list_tasks, get_task"),
+                              ({"kanban_db_path": None}, "kanban_db_path"),
                               ({"SCHEMA_SQL": "CREATE TABLE tasks (id TEXT)"}, "task_events"),
+                              ({"SCHEMA_SQL": "-- task_events is in a comment only"}, "task_events"),
+                              ({"SCHEMA_SQL": without_payload}, "payload"),
                               ({"Task": OldTask}, "created_by")):
-            with self.subTest(said), patch.dict(sys.modules, self.fake_hermes(**changes)):
+            with self.subTest(said), patch.dict(sys.modules, fake_hermes(**changes)):
                 with self.assertRaises(held_tasks.Unavailable) as raised:
                     held_tasks.native()
                 self.assertIn(said, str(raised.exception))
@@ -210,6 +241,16 @@ class Reading(FakeBoardCase):
             "since": 5_000, "revision": self.revision("t_mine"), "resume": held_tasks.RESUME,
         }])
         self.assertEqual([t["task"] for t in self.board.read("research")], ["t_theirs"])
+
+    def test_the_board_is_read_read_only_never_through_hermes_s_writer(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        before = self.kb.dbs["default"].read_bytes()
+        self.assertEqual(len(self.board.read("main")), 1)
+        self.assertEqual(self.kb.opened, [])
+        self.assertEqual(self.kb.dbs["default"].read_bytes(), before)
+        self.board.resume("main", "t_1", self.revision("t_1"))
+        self.assertEqual(self.kb.opened, [self.kb.dbs["default"]])
 
     def test_a_task_that_gave_up_says_after_how_many_failures_and_the_last_error(self):
         self.kb.create("t_a1b2", assignee="writer")
@@ -248,6 +289,33 @@ class Reading(FakeBoardCase):
         [task] = self.board.read("main")
         self.assertEqual((task["reason"], task["since"]), ("", 3_000))
 
+    def test_an_event_time_the_wire_cannot_carry_gives_way_to_the_creation_time_said_once(self):
+        with self.kb.db() as conn, conn:
+            conn.execute("INSERT INTO tasks VALUES ('t_far', 'Far', NULL, 'blocked', 'main', 1500, NULL)")
+            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) "
+                         "VALUES ('t_far', 'blocked', '{}', '1e20')")
+            conn.execute("INSERT INTO tasks VALUES ('t_before', 'Before', NULL, 'blocked', 'main', -5, NULL)")
+            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) "
+                         "VALUES ('t_before', 'blocked', '{}', -7)")
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            found = {t["task"]: t["since"] for t in self.board.read("main")}
+        self.assertEqual(found, {"t_far": 1500, "t_before": 0})
+        self.assertEqual(len(logs.output), 2)
+        with self.assertNoLogs("enclos.held_tasks", "WARNING"):
+            self.board.read("main")
+
+    def test_text_the_sandbox_wrote_with_a_lone_surrogate_still_encodes(self):
+        self.kb.create("t_1", assignee="writer")
+        self.kb.hold("t_1", "gave_up", '{"failures": 2, "error": "bad \\ud800 byte"}')
+        self.kb.create("t_2")
+        self.kb.hold("t_2", payload='{"reason": "why \\udfff not"}', at=3_000)
+        tasks = self.board.read("main")
+        line = protocol.encode_line(protocol.held_tasks(tasks))
+        self.assertIn("why", tasks[0]["reason"])
+        self.assertNotIn("\udfff", tasks[0]["reason"])
+        self.assertEqual(tasks[1]["last_error"].count("�") > 0, True)
+        self.assertTrue(line.endswith(b"\n"))
+
     def test_the_assignee_is_named_only_when_another_agent_does_the_work(self):
         self.kb.create("t_self", assignee="main")
         self.kb.hold("t_self")
@@ -257,13 +325,11 @@ class Reading(FakeBoardCase):
         self.assertNotIn("assignee", tasks["t_self"])
         self.assertEqual(tasks["t_other"]["assignee"], "writer")
 
-    def test_the_newest_32_first(self):
+    def test_every_held_task_newest_first(self):
         for n in range(40):
             self.kb.create(f"t_{n:02}")
             self.kb.hold(f"t_{n:02}", at=10_000 + n)
-        with self.assertLogs("enclos.held_tasks", "INFO"):
-            tasks = self.board.read("main")
-        self.assertEqual([t["task"] for t in tasks], [f"t_{n:02}" for n in range(39, 7, -1)])
+        self.assertEqual([t["task"] for t in self.board.read("main")], [f"t_{n:02}" for n in range(39, -1, -1)])
 
     def test_the_revision_is_the_task_s_latest_event_so_a_comment_moves_it(self):
         self.kb.create("t_1")
@@ -283,14 +349,14 @@ class Reading(FakeBoardCase):
                          [200, 1_000, 2_000, 64])
 
     def test_an_id_the_wire_cannot_carry_is_left_out_and_said_once(self):
-        for bad in ("t_\x07bell", "t_" + "x" * 200, "t_​hidden"):
+        for bad in ("t_\x07bell", "t_" + "x" * 200, "t_​hidden", "ops/t_1"):
             self.kb.create(bad)
             self.kb.hold(bad)
         self.kb.create("t_good")
         self.kb.hold("t_good")
         with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
             self.assertEqual([t["task"] for t in self.board.read("main")], ["t_good"])
-        self.assertEqual(len(logs.output), 3)
+        self.assertEqual(len(logs.output), 4)
         with self.assertNoLogs("enclos.held_tasks", "WARNING"):
             self.board.read("main")
 
@@ -308,12 +374,49 @@ class Reading(FakeBoardCase):
         self.kb.hold("t_1")
         self.assertEqual([t["task"] for t in self.board.read("main")], ["t_1"])
 
+    def test_a_task_two_boards_would_name_alike_is_listed_once(self):
+        copy = Path(self.temporary.name) / "copy.db"
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        copy.write_bytes(self.kb.dbs["default"].read_bytes())
+        listing = self.kb.list_boards
+        self.kb.list_boards = lambda **_: [*listing(), {"slug": "default", "db_path": str(copy)}]
+        self.assertEqual([t["task"] for t in self.board.read("main")], ["t_1"])
+
     def test_a_board_without_a_database_is_neither_read_nor_created(self):
         missing = Path(self.temporary.name) / "boards" / "new" / "kanban.db"
         self.kb.dbs["new"] = missing
         self.assertEqual(self.board.read("main"), [])
         self.assertFalse(missing.exists())
-        self.assertNotIn(missing, self.kb.opened)
+
+    def test_a_board_that_cannot_be_read_stands_as_last_read_and_the_others_are_reported(self):
+        self.kb.add_board("ops")
+        self.kb.create("t_ops", board="ops")
+        self.kb.hold("t_ops", board="ops", at=3_000)
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        self.assertEqual([t["task"] for t in self.board.read("main")], ["ops/t_ops", "t_1"])
+        good = self.kb.dbs["ops"].read_bytes()
+        self.kb.dbs["ops"].write_bytes(b"not a database" * 100)
+        self.kb.create("t_2")
+        self.kb.hold("t_2", at=4_000)
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            self.assertEqual([t["task"] for t in self.board.read("main")], ["t_2", "ops/t_ops", "t_1"])
+        self.assertIn("ops", logs.output[0])
+        # Said again only after a while
+        with self.assertNoLogs("enclos.held_tasks", "WARNING"):
+            self.board.read("main")
+        with patch.object(held_tasks, "RETELL_SECONDS", 0), self.assertLogs("enclos.held_tasks", "WARNING"):
+            self.board.read("main")
+        self.kb.dbs["ops"].write_bytes(good)
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            self.board.read("main")
+        self.assertIn("reads again", logs.output[0])
+
+    def test_boards_that_cannot_be_listed_raise(self):
+        self.kb.listing_error = RuntimeError("no root")
+        with self.assertRaises(RuntimeError):
+            self.board.read("main")
 
 
 class Resuming(FakeBoardCase):
@@ -344,6 +447,18 @@ class Resuming(FakeBoardCase):
         self.kb.unblock_result = False
         self.assertEqual(self.resume_error("t_1", self.revision("t_1")), "conflict")
 
+    def test_hermes_raising_after_it_committed_the_unblock_is_a_resume(self):
+        self.kb.raise_after_commit = True
+        with self.assertLogs("enclos.held_tasks", "WARNING"):
+            self.board.resume("main", "t_1", self.revision("t_1"))
+        self.assertEqual(self.kb.status("t_1"), "ready")
+
+    def test_hermes_raising_before_it_unblocked_is_raised(self):
+        self.kb.unblock_error = RuntimeError("database is locked")
+        with self.assertRaises(RuntimeError):
+            self.board.resume("main", "t_1", self.revision("t_1"))
+        self.assertEqual(self.kb.status("t_1"), "blocked")
+
     def test_another_agent_s_task_or_an_unknown_one_is_not_found(self):
         self.kb.create("t_theirs", created_by="research")
         self.kb.hold("t_theirs")
@@ -360,157 +475,230 @@ class Resuming(FakeBoardCase):
         self.assertEqual((self.kb.status("t_1", "ops"), self.kb.status("t_1")), ("ready", "blocked"))
 
 
-class Sent(FakeBoardCase):
+class Sent(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
     """What the manager sends the bridge."""
 
     def setUp(self):
         super().setUp()
         self.sent: list[dict] = []
         self.connected = True
+        self.failures: list[Exception] = []
+        self.arrived: Optional[asyncio.Event] = None
 
     async def write(self, message):
+        if self.failures:
+            raise self.failures.pop(0)
         if not self.connected:
             return False
         self.sent.append(message)
+        if self.arrived is not None:
+            self.arrived.set()
         return True
 
-    def manager(self, bridge=True):
-        manager = held_tasks.Manager("main", self.write, board=self.board, refresh_seconds=3600)
+    def manager(self, bridge=True, refresh_seconds=3600):
+        manager = held_tasks.Manager("main", self.write, board=self.board, refresh_seconds=refresh_seconds)
         manager.bridge_supports = bridge
         return manager
 
-    async def settle(self):
-        for _ in range(20):
-            await asyncio.sleep(0.01)
+    async def lists_reach(self, count):
+        """Waits until `count` lists were sent."""
+        self.arrived = self.arrived or asyncio.Event()
+        while len(self.lists()) < count:
+            self.arrived.clear()
+            await asyncio.wait_for(self.arrived.wait(), 5)
 
     def lists(self):
         return [[t["task"] for t in m["tasks"]] for m in self.sent if m["type"] == "held_tasks"]
 
-    def test_the_whole_list_after_the_hello_then_only_when_it_changes(self):
-        async def run():
-            self.kb.create("t_1")
-            self.kb.hold("t_1")
-            manager = self.manager()
-            manager.start()
-            await self.settle()
-            self.assertEqual(self.lists(), [["t_1"]])
-            manager.poke()
-            await self.settle()
-            self.assertEqual(self.lists(), [["t_1"]])
-            self.kb.create("t_2")
-            self.kb.hold("t_2", at=3_000)
-            manager.poke()
-            await self.settle()
-            self.assertEqual(self.lists(), [["t_1"], ["t_2", "t_1"]])
-            # A new connection gets the whole list again
-            manager.start()
-            await self.settle()
-            self.assertEqual(self.lists()[-1], ["t_2", "t_1"])
-            self.assertEqual(len(self.lists()), 3)
-            manager.stop()
-        asyncio.run(run())
+    async def test_the_whole_list_after_the_hello_then_only_when_it_changes(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        manager = self.manager()
+        manager.start()
+        await self.lists_reach(1)
+        await manager.refresh()
+        self.assertEqual(self.lists(), [["t_1"]])
+        self.kb.create("t_2")
+        self.kb.hold("t_2", at=3_000)
+        manager.poke()
+        await self.lists_reach(2)
+        self.assertEqual(self.lists(), [["t_1"], ["t_2", "t_1"]])
+        # A new connection gets the whole list again
+        manager.start()
+        await self.lists_reach(3)
+        self.assertEqual(self.lists()[-1], ["t_2", "t_1"])
+        manager.stop()
 
-    def test_an_empty_list_is_sent_so_the_bridge_releases_old_cards(self):
-        async def run():
-            manager = self.manager()
-            manager.start()
-            await self.settle()
-            manager.stop()
-        asyncio.run(run())
+    async def test_an_empty_list_is_sent_so_the_bridge_releases_old_cards(self):
+        await self.manager().refresh()
         self.assertEqual(self.lists(), [[]])
 
-    def test_the_timer_reads_the_board_again(self):
-        async def run():
-            manager = held_tasks.Manager("main", self.write, board=self.board, refresh_seconds=0.02)
-            manager.bridge_supports = True
-            manager.start()
-            await self.settle()
-            self.kb.create("t_1")
-            self.kb.hold("t_1")
-            await asyncio.sleep(0.1)
-            manager.stop()
-        asyncio.run(run())
-        self.assertEqual(self.lists(), [[], ["t_1"]])
+    async def test_the_timer_reads_the_board_again(self):
+        manager = self.manager(refresh_seconds=0.02)
+        manager.start()
+        await self.lists_reach(1)
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        await self.lists_reach(2)
+        manager.stop()
+        self.assertEqual(self.lists()[:2], [[], ["t_1"]])
 
-    def test_nothing_is_sent_to_a_bridge_without_the_capability(self):
-        async def run():
-            manager = self.manager(bridge=False)
-            manager.start()
-            await self.settle()
-            await manager.resume(protocol.message("held_task.resume", task="t_1", revision="e:1",
-                                                  person="p@example.com", device="d-1"))
-        asyncio.run(run())
+    async def test_nothing_is_sent_to_a_bridge_without_the_capability(self):
+        manager = self.manager(bridge=False)
+        manager.start()
+        await manager.refresh()
+        await manager.resume(protocol.message("held_task.resume", task="t_1", revision="e:1",
+                                              person="p@example.com", device="d-1"))
         self.assertEqual([(m["type"], m.get("code")) for m in self.sent], [("error", "unsupported")])
 
-    def test_a_board_that_cannot_be_read_sends_nothing_rather_than_an_empty_list(self):
-        async def run():
-            self.kb.create("t_1")
-            self.kb.hold("t_1")
-            manager = self.manager()
-            manager.start()
-            await self.settle()
-            self.kb.dbs["broken"] = Path(self.temporary.name) / "broken.db"
-            self.kb.dbs["broken"].write_bytes(b"not a database" * 100)
-            with self.assertLogs("enclos.held_tasks", "WARNING"):
-                manager.poke()
-                await self.settle()
-            manager.stop()
-        asyncio.run(run())
+    async def test_boards_that_cannot_be_listed_send_nothing_rather_than_an_empty_list(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        manager = self.manager()
+        await manager.refresh()
+        self.kb.listing_error = RuntimeError("no root")
+        with self.assertLogs("enclos.held_tasks", "ERROR"):
+            await manager.refresh(force=True)
         self.assertEqual(self.lists(), [["t_1"]])
 
-    def test_a_list_the_bridge_refused_is_sent_again_unless_it_could_not_read_it(self):
-        async def run():
-            manager = self.manager()
+    async def test_a_failure_while_sending_does_not_stop_the_reports(self):
+        manager = self.manager()
+        self.failures.append(UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"))
+        with self.assertLogs("enclos.held_tasks", "ERROR"):
             manager.start()
-            await self.settle()
-            manager.refused(self.sent[-1]["id"], "bad_message")
-            manager.poke()
-            await self.settle()
-            self.assertEqual(len(self.lists()), 1)
-            manager.refused(self.sent[-1]["id"], "internal")
-            manager.poke()
-            await self.settle()
-            self.assertEqual(len(self.lists()), 2)
-            manager.stop()
-        asyncio.run(run())
+            await asyncio.sleep(0)
+            for _ in range(100):
+                if not self.failures:
+                    break
+                await asyncio.sleep(0.01)
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        manager.poke()
+        await self.lists_reach(1)
+        self.assertEqual(self.lists(), [["t_1"]])
+        manager.stop()
 
-    def resume(self, manager, **fields):
+    async def test_a_list_the_bridge_refused_is_sent_again_unless_it_could_not_read_it(self):
+        manager = self.manager()
+        await manager.refresh()
+        manager.refused(self.sent[-1]["id"], "bad_message")
+        await manager.refresh()
+        self.assertEqual(len(self.lists()), 1)
+        manager.refused(self.sent[-1]["id"], "internal")
+        await manager.refresh()
+        self.assertEqual(len(self.lists()), 2)
+
+    async def test_past_32_the_newest_go_and_the_cut_is_said_once_per_change(self):
+        for n in range(34):
+            self.kb.create(f"t_{n:02}")
+            self.kb.hold(f"t_{n:02}", at=10_000 + n)
+        manager = self.manager()
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            await manager.refresh()
+        self.assertIn("t_00, t_01", logs.output[0])
+        self.assertEqual(self.lists()[0], [f"t_{n:02}" for n in range(33, 1, -1)])
+        with self.assertNoLogs("enclos.held_tasks", "WARNING"):
+            await manager.refresh(force=True)
+        self.kb.create("t_99")
+        self.kb.hold("t_99", at=20_000)
+        with self.assertLogs("enclos.held_tasks", "WARNING"):
+            await manager.refresh()
+
+    async def resume(self, manager, **fields):
         message = protocol.message("held_task.resume", person="p@example.com", device="d-1", **fields)
-        asyncio.run(manager.resume(message))
+        await manager.resume(message)
         return message
 
-    def test_a_resume_answers_resumed_then_sends_a_fresh_list(self):
+    async def test_a_resume_answers_resumed_then_sends_a_fresh_list(self):
         self.kb.create("t_1")
         self.kb.hold("t_1")
         manager = self.manager()
         with self.assertLogs("enclos.held_tasks", "INFO") as logs:
-            message = self.resume(manager, task="t_1", revision=self.revision("t_1"))
+            message = await self.resume(manager, task="t_1", revision=self.revision("t_1"))
         self.assertEqual([(m["type"], m.get("of")) for m in self.sent],
                          [("held_task.resumed", message["id"]), ("held_tasks", None)])
         self.assertEqual(self.sent[1]["tasks"], [])
         self.assertTrue(any("p@example.com" in line and "d-1" in line for line in logs.output))
 
-    def test_a_refused_resume_answers_its_code_then_sends_the_list_all_the_same(self):
+    async def test_a_list_read_before_a_resume_is_never_sent_after_its_answer(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        revision = self.revision("t_1")
+        reading, release = threading.Event(), threading.Event()
+        read = self.board.read
+
+        def slow_read(profile):
+            found = read(profile)
+            reading.set()
+            release.wait(5)
+            return found
+
+        manager = self.manager()
+        with patch.object(self.board, "read", slow_read):
+            refresh = asyncio.create_task(manager.refresh())
+            await asyncio.to_thread(reading.wait, 5)
+            resume = asyncio.create_task(self.resume(manager, task="t_1", revision=revision))
+            await asyncio.sleep(0.01)
+            release.set()
+            await asyncio.gather(refresh, resume)
+        types_ = [m["type"] for m in self.sent]
+        after = self.sent[types_.index("held_task.resumed") + 1:]
+        self.assertTrue(after)
+        self.assertTrue(all("t_1" not in [t["task"] for t in m["tasks"]] for m in after))
+
+    async def test_a_refused_resume_answers_its_code_then_sends_the_list_all_the_same(self):
         self.kb.create("t_1")
         self.kb.hold("t_1")
         manager = self.manager()
-        message = self.resume(manager, task="t_1", revision="e:1")
+        message = await self.resume(manager, task="t_1", revision="e:1")
         self.assertEqual([(m["type"], m.get("code"), m.get("of")) for m in self.sent],
                          [("error", "conflict", message["id"]), ("held_tasks", None, None)])
         self.sent.clear()
-        self.resume(manager, task="t_2", revision="e:1")
+        await self.resume(manager, task="t_2", revision="e:1")
         self.assertEqual([(m["type"], m.get("code")) for m in self.sent],
                          [("error", "not_found"), ("held_tasks", None)])
 
-    def test_hermes_failing_answers_internal_and_is_logged(self):
+    async def test_hermes_failing_answers_internal_and_is_logged(self):
         self.kb.create("t_1")
         self.kb.hold("t_1")
         self.kb.unblock_error = RuntimeError("database is locked")
         manager = self.manager()
         with self.assertLogs("enclos.held_tasks", "ERROR"):
-            self.resume(manager, task="t_1", revision=self.revision("t_1"))
+            await self.resume(manager, task="t_1", revision=self.revision("t_1"))
         self.assertEqual(self.sent[0]["code"], "internal")
         self.assertNotIn("database is locked", self.sent[0]["message"])
+
+    async def test_hermes_failing_after_it_committed_answers_resumed(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        self.kb.raise_after_commit = True
+        manager = self.manager()
+        with self.assertLogs("enclos.held_tasks", "WARNING"):
+            await self.resume(manager, task="t_1", revision=self.revision("t_1"))
+        self.assertEqual(self.sent[0]["type"], "held_task.resumed")
+
+    async def test_an_answer_that_cannot_be_sent_is_logged(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        self.connected = False
+        manager = self.manager()
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            await self.resume(manager, task="t_1", revision=self.revision("t_1"))
+        self.assertTrue(any("could not be sent" in line for line in logs.output))
+
+    async def test_a_resume_that_fails_beside_the_connection_is_logged(self):
+        manager = self.manager()
+
+        async def broken():
+            raise RuntimeError("unexpected")
+
+        with self.assertLogs("enclos.held_tasks", "ERROR"):
+            task = asyncio.create_task(broken())
+            manager.track(task)
+            with contextlib.suppress(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+        self.assertEqual(manager.tasks, set())
 
 
 @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
@@ -557,6 +745,8 @@ class NativeHermesHeldTasks(unittest.TestCase):
         self.assertLessEqual(abs(task["since"] - time.time()), 60)
         self.board.resume("main", task_id, task["revision"])
         native = self.kb.get_task(self.conn, task_id)
+        # The retry budget is Hermes's `consecutive_failures`, a public Task
+        # field; unblock_task resets it.
         self.assertEqual((native.status, native.consecutive_failures), ("ready", 0))
         self.assertEqual(self.board.read("main"), [])
 
@@ -577,7 +767,10 @@ class NativeHermesHeldTasks(unittest.TestCase):
     def test_a_task_the_dispatcher_gave_up_on_says_so(self):
         task_id = self.kb.create_task(self.conn, title="Fetch the feed", assignee="main", created_by="main",
                                       max_retries=1)
-        self.assertTrue(self.kb._record_task_failure(self.conn, task_id, "rate limited", outcome="crashed"))
+        # Hermes has no public call that makes the dispatcher give up: its own
+        # failure recorder is the one path that writes a `gave_up` event.
+        from hermes_cli.kanban_db_dispatch import _record_task_failure
+        self.assertTrue(_record_task_failure(self.conn, task_id, "rate limited", outcome="crashed"))
         [task] = self.board.read("main")
         self.assertEqual((task["reason"], task["last_error"]), ("Gave up after 1 consecutive failure.",
                                                                 "rate limited"))
@@ -594,6 +787,16 @@ class NativeHermesHeldTasks(unittest.TestCase):
             self.board.resume("main", task["task"], self.latest(ops, task_id))
             self.assertEqual(self.kb.get_task(ops, task_id).status, "ready")
 
+    def test_reading_never_creates_a_board_s_database(self):
+        self.kb.create_board("empty")
+        database = Path(self.kb.list_boards(include_archived=False)[-1]["db_path"])
+        database.unlink()
+        for sidecar in ("-wal", "-shm"):
+            Path(f"{database}{sidecar}").unlink(missing_ok=True)
+        self.held()
+        self.assertEqual(len(self.board.read("main")), 1)
+        self.assertFalse(database.exists())
+
     def test_the_manager_sends_the_list_and_answers_a_resume(self):
         task_id = self.held()
         sent = []
@@ -605,15 +808,10 @@ class NativeHermesHeldTasks(unittest.TestCase):
         async def run():
             manager = held_tasks.Manager("main", write, board=self.board, refresh_seconds=3600)
             manager.bridge_supports = True
-            manager.start()
-            for _ in range(100):
-                if sent:
-                    break
-                await asyncio.sleep(0.02)
+            await manager.refresh()
             revision = sent[0]["tasks"][0]["revision"]
             await manager.resume(protocol.message("held_task.resume", task=task_id, revision=revision,
                                                   person="p@example.com", device="d-1"))
-            manager.stop()
 
         asyncio.run(run())
         self.assertEqual([m["type"] for m in sent], ["held_tasks", "held_task.resumed", "held_tasks"])

@@ -229,6 +229,14 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
         writer.close()
 
+    async def test_a_hermes_without_a_board_does_not_announce_held_tasks(self):
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["held_tasks"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertNotIn("held_tasks", hello["capabilities"])
+        writer.close()
+
     async def test_a_held_task_resume_is_unsupported_not_a_second_hello(self):
         reader, writer = await self.bridge()
         await self.hello(reader, writer)
@@ -436,6 +444,16 @@ class HeldTasksOverTheSocket(unittest.IsolatedAsyncioTestCase):
     async def next(self, reader):
         return json.loads(await asyncio.wait_for(reader.readline(), 5))
 
+    async def test_one_list_after_the_hello_written_to_the_bridge_not_kept_in_the_outbox(self):
+        reader, writer = await self.connect(["held_tasks"])
+        self.assertEqual((await self.next(reader))["type"], "held_tasks")
+        writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="hi"))
+        await writer.drain()
+        # Nothing changed on the board: the next line is the message's ack
+        self.assertEqual((await self.next(reader))["type"], "ack")
+        self.assertEqual(self.adapter._outbox.pending(), [])
+        writer.close()
+
     async def test_a_bridge_without_the_capability_gets_no_list(self):
         reader, writer = await self.connect([])
         writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="hi"))
@@ -464,6 +482,26 @@ class HeldTasksOverTheSocket(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(ticked, board="default", profile_name="default", outcome="idle")
         self.assertEqual((await self.next(reader))["tasks"], [])
         writer.close()
+
+
+class Registration(unittest.TestCase):
+    def registered(self, valid_hooks):
+        plugins = types.ModuleType("hermes_cli.plugins")
+        plugins.VALID_HOOKS = set(valid_hooks)
+        package = types.ModuleType("hermes_cli")
+        package.plugins = plugins
+        ctx = Mock()
+        module = sys.modules[EnclosAdapter.__module__]
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.plugins": plugins}):
+            module.register(ctx)
+        return {c.args[0]: c.args[1] for c in ctx.register_hook.call_args_list}
+
+    def test_the_dispatch_tick_hook_is_registered_only_when_hermes_knows_it(self):
+        module = sys.modules[EnclosAdapter.__module__]
+        hooks = self.registered({"on_kanban_dispatch_tick"})
+        self.assertIs(hooks["on_kanban_dispatch_tick"], module._kanban_ticked)
+        with self.assertLogs("enclos.adapter", "INFO"):
+            self.assertNotIn("on_kanban_dispatch_tick", self.registered(set()))
 
 
 if __name__ == "__main__":
