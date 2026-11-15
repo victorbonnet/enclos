@@ -5185,3 +5185,106 @@ fn usage_reads_each_agents_records_inside_the_sandbox_and_removes_its_report() {
     assert!(!left, "the report stayed in the home");
     assert!(lab.audit().contains("usage session"), "{}", lab.audit());
 }
+
+/// A stand-in for Hermes's own Python, where the usage reader looks for
+/// it: `body` runs with the reader's words (`-I -c <script> <report> ...`),
+/// the report's path in `$4`.
+fn usage_python(lab: &Lab, body: &str) {
+    let bin = lab.home.join(".hermes/tools/python-stub/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::test_scripts::write_script(&bin.join("python3"), body);
+}
+
+fn usage_of(lab: &Lab) -> Fact<Vec<crate::engine::AgentUsage>> {
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    view.sandboxes.into_iter().next().unwrap().agents
+}
+
+fn report_left(lab: &Lab) -> bool {
+    std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        })
+}
+
+#[test]
+fn a_usage_reader_that_fails_says_how_and_leaves_no_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // It exits non-zero without a word: how it ended.
+    usage_python(&lab, "exit 3");
+    assert_eq!(
+        usage_of(&lab),
+        Fact::CannotTell("Hermes's usage reader exited with 3".into())
+    );
+    // It wrote a report, then failed: the report goes all the same.
+    usage_python(&lab, "printf '{}' > \"$4\"; exit 1");
+    assert!(matches!(usage_of(&lab), Fact::CannotTell(why) if why.contains("exited with 1")));
+    assert!(!report_left(&lab));
+    // It wrote what is not a report.
+    usage_python(&lab, "printf 'not json' > \"$4\"");
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert!(why.starts_with("the usage report is not valid"), "{why}");
+    assert!(!report_left(&lab));
+    // It could not read at all, and said why, escaped.
+    usage_python(
+        &lab,
+        "printf '{\"format\":1,\"agents\":[],\"error\":\"OSError: \\\\u001b[2J gone\"}' > \"$4\"",
+    );
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert_eq!(
+        why,
+        "Hermes's usage reader could not read: OSError: \\u{1b}[2J gone"
+    );
+    // Nothing it prints reaches enclos's output: it goes nowhere.
+    usage_python(
+        &lab,
+        "echo printed; echo said >&2; printf '{\"format\":1,\"agents\":[]}' > \"$4\"",
+    );
+    assert!(matches!(usage_of(&lab), Fact::Known(_)));
+}
+
+#[test]
+fn usage_of_every_sandbox_leaves_one_not_running_unread_and_runs_nothing_in_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let sessions_before = lab.audit().matches("usage session").count();
+    lab.engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = lab.engine.state.get(&lab.name)?.unwrap();
+                record.state = crate::model::sandbox::SandboxState::Stopped;
+                lab.engine.state.put(lock, &record)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), None, since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert!(
+        matches!(&sandbox.agents, Fact::CannotTell(why) if why.starts_with("not running; `enclos usage home`")),
+        "{sandbox:?}"
+    );
+    assert_eq!(
+        lab.audit().matches("usage session").count(),
+        sessions_before
+    );
+}

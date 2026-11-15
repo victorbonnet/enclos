@@ -409,12 +409,17 @@ impl RuntimeAdapter for Hermes {
         report: &Path,
     ) -> Option<SandboxCommand> {
         // Hermes keeps each agent's sessions, with their token counts and
-        // cost, in its own `state.db` (`hermes_state.py`); its own Python
-        // reads them read-only inside the sandbox.
+        // cost, in its own `state.db` (`hermes_state.py`); its own Python,
+        // which its installer puts in `~/.hermes/tools/python-<version>/`
+        // (seen with the install of 2026-11), reads them read-only inside
+        // the sandbox, else the sandbox's `python3`. Isolated (`-I`), so no
+        // file the agent planted in its site folders or here runs; and its
+        // output goes nowhere, so nothing it prints reaches the host's
+        // terminal or JSON unescaped: what it has to say is in the report.
         let mut words: Vec<OsString> = vec![
             "/bin/sh".into(),
             "-c".into(),
-            "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; script=\"$1\"; shift; exec \"$python\" -c \"$script\" \"$@\"".into(),
+            "python=python3; for candidate in \"$HOME\"/.hermes/tools/python-*/bin/python3; do if [ -x \"$candidate\" ]; then python=\"$candidate\"; fi; done; script=\"$1\"; shift; exec \"$python\" -I -c \"$script\" \"$@\" </dev/null >/dev/null 2>&1".into(),
             "enclos-hermes-usage".into(),
             include_str!("hermes/usage.py").into(),
             report.as_os_str().to_owned(),
