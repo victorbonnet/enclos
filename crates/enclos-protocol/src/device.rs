@@ -321,6 +321,27 @@ pub enum ToDevice {
         agent: String,
         commands: Vec<Command>,
     },
+    /// What an agent is doing, as this person may see it: after
+    /// `agents.list` for each agent not idle, and whenever it changes.
+    #[serde(rename = "agent.activity")]
+    AgentActivity {
+        /// `<sandbox>/<agent>`.
+        agent: String,
+        #[serde(flatten)]
+        activity: crate::task::Activity,
+    },
+    /// One task, its `assignee` and `asked_by` as `<sandbox>/<agent>`: at
+    /// `sync` and whenever it changes, to the host's person only.
+    #[serde(rename = "task")]
+    Task { task: crate::task::Task },
+    /// A task the bridge no longer keeps.
+    #[serde(rename = "task.removed")]
+    TaskRemoved {
+        /// The assignee, `<sandbox>/<agent>`.
+        agent: String,
+        /// Its id.
+        task: String,
+    },
     /// Bytes of an attachment, from `offset`, at most [`ATTACHMENT_CHUNK`]:
     /// a Noise message holds 64 KiB, base64 included.
     #[serde(rename = "attachment.data")]
@@ -370,6 +391,9 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "typing",
     "tool",
     "commands",
+    "agent.activity",
+    "task",
+    "task.removed",
     "group.state",
     "attachment.data",
     "synced",
