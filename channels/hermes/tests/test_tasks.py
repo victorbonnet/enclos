@@ -123,6 +123,16 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(list(found), ["t-long"])
         self.assertEqual((len(found["t-long"]["title"]), len(found["t-long"]["summary"])), (120, 500))
 
+    def test_a_cell_of_invalid_utf8_does_not_stop_the_reading(self):
+        self.scratch.task("t-1")
+        self.scratch.task("t-2", "done", created_at=NOW - 50)
+        self.scratch.run("UPDATE tasks SET title = CAST(x'ff' AS TEXT) || ' report' WHERE id = 't-1'")
+        # A BLOB cell is text too, not b'...'.
+        self.scratch.run("UPDATE tasks SET result = x'416c6c20ff66696e65' WHERE id = 't-2'")
+        found = self.read()
+        self.assertEqual(found["t-1"]["title"], "� report")
+        self.assertEqual(found["t-2"]["summary"], "All �fine")
+
     def test_every_board_is_read_newest_first(self):
         other = Scratch(self.folder)
         self.board = tasks.Board("engineer", lambda: [self.scratch.path, other.path], "enclos")
@@ -237,6 +247,70 @@ class ReporterTest(unittest.IsolatedAsyncioTestCase):
         [(kind, listed)] = self.sent.take()
         self.assertEqual((kind, [t["id"] for t in listed]), ("tasks", ["t-1"]))
 
+    async def test_a_second_hello_repeats_the_whole_state(self):
+        # The bridge makes the agent idle when a connection closes, and keeps
+        # only the tasks of the last list: the next hello repeats both.
+        self.scratch.task("t-1")
+        await self.reporter.connected()
+        await self.reporter.answering("c-1", True)
+        [(_, [task]), _, _] = self.sent.take()
+        await self.reporter.connected()
+        self.assertEqual(self.sent.take(), [("tasks", [task]),
+                                            ("agent.activity", [{"kind": "answering", "conversation": "c-1"}])])
+
+    async def test_a_refused_update_is_sent_again_at_the_next_reading(self):
+        self.scratch.task("t-1")
+        await self.reporter.connected()
+        self.reporter.acknowledged(self.sent.messages[0]["id"])
+        self.sent.take()
+        self.scratch.set("t-1", status="blocked")
+        self.scratch.event("t-1", "blocked", NOW)
+        await self.watch_once()
+        [update] = self.sent.messages
+        self.sent.take()
+        # The bridge's answer to a refused message: an error, then the ack.
+        self.reporter.refused(update["id"])
+        self.reporter.acknowledged(update["id"])
+        self.scratch.task("t-2")
+        await self.watch_once()
+        self.assertEqual(sorted((k, t["id"], t["state"]) for k, t in self.sent.take()),
+                         [("task.update", "t-1", "blocked"), ("task.update", "t-2", "queued")])
+
+    async def test_each_task_of_a_refused_list_is_sent_again_at_the_next_reading(self):
+        self.scratch.task("t-1")
+        self.scratch.task("t-2")
+        await self.reporter.connected()
+        [listed, _] = self.sent.messages
+        self.sent.take()
+        self.reporter.refused(listed["id"])
+        self.scratch.task("t-3", assignee="reviewer")  # the board changed, not this agent's tasks
+        await self.watch_once()
+        self.assertEqual(sorted((k, t["id"]) for k, t in self.sent.take()),
+                         [("task.update", "t-1"), ("task.update", "t-2")])
+
+    async def test_an_ack_clears_what_a_task_message_carried(self):
+        self.scratch.task("t-1")
+        await self.reporter.connected()
+        [listed, _] = self.sent.messages
+        self.sent.take()
+        self.assertEqual(dict(self.reporter._unanswered), {listed["id"]: ["t-1"]})
+        self.reporter.acknowledged(listed["id"])
+        self.assertEqual(dict(self.reporter._unanswered), {})
+        # An error that comes after the ack, or for another message, changes nothing.
+        self.reporter.refused(listed["id"])
+        self.reporter.refused("m-other")
+        self.scratch.task("t-2", assignee="reviewer")
+        await self.watch_once()
+        self.assertEqual(self.sent.take(), [])
+
+    async def test_unanswered_task_messages_are_bounded(self):
+        self.scratch.task("t-1")
+        with patch.object(tasks, "MAX_UNANSWERED", 3):
+            for _ in range(5):
+                await self.reporter._refresh(whole=True)
+        self.assertEqual(len(self.reporter._unanswered), 3)
+        self.assertEqual(list(self.reporter._unanswered), [m["id"] for m in self.sent.messages[-3:]])
+
     async def test_a_bridge_without_the_capabilities_gets_neither(self):
         self.scratch.task("t-1", "running")
         self.reporter.bridge = frozenset()
@@ -334,6 +408,10 @@ class RealHermesBoardTest(unittest.TestCase):
         self.assertEqual((by_id[done]["conversation"], by_id[done]["asked_by"], by_id[done]["summary"]),
                          ("c-1", "main", "All done"))
         self.assertTrue(all(t["since"] > 0 and t["assignee"] == "engineer" for t in found))
+
+    def test_every_board_hook_is_one_hermes_has(self):
+        from hermes_cli.plugins import VALID_HOOKS
+        self.assertEqual(set(tasks.HOOKS) - set(VALID_HOOKS), set())
 
 
 if __name__ == "__main__":

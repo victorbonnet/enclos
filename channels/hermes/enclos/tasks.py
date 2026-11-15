@@ -10,10 +10,11 @@ to look sooner. Nothing here writes the board, nor opens it through Hermes's
 
 Nothing is kept either: the bridge acknowledges a task once stored, and ends
 the connection when it cannot, so the list sent after the next hello repairs
-whatever was lost.
+whatever was lost. A task it refuses is sent again at the next reading.
 """
 
 import asyncio
+import collections
 import contextlib
 import logging
 import os
@@ -46,6 +47,9 @@ ENDED_SECONDS = 3 * 24 * 3600
 MAX_TITLE_CHARS = 120
 MAX_SUMMARY_CHARS = 500
 MAX_DOING = 16
+# The task messages the bridge has not answered yet, by message id: as many
+# as fit, the oldest forgotten first.
+MAX_UNANSWERED = 1024
 
 # Hermes's hooks after a board write, taken as a cue to read it again.
 HOOKS = ("kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked", "on_kanban_task_updated")
@@ -70,7 +74,14 @@ def _epoch(value: Any) -> Optional[int]:
     return max(0, int(value))
 
 
+def _lossy(value: bytes) -> str:
+    return value.decode("utf-8", "replace")
+
+
 def _line(value: Any, chars: int) -> str:
+    # A BLOB cell comes as bytes, which `str` would show as b'...'.
+    if isinstance(value, bytes):
+        value = _lossy(value)
     return " ".join(str(value or "").split())[:chars].rstrip()
 
 
@@ -129,6 +140,9 @@ class Board:
     def _open(path: str) -> sqlite3.Connection:
         conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
         conn.row_factory = sqlite3.Row
+        # As Hermes reads its board: a cell of invalid UTF-8 would otherwise
+        # fail the whole read, and with it every task's report.
+        conn.text_factory = _lossy
         return conn
 
     def cursor(self) -> tuple:
@@ -207,6 +221,9 @@ class Reporter:
         self._since = 0
         # The tasks the bridge was last given, by id, and the board's cursor then.
         self._sent: dict[str, dict[str, Any]] = {}
+        # By message id: the task ids each task message carried, until the
+        # bridge answers it.
+        self._unanswered: collections.OrderedDict[str, list[str]] = collections.OrderedDict()
         self._cursor: Optional[tuple] = None
         # One reading and sending at a time, so an older list never follows a newer one.
         self._lock = asyncio.Lock()
@@ -233,11 +250,25 @@ class Reporter:
         """A board changed, by a hook's word: look now rather than at the next poll."""
         self._cue.set()
 
+    def acknowledged(self, of: Optional[str]) -> None:
+        """The bridge's `ack` of message `of`: the tasks it carried are its."""
+        self._unanswered.pop(of, None)
+
+    def refused(self, of: Optional[str]) -> None:
+        """The bridge's `error` for message `of`. When it carried tasks, they
+        are taken as not sent, so the next reading sends them again: one
+        refused because the sandbox had 100 tasks still going goes once the
+        board changes again, perhaps with room."""
+        for task_id in self._unanswered.pop(of, ()):
+            self._sent.pop(task_id, None)
+
     async def connected(self) -> None:
         """After a bridge hello: the agent's whole state, which the bridge
         replaces its own with."""
         if self.board:
             async with self._lock:
+                # The last connection's answers will not come.
+                self._unanswered.clear()
                 await self._refresh(whole=True)
         await self._send_activity()
 
@@ -296,14 +327,22 @@ class Reporter:
         self._cursor = cursor
         now = int(time.time())
         current = listed(tasks, now)
+        messages = []
         if "tasks" in self.bridge:
             if whole or set(self._sent) - {t["id"] for t in current}:
-                await self._write(protocol.message("tasks", tasks=current))
+                messages.append(protocol.message("tasks", tasks=current))
             else:
-                for task in current:
-                    if self._sent.get(task["id"]) != task:
-                        await self._write(protocol.message("task.update", task=task))
+                messages.extend(protocol.message("task.update", task=t) for t in current
+                                if self._sent.get(t["id"]) != t)
+        # Taken as sent before the first write: the bridge's `error` for one
+        # can be read while the next is on its way.
         self._sent = {t["id"]: t for t in current}
+        for message in messages:
+            carried = message["tasks"] if message["type"] == "tasks" else [message["task"]]
+            self._unanswered[message["id"]] = [t["id"] for t in carried]
+            while len(self._unanswered) > MAX_UNANSWERED:
+                self._unanswered.popitem(last=False)
+            await self._write(message)
         self._running = [t["id"] for t in tasks if t["state"] == "running"]
         return self._update_doing()
 

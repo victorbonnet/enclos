@@ -294,6 +294,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._outbox.acknowledge(message["of"])
             self._questions.acknowledge(message["of"])
             approvals.answered(self._answers, message)
+            self._reporter.acknowledged(message["of"])
         elif kind == "policy.context":
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
@@ -319,6 +320,8 @@ class EnclosAdapter(BasePlatformAdapter):
             task.add_done_callback(self._routine_tasks.discard)
         elif kind == "error":
             approvals.answered(self._answers, message)
+            # A task it refused is sent again at the board's next reading.
+            self._reporter.refused(message.get("of"))
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
             # A question or runtime approval the bridge refused would wait unseen: a
             # question goes as text, an approval is denied or sent as text.
