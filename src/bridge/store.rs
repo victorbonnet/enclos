@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 mod deletion_store;
 #[path = "forget_store.rs"]
 mod forget_store;
-pub use forget_store::setup_home;
+pub use forget_store::{Forget, setup_home};
 #[path = "question_store.rs"]
 mod question_store;
 pub use question_store::{

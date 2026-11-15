@@ -3,10 +3,27 @@
 //! gets if it is made again.
 use super::*;
 
+/// Why forgetting an agent changed nothing.
+#[derive(Debug)]
+pub enum Forget {
+    Storage(rusqlite::Error),
+    /// The deletion record of this conversation id is another person's:
+    /// direct conversations keep their owner, so only a database edited by
+    /// hand gets here, and no retry helps.
+    OwnedByAnother(String),
+}
+
+impl std::convert::From<rusqlite::Error> for Forget {
+    fn from(error: rusqlite::Error) -> Self {
+        Forget::Storage(error)
+    }
+}
+
 impl Store {
     /// The id of `agent`'s (`<sandbox>/<agent>`) Home: [`home_id`] until the
-    /// agent is forgotten, `None` from then on until `runtime configure`
-    /// sets it up again ([`Store::claim_home`]), and the id it claimed then.
+    /// agent is forgotten, `None` from then on until `runtime configure
+    /// --channel app`, or an import into its name, sets it up again
+    /// ([`Store::claim_home`]), and the id claimed then.
     pub fn home_of(&self, agent: &str) -> rusqlite::Result<Option<String>> {
         let row: Option<Option<String>> = self
             .db
@@ -68,16 +85,18 @@ impl Store {
     /// direct conversations with it, its Home among them, as a completed
     /// deletion each (ADR 0062, proposed), so every device of theirs drops
     /// them at sync; leaves its groups; and keeps the agent's Home
-    /// forgotten until it is set up again. One `agent.forget` log entry
-    /// names the agent and every id. The ids deleted, in order, and the
+    /// forgotten until it is set up again. When it deletes any, one
+    /// `agent.forget` log entry names the agent and every id; with none
+    /// left, it logs nothing. The ids deleted, in order, and the
     /// attachment files the rows named.
     pub fn forget_agent(
         &self,
         agent: &str,
         owner: &str,
         device: &str,
-    ) -> rusqlite::Result<(Vec<String>, Vec<String>)> {
-        let (sandbox, name) = agent.split_once('/').ok_or(rusqlite::Error::InvalidQuery)?;
+    ) -> Result<(Vec<String>, Vec<String>), Forget> {
+        // Not `<sandbox>/<agent>`: no conversation is its.
+        let (sandbox, name) = agent.split_once('/').unwrap_or((agent, ""));
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -102,8 +121,10 @@ impl Store {
                  ON CONFLICT(id) DO UPDATE SET targets = '[]', done = 1 WHERE owner = excluded.owner",
                 params![id, owner],
             )?;
+            // Another person's deletion of it: the transaction, dropped,
+            // changes nothing.
             if recorded != 1 {
-                return Err(rusqlite::Error::InvalidQuery);
+                return Err(Forget::OwnedByAnother(id.clone()));
             }
             for table in ["questions", "turns", "members", "attachments", "messages"] {
                 tx.execute(
@@ -187,6 +208,8 @@ pub fn setup_home(path: &Path, agent: &str, claim: bool) -> rusqlite::Result<Str
         return Store::open(path)?.claim_home(agent);
     }
     let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // As `Store::open` does: the bridge may be writing.
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
     // A database from before ADR 0067 has forgotten no agent.
     let known: bool = db.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'homes')",
@@ -289,6 +312,28 @@ mod tests {
         let (ids, _) = store.forget_agent("lab/coder", "alice", "phone").unwrap();
         assert_eq!(ids, ["c-1"]);
         assert_eq!(store.deletions("alice").unwrap(), ["c-1"]);
+    }
+
+    #[test]
+    fn another_persons_deletion_of_one_of_them_changes_nothing() {
+        let (_dir, store) = store();
+        store.ensure_home("lab/coder", "alice", true).unwrap();
+        store.conversation("c-1", "lab", "coder", "alice").unwrap();
+        store
+            .db
+            .execute_batch(
+                "INSERT INTO conversation_deletions (id, owner, targets) VALUES ('c-1', 'bob', '[]')",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.forget_agent("lab/coder", "alice", "phone"),
+            Err(Forget::OwnedByAnother(id)) if id == "c-1"
+        ));
+        assert!(store.conversation_info("home.lab.coder").unwrap().is_some());
+        assert_eq!(
+            store.home_of("lab/coder").unwrap().as_deref(),
+            Some("home.lab.coder")
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! runtime's checks confirm gone, only by the host's person. Nothing native
 //! is left, so no plugin is asked.
 use super::*;
+use crate::bridge::store::Forget;
 
 #[cfg(test)]
 #[path = "forget_tests.rs"]
@@ -28,19 +29,25 @@ impl Hub {
     /// the runtime's no-follow checks confirm removed, with no identity or
     /// data left: those the app may offer to forget. Only the host's
     /// person forgets, so anyone else hears of none.
-    pub(super) fn removed_agents(&self, store: &Store, person: &str) -> Vec<String> {
+    pub(super) fn removed_agents(
+        &self,
+        store: &Store,
+        person: &str,
+    ) -> Result<Vec<String>, ErrorBody> {
         if self.known_host().as_deref() != Some(person) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        store
-            .forget_candidates(person)
-            .unwrap_or_else(|e| {
-                eprintln!("enclos app: cannot list the agents to forget: {e}");
-                Vec::new()
-            })
+        let candidates = store.forget_candidates(person).map_err(|e| {
+            eprintln!("enclos app: cannot list the agents to forget: {e}");
+            refused(
+                ErrorCode::Internal,
+                "The removed agents could not be listed. Try again later.",
+            )
+        })?;
+        Ok(candidates
             .into_iter()
             .filter(|agent| self.deletion_target_absent(agent))
-            .collect()
+            .collect())
     }
 
     /// Forgets `agent` (`<sandbox>/<agent>`) for the host's person, from a
@@ -81,10 +88,24 @@ impl Hub {
         }
         let (ids, files) = store
             .forget_agent(agent, person, &device.id)
-            .map_err(storage)?;
-        // Any a device added meanwhile: their rows are gone already.
+            .map_err(|e| match e {
+                Forget::Storage(e) => storage(e),
+                Forget::OwnedByAnother(id) => {
+                    eprintln!(
+                        "enclos app: forgetting {agent}: conversation {id} has a deletion of another person's"
+                    );
+                    refused(
+                        ErrorCode::Internal,
+                        "Forget cannot finish: one of these conversations is in another person's deletion.",
+                    )
+                }
+            })?;
+        // Any a device added meanwhile: their rows are gone already, so a
+        // file left now is said here, or nobody would find it.
         for file in files {
-            let _ = self.remove_media(&file);
+            if self.remove_media(&file).is_err() {
+                eprintln!("enclos app: forgetting {agent}: attachment {file} is left in app media");
+            }
         }
         let mut groups = self.groups.lock().expect("not poisoned");
         for id in &ids {
@@ -92,8 +113,14 @@ impl Hub {
         }
         drop(groups);
         for id in ids {
-            if let Ok(conversation) = ConversationId::new(id) {
-                self.deliver(person, ToDevice::ConversationDeleted { conversation });
+            match ConversationId::new(id.as_str()) {
+                Ok(conversation) => {
+                    self.deliver(person, ToDevice::ConversationDeleted { conversation })
+                }
+                // Not one a device could have been told of either.
+                Err(e) => eprintln!(
+                    "enclos app: forgetting {agent}: conversation {id:?} deleted, but its id is refused ({e})"
+                ),
             }
         }
         Ok(())
@@ -111,10 +138,13 @@ impl Hub {
         match std::fs::remove_file(self.media().join(file)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(refused(
-                ErrorCode::Internal,
-                "An attachment could not be removed. Retry Forget.",
-            )),
+            Err(e) => {
+                eprintln!("enclos app: cannot remove attachment {file}: {e}");
+                Err(refused(
+                    ErrorCode::Internal,
+                    "An attachment could not be removed. Retry Forget.",
+                ))
+            }
         }
     }
 }

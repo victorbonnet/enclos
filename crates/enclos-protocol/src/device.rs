@@ -262,8 +262,10 @@ pub enum ToDevice {
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
-    /// The person's agents the host confirmed removed, with no runtime
-    /// identity or data left: those `agent.forget` accepts.
+    /// The agents the host confirmed removed, with no runtime identity or
+    /// data left, that the person has a Home or a direct conversation
+    /// with: `agent.forget` accepts each. Empty for anyone but the host's
+    /// person.
     #[serde(rename = "agents.removed.list")]
     AgentsRemovedList {
         /// `<sandbox>/<agent>` each.

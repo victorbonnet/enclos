@@ -459,7 +459,11 @@ impl Engine {
             &format!("{name}/{agent}"),
             confirm != Confirm::DryRun,
         )
-        .map_err(|e| session(format!("cannot read the app bridge's database: {e}")))?;
+        .map_err(|e| {
+            session(format!(
+                "cannot read or update the app bridge's database: {e}"
+            ))
+        })?;
         // The public key the plugin checks each runtime-approval decision
         // against (ADR 0060).
         let bridge_key = self.app_approval_public_key(confirm)?;

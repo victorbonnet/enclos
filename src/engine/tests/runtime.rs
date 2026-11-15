@@ -4792,6 +4792,12 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             .unwrap(),
     );
     let policy_before = lab.engine.policy(&other).unwrap().snapshot.policy;
+    // An agent of the destination's name was forgotten in the app: the
+    // import claims a new Home for it (ADR 0067, proposed).
+    let host = store.host_person().unwrap().unwrap();
+    store
+        .forget_agent("other/comptoir-dev", &host, "phone")
+        .unwrap();
     let manifest = done(
         lab.engine
             .import_agent_export(
@@ -4843,9 +4849,13 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     let app = lab.engine.app_endpoint(&other, "comptoir-dev").unwrap();
     assert_ne!(app.token.expose(), "old-bridge-token");
     assert!(app.socket.to_string_lossy().contains("comptoir-dev"));
-    let target_home = crate::bridge::store::home_id("other/comptoir-dev");
+    let target_home = "home.other.comptoir-dev.2";
     assert_eq!(
-        store.messages_after(&target_home, 0).unwrap()[0].text,
+        store.home_of("other/comptoir-dev").unwrap().as_deref(),
+        Some(target_home)
+    );
+    assert_eq!(
+        store.messages_after(target_home, 0).unwrap()[0].text,
         "history survives"
     );
     assert_eq!(

@@ -312,7 +312,11 @@ impl Engine {
                     &format!("{name}/{agent}"),
                     !metadata_only,
                 )
-                .map_err(|e| failed(format!("cannot read the app bridge's database: {e}")))?;
+                .map_err(|e| {
+                    failed(format!(
+                        "cannot read or update the app bridge's database: {e}"
+                    ))
+                })?;
                 s.history.conversation_map(&home).map_err(failed)?
             }
             None => Default::default(),
