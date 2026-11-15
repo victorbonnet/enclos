@@ -43,6 +43,7 @@ mod status;
 #[cfg(test)]
 pub(crate) mod tests;
 mod unenforced;
+mod usage;
 
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
@@ -75,6 +76,10 @@ pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
     RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted,
     human_bytes, printable_line,
+};
+pub use usage::{
+    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, REPORT_FORMAT, SandboxUsage,
+    Tokens, UsageView,
 };
 
 use std::path::PathBuf;

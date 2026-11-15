@@ -154,6 +154,20 @@ impl Engine {
         .map(|(end, _)| end)
     }
 
+    /// [`Engine::run_in_sandbox`] as an exec session, for a runtime's own
+    /// command that reads something for enclos: it does not hold back a
+    /// runtime's settings restart (ADR 0031), as `exec` does not.
+    pub(super) fn run_exec_in_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+    ) -> Result<SessionEnd> {
+        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Exec, None)
+            .map(|(end, _)| end)
+    }
+
     /// [`Engine::run_in_sandbox`], told to end at `deadline`, as `launch`
     /// is when its service stops: every member of the session is stopped,
     /// TERM then KILL, whatever its process group, and so is what it left
