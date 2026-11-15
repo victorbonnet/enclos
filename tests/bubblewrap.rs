@@ -150,7 +150,9 @@ impl Lab {
     /// its own to `~/gateway.port`; it answers each connection with that
     /// token, and exits 1, for the service manager to start it again, when
     /// a connection says `exit`. On `USR1`, Hermes's graceful restart, it
-    /// adds its token to `~/gateway.usr1` and exits 75, as Hermes does.
+    /// adds its token to `~/gateway.usr1` and exits 75, as Hermes does once
+    /// drained: it runs no work, so a test shows where the signal went, not
+    /// a drain.
     fn with_stand_in_hermes(&self) {
         use enclos::state::StateStore;
         let layout = self.layout();

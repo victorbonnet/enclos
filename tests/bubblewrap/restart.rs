@@ -2,9 +2,9 @@
 //! session's root is `enclos holder join`, on the host; the runtime's
 //! program runs below it, bubblewrap and `enclos inside`, as the second
 //! process of the session's PID namespace. The restart signal must reach
-//! that program: sent to the root, it ended `holder join` (exit 138), and
-//! `launch` then stopped the program with TERM, so a Hermes gateway did not
-//! drain.
+//! that program. Before the fix for issue #292 it was sent to the root,
+//! which it ended (exit 138), and `launch` then stopped the program with
+//! TERM, so a Hermes gateway did not drain.
 
 use std::time::Duration;
 

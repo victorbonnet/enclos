@@ -152,6 +152,8 @@ impl Engine {
         // services a version of enclos without it installed, is installed.
         self.ensure_holder(&record)?;
         let mut watch = self.settings_watch(name, kind, service);
+        // A backend with a namespace holder runs each session in a PID
+        // namespace of its own, below `enclos holder join` (design §5).
         let program_at = match self.holder_of(record.backend) {
             Some(_) => super::restart::ProgramAt::PidNamespace,
             None => super::restart::ProgramAt::Root,
