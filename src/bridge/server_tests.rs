@@ -2773,13 +2773,25 @@ mod refusal_collection {
         Store,
         Device,
     ) {
-        let (dir, engine, name, mut hub, store, device) = sandbox_approval_hub();
-        Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
-            name: format!("{name}/main"),
-            runtime: "hermes".into(),
-            socket: dir.path().join("not-connected.sock"),
-            token: "fixture".into(),
-        });
+        let (dir, engine, name) = crate::engine::tests::policy::with_sandbox();
+        let hub = Arc::new(Hub::new(
+            Transport::Tailscale,
+            no_whois(),
+            dir.path().join("app.db"),
+            crate::layout::Layout::at(dir.path().join("enclos")),
+            vec![],
+            vec![AgentEndpoint {
+                name: format!("{name}/main"),
+                runtime: "hermes".into(),
+                socket: dir.path().join("not-connected.sock"),
+                token: "fixture".into(),
+            }],
+            Some("owner@example.com".into()),
+            SILENCE,
+        ));
+        let store = hub.store().unwrap();
+        let device = avatar_device("phone", "owner@example.com");
+        store.add_device(&device).unwrap();
         let policy = engine.mobile_policy(&name).unwrap();
         let change = enclos_protocol::policy::PolicyChange {
             field: "mode".into(),
