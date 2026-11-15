@@ -5123,3 +5123,65 @@ fn review_resume_failure_reports_that_presentation_was_already_restored() {
         Some("Recovered name")
     );
 }
+
+#[test]
+fn usage_reads_each_agents_records_inside_the_sandbox_and_removes_its_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // `scout` is listed, and was never used: no `state.db` of its own.
+    let scout = lab.home.join(".hermes/profiles/scout");
+    std::fs::create_dir_all(&scout).unwrap();
+    std::fs::write(scout.join("config.yaml"), "").unwrap();
+    // Hermes's table, without `cache_write_tokens`: an older Hermes's.
+    let db = rusqlite::Connection::open(lab.home.join(".hermes/state.db")).unwrap();
+    db.execute_batch(
+        "create table sessions(id text, source text, model text, title text, started_at real,
+             last_activity_at real, api_call_count integer, input_tokens integer,
+             output_tokens integer, cache_read_tokens integer, cost_status text,
+             estimated_cost_usd real);
+         insert into sessions values
+             ('s1', 'enclos', 'gpt', 'Weather', 4102444800, 4102444800, 26, 83087, 6084,
+              762752, 'included', 0.0),
+             ('old', 'cli', 'gpt', 'Old', 1, 1, 1, 9, 9, 9, 'included', 0.0);",
+    )
+    .unwrap();
+    drop(db);
+
+    let since = crate::model::Timestamp::from_second(1_000_000).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert_eq!(sandbox.runtime, Some("Hermes"));
+    let Fact::Known(agents) = &sandbox.agents else {
+        panic!("{sandbox:?}")
+    };
+    let by_name = |n: &str| &agents.iter().find(|a| a.agent == n).unwrap().usage;
+    let Fact::Known(records) = by_name("default") else {
+        panic!("{agents:?}")
+    };
+    let [model] = records.models.as_slice() else {
+        panic!("{records:?}")
+    };
+    // The old chat is outside the window, and a count the table does not
+    // keep is not provided, never 0.
+    assert_eq!(model.chats, 1);
+    assert_eq!(model.calls, Some(26));
+    assert_eq!(model.tokens.input, Some(83087));
+    assert_eq!(model.tokens.cache_read, Some(762752));
+    assert_eq!(model.tokens.cache_write, None);
+    assert_eq!(model.cost.kind, crate::engine::CostKind::Included);
+    assert_eq!(records.top[0].title.as_deref(), Some("Weather"));
+    assert_eq!(by_name("scout"), &Fact::Absent);
+    let left = std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        });
+    assert!(!left, "the report stayed in the home");
+    assert!(lab.audit().contains("usage session"), "{}", lab.audit());
+}

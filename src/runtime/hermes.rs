@@ -402,6 +402,28 @@ impl RuntimeAdapter for Hermes {
         }
     }
 
+    fn usage(
+        &self,
+        agents: &[RuntimeAgentName],
+        since: i64,
+        report: &Path,
+    ) -> Option<SandboxCommand> {
+        // Hermes keeps each agent's sessions, with their token counts and
+        // cost, in its own `state.db` (`hermes_state.py`); its own Python
+        // reads them read-only inside the sandbox.
+        let mut words: Vec<OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; script=\"$1\"; shift; exec \"$python\" -c \"$script\" \"$@\"".into(),
+            "enclos-hermes-usage".into(),
+            include_str!("hermes/usage.py").into(),
+            report.as_os_str().to_owned(),
+            since.to_string().into(),
+        ];
+        words.extend(agents.iter().map(|a| OsString::from(a.as_str())));
+        Some(SandboxCommand::new(words))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or

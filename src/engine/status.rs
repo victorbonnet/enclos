@@ -35,7 +35,7 @@ use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
 pub(super) use facts::read_provider;
 use facts::{exists, newest, read_value};
-use printable::printable;
+pub(super) use printable::printable;
 pub use printable::printable_line;
 use suggestion::REFUSED_DAYS;
 pub use suggestion::{IDLE_DAYS, Suggestion, suggest};

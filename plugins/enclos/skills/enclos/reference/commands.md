@@ -558,3 +558,16 @@ enclos status [OPTIONS] [SANDBOX]
 ```
 
 - `[SANDBOX]`: Only this sandbox.
+
+### `enclos usage`
+
+What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them.
+
+Reads the runtime's records inside the sandbox, as an exec session. In JSON, each count the runtime does not keep is `null`, and each read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or `"not_provided"`.
+
+```text
+enclos usage [OPTIONS] [SANDBOX]
+```
+
+- `[SANDBOX]`: Only this sandbox, read even when it is not running. Without it, every running sandbox.
+- `--since <DURATION>`: Native chats active in this past window, such as 24h or 30d; each counts whole. Default: `7d`.
