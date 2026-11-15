@@ -35,6 +35,7 @@ from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
 from . import decisions
+from . import held_tasks
 from . import routines
 from . import questions
 from . import runtime_approvals
@@ -102,6 +103,9 @@ class EnclosAdapter(BasePlatformAdapter):
                                      os.environ.get("ENCLOS_SANDBOX", ""), self._agent))
         # By message id: a policy request's tool call waiting for the bridge.
         self._answers: dict[str, asyncio.Future] = {}
+        # This agent's blocked tasks on Hermes's kanban board (ADR 0066): the
+        # agent is the Hermes profile its socket names.
+        self._held = held_tasks.Manager(self._agent, self._write)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -136,6 +140,7 @@ class EnclosAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         _ADAPTERS.discard(self)
         await self._questions.close()
+        await self._held.close()
         self._mark_disconnected()
         if self._bridge:
             self._bridge.close()
@@ -174,6 +179,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._adopt_home(hello.get("home"))
         self._questions.bridge_supports = "questions" in hello.get("capabilities", [])
         self._questions.bridge_runtime_supports = "runtime_approvals" in hello.get("capabilities", [])
+        self._held.bridge_supports = "held_tasks" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
@@ -185,6 +191,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("questions")
             if self._questions.approvals_available:
                 capabilities.append("runtime_approvals")
+            if self._held.native:
+                capabilities.append("held_tasks")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
@@ -200,6 +208,8 @@ class EnclosAdapter(BasePlatformAdapter):
                     continue
                 await self._write(message)
             await self._questions.fallback_cards()
+            # The whole list now, when the bridge takes it, then on changes.
+            self._held.start()
             while True:
                 try:
                     line = await lines.read_line(reader)
@@ -223,6 +233,7 @@ class EnclosAdapter(BasePlatformAdapter):
         finally:
             # Only the connection that holds the slot gives it back
             if self._bridge is writer:
+                self._held.stop()
                 self._bridge = None
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
@@ -303,12 +314,19 @@ class EnclosAdapter(BasePlatformAdapter):
             task = asyncio.create_task(self._routine(message))
             self._routine_tasks.add(task)
             task.add_done_callback(self._routine_tasks.discard)
+        elif kind == "held_task.resume":
+            # Hermes's unblock waits on the board's write lock: it runs
+            # beside the connection, as a routine control does.
+            task = asyncio.create_task(self._held.resume(message))
+            self._held.tasks.add(task)
+            task.add_done_callback(self._held.tasks.discard)
         elif kind == "error":
             approvals.answered(self._answers, message)
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
             # A question or runtime approval the bridge refused would wait unseen: a
             # question goes as text, an approval is denied or sent as text.
             await self._questions.refused(message.get("of"), message.get("code"))
+            self._held.refused(message.get("of"), message.get("code"))
             of = message.get("of")
             if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
                 # The bridge cannot read it: sent again, it would be refused again
@@ -710,6 +728,28 @@ def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: 
     return None
 
 
+def _kanban_ticked(**_: Any) -> None:
+    """Hermes's kanban dispatcher ticked, in whichever thread runs it: each
+    connected adapter reads its held tasks again, on its own loop. No block
+    fires a hook in the gateway (a worker's runs in the worker), so this and
+    the adapter's timer are what notice one. Returns at once."""
+    for adapter in list(_ADAPTERS):
+        try:
+            adapter._loop.call_soon_threadsafe(adapter._held.poke)
+        except Exception:
+            logger.debug("[enclos] A kanban tick was not passed on", exc_info=True)
+    return None
+
+
+def _hook_known(name: str) -> bool:
+    """Whether this Hermes fires the plugin hook `name` (an older one warns of an unknown name)."""
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+        return name in VALID_HOOKS
+    except Exception:
+        return False
+
+
 def _env_enablement() -> dict | None:
     """On for an agent whose secrets give it a socket and a token."""
     socket_path = _setting(None, "socket", "MOBILE_APP_SOCKET")
@@ -738,3 +778,7 @@ def register(ctx) -> None:
         platform_hint=protocol.PLATFORM_HINT)
     ctx.register_hook("pre_tool_call", lambda **kwargs: _tool_step("start", **kwargs))
     ctx.register_hook("post_tool_call", lambda **kwargs: _tool_step("end", **kwargs))
+    if _hook_known("on_kanban_dispatch_tick"):
+        ctx.register_hook("on_kanban_dispatch_tick", _kanban_ticked)
+    else:
+        logger.info("[enclos] This Hermes has no kanban dispatch hook; held tasks are read on a timer only")

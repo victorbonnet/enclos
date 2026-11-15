@@ -123,6 +123,12 @@ class ToTheBridge(unittest.TestCase):
             protocol.tool("c-42", "call_7Hq2", "web_search", "end", ok=True, duration_ms=1840),
             "from_plugin_tool_end.json")
 
+    def test_held_tasks_have_the_fixtures_shape(self):
+        tasks = json.loads(fixture("from_plugin_held_tasks.json"))["tasks"]
+        self.assert_like_fixture(protocol.held_tasks(tasks), "from_plugin_held_tasks.json")
+        of = json.loads(fixture("from_plugin_held_task_resumed.json"))["of"]
+        self.assert_like_fixture(protocol.held_task_resumed(of), "from_plugin_held_task_resumed.json")
+
     def test_hermes_uniqueness_suffix_is_dropped(self):
         self.assertEqual(protocol.runtime_title("Paris weather #2"), "Paris weather")
         self.assertEqual(protocol.runtime_title("  Paris   weather "), "Paris weather")

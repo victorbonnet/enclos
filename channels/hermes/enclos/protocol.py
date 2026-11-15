@@ -374,6 +374,16 @@ def runtime_title(text: str) -> str:
     return re.sub(r"\s+#\d+$", "", " ".join(text.split()))
 
 
+def held_tasks(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Every task of this agent's runtime held now, whole (`held_tasks.py` builds each)."""
+    return _message("held_tasks", tasks=tasks)
+
+
+def held_task_resumed(of: str) -> dict[str, Any]:
+    """The runtime resumed the task the bridge's `held_task.resume` `of` named."""
+    return _message("held_task.resumed", of=of)
+
+
 def ack(of: str) -> dict[str, Any]:
     return _message("ack", of=of)
 
