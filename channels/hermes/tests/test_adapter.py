@@ -294,6 +294,37 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["text"], "second")
         writer.close()
 
+    async def test_activity_follows_typing_for_a_bridge_that_reads_it(self):
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["activity", "tasks"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        # No board in this Hermes: activity, and no tasks
+        self.assertIn("activity", hello["capabilities"])
+        self.assertNotIn("tasks", hello["capabilities"])
+        idle = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((idle["type"], idle["doing"], idle["since"]), ("agent.activity", [], 0))
+        await self.adapter.send_typing("c-1")
+        typing, activity = [json.loads(await asyncio.wait_for(reader.readline(), 5)) for _ in range(2)]
+        self.assertEqual((typing["type"], typing["on"]), ("typing", True))
+        self.assertEqual(activity["doing"], [{"kind": "answering", "conversation": "c-1"}])
+        # The bridge acknowledges it, which changes nothing
+        writer.write(line("ack", of=activity["id"]))
+        await writer.drain()
+        await self.adapter.stop_typing("c-1")
+        typing, activity = [json.loads(await asyncio.wait_for(reader.readline(), 5)) for _ in range(2)]
+        self.assertEqual((typing["on"], activity["doing"], activity["since"]), (False, [], 0))
+        writer.close()
+
+    async def test_an_older_bridge_gets_no_activity(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        await self.adapter.send_typing("c-1")
+        await self.adapter.stop_typing("c-1")
+        sent = [json.loads(await asyncio.wait_for(reader.readline(), 5))["type"] for _ in range(2)]
+        self.assertEqual(sent, ["typing", "typing"])
+        writer.close()
+
     async def test_a_kept_message_the_bridge_could_not_read_is_set_aside_not_sent(self):
         bad = protocol.message_out("c" * 129, "kept by an older plugin")
         good = protocol.message_out("c-1", "fine")
