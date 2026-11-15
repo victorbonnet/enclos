@@ -308,15 +308,21 @@ Each entry has `seq`, `time` (Unix seconds), `user`, `host`, `command`, `target`
 
 ### Notifications
 
-Not built yet: the bridge sends no push. `enclos-protocol`'s `preview` seals and opens a preview as below; nothing in the bridge calls it, and no FCM client exists. The bridge will send with a service-account key its host's user gives it ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed), and the app shows no notification for a preview that does not open.
+The bridge sends through FCM's HTTP v1 API with a service-account key its host's user gives it with `enclos app push key` ([ADR 0065](adr/0065-each-host-sends-push-through-fcm-with-a-key-its-user-gives-it.md), proposed). Without one it sends no push, and a device gets what came at its next sync.
 
-When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is
+A device gives its FCM token at pairing (`pair.request`'s `push`), and with `push.token` at each connection and whenever it changes. The bridge keeps only a token of kind `fcm`, of at most 4,096 letters, digits and `-_:.`, given either way; it logs any other as `push token refused`. The same token given again keeps why the last push to it failed; a new one clears it.
+
+When an agent's message is stored for a conversation whose owner has no device connected, or a question or a runtime approval is asked there while it waits for them, the bridge sends a push to each of the owner's devices that gave a token. A runtime's `status` line is not pushed: it waits, quiet, for the next sync. A device counts as connected until its session ends, so a device that goes to the background closes its connection, or nothing is pushed to it for up to the bridge's silence limit (75 s). A device unpaired, or that gave another token, while its push waited gets none. It is a high-priority data message, with no notification part of Google's, whose data are, all strings as FCM requires:
 
 ```json
-{"v":1,"host":"<host name>","seq":1234,"preview":"<base64url: nonce ‖ ciphertext>"}
+{"v":"1","host":"<host name>","seq":"1234","preview":"<base64url: nonce ‖ ciphertext>"}
 ```
 
-`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`, padded to 2,048 bytes (the byte `0x80`, then zeros) so its length does not tell the text's. Its associated data are `v`, `host` and `seq`, so a preview opens only with the ones it was sealed with: one kept by the push service cannot come back under another `seq`. The app drops a `seq` it has already shown. Google sees the host's name, a number and ciphertext of one size. The app decrypts it, shows the notification, and fetches the message with `sync` over the tailnet when it can.
+`host` is the name `enclos app serve` reads from its transport's address as it starts, as `enclos app pair` names the host in its links when given no `--url`; `host` when the address cannot be read, which `app serve` says. A device need not know the name: it opens a preview under the push's own `host`. `seq` is the message's (the last piece's, for a message stored in several). Pushes waiting together go once per device, the newest.
+
+`preview` is XChaCha20-Poly1305 under the device's `push_key`, over `{"agent":"lab/main","conversation":…,"text":"<at most 120 characters>"}`, padded to 2,048 bytes (the byte `0x80`, then zeros) so its length does not tell the text's. The text is the message on one line, without hidden characters and with its markdown marks, which the app takes out. Its associated data are `v`, `host` and `seq`, so a preview opens only with the ones it was sealed with: one kept by the push service cannot come back under another `seq`. Google sees the host's name, a number and ciphertext of one size. The Android app (enclos-app; not yet tried on a phone, design §14) opens it with the `push_key` of each host it paired with, under the push's own `host`; it shows no notification for a preview that opens under none, and drops a `seq` it has already shown. It shows the notification, and fetches the message with `sync` over the tailnet when it can.
+
+The bridge keeps what became of the last push to each device. When FCM no longer knows a token (`UNREGISTERED`), the bridge forgets it until the device gives a new one and logs `push token dropped`. When a push fails, `enclos app status` shows why for that device, until one goes through or the key is replaced or removed; the bridge logs `push failed` when the reason changes, and `push working` once one goes through again. Google's token endpoint refusing the key (400, 401 or 403) reads as a refused key; one that is unavailable (429, 5xx) says so, and nothing of the key.
 
 ## Capabilities
 

@@ -94,6 +94,28 @@ enum AppVerb {
         #[arg(short = 'n', default_value_t = 50)]
         lines: i64,
     },
+    /// Push to paired devices through FCM (ADR 0065, proposed): give the
+    /// bridge a key to send with, or take it away.
+    Push {
+        #[command(subcommand)]
+        verb: PushVerb,
+    },
+}
+
+#[derive(Subcommand)]
+enum PushVerb {
+    /// Give the bridge the service-account key it sends pushes with: the
+    /// JSON file Google Cloud gives, of a service account of the app's
+    /// Firebase project allowed `cloudmessaging.messages.create` alone. It
+    /// replaces any key given before; the running bridge takes it at its
+    /// next push. How to set up the project and make the key:
+    /// https://github.com/victorbonnet/enclos/blob/main/docs/push-setup.md
+    Key {
+        /// The key file. Remove it once given: enclos keeps its own copy.
+        file: std::path::PathBuf,
+    },
+    /// Remove the bridge's push key: it sends no push from then on.
+    Off,
 }
 
 pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
@@ -104,11 +126,94 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
         } => chat(engine, by, target, conversation),
         AppVerb::Serve { port, transport } => serve(engine, port, transport),
         AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
-        AppVerb::Devices | AppVerb::Status => devices(engine),
+        AppVerb::Devices => devices(engine, false),
+        AppVerb::Status => devices(engine, true),
         AppVerb::Unpair { device } => unpair(engine, by, &device),
         AppVerb::Host { person } => host(engine, by, person),
         AppVerb::Log { lines } => log(engine, lines),
+        AppVerb::Push {
+            verb: PushVerb::Key { file },
+        } => push_key(engine, by, &file),
+        AppVerb::Push {
+            verb: PushVerb::Off,
+        } => push_off(engine, by),
     }
+}
+
+fn push_key(engine: &Engine, by: &Actor, file: &std::path::Path) -> Result<u8> {
+    use enclos::bridge::push;
+    let json = push::read_bounded(file)
+        .map_err(|e| failed(format!("cannot read {}: {e}", file.display())))?;
+    // Checked before the audit entry: a file that is no key changes nothing.
+    let project = push::PushKey::parse(&json)
+        .map_err(|e| failed(format!("{} cannot be used: {e}", file.display())))?
+        .project()
+        .to_owned();
+    let key = engine.app_access(
+        by,
+        "app push key",
+        project,
+        |key: &push::PushKey| format!("pushes go through FCM as {}", key.email()),
+        || {
+            let key = push::write_key(&engine.app_push_key_path(), &json).map_err(failed)?;
+            forget_push_failures(engine)?;
+            Ok(key)
+        },
+    )?;
+    match output::json() {
+        true => output::emit(&json!({
+            "push": "on",
+            "project": key.project(),
+            "account": key.email(),
+        })),
+        false => println!(
+            "Push on: the bridge sends through FCM as {}, for project {}, from its next push. Remove {}: enclos keeps its own copy.",
+            key.email(),
+            key.project(),
+            file.display()
+        ),
+    }
+    Ok(exit::OK)
+}
+
+fn push_off(engine: &Engine, by: &Actor) -> Result<u8> {
+    let path = engine.app_push_key_path();
+    let removed = engine.app_access(
+        by,
+        "app push off",
+        "push".to_owned(),
+        |removed: &bool| match removed {
+            true => "the push key removed".to_owned(),
+            false => "no push key to remove".to_owned(),
+        },
+        || {
+            let removed = enclos::bridge::push::remove_key(&path)
+                .map_err(|e| failed(format!("cannot remove {}: {e}", path.display())))?;
+            forget_push_failures(engine)?;
+            Ok(removed)
+        },
+    )?;
+    match output::json() {
+        true => output::emit(&json!({"push": "off", "removed": removed})),
+        false if removed => println!("Push off: the bridge sends no push from now on."),
+        false => println!("Push was off already: the bridge has no push key."),
+    }
+    Ok(exit::OK)
+}
+
+/// Forgets why each device's last push failed, once the key it failed with
+/// is replaced or removed: `app status` then says nothing of an old key.
+fn forget_push_failures(engine: &Engine) -> Result<()> {
+    open_store(engine)?
+        .clear_push_failures()
+        .map_err(|e| failed(format!("cannot clear the devices' push failures: {e}")))
+}
+
+/// Whether the bridge pushes, as `app status` shows it: the key's project,
+/// none, or why the key there cannot be used.
+fn push_state(engine: &Engine) -> std::result::Result<Option<String>, String> {
+    enclos::bridge::push::read_key(&engine.app_push_key_path())
+        .map(|key| key.map(|k| k.project().to_owned()))
 }
 
 fn failed(what: String) -> Error {
@@ -148,6 +253,24 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     for agent in &agents {
         eprintln!("  {}", agent.name);
     }
+    // The name each push carries, which the preview is bound to: the one
+    // `app pair` gives the host when it reads the address from the transport.
+    let host = transport
+        .address()
+        .map(|address| link_host(&address))
+        .unwrap_or_else(|| FALLBACK_HOST.to_owned());
+    if host == FALLBACK_HOST {
+        eprintln!(
+            "Pushes call this host `{FALLBACK_HOST}`: the bridge's address could not be read from {transport} as it started. Previews still open on paired devices."
+        );
+    }
+    match push_state(engine) {
+        Ok(Some(project)) => eprintln!("Push: on, through FCM for project {project}."),
+        Ok(None) => eprintln!(
+            "Push: off until `enclos app push key <file>` gives a key; this bridge takes it without a restart."
+        ),
+        Err(why) => eprintln!("Push: off: {why}"),
+    }
     let executable = std::env::current_exe().map_err(|e| {
         failed(format!(
             "cannot locate enclos for runtime installation: {e}"
@@ -162,6 +285,10 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         approvals,
         agents,
         Host::new(engine.app_layout(), executable),
+        server::Push {
+            key: engine.app_push_key_path(),
+            host,
+        },
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
     Ok(exit::OK)
@@ -426,27 +553,83 @@ fn instant(seconds: i64) -> Value {
     }
 }
 
-fn devices(engine: &Engine) -> Result<u8> {
+/// A device's push, as `app status` shows it: `none` without a token,
+/// `failing` with why, or `ready`.
+fn device_push(
+    store: &Store,
+    device: &enclos::bridge::store::Device,
+) -> Result<(&'static str, Option<String>)> {
+    if device.push_token.is_none() {
+        return Ok(("none", None));
+    }
+    let failure = store
+        .push_failure(&device.id)
+        .map_err(|e| failed(format!("cannot read how {}'s pushes went: {e}", device.id)))?;
+    Ok(match failure {
+        Some(why) => ("failing", Some(why)),
+        None => ("ready", None),
+    })
+}
+
+/// `app devices`, and with `status`, whether the bridge pushes and how
+/// each device's pushes go.
+fn devices(engine: &Engine, status: bool) -> Result<u8> {
     let store = open_store(engine)?;
     let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+    let push = status.then(|| push_state(engine));
+    // Each device's push, for `app status`: none for `app devices`.
+    let pushes = match status {
+        true => devices
+            .iter()
+            .map(|d| device_push(&store, d).map(Some))
+            .collect::<Result<Vec<_>>>()?,
+        false => vec![None; devices.len()],
+    };
     if output::json() {
-        output::emit(&json!({
-            "devices": devices.iter().map(|d| json!({
-                "device": d.id,
-                "name": d.name,
-                "person": d.person,
-                "paired_at": instant(d.paired),
-                "seen_at": d.seen.map(instant),
-            })).collect::<Vec<_>>(),
-        }));
+        let mut out = json!({
+            "devices": devices.iter().zip(&pushes).map(|(d, pushes)| {
+                let mut device = json!({
+                    "device": d.id,
+                    "name": d.name,
+                    "person": d.person,
+                    "paired_at": instant(d.paired),
+                    "seen_at": d.seen.map(instant),
+                });
+                if let Some((state, why)) = pushes {
+                    device["push"] = json!(state);
+                    device["push_failure"] = json!(why);
+                }
+                device
+            }).collect::<Vec<_>>(),
+        });
+        match &push {
+            Some(Ok(Some(project))) => out["push"] = json!({"on": true, "project": project}),
+            Some(Ok(None)) => out["push"] = json!({"on": false}),
+            Some(Err(why)) => out["push"] = json!({"on": false, "error": why}),
+            None => {}
+        }
+        output::emit(&out);
         return Ok(exit::OK);
+    }
+    match &push {
+        Some(Ok(Some(project))) => println!("Push: on, through FCM for project {project}."),
+        Some(Ok(None)) => println!(
+            "Push: off. Give the bridge a key with `enclos app push key <file>` (how to make one: docs/push-setup.md); meanwhile a device gets what came at its next sync."
+        ),
+        Some(Err(why)) => println!("Push: off: {why}"),
+        None => {}
     }
     if devices.is_empty() {
         println!("No paired device: pair one with `enclos app pair`.");
     }
-    for d in devices {
+    for (d, pushes) in devices.into_iter().zip(pushes) {
+        let pushes = match pushes {
+            Some((state, Some(why))) => format!(", push {state}: {}", shown(&why)),
+            Some((state, None)) => format!(", push {state}"),
+            None => String::new(),
+        };
         println!(
-            "{}  {}  {}  paired {}, seen {}",
+            "{}  {}  {}  paired {}, seen {}{pushes}",
             d.id,
             shown(&d.name),
             shown(&d.person),

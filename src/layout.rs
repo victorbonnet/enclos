@@ -299,6 +299,13 @@ impl Layout {
         self.data.join("app-approvals.key")
     }
 
+    /// The service-account key the bridge pushes through FCM with (ADR
+    /// 0065, proposed), which `enclos app push key` gives it: no sandbox may
+    /// read it, or an agent could send to every device of the app.
+    pub fn app_push_key(&self) -> PathBuf {
+        self.data.join("app-push-key.json")
+    }
+
     /// The files agents sent with their messages (and those an import
     /// restores), one per attachment id. For the host alone: a sandbox that
     /// read it would read other sandboxes' files.
@@ -392,6 +399,9 @@ impl Layout {
             // The key the bridge signs runtime-approval decisions with: a
             // sandbox that read it could sign its own (ADR 0060).
             self.app_approval_key(),
+            // The key the bridge pushes with: a sandbox that read it could
+            // wake every device of the app's Firebase project (ADR 0065).
+            self.app_push_key(),
             // Which `policy test` runs are under way and their run tags
             // (ADR 0059): every sandbox's, which no sandbox may read.
             self.probe_sources(),
@@ -603,6 +613,7 @@ mod tests {
                 layout.app_store(),
                 layout.app_bridge_key(),
                 layout.app_approval_key(),
+                layout.app_push_key(),
                 layout.probe_sources(),
             ]
         );
@@ -611,7 +622,8 @@ mod tests {
 
     /// The bridge's database and keys are hidden on every system: the
     /// approval key above all, which would let an agent sign its own
-    /// decisions (ADR 0060).
+    /// decisions (ADR 0060), and the push key, which would let it send to
+    /// every device of the app (ADR 0065).
     #[test]
     fn the_bridges_files_are_on_the_hidden_files() {
         let layout = Layout::at("/data/enclos");
@@ -621,6 +633,7 @@ mod tests {
                 layout.app_store(),
                 layout.app_bridge_key(),
                 layout.app_approval_key(),
+                layout.app_push_key(),
                 layout.probe_sources(),
             ] {
                 assert!(file.starts_with(layout.data()));
