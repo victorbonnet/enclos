@@ -190,6 +190,10 @@ _Avoid_: busy state, presence, status (enclos's own)
 An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
 _Avoid_: runtime approval, policy request (different authority)
 
+**Held task**:
+Background work an agent's runtime started that has stopped and waits for a person before it runs again. The runtime keeps it; the app shows it and may resume it.
+_Avoid_: blocked task, stuck task, job, ticket (except when naming a runtime's own feature, such as a blocked task on Hermes's kanban board)
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service

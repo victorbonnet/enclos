@@ -1,6 +1,6 @@
 # Hermes's kanban board, for the `tasks` capability
 
-Read from Hermes's default branch at `8b4c5343` (2026-11-15), for [ADR 0067](../adr/0067-tasks-and-agent-activity-are-reported-not-controlled.md) (proposed). Source reading only: nothing here was run against a gateway (design §14).
+Read from Hermes's default branch at `8b4c5343` (2026-11-15), for [ADR 0068](../adr/0068-tasks-and-agent-activity-are-reported-not-controlled.md) (proposed). Source reading only: nothing here was run against a gateway (design §14).
 
 ## Where the work runs
 

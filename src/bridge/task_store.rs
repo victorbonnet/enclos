@@ -1,5 +1,5 @@
 //! The tasks the bridge keeps and each agent's current activity
-//! (`docs/protocol.md`, Tasks and agent activity; ADR 0067, proposed).
+//! (`docs/protocol.md`, Tasks and agent activity; ADR 0068, proposed).
 use super::*;
 use enclos_protocol::task::{Activity, ENDED_RETENTION_SECS, MAX_TASKS, Task};
 use std::collections::HashMap;
