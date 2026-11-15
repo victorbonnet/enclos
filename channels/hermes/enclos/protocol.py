@@ -20,6 +20,10 @@ FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rena
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
+MAX_MODEL_CHARS = 120
+# The token counts a `usage` message may carry; one the runtime does not
+# keep is left out, which the bridge reads as not counted, not 0.
+USAGE_TOKENS = ("input", "output", "cache_read", "cache_write", "reasoning")
 # The longest conversation title sent (Hermes' own limit is 100 characters).
 MAX_TITLE_CHARS = 100
 
@@ -363,6 +367,21 @@ def tool(conversation: str, call: str, name: str, phase: str, label: str | None 
     if duration_ms is not None:
         fields["duration_ms"] = max(0, int(duration_ms))
     return _message("tool", **fields)
+
+
+def usage(conversation: str, tokens: dict[str, Any], model: str | None = None,
+          background: bool = False) -> dict[str, Any]:
+    """What one model call of the agent consumed: `tokens` by the names of
+    `USAGE_TOKENS`, each a whole number of at least 0, the others left out."""
+    counts = {k: int(v) for k, v in tokens.items()
+              if k in USAGE_TOKENS and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    fields: dict[str, Any] = {"conversation": conversation}
+    if model:
+        fields["model"] = " ".join(str(model).split())[:MAX_MODEL_CHARS]
+    if background:
+        fields["background"] = True
+    fields["tokens"] = counts
+    return _message("usage", **fields)
 
 
 def runtime_title(text: str) -> str:

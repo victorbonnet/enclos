@@ -77,6 +77,8 @@ class EnclosAdapter(BasePlatformAdapter):
         self._outbox = Outbox(os.path.join(os.path.dirname(self._path), f"{os.path.basename(self._path)}.outbox"))
         self._server: Optional[asyncio.base_events.Server] = None
         self._bridge: Optional[asyncio.StreamWriter] = None
+        # Whether the connected bridge takes `usage` (its hello says so).
+        self._bridge_usage = False
         self._lock = asyncio.Lock()
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
@@ -140,6 +142,7 @@ class EnclosAdapter(BasePlatformAdapter):
         if self._bridge:
             self._bridge.close()
             self._bridge = None
+            self._bridge_usage = False
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -174,9 +177,13 @@ class EnclosAdapter(BasePlatformAdapter):
         self._adopt_home(hello.get("home"))
         self._questions.bridge_supports = "questions" in hello.get("capabilities", [])
         self._questions.bridge_runtime_supports = "runtime_approvals" in hello.get("capabilities", [])
+        # An older bridge would answer each `usage` as an unknown type.
+        self._bridge_usage = "usage" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
+            if _USAGE_HOOKS:
+                capabilities.append("usage")
             if conversations.available(self):
                 capabilities.append("conversation_delete")
             if self._routines.available:
@@ -224,6 +231,7 @@ class EnclosAdapter(BasePlatformAdapter):
             # Only the connection that holds the slot gives it back
             if self._bridge is writer:
                 self._bridge = None
+                self._bridge_usage = False
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -710,6 +718,48 @@ def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: 
     return None
 
 
+def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> None:
+    """Passes on what a model call of a turn in an app conversation used,
+    from Hermes's `post_api_request` (the agent's own calls) or
+    `post_auxiliary_call` (a title, a summary of a long context: background).
+    A call outside such a turn, as a background call made off the turn's
+    thread may be, has no conversation, and is not sent: `enclos usage`
+    still counts it, from Hermes's records."""
+    try:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+            return None
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        if not chat_id or not isinstance(usage, dict) or not _ADAPTERS:
+            return None
+        # Hermes's normalized buckets (`agent/usage_pricing.CanonicalUsage`).
+        tokens = {name: usage.get(name + "_tokens") for name in protocol.USAGE_TOKENS}
+        message = protocol.usage(chat_id, tokens, model=model if isinstance(model, str) else None,
+                                 background=background)
+        # Every connected adapter whose bridge takes them: the bridge keeps
+        # usage only for a conversation of its connection's agent.
+        for adapter in list(_ADAPTERS):
+            if getattr(adapter, "_bridge_usage", False):
+                adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
+    except Exception:
+        logger.debug("[enclos] A model call's usage was not passed on", exc_info=True)
+    return None
+
+
+# Whether this Hermes took the usage hooks: an older one may not know them.
+_USAGE_HOOKS = False
+
+
+def _register_usage_hooks(ctx) -> None:
+    global _USAGE_HOOKS
+    try:
+        ctx.register_hook("post_api_request", lambda **kwargs: _usage(False, **kwargs))
+        ctx.register_hook("post_auxiliary_call", lambda **kwargs: _usage(True, **kwargs))
+        _USAGE_HOOKS = True
+    except Exception:
+        logger.info("[enclos] This Hermes has no model call hooks: the app gets no usage")
+
+
 def _env_enablement() -> dict | None:
     """On for an agent whose secrets give it a socket and a token."""
     socket_path = _setting(None, "socket", "MOBILE_APP_SOCKET")
@@ -738,3 +788,4 @@ def register(ctx) -> None:
         platform_hint=protocol.PLATFORM_HINT)
     ctx.register_hook("pre_tool_call", lambda **kwargs: _tool_step("start", **kwargs))
     ctx.register_hook("post_tool_call", lambda **kwargs: _tool_step("end", **kwargs))
+    _register_usage_hooks(ctx)

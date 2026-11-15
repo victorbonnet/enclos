@@ -89,6 +89,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         "routine_response",
         include_str!("fixtures/plugin/from_plugin_routine_response.json"),
     ),
+    (
+        "usage",
+        include_str!("fixtures/plugin/from_plugin_usage.json"),
+    ),
 ];
 
 fn json(bytes: &[u8]) -> serde_json::Value {

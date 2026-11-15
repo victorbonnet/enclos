@@ -307,6 +307,54 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["id"] for m in self.adapter._outbox.pending()], [good["id"]])
         writer.close()
 
+    async def test_a_model_calls_usage_reaches_only_a_bridge_that_takes_it(self):
+        module = sys.modules[type(self.adapter).__module__]
+        env = {"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "c-42"}
+        session = types.ModuleType("gateway.session_context")
+        session.get_session_env = lambda name: env.get(name)
+        # Hermes's buckets: `reasoning_tokens` not reported, and a count
+        # that is not a whole number left out.
+        call = {"input_tokens": 2104, "output_tokens": 96, "cache_read_tokens": 31744,
+                "cache_write_tokens": True, "prompt_tokens": 33848}
+
+        async def next_usage(reader):
+            while True:
+                try:
+                    message = json.loads(await asyncio.wait_for(reader.readline(), 0.5))
+                except asyncio.TimeoutError:
+                    return None
+                if message["type"] == "usage":
+                    return message
+
+        with patch.dict(sys.modules, {"gateway.session_context": session}), \
+                patch.object(module, "_USAGE_HOOKS", True):
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN, capabilities=["usage"]))
+            await writer.drain()
+            hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            self.assertIn("usage", hello["capabilities"])
+            module._usage(False, usage=call, model="gpt-6.1-sol")
+            message = await next_usage(reader)
+            self.assertEqual(message["conversation"], "c-42")
+            self.assertEqual(message["model"], "gpt-6.1-sol")
+            self.assertEqual(message["tokens"], {"input": 2104, "output": 96, "cache_read": 31744})
+            self.assertNotIn("background", message)
+            # Another platform's turn is not an app conversation's.
+            env["HERMES_SESSION_PLATFORM"] = "telegram"
+            module._usage(True, usage=call, model="m")
+            self.assertIsNone(await next_usage(reader))
+            writer.close()
+
+            # A bridge that does not name `usage` gets none.
+            env["HERMES_SESSION_PLATFORM"] = "enclos"
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN))
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), 5)
+            module._usage(False, usage=call, model="m")
+            self.assertIsNone(await next_usage(reader))
+            writer.close()
+
 
 if __name__ == "__main__":
     unittest.main()
