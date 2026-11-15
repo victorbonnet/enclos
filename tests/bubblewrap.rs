@@ -28,6 +28,9 @@ mod mount_race;
 #[path = "bubblewrap/status.rs"]
 mod status;
 
+#[path = "bubblewrap/restart.rs"]
+mod restart;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};
@@ -146,7 +149,8 @@ impl Lab {
     /// 127.0.0.1:0, as Hermes's does, and writes its port and a token of
     /// its own to `~/gateway.port`; it answers each connection with that
     /// token, and exits 1, for the service manager to start it again, when
-    /// a connection says `exit`.
+    /// a connection says `exit`. On `USR1`, Hermes's graceful restart, it
+    /// adds its token to `~/gateway.usr1` and exits 75, as Hermes does.
     fn with_stand_in_hermes(&self) {
         use enclos::state::StateStore;
         let layout = self.layout();
@@ -193,11 +197,16 @@ impl Lab {
 
 /// The stand-in gateway, in Python, between single quotes.
 const STAND_IN_GATEWAY: &str = r#"
-import os, socket
+import os, signal, socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
 s.listen()
 token = os.urandom(4).hex()
+def restart(*_):
+    with open(os.path.join(os.environ["HOME"], "gateway.usr1"), "a") as f:
+        f.write(token + "\n")
+    raise SystemExit(75)
+signal.signal(signal.SIGUSR1, restart)
 port = os.path.join(os.environ["HOME"], "gateway.port")
 with open(port + ".tmp", "w") as f:
     f.write("%d %s" % (s.getsockname()[1], token))

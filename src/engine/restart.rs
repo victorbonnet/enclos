@@ -5,11 +5,12 @@ use std::time::{Duration, Instant};
 
 use super::Engine;
 use crate::error::Result;
-use crate::lifecycle::process::{Signalled, is_same, signal_process};
+use crate::lifecycle::proc::program_in_pid_namespace;
+use crate::lifecycle::process::{Signalled, is_same, reference, signal_process};
 use crate::model::audit::{Actor, Intent, Outcome};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::model::session::{SessionKind, SessionRecord};
+use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 use crate::runtime::home::read_text;
 use crate::runtime::{HomePath, Signal, Unreadable, adapter};
 use crate::state::StateLock;
@@ -24,6 +25,20 @@ const RETRY: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(64 * 60);
 
 type Read = std::result::Result<Option<String>, Unreadable>;
+
+/// Where a service session's program runs, which the restart signal must
+/// reach (ADR 0031).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProgramAt {
+    /// The session's root: `sandbox-exec` and its wrapper `exec` it.
+    Root,
+    /// The second process of the session's own PID namespace (design §5,
+    /// What a session runs first). The root is `enclos holder join`, on the
+    /// host, whose child is bubblewrap's outer process: a signal sent there
+    /// would end `holder join`, and `launch` would then stop the program
+    /// with TERM, a restart that waits for nothing.
+    PidNamespace,
+}
 
 pub(super) struct SettingsWatch {
     home: PathBuf,
@@ -139,6 +154,7 @@ impl Engine {
         &self,
         by: &Actor,
         session: &SessionRecord,
+        at: ProgramAt,
         signal: Signal,
         changed: &[HomePath],
     ) -> Result<Option<std::result::Result<(), String>>> {
@@ -157,12 +173,13 @@ impl Engine {
         let ticket = self.audit.begin(&lock, intent)?;
         let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
         let changed = format!("{} changed", files.join(", "));
-        let sent = match signal_process(&session.root, signal) {
+        let sent = match program(session, at)
+            .and_then(|program| signal_process(&program, signal).map_err(|e| e.to_string()))
+        {
             Ok(Signalled::Sent) => Ok(()),
             Ok(Signalled::Gone) => Err("its program had already exited".to_owned()),
             Ok(Signalled::NotLeader) => Err("its program no longer leads its group".to_owned()),
-            Ok(Signalled::Failed(why)) => Err(why),
-            Err(e) => Err(e.to_string()),
+            Ok(Signalled::Failed(why)) | Err(why) => Err(why),
         };
         let outcome = match &sent {
             Ok(()) => Outcome::ok(format!("{changed}: sent {}", signal.name())),
@@ -174,6 +191,34 @@ impl Engine {
         // The signal is already sent; `audit verify` reports the unfinished entry.
         let _ = self.audit.finish(ticket, outcome);
         Ok(Some(sent))
+    }
+}
+
+/// The program of `session`, as it runs `at`. In a PID namespace it is
+/// looked up again once referred to, so a pid reused in between, by a
+/// process that cannot be the root's program, is never the one returned;
+/// `signal_process` then checks it is still that process.
+fn program(session: &SessionRecord, at: ProgramAt) -> std::result::Result<ProcessRef, String> {
+    const GONE: &str = "its program had already exited";
+    let root = &session.root;
+    if at == ProgramAt::Root {
+        return Ok(root.clone());
+    }
+    let look = || -> std::result::Result<Option<u32>, String> {
+        if !is_same(root).map_err(|e| e.to_string())? {
+            return Err(GONE.to_owned());
+        }
+        program_in_pid_namespace(root.pid).map_err(|e| e.to_string())
+    };
+    let Some(pid) = look()? else {
+        return Err("its program has not started yet".to_owned());
+    };
+    let program = reference(pid)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| GONE.to_owned())?;
+    match look()? {
+        Some(again) if again == pid => Ok(program),
+        _ => Err(GONE.to_owned()),
     }
 }
 
