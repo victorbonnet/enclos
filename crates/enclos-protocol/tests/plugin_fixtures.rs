@@ -105,6 +105,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         "held_task_resumed",
         include_str!("fixtures/plugin/from_plugin_held_task_resumed.json"),
     ),
+    (
+        "usage_agent",
+        include_str!("fixtures/plugin/from_plugin_usage_agent.json"),
+    ),
 ];
 
 fn json(bytes: &[u8]) -> serde_json::Value {

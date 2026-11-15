@@ -208,6 +208,10 @@ pub enum FromPlugin {
     /// bridge whose `hello` names [`Capability::Usage`].
     #[serde(rename = "usage")]
     Usage(crate::usage::CallUsage),
+    /// What model calls of the agent outside any app conversation consumed:
+    /// only to a bridge whose `hello` names [`Capability::AgentUsage`].
+    #[serde(rename = "usage.agent")]
+    AgentUsage(crate::usage::AgentCallUsage),
     /// The commands a person may type to the runtime (`/new`, `/model`),
     /// whole: after the `hello`, and again when they change.
     #[serde(rename = "commands")]
@@ -241,6 +245,7 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "conversation.title",
     "tool",
     "usage",
+    "usage.agent",
     "commands",
     "agent.activity",
     "task.update",
@@ -351,6 +356,9 @@ pub enum Capability {
     /// It reports what each model call of the agent consumed (`usage`); a
     /// bridge that takes them names it in its own `hello`.
     Usage,
+    /// It reports the agent's model calls outside app conversations too
+    /// (`usage.agent`); a bridge that takes them names it in its `hello`.
+    AgentUsage,
     #[serde(other)]
     Unknown,
 }

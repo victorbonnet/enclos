@@ -81,6 +81,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._bridge: Optional[asyncio.StreamWriter] = None
         # Whether the connected bridge takes `usage` (its hello says so).
         self._bridge_usage = False
+        self._bridge_agent_usage = False
         self._lock = asyncio.Lock()
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
@@ -155,6 +156,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._bridge.close()
             self._bridge = None
             self._bridge_usage = False
+            self._bridge_agent_usage = False
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -193,11 +195,14 @@ class EnclosAdapter(BasePlatformAdapter):
         self._reporter.bridge = frozenset(hello.get("capabilities", []))
         # An older bridge would answer each `usage` as an unknown type.
         self._bridge_usage = "usage" in hello.get("capabilities", [])
+        self._bridge_agent_usage = "agent_usage" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
             if _USAGE_HOOKS:
                 capabilities.append("usage")
+                if _AGENT_USAGE:
+                    capabilities.append("agent_usage")
             if conversations.available(self):
                 capabilities.append("conversation_delete")
             if self._routines.available:
@@ -258,6 +263,7 @@ class EnclosAdapter(BasePlatformAdapter):
                 self._held.stop()
                 self._bridge = None
                 self._bridge_usage = False
+                self._bridge_agent_usage = False
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -780,13 +786,18 @@ def _kanban_ticked(**_: Any) -> None:
     return None
 
 
-def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> None:
-    """Passes on what a model call of a turn in an app conversation used,
-    from Hermes's `post_api_request` (the agent's own calls) or
-    `post_auxiliary_call` (a title, a summary of a long context: background).
-    A call outside such a turn, as a background call made off the turn's
-    thread may be, has no conversation, and is not sent: `enclos usage`
-    still counts it, from Hermes's records. A failed call carries no usage.
+def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any = None, **_: Any) -> None:
+    """Passes on what a model call used, from Hermes's `post_api_request`
+    (the agent's own calls) or `post_auxiliary_call` (a title, a summary of
+    a long context: background). A call of a turn in an app conversation
+    goes as `usage`, with its conversation. A call outside the app (a
+    routine's run, a talk in the sandbox, another channel's chat) goes as
+    `usage.agent`, to the connection of the agent whose home Hermes runs it
+    in, when this Hermes can name that agent. An app call whose conversation
+    is unknown, as a background call made off the turn's context may be, is
+    not sent: it is neither the conversation's nor outside the app, and
+    `enclos usage` still counts it from Hermes's records. A failed call
+    carries no usage.
 
     It never fails the turn: what goes wrong is logged, as a warning the
     first time, so that a Hermes whose hooks changed says so once."""
@@ -794,10 +805,7 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
         return None
     try:
         from gateway.session_context import get_session_env
-        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
-            return None
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-        if not chat_id or usage is None or not _ADAPTERS:
+        if usage is None or not _ADAPTERS:
             return None
         if not isinstance(usage, dict):
             _warn_once("usage", "[enclos] Hermes passed a model call's usage as %s, not a dict: "
@@ -805,16 +813,49 @@ def _usage(background: bool, usage: Any = None, model: Any = None, **_: Any) -> 
             return None
         # Hermes's normalized buckets (`agent/usage_pricing.CanonicalUsage`).
         tokens = {name: usage.get(name + "_tokens") for name in protocol.USAGE_TOKENS}
-        message = protocol.usage(chat_id, tokens, model=model if isinstance(model, str) else None,
-                                 background=background)
-        # Every connected adapter whose bridge takes them: the bridge keeps
-        # usage only for a conversation of its connection's agent.
+        model = model if isinstance(model, str) else None
+        platform = get_session_env("HERMES_SESSION_PLATFORM") or platform
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+        if platform == PLATFORM:
+            if not chat_id:
+                return None
+            message = protocol.usage(chat_id, tokens, model=model, background=background)
+            # Every connected adapter whose bridge takes them: the bridge
+            # keeps usage only for a conversation of its connection's agent.
+            for adapter in list(_ADAPTERS):
+                if getattr(adapter, "_bridge_usage", False):
+                    adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
+            return None
+        if not _AGENT_USAGE:
+            return None
+    except Exception:
+        _warn_once("app", "[enclos] A model call's usage was not passed on", exc_info=True)
+        return None
+    try:
+        # Outside any app conversation: the agent whose home Hermes runs
+        # this call in (one gateway serves every profile), to its own
+        # connection alone, as the bridge counts it under that agent.
+        agent = _current_agent()
+        if agent is None:
+            _warn_once("agent", "[enclos] Hermes ran a model call in a home of no agent: "
+                       "its usage outside the app is not passed on")
+            return None
+        message = protocol.agent_usage(tokens, model=model, background=background,
+                                       source=platform if isinstance(platform, str) else None)
         for adapter in list(_ADAPTERS):
-            if getattr(adapter, "_bridge_usage", False):
+            if adapter._agent == agent and getattr(adapter, "_bridge_agent_usage", False):
                 adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))
     except Exception:
-        _warn_once("failed", "[enclos] A model call's usage was not passed on", exc_info=True)
+        _warn_once("outside", "[enclos] A model call's usage outside the app was not passed on",
+                   exc_info=True)
     return None
+
+
+def _current_agent() -> Optional[str]:
+    """The agent (Hermes profile) a call runs for: the profile owning the
+    home Hermes has for it, which a gateway serving several sets per turn."""
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    return profile_name_for_home(get_hermes_home())
 
 
 _WARNED: set = set()
@@ -832,6 +873,10 @@ def _warn_once(key: str, message: str, *args: Any, exc_info: bool = False) -> No
 # Whether this Hermes calls the plugin with the agent's model calls
 # (`post_api_request`), so that its `hello` names `usage`.
 _USAGE_HOOKS = False
+# Whether it can also name the agent a call outside the app is for
+# (`hermes_constants.profile_name_for_home`), so that its `hello` names
+# `agent_usage`.
+_AGENT_USAGE = False
 
 
 def _register_usage_hooks(ctx) -> None:
@@ -839,7 +884,12 @@ def _register_usage_hooks(ctx) -> None:
     not know with only a warning (`track_hook`), so its list is read first:
     a Hermes without `post_api_request` registers nothing, and its plugin
     does not name `usage`."""
-    global _USAGE_HOOKS
+    global _USAGE_HOOKS, _AGENT_USAGE
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home  # noqa: F401
+        _AGENT_USAGE = True
+    except Exception:
+        logger.info("[enclos] This Hermes cannot name a call's agent: the app gets no usage outside it")
     try:
         from hermes_cli.plugins import VALID_HOOKS
     except Exception:

@@ -463,6 +463,100 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await next_usage(reader))["conversation"], "marker")
             writer.close()
 
+    async def test_a_call_outside_the_app_goes_to_its_agents_connection_alone(self):
+        module = sys.modules[type(self.adapter).__module__]
+        env = {"HERMES_SESSION_PLATFORM": "cron"}
+        session = types.ModuleType("gateway.session_context")
+        session.get_session_env = lambda name: env.get(name)
+        call = {"input_tokens": 5120, "output_tokens": 240}
+
+        async def next_usage(reader):
+            while True:
+                message = json.loads(await asyncio.wait_for(reader.readline(), 5))
+                if message["type"] in ("usage", "usage.agent"):
+                    return message
+
+        with patch.dict(sys.modules, {"gateway.session_context": session}), \
+                patch.object(module, "_USAGE_HOOKS", True), patch.object(module, "_AGENT_USAGE", True):
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN, capabilities=["usage", "agent_usage"]))
+            await writer.drain()
+            hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            self.assertIn("agent_usage", hello["capabilities"])
+            # A call of another agent of the gateway is not this one's.
+            with patch.object(module, "_current_agent", lambda: "scout"):
+                module._usage(False, usage=call, model="m")
+            # This agent's routine: to its connection, with where it came from.
+            with patch.object(module, "_current_agent", lambda: self.adapter._agent):
+                module._usage(True, usage=call, model="gpt")
+            message = await next_usage(reader)
+            self.assertEqual(message["type"], "usage.agent")
+            self.assertEqual(message["source"], "cron")
+            self.assertEqual(message["model"], "gpt")
+            self.assertTrue(message["background"])
+            self.assertNotIn("conversation", message)
+            self.assertEqual(message["tokens"], {"input": 5120, "output": 240})
+            # An agent Hermes cannot name: nothing, and a warning says so;
+            # an app call with no conversation: nothing either. Then an app
+            # call shows nothing came before it.
+            with patch.object(module, "_current_agent", lambda: None), \
+                    patch.object(module, "_WARNED", set()), self.assertLogs("enclos.adapter", "WARNING") as said:
+                module._usage(False, usage=call, model="m")
+            self.assertIn("home of no agent", said.output[0])
+            env.update({"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": None})
+            module._usage(True, usage=call, model="m")
+            env.update({"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "c-1"})
+            module._usage(False, usage=call, model="m")
+            self.assertEqual((await next_usage(reader))["type"], "usage")
+            writer.close()
+
+            # A bridge that takes app usage but not the rest gets none of it.
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN, capabilities=["usage"]))
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), 5)
+            env.update({"HERMES_SESSION_PLATFORM": "cron", "HERMES_SESSION_CHAT_ID": None})
+            with patch.object(module, "_current_agent", lambda: self.adapter._agent):
+                module._usage(False, usage=call, model="m")
+            env.update({"HERMES_SESSION_PLATFORM": "enclos", "HERMES_SESSION_CHAT_ID": "c-2"})
+            module._usage(False, usage=call, model="m")
+            self.assertEqual((await next_usage(reader))["conversation"], "c-2")
+            writer.close()
+
+    async def test_the_hooks_platform_names_a_call_whose_session_does_not(self):
+        module = sys.modules[type(self.adapter).__module__]
+        session = types.ModuleType("gateway.session_context")
+        session.get_session_env = lambda name: None
+        with patch.dict(sys.modules, {"gateway.session_context": session}), \
+                patch.object(module, "_USAGE_HOOKS", True), patch.object(module, "_AGENT_USAGE", True), \
+                patch.object(module, "_current_agent", lambda: self.adapter._agent):
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN, capabilities=["usage", "agent_usage"]))
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), 5)
+            module._usage(True, usage={"input_tokens": 1}, model="m", platform="cron")
+            while True:
+                message = json.loads(await asyncio.wait_for(reader.readline(), 5))
+                if message["type"] == "usage.agent":
+                    break
+            self.assertEqual(message["source"], "cron")
+            writer.close()
+
+    async def test_a_plugin_names_only_the_usage_its_hermes_can_report(self):
+        module = sys.modules[type(self.adapter).__module__]
+        for hooks, agent, expected in ((False, False, []), (True, False, ["usage"]), (True, True, ["usage", "agent_usage"])):
+            with patch.object(module, "_USAGE_HOOKS", hooks), patch.object(module, "_AGENT_USAGE", agent):
+                reader, writer = await self.bridge()
+                writer.write(line("hello", token=TOKEN))
+                await writer.drain()
+                hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+                self.assertEqual([c for c in hello["capabilities"] if "usage" in c], expected)
+                writer.close()
+                for _ in range(50):
+                    if self.adapter._bridge is None:
+                        break
+                    await asyncio.sleep(0.02)
+
     async def test_usage_is_not_sent_by_a_plugin_whose_hermes_lacks_the_hooks(self):
         module = sys.modules[type(self.adapter).__module__]
         with patch.object(module, "_USAGE_HOOKS", False), patch.object(module, "_ADAPTERS", {self.adapter}):
@@ -475,7 +569,7 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
 class UsageHooks(unittest.TestCase):
     """Which hooks the plugin registers, by the hooks Hermes lists."""
 
-    def register(self, hooks):
+    def register(self, hooks, names_agents=True):
         module = sys.modules["enclos.adapter"]
         recorded = []
         ctx = types.SimpleNamespace(register_hook=lambda name, callback: recorded.append(name))
@@ -484,10 +578,17 @@ class UsageHooks(unittest.TestCase):
             plugins = types.ModuleType("hermes_cli.plugins")
             plugins.VALID_HOOKS = set(hooks)
             listing = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.plugins": plugins}
-        with patch.dict(sys.modules, listing), patch.object(module, "_USAGE_HOOKS", False):
+        constants = types.ModuleType("hermes_constants")
+        if names_agents:
+            constants.get_hermes_home = lambda: None
+            constants.profile_name_for_home = lambda home: None
+        listing["hermes_constants"] = constants
+        with patch.dict(sys.modules, listing), patch.object(module, "_USAGE_HOOKS", False), \
+                patch.object(module, "_AGENT_USAGE", False):
             if hooks is None:
                 sys.modules["hermes_cli"] = None
             module._register_usage_hooks(ctx)
+            self.agent_usage = module._AGENT_USAGE
             return recorded, module._USAGE_HOOKS
 
     def test_both_hooks_where_hermes_has_both(self):
@@ -496,6 +597,12 @@ class UsageHooks(unittest.TestCase):
 
     def test_the_agents_calls_alone_where_hermes_has_no_background_hook(self):
         self.assertEqual(self.register({"post_api_request"}), (["post_api_request"], True))
+
+    def test_calls_outside_the_app_only_where_hermes_can_name_their_agent(self):
+        self.register({"post_api_request"})
+        self.assertTrue(self.agent_usage)
+        self.register({"post_api_request"}, names_agents=False)
+        self.assertFalse(self.agent_usage)
 
     def test_none_and_no_usage_where_hermes_lacks_the_hook_or_lists_none(self):
         # Hermes would take an unknown name with a warning: it is not tried.

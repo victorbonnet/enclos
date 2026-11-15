@@ -131,6 +131,7 @@ impl Store {
                 "turns",
                 "members",
                 "attachments",
+                "usage_hours",
                 "messages",
                 "held_tasks",
             ] {
@@ -146,6 +147,13 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO homes (agent, id) VALUES (?1, NULL) ON CONFLICT(agent) DO UPDATE SET id = NULL",
+            [agent],
+        )?;
+        // Its usage outside the app, which only the host's person, who
+        // forgets it, sees.
+        tx.execute("DELETE FROM agent_usage_hours WHERE agent = ?1", [agent])?;
+        tx.execute(
+            "DELETE FROM agent_usage_reporters WHERE agent = ?1",
             [agent],
         )?;
         if !ids.is_empty() {

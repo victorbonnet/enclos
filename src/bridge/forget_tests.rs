@@ -306,3 +306,30 @@ fn forgetting_an_agent_drops_the_tasks_kept_for_it() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].id, "t2");
 }
+
+#[test]
+fn forgetting_an_agent_drops_its_usage_in_and_out_of_the_app() {
+    let (_dir, hub, store) = fixture();
+    let (device, _rx) = phone(&hub, &store, "phone", "alice");
+    store.ensure_home("gone/coder", "alice", true).unwrap();
+    store.conversation("c-1", "gone", "coder", "alice").unwrap();
+    store
+        .add_usage("c-1", "coder", 1_800_000_000, 1, Default::default())
+        .unwrap();
+    store
+        .add_agent_usage("gone/coder", 1_800_000_000, 1, Default::default())
+        .unwrap();
+    store
+        .add_agent_usage("gone/lead", 1_800_000_000, 1, Default::default())
+        .unwrap();
+    store.set_reports_outside("gone/coder", true).unwrap();
+    hub.forget_agent(&store, &device, "alice", "gone/coder")
+        .unwrap();
+    assert_eq!(store.usage("c-1").unwrap(), None);
+    let left = store.usage_since("alice", 0, true).unwrap();
+    assert_eq!(
+        left.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        ["gone/lead"]
+    );
+    assert!(store.outside_reporters().unwrap().is_empty());
+}

@@ -688,6 +688,14 @@ impl Hub {
         {
             self.sync_questions(store, agent, &mut writer)?;
         }
+        if let Some(store) = &store
+            && let Err(e) = store
+                .set_reports_outside(agent, hello.capabilities.contains(&Capability::AgentUsage))
+        {
+            eprintln!(
+                "enclos app: {agent}: whether it reports usage outside the app is not kept: {e}"
+            );
+        }
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
         let reports_activity = hello.capabilities.contains(&Capability::Activity);
         let reports_tasks = hello.capabilities.contains(&Capability::Tasks);
@@ -1117,6 +1125,18 @@ impl Hub {
                         let result = hub.tasks_reported(&store, &agent, tasks);
                         if !answer_tasks(&hub, &agent, &mut acks, message.id, result) {
                             break;
+                        }
+                    }
+                    FromPlugin::AgentUsage(call) => {
+                        hub.pace_usage(&agent);
+                        let at = crate::bridge::store::now();
+                        let calls = call.calls.min(MAX_CALLS);
+                        // Under the connection's agent, by the hour; where
+                        // the plugin says the calls came from is not kept.
+                        if let Err(e) =
+                            store.add_agent_usage(&agent, at, calls, call.tokens.bounded())
+                        {
+                            eprintln!("enclos app: {agent}: usage not kept: {e}");
                         }
                     }
                     FromPlugin::Usage(call) => {
@@ -2352,11 +2372,70 @@ fn run_session(
             Err(Unread::Ended(why)) => return Err(why),
         };
         match message.body {
-            FromDevice::UsageGet { since } => {
+            FromDevice::UsageGet {
+                since,
+                bucket,
+                offset,
+            } => {
                 let since = i64::try_from(since).unwrap_or(i64::MAX);
-                match store.usage_since(person, since) {
-                    Ok(mut agents) => {
-                        agents.truncate(enclos_protocol::usage::MAX_REPORT_AGENTS);
+                let max = enclos_protocol::usage::MAX_OFFSET;
+                let offset = offset.unwrap_or(0);
+                // A series of more buckets than it holds would leave the
+                // window's start blank: refused, as a wrong bucket is.
+                let now = crate::bridge::store::now();
+                let refused = match bucket {
+                    Some(b) if !enclos_protocol::usage::BUCKETS.contains(&b) => {
+                        Some("A usage bucket is an hour (3600) or a day (86400).".to_owned())
+                    }
+                    Some(b)
+                        if (now - since.min(now)) / i64::from(b) + 1
+                            > i64::try_from(enclos_protocol::usage::MAX_POINTS)
+                                .unwrap_or(i64::MAX) =>
+                    {
+                        Some(format!(
+                            "A usage series holds at most {} buckets: ask for days over a longer window.",
+                            enclos_protocol::usage::MAX_POINTS
+                        ))
+                    }
+                    _ if offset.abs() > max => {
+                        Some("A device's offset from UTC is at most 14 hours.".to_owned())
+                    }
+                    _ => None,
+                };
+                // The agents' calls outside app conversations are the
+                // host's person's to see, as the host is.
+                let outside = hub.known_host().as_deref() == Some(person);
+                let read = match refused {
+                    Some(_) => Ok((Vec::new(), Vec::new(), Vec::new())),
+                    None => store
+                        .usage_window(person, since, outside, bucket.map(|b| (b, offset)))
+                        .and_then(|(agents, series)| {
+                            let reporters = match outside {
+                                true => store.outside_reporters()?,
+                                false => Vec::new(),
+                            };
+                            Ok((agents, series, reporters))
+                        }),
+                };
+                match (refused, read) {
+                    (Some(why), _) => link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::BadMessage,
+                        message: why,
+                    }))?,
+                    (None, Ok((mut agents, series, reporters))) => {
+                        let cap = match bucket {
+                            Some(_) => enclos_protocol::usage::MAX_REPORT_AGENTS_WITH_SERIES,
+                            None => enclos_protocol::usage::MAX_REPORT_AGENTS,
+                        };
+                        if agents.len() > cap {
+                            // The heaviest, then back in name order; a stable
+                            // sort keeps names in order among equals.
+                            agents
+                                .sort_by_key(|(_, total)| std::cmp::Reverse(total.tokens.total()));
+                            agents.truncate(cap);
+                            agents.sort_by(|a, b| a.0.cmp(&b.0));
+                        }
                         link.send(ToDevice::UsageReport {
                             of: message.id,
                             // The hour that holds `since`, where the sums start.
@@ -2364,13 +2443,19 @@ fn run_session(
                             agents: agents
                                 .into_iter()
                                 .map(|(agent, total)| enclos_protocol::usage::AgentUsage {
+                                    // Its calls outside the app counted, as
+                                    // its plugin said it reports them.
+                                    outside: reporters.contains(&agent),
                                     agent,
                                     total,
                                 })
                                 .collect(),
+                            outside,
+                            bucket,
+                            series,
                         })?;
                     }
-                    Err(e) => {
+                    (None, Err(e)) => {
                         eprintln!("enclos app: usage could not be read: {e}");
                         link.send(ToDevice::Error(ErrorBody {
                             of: Some(message.id),
@@ -5828,11 +5913,19 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         }
         let (mut device, _) = connect(&bridge, &phone);
         let since = u64::try_from(now - 3600 + 123).unwrap();
-        device.send("u1", FromDevice::UsageGet { since });
+        device.send(
+            "u1",
+            FromDevice::UsageGet {
+                since,
+                bucket: None,
+                offset: None,
+            },
+        );
         let Some(ToDevice::UsageReport {
             of,
             since: from,
             agents,
+            ..
         }) = device.receive()
         else {
             panic!("a usage report")
@@ -5844,7 +5937,14 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_eq!(agents[0].agent, "lab/main");
         assert_eq!(agents[0].total.tokens.input, Some(10));
         // A window starting after any time: nothing, and no failure.
-        device.send("u2", FromDevice::UsageGet { since: u64::MAX });
+        device.send(
+            "u2",
+            FromDevice::UsageGet {
+                since: u64::MAX,
+                bucket: None,
+                offset: None,
+            },
+        );
         assert!(
             matches!(device.receive(), Some(ToDevice::UsageReport { of, agents, .. }) if of.as_str() == "u2" && agents.is_empty())
         );
@@ -5864,13 +5964,367 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             .unwrap()
             .unwrap();
         }
-        device.send("u3", FromDevice::UsageGet { since: 0 });
+        device.send(
+            "u3",
+            FromDevice::UsageGet {
+                since: 0,
+                bucket: None,
+                offset: None,
+            },
+        );
         let Some(ToDevice::UsageReport { agents, .. }) = device.receive() else {
             panic!("a usage report")
         };
         assert_eq!(agents.len(), enclos_protocol::usage::MAX_REPORT_AGENTS);
         assert_eq!(agents[0].agent, "lab/a000");
         assert!(agents.windows(2).all(|w| w[0].agent < w[1].agent));
+    }
+
+    #[test]
+    fn usage_over_time_is_each_agents_buckets_heaviest_first_in_the_devices_days() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let alice = "alice@example.com";
+        store.conversation("c-a", "lab", "a", alice).unwrap();
+        store.conversation("c-b", "lab", "b", alice).unwrap();
+        // 2027-01-15 08:00 UTC.
+        let now: i64 = 1_800_000_000;
+        let hour = 3_600;
+        let day = 86_400;
+        for (agent, c, at, input) in [
+            ("lab/a", "c-a", now - 25 * hour, 100),
+            ("lab/a", "c-a", now - 60, 10),
+            ("lab/b", "c-b", now - 3 * hour, 5),
+        ] {
+            call_usage(&store, agent, call(c, None, 1, input), at)
+                .unwrap()
+                .unwrap();
+        }
+        store
+            .add_agent_usage(
+                "lab/c",
+                now - 2 * hour,
+                1,
+                enclos_protocol::usage::UsageTokens {
+                    input: Some(5_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let tokens = |s: &enclos_protocol::usage::UsageSeries| {
+            s.points.iter().map(|p| p.tokens).collect::<Vec<_>>()
+        };
+        // UTC days, the person's conversations alone.
+        let series = store.usage_series(alice, 0, false, 86_400, 0).unwrap();
+        let names: Vec<&str> = series.iter().map(|s| s.agent.as_str()).collect();
+        // c-a's calls each carry 1,000 cache reads beside their input.
+        assert_eq!(names, ["lab/a", "lab/b"]);
+        assert_eq!(tokens(&series[0]), [Some(1_100), Some(1_010)]);
+        assert!(series[0].points.iter().all(|p| p.at % 86_400 == 0));
+        assert_eq!(
+            series[0].points[1].at,
+            u64::try_from(now / day * day).unwrap()
+        );
+        // With the calls outside the app, the routine's agent leads.
+        let all = store.usage_series(alice, 0, true, 86_400, 0).unwrap();
+        assert_eq!(all[0].agent, "lab/c");
+        // A device 9 hours west of UTC: its days start at 09:00 UTC, and
+        // 08:00 UTC is still its yesterday.
+        let west = store
+            .usage_series(alice, 0, false, 86_400, -9 * 3_600)
+            .unwrap();
+        assert!(west[0].points.iter().all(|p| p.at % 86_400 == 9 * 3_600));
+        // By the hour, since a time: the hours that saw a call.
+        let hours = store
+            .usage_series(alice, now - 4 * hour, false, 3_600, 0)
+            .unwrap();
+        assert_eq!(hours.iter().map(|s| s.points.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn a_device_is_refused_a_series_longer_than_one_holds_or_an_offset_past_14_hours() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        let now = u64::try_from(crate::bridge::store::now()).unwrap();
+        for (id, since, bucket, offset) in [
+            // A week by the hour: 169 buckets.
+            ("u1", now - 7 * 86_400, 3_600, 0),
+            ("u2", now - 86_400, 86_400, 15 * 3_600),
+            ("u3", now - 86_400, 86_400, -15 * 3_600),
+        ] {
+            device.send(
+                id,
+                FromDevice::UsageGet {
+                    since,
+                    bucket: Some(bucket),
+                    offset: Some(offset),
+                },
+            );
+            assert!(
+                matches!(device.receive(), Some(ToDevice::Error(ErrorBody { code: ErrorCode::BadMessage, of: Some(of), .. })) if of.as_str() == id),
+                "{id}"
+            );
+        }
+        // A day by the hour, and a month by the day, fit.
+        for (id, since, bucket) in [
+            ("u4", now - 86_400, 3_600),
+            ("u5", now - 30 * 86_400, 86_400),
+        ] {
+            device.send(
+                id,
+                FromDevice::UsageGet {
+                    since,
+                    bucket: Some(bucket),
+                    offset: Some(14 * 3_600),
+                },
+            );
+            assert!(
+                matches!(device.receive(), Some(ToDevice::UsageReport { of, .. }) if of.as_str() == id),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_series_a_report_lists_the_heaviest_agents_in_name_order() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        let now = crate::bridge::store::now();
+        let cap = enclos_protocol::usage::MAX_REPORT_AGENTS_WITH_SERIES;
+        // The lightest is a00, the heaviest a50.
+        for i in 0..=cap {
+            let agent = format!("a{i:02}");
+            store
+                .conversation(&format!("c-{agent}"), "lab", &agent, PERSON)
+                .unwrap();
+            let input = 1 + u64::try_from(i).unwrap();
+            call_usage(
+                &store,
+                &format!("lab/{agent}"),
+                call(&format!("c-{agent}"), None, 1, input),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let (mut device, _) = connect(&bridge, &phone);
+        let since = u64::try_from(now - 3_600).unwrap();
+        for (id, bucket, listed) in [("u1", Some(3_600), cap), ("u2", None, cap + 1)] {
+            device.send(
+                id,
+                FromDevice::UsageGet {
+                    since,
+                    bucket,
+                    offset: None,
+                },
+            );
+            let Some(ToDevice::UsageReport { agents, .. }) = device.receive() else {
+                panic!("a usage report")
+            };
+            assert_eq!(agents.len(), listed, "{id}");
+            assert!(agents.windows(2).all(|w| w[0].agent < w[1].agent), "{id}");
+            assert_eq!(
+                agents.iter().any(|a| a.agent == "lab/a00"),
+                bucket.is_none(),
+                "{id}: the lightest is the one left out"
+            );
+        }
+    }
+
+    #[test]
+    fn hours_are_the_hours_whatever_the_offset_and_days_start_at_its_midnight() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.conversation("c-a", "lab", "a", PERSON).unwrap();
+        // 2027-01-15 08:00 UTC, and 18:00 UTC: 23:30 at +5:30, still the 15th.
+        let morning: i64 = 1_800_000_000;
+        let evening = morning + 10 * 3_600;
+        for at in [morning, evening, evening + 3_600] {
+            call_usage(&store, "lab/a", call("c-a", None, 1, 1), at)
+                .unwrap()
+                .unwrap();
+        }
+        let india = 5 * 3_600 + 1_800;
+        let hours = store.usage_series(PERSON, 0, false, 3_600, india).unwrap();
+        let at: Vec<u64> = hours[0].points.iter().map(|p| p.at).collect();
+        assert!(at.iter().all(|a| a % 3_600 == 0), "{at:?}");
+        let days = store.usage_series(PERSON, 0, false, 86_400, india).unwrap();
+        let calls: Vec<u64> = days[0].points.iter().map(|p| p.calls).collect();
+        // 08:00 and 18:00 UTC on the 15th there; 19:00 UTC is its 16th.
+        assert_eq!(calls, [2, 1]);
+        assert!(days[0].points.iter().all(|p| (p.at + 19_800) % 86_400 == 0));
+    }
+
+    #[test]
+    fn calls_outside_the_app_add_up_by_the_hour_and_old_ones_go() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let now: i64 = 1_800_000_000;
+        let tokens = |input| enclos_protocol::usage::UsageTokens {
+            input: Some(input),
+            ..Default::default()
+        };
+        store.add_agent_usage("lab/a", now, 1, tokens(10)).unwrap();
+        store
+            .add_agent_usage("lab/a", now + 60, 2, tokens(5))
+            .unwrap();
+        let total = store.usage_since(PERSON, 0, true).unwrap();
+        assert_eq!(total[0].1.calls, 3);
+        assert_eq!(total[0].1.tokens.input, Some(15));
+        // A call past the days kept drops what came before them.
+        let later = now + (crate::bridge::store::AGENT_USAGE_DAYS + 1) * 86_400;
+        store.add_agent_usage("lab/a", later, 1, tokens(1)).unwrap();
+        let total = store.usage_since(PERSON, 0, true).unwrap();
+        assert_eq!(total[0].1.tokens.input, Some(1));
+        // A point with no counted token says so, not 0.
+        store
+            .add_agent_usage("lab/b", later, 1, Default::default())
+            .unwrap();
+        let series = store.usage_series(PERSON, 0, true, 86_400, 0).unwrap();
+        let b = series.iter().find(|s| s.agent == "lab/b").unwrap();
+        assert_eq!(b.points[0].tokens, None);
+        // Which agents report them: as their plugins said last.
+        store.set_reports_outside("lab/a", true).unwrap();
+        store.set_reports_outside("lab/b", true).unwrap();
+        store.set_reports_outside("lab/b", false).unwrap();
+        assert_eq!(store.outside_reporters().unwrap(), ["lab/a"]);
+    }
+
+    #[test]
+    fn a_series_keeps_the_heaviest_agents_and_their_latest_buckets() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let now: i64 = 1_800_000_000;
+        let max = enclos_protocol::usage::MAX_SERIES;
+        for i in 0..max + 2 {
+            let agent = format!("a{i}");
+            store
+                .conversation(&format!("c-{agent}"), "lab", &agent, PERSON)
+                .unwrap();
+            let input = 1 + u64::try_from(i).unwrap();
+            call_usage(
+                &store,
+                &format!("lab/{agent}"),
+                call(&format!("c-{agent}"), None, 1, input),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let series = store.usage_series(PERSON, 0, false, 3_600, 0).unwrap();
+        assert_eq!(series.len(), max);
+        assert_eq!(series[0].agent, format!("lab/a{}", max + 1));
+        // One agent busy every hour for longer than a series holds.
+        let points = enclos_protocol::usage::MAX_POINTS;
+        for h in 0..points + 10 {
+            let at = now - i64::try_from(h).unwrap() * 3_600;
+            call_usage(&store, "lab/a0", call("c-a0", None, 1, 1_000_000), at)
+                .unwrap()
+                .unwrap();
+        }
+        let series = store.usage_series(PERSON, 0, false, 3_600, 0).unwrap();
+        let busy = &series[0];
+        assert_eq!(busy.agent, "lab/a0");
+        assert_eq!(busy.points.len(), points);
+        assert_eq!(
+            busy.points.last().unwrap().at,
+            u64::try_from(now / 3_600 * 3_600).unwrap()
+        );
+        assert!(busy.points.windows(2).all(|w| w[0].at < w[1].at));
+    }
+
+    #[test]
+    fn a_device_gets_series_and_the_calls_outside_the_app_only_as_the_hosts_person() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-mine", "lab", "main", PERSON).unwrap();
+        let now = crate::bridge::store::now();
+        call_usage(&store, "lab/main", call("c-mine", None, 1, 10), now)
+            .unwrap()
+            .unwrap();
+        store
+            .add_agent_usage(
+                "lab/main",
+                now,
+                2,
+                enclos_protocol::usage::UsageTokens {
+                    input: Some(500),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fn ask(device: &mut PhoneLink, id: &str, bucket: Option<u32>) -> Option<ToDevice> {
+            let since = u64::try_from(crate::bridge::store::now() - 2 * 86_400).unwrap();
+            device.send(
+                id,
+                FromDevice::UsageGet {
+                    since,
+                    bucket,
+                    offset: Some(3_600),
+                },
+            );
+            device.receive()
+        }
+        store.set_reports_outside("lab/main", true).unwrap();
+        store.set_host(PERSON).unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        let Some(ToDevice::UsageReport {
+            agents,
+            outside,
+            bucket,
+            series,
+            ..
+        }) = ask(&mut device, "u1", Some(86_400))
+        else {
+            panic!("a usage report")
+        };
+        assert!(outside);
+        // Its plugin reports its calls outside the app: counted, and said.
+        assert!(agents[0].outside);
+        assert_eq!(bucket, Some(86_400));
+        assert_eq!(agents[0].total.tokens.input, Some(510));
+        assert_eq!(agents[0].total.calls, 3);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].points.iter().map(|p| p.calls).sum::<u64>(), 3);
+        // Without a bucket, no series.
+        assert!(
+            matches!(ask(&mut device, "u2", None), Some(ToDevice::UsageReport { series, .. }) if series.is_empty())
+        );
+        // A bucket it does not offer is refused, saying so.
+        assert!(
+            matches!(ask(&mut device, "u3", Some(60)), Some(ToDevice::Error(ErrorBody { code: ErrorCode::BadMessage, of: Some(of), .. })) if of.as_str() == "u3")
+        );
+        // Another person is the host's: the conversations' alone.
+        store.set_host("another@example.com").unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        device.send(
+            "u4",
+            FromDevice::UsageGet {
+                since: u64::try_from(now - 3_600).unwrap(),
+                bucket: Some(3_600),
+                offset: None,
+            },
+        );
+        let Some(ToDevice::UsageReport {
+            agents,
+            outside,
+            series,
+            ..
+        }) = device.receive()
+        else {
+            panic!("a usage report")
+        };
+        assert!(!outside);
+        assert!(!agents[0].outside);
+        assert_eq!(agents[0].total.tokens.input, Some(10));
+        // Nor in its series: the conversation's one call alone.
+        assert_eq!(series[0].points.iter().map(|p| p.calls).sum::<u64>(), 1);
     }
 
     #[test]
@@ -5905,7 +6359,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         }
         let input = |since: i64| -> Vec<(String, Option<u64>, u64)> {
             store
-                .usage_since("alice@example.com", since)
+                .usage_since("alice@example.com", since, false)
                 .unwrap()
                 .into_iter()
                 .map(|(agent, t)| (agent, t.tokens.input, t.calls))
