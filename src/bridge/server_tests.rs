@@ -2728,11 +2728,26 @@ fn approval_a_refusal_counts_once_and_a_denial_is_not_asked_again() {
     // policy became since.
     assert!(approvals::refusal_counted(&known, "lab", access, 90, 50));
     assert!(approvals::refusal_counted(&known, "lab", access, 100, 50));
+    // The proxy's explicit default port is the stored destination's other spelling.
+    assert!(approvals::refusal_counted(
+        &known,
+        "lab",
+        &network("example.com:443"),
+        90,
+        50
+    ));
+    assert!(!approvals::refusal_counted(
+        &known,
+        "lab",
+        &network("example.com:8443"),
+        90,
+        50
+    ));
     // Tried again after it: a new refusal.
     assert!(!approvals::refusal_counted(&known, "lab", access, 101, 50));
     // Another sandbox, scope or opt-in is another request.
     assert!(!approvals::refusal_counted(&known, "other", access, 90, 50));
-    let mut private = access.clone();
+    let mut private = network("example.com:443");
     private.private = true;
     assert!(!approvals::refusal_counted(&known, "lab", &private, 90, 50));
     assert!(!approvals::refusal_counted(
@@ -2787,10 +2802,7 @@ mod refusal_collection {
             )
             .unwrap();
         // The log and request times below are explicit, independent of the clock.
-        rusqlite::Connection::open(&hub.store_path)
-            .unwrap()
-            .execute("INSERT INTO approval_marks VALUES ('refusals', 50)", [])
-            .unwrap();
+        store.set_refusals_since(50).unwrap();
         (dir, engine, name, hub, store, device)
     }
 
@@ -2825,6 +2837,7 @@ mod refusal_collection {
             hub.collect_refusals(&store).unwrap();
             let mut request = store.approvals().unwrap().remove(0);
             assert_eq!(request.access, network("example.com"));
+            assert_eq!(request.action, "Connect to example.com");
             assert!(request.agent.is_empty());
             request.time = 110;
             assert!(store.refresh_approval(&request).unwrap());

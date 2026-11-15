@@ -1021,6 +1021,14 @@ impl Store {
             |r| r.get(0),
         )
     }
+    #[cfg(test)]
+    pub fn set_refusals_since(&self, at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO approval_marks (name, at) VALUES ('refusals', ?1) ON CONFLICT(name) DO UPDATE SET at=excluded.at",
+            [at],
+        )?;
+        Ok(())
+    }
     pub fn approval(
         &self,
         id: &str,

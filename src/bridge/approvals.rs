@@ -53,7 +53,8 @@ pub(super) const MAX_PENDING: usize = 50;
 /// already had its chance: it is older than the bridge's first collection
 /// (`since`), or a request for the same scope was made after it. Then a
 /// denial stays a denial when the policy later changes for another reason;
-/// only a refusal after the request asks again.
+/// only a refusal after the request asks again. Both spellings of the same
+/// access match after normalization.
 pub(super) fn refusal_counted(
     known: &[Approval],
     sandbox: &str,
@@ -61,10 +62,11 @@ pub(super) fn refusal_counted(
     last: i64,
     since: i64,
 ) -> bool {
+    let access = crate::engine::normalized(access);
     last < since
         || known
             .iter()
-            .any(|a| a.sandbox == sandbox && &a.access == access && a.time >= last)
+            .any(|a| a.sandbox == sandbox && a.access == access && a.time >= last)
 }
 
 /// Whether `agent` (`<sandbox>/<agent>`, as its connection names it) may
@@ -373,12 +375,11 @@ impl Hub {
                 if !matches!(d.reason, Reason::NotAllowed | Reason::PrivateAddress) {
                     continue;
                 }
-                let target = crate::model::net::destination(&d.host, d.port);
                 let private = d.reason == Reason::PrivateAddress;
-                // Match the spelling stored by request_access before counting old refusals.
+                // Keep the request's destination and action in the stored spelling.
                 let access = crate::engine::normalized(&Access {
                     kind: AccessKind::Network,
-                    target: target.clone(),
+                    target: crate::model::net::destination(&d.host, d.port),
                     private,
                 });
                 if refusal_counted(&known, sandbox, &access, d.last.as_second(), since) {
@@ -394,13 +395,8 @@ impl Hub {
                     }
                 }
                 // The log is sandbox-wide: do not invent a requesting agent or conversation.
-                self.request_access(
-                    store,
-                    sandbox,
-                    None,
-                    access,
-                    &format!("Connect to {target}"),
-                )?;
+                let action = format!("Connect to {}", access.target);
+                self.request_access(store, sandbox, None, access, &action)?;
             }
         }
         Ok(())
