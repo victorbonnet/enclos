@@ -50,6 +50,14 @@ class NativeHermesCommands(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await asyncio.wait_for(self.adapter.disconnect(), 5)
+        # Hermes writes the gateway's runtime status (`gateway_state.json`,
+        # through a temporary file in the profile) from a thread of its own
+        # since its default branch of 2026-11-15: the profile is removed
+        # only once that thread has written. An older Hermes writes it at
+        # once and has no such function.
+        flush = getattr(importlib.import_module("gateway.status"), "flush_runtime_status_async", None)
+        if flush is not None:
+            await flush(5)
 
     def test_hermes_has_commands_to_list(self):
         listed = self.adapter_module._hermes_commands()
