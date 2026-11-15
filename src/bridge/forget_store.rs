@@ -126,7 +126,14 @@ impl Store {
             if recorded != 1 {
                 return Err(Forget::OwnedByAnother(id.clone()));
             }
-            for table in ["questions", "turns", "members", "attachments", "messages"] {
+            for table in [
+                "questions",
+                "turns",
+                "members",
+                "attachments",
+                "messages",
+                "held_tasks",
+            ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE conversation = ?1"),
                     [id],

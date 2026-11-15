@@ -1,0 +1,1 @@
+{"v":1,"id":"result-1","type":"held_task.result","of":"tap-1","held_task":{"agent":"lab/main","conversation":"home.lab.main","task":"t_a1b2","title":"Write the weekly report","reason":"Gave up after 3 consecutive failures.","since":1763164800,"resume":"Runs it again with a fresh retry budget.","state":"resumed","revision":1}}

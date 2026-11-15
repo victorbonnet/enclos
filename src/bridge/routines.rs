@@ -573,6 +573,7 @@ impl Hub {
                     std::thread::sleep(Duration::from_secs(1));
                     self.expire_routines(&store);
                     self.expire_questions(&store);
+                    self.expire_held_resumes(&store);
                 },
                 Err(e) => {
                     eprintln!(

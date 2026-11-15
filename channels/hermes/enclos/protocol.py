@@ -16,7 +16,7 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
 FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "conversation.delete", "routine.request",
-                     "question.answer", "question.sync", "ack", "error")
+                     "question.answer", "question.sync", "held_task.resume", "ack", "error")
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
@@ -215,6 +215,9 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
                 raise ValueError("questions must contain at most 128 ids")
             for question_id in ids:
                 _check_id(question_id, "question")
+        elif kind == "held_task.resume":
+            for field in ("task", "revision", "person", "device"):
+                _check_id(message.get(field), field)
         elif kind == "ack":
             _check_id(message.get("of"), "of")
         elif kind == "error":
@@ -388,6 +391,16 @@ def runtime_title(text: str) -> str:
     """A Hermes session title as the app should show it: without the ` #2`
     Hermes adds to keep its titles unique, which says nothing to the person."""
     return re.sub(r"\s+#\d+$", "", " ".join(text.split()))
+
+
+def held_tasks(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Every task of this agent's runtime held now, whole (`held_tasks.py` builds each)."""
+    return _message("held_tasks", tasks=tasks)
+
+
+def held_task_resumed(of: str) -> dict[str, Any]:
+    """The runtime resumed the task the bridge's `held_task.resume` `of` named."""
+    return _message("held_task.resumed", of=of)
 
 
 def ack(of: str) -> dict[str, Any]:

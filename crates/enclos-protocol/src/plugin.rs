@@ -5,7 +5,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{self, ConversationId, MessageId, Person, QuestionId};
+use crate::ids::{self, ConversationId, HeldTaskId, MessageId, Person, QuestionId};
 
 /// A name the sandbox sends, which the host may print: the id rule.
 fn name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -40,6 +40,20 @@ pub enum FromBridge {
     },
     #[serde(rename = "question.sync")]
     QuestionSync { questions: Vec<QuestionId> },
+    /// Resume this held task with the runtime's own operation, only while
+    /// it is still held. `revision` is the runtime's, from the plugin's last
+    /// `held_tasks`: the plugin refuses (`conflict`) one that is no longer
+    /// current when it checks. A live control from the host's person,
+    /// never queued: the plugin answers `held_task.resumed` or an `error`.
+    #[serde(rename = "held_task.resume")]
+    HeldTaskResume {
+        task: HeldTaskId,
+        revision: crate::ids::HeldTaskRevision,
+        /// Who asked, from which of their paired devices, as the bridge
+        /// authenticated them.
+        person: Person,
+        device: String,
+    },
     #[serde(rename = "routine.request")]
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
@@ -100,6 +114,7 @@ pub enum FromBridge {
 pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "question.answer",
     "question.sync",
+    "held_task.resume",
     "routine.request",
     "policy.context",
     "hello",
@@ -130,6 +145,17 @@ pub enum FromPlugin {
     },
     #[serde(rename = "routine.response")]
     RoutineResponse(crate::routine::RoutineReply),
+    /// Every task of this agent's runtime held now, whole (at most
+    /// [`crate::held_task::MAX_HELD_TASKS`]): after the `hello`, and again
+    /// whenever one is held, changes or is no longer held. The bridge
+    /// releases the cards of tasks it no longer lists.
+    #[serde(rename = "held_tasks")]
+    HeldTasks {
+        tasks: Vec<crate::held_task::HeldTask>,
+    },
+    /// The runtime resumed the task a `held_task.resume` named.
+    #[serde(rename = "held_task.resumed")]
+    HeldTaskResumed { of: MessageId },
     /// The plugin's answer to the bridge's `hello`.
     #[serde(rename = "hello")]
     Hello {
@@ -206,6 +232,8 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "question.ask",
     "question.update",
     "routine.response",
+    "held_tasks",
+    "held_task.resumed",
     "hello",
     "approval.request",
     "message.out",
@@ -313,6 +341,9 @@ pub enum Capability {
     RuntimeApprovals,
     /// It permanently deletes a conversation's native session history.
     ConversationDelete,
+    /// It reports its runtime's held tasks and resumes one (`held_tasks`,
+    /// `held_task.resume`); requires the bridge's matching hello capability.
+    HeldTasks,
     /// It reports what the agent is doing (`agent.activity`).
     Activity,
     /// It reports the agent's tasks (`task.update`, `tasks`).
