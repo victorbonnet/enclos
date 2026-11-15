@@ -380,6 +380,7 @@ impl Hub {
                 seq: i64::MAX,
                 attachments: vec![],
                 question: Some(question.id.clone()),
+                held_task: None,
             })
         };
         if !bounded(&introduction()) {
@@ -792,6 +793,7 @@ impl Hub {
         let message = change.message.map(|message| {
             ToDevice::Message(ConversationMessage {
                 question: message.question,
+                held_task: None,
                 conversation: current.info.conversation.clone(),
                 agent: current.info.agent.clone(),
                 from: "agent".into(),

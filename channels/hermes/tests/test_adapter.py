@@ -109,7 +109,7 @@ def setUpModule():
     from gateway.config import PlatformConfig
 
 
-from enclos import protocol  # noqa: E402
+from enclos import held_tasks, protocol  # noqa: E402
 
 TOKEN = "t" * 64
 
@@ -227,6 +227,27 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         error = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual((error["code"], error["of"]), ("version", "m9"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
+        writer.close()
+
+    async def test_a_hermes_without_a_board_does_not_announce_held_tasks(self):
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["held_tasks"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertNotIn("held_tasks", hello["capabilities"])
+        writer.close()
+
+    async def test_a_held_task_resume_is_unsupported_not_a_second_hello(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(line("held_task.resume", task="t_1", revision="e:1", person="p@example.com", device="d1")
+                     .replace(b'"id": "', b'"id": "resume-', 1))
+        await writer.drain()
+        while True:
+            answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            if answer["type"] == "error" and answer.get("of", "").startswith("resume-"):
+                break
+        self.assertEqual(answer["code"], "unsupported")
         writer.close()
 
     async def test_a_message_the_runtime_did_not_take_is_not_a_duplicate_when_sent_again(self):
@@ -587,6 +608,107 @@ class UsageHooks(unittest.TestCase):
         # Hermes would take an unknown name with a warning: it is not tried.
         self.assertEqual(self.register({"post_auxiliary_call"}), ([], False))
         self.assertEqual(self.register(None), ([], False))
+
+
+class StubBoard:
+    """A kanban board that holds what the test says (held_tasks.Board's methods)."""
+
+    def __init__(self):
+        self.tasks = [{"task": "t_1", "title": "Write the report", "reason": "Which client?", "since": 1,
+                       "revision": "e:2", "resume": held_tasks.RESUME}]
+        self.resumed = []
+
+    def read(self, profile):
+        return list(self.tasks) if profile == "main" else []
+
+    def resume(self, profile, ref, revision):
+        if revision != "e:2":
+            raise held_tasks.HeldTaskError("conflict", "The task changed since; it was not resumed.")
+        self.resumed.append((profile, ref))
+        self.tasks = []
+
+
+class HeldTasksOverTheSocket(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "app", "main.sock")
+        self.board = StubBoard()
+        with patch.object(held_tasks, "native", return_value=self.board):
+            self.adapter = EnclosAdapter(PlatformConfig({"socket": self.path, "token": TOKEN}))
+        self.assertTrue(await self.adapter.connect())
+
+    async def asyncTearDown(self):
+        await asyncio.wait_for(self.adapter.disconnect(), 5)
+
+    async def connect(self, capabilities):
+        reader, writer = await asyncio.open_unix_connection(self.path, limit=protocol.MAX_MESSAGE_BYTES + 1)
+        writer.write(line("hello", token=TOKEN, capabilities=capabilities))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertIn("held_tasks", hello["capabilities"])
+        return reader, writer
+
+    async def next(self, reader):
+        return json.loads(await asyncio.wait_for(reader.readline(), 5))
+
+    async def test_one_list_after_the_hello_written_to_the_bridge_not_kept_in_the_outbox(self):
+        reader, writer = await self.connect(["held_tasks"])
+        self.assertEqual((await self.next(reader))["type"], "held_tasks")
+        writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="hi"))
+        await writer.drain()
+        # Nothing changed on the board: the next line is the message's ack
+        self.assertEqual((await self.next(reader))["type"], "ack")
+        self.assertEqual(self.adapter._outbox.pending(), [])
+        writer.close()
+
+    async def test_a_bridge_without_the_capability_gets_no_list(self):
+        reader, writer = await self.connect([])
+        writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="hi"))
+        await writer.drain()
+        self.assertEqual((await self.next(reader))["type"], "ack")
+        writer.close()
+
+    async def test_the_list_after_the_hello_then_a_resume_and_a_fresh_list(self):
+        reader, writer = await self.connect(["held_tasks"])
+        listed = await self.next(reader)
+        self.assertEqual((listed["type"], [t["task"] for t in listed["tasks"]]), ("held_tasks", ["t_1"]))
+        resume = line("held_task.resume", task="t_1", revision="e:2", person="alice@example.com", device="d-1")
+        writer.write(resume)
+        await writer.drain()
+        resumed = await self.next(reader)
+        self.assertEqual((resumed["type"], resumed["of"]), ("held_task.resumed", json.loads(resume)["id"]))
+        self.assertEqual((await self.next(reader))["tasks"], [])
+        self.assertEqual(self.board.resumed, [("main", "t_1")])
+        writer.close()
+
+    async def test_a_kanban_tick_from_another_thread_reads_the_board_again(self):
+        reader, writer = await self.connect(["held_tasks"])
+        await self.next(reader)
+        self.board.tasks = []
+        ticked = sys.modules[EnclosAdapter.__module__]._kanban_ticked
+        await asyncio.to_thread(ticked, board="default", profile_name="default", outcome="idle")
+        self.assertEqual((await self.next(reader))["tasks"], [])
+        writer.close()
+
+
+class Registration(unittest.TestCase):
+    def registered(self, valid_hooks):
+        plugins = types.ModuleType("hermes_cli.plugins")
+        plugins.VALID_HOOKS = set(valid_hooks)
+        package = types.ModuleType("hermes_cli")
+        package.plugins = plugins
+        ctx = Mock()
+        module = sys.modules[EnclosAdapter.__module__]
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.plugins": plugins}):
+            module.register(ctx)
+        return {c.args[0]: c.args[1] for c in ctx.register_hook.call_args_list}
+
+    def test_the_dispatch_tick_hook_is_registered_only_when_hermes_knows_it(self):
+        module = sys.modules[EnclosAdapter.__module__]
+        hooks = self.registered({"on_kanban_dispatch_tick"})
+        self.assertIs(hooks["on_kanban_dispatch_tick"], module._kanban_ticked)
+        with self.assertLogs("enclos.adapter", "INFO"):
+            self.assertNotIn("on_kanban_dispatch_tick", self.registered(set()))
 
 
 if __name__ == "__main__":

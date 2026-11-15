@@ -32,6 +32,11 @@ class FromTheBridge(unittest.TestCase):
         cases = [
             (b'{"v":1,"id":"m1","type":"message.edit"}', "unknown_type"),
             (b'{"v":1,"id":"m1","type":"message.in","text":"no conversation"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"t","person":"p","device":"d"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"t","revision":"e\\n1","person":"p","device":"d"}',
+             "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"","revision":"e:1","person":"p","device":"d"}',
+             "bad_message"),
             (b'{"v":2,"id":"m1","type":"ack","of":"m0"}', "version"),
             (b'{"id":"m1","type":"ack","of":"m0"}', "bad_message"),
             (b'{"v":1,"id":"","type":"ack","of":"m0"}', "bad_message"),
@@ -130,6 +135,12 @@ class ToTheBridge(unittest.TestCase):
             protocol.agent_usage({"input": 5120, "output": 240, "cache_read": 0}, model="gpt-6.1-sol",
                                  source="cron"),
             "from_plugin_usage_agent.json")
+
+    def test_held_tasks_have_the_fixtures_shape(self):
+        tasks = json.loads(fixture("from_plugin_held_tasks.json"))["tasks"]
+        self.assert_like_fixture(protocol.held_tasks(tasks), "from_plugin_held_tasks.json")
+        of = json.loads(fixture("from_plugin_held_task_resumed.json"))["of"]
+        self.assert_like_fixture(protocol.held_task_resumed(of), "from_plugin_held_task_resumed.json")
 
     def test_hermes_uniqueness_suffix_is_dropped(self):
         self.assertEqual(protocol.runtime_title("Paris weather #2"), "Paris weather")

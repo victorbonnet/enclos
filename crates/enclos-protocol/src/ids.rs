@@ -87,6 +87,15 @@ id!(
     /// One immutable question, distinct from a message or runtime's transient waiter id.
     QuestionId
 );
+id!(
+    /// A runtime's id for a held task (ADR 0066), as its plugin reports it.
+    HeldTaskId
+);
+id!(
+    /// A runtime's opaque revision of one hold of a held task: what a
+    /// resume names, never the bridge's card revision (a number).
+    HeldTaskRevision
+);
 
 #[cfg(test)]
 mod tests {

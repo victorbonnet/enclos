@@ -85,6 +85,18 @@ def _line(value: Any, chars: int) -> str:
     return " ".join(str(value or "").split())[:chars].rstrip()
 
 
+def read_only(path: Any) -> sqlite3.Connection:
+    """A board's database, opened read-only (a `mode=ro` URI, as Hermes's own
+    `gateway/session_kanban.py` reads it): never created nor migrated, as
+    Hermes's `connect()` would."""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    conn.row_factory = sqlite3.Row
+    # As Hermes reads its board: a cell of invalid UTF-8 would otherwise
+    # fail the whole read, and with it every task's report.
+    conn.text_factory = _lossy
+    return conn
+
+
 def task_of(row: Any, agent: str) -> Optional[dict[str, Any]]:
     """The task a board row is on the plugin leg, or None when it has none: an
     archived task, a status this plugin does not know, an id the bridge would
@@ -138,12 +150,7 @@ class Board:
 
     @staticmethod
     def _open(path: str) -> sqlite3.Connection:
-        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
-        conn.row_factory = sqlite3.Row
-        # As Hermes reads its board: a cell of invalid UTF-8 would otherwise
-        # fail the whole read, and with it every task's report.
-        conn.text_factory = _lossy
-        return conn
+        return read_only(path)
 
     def cursor(self) -> tuple:
         """Each board's newest event: it changes whenever a board does."""

@@ -133,6 +133,7 @@ impl Store {
                 "attachments",
                 "usage_hours",
                 "messages",
+                "held_tasks",
             ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE conversation = ?1"),
