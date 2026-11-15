@@ -2131,7 +2131,7 @@ fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices()
         None,
         "a display name never addresses another agent"
     );
-    assert_eq!(hub.agents()[0].name, "lab/comptoir-dev");
+    assert!(hub.serves("lab/comptoir-dev"));
     assert!(hub.plugins.lock().unwrap().is_empty());
     r1.try_recv().unwrap();
     r2.try_recv().unwrap();
