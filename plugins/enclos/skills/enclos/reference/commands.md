@@ -393,7 +393,7 @@ Push to paired devices through FCM (ADR 0065, proposed): give the bridge a key t
 
 ##### `enclos app push key`
 
-Give the bridge the service-account key it sends pushes with: the JSON file Google Cloud gives, of a service account of the app's Firebase project allowed `cloudmessaging.messages.create` alone. It replaces any key given before; the running bridge takes it at its next push
+Give the bridge the service-account key it sends pushes with: the JSON file Google Cloud gives, of a service account of the app's Firebase project allowed `cloudmessaging.messages.create` alone. It replaces any key given before; the running bridge takes it at its next push. How to set up the project and make the key: https://github.com/victorbonnet/enclos/blob/main/docs/push-setup.md
 
 ```text
 enclos app push key [OPTIONS] <FILE>

@@ -108,7 +108,8 @@ enum PushVerb {
     /// JSON file Google Cloud gives, of a service account of the app's
     /// Firebase project allowed `cloudmessaging.messages.create` alone. It
     /// replaces any key given before; the running bridge takes it at its
-    /// next push.
+    /// next push. How to set up the project and make the key:
+    /// https://github.com/victorbonnet/enclos/blob/main/docs/push-setup.md
     Key {
         /// The key file. Remove it once given: enclos keeps its own copy.
         file: std::path::PathBuf,
@@ -613,7 +614,7 @@ fn devices(engine: &Engine, status: bool) -> Result<u8> {
     match &push {
         Some(Ok(Some(project))) => println!("Push: on, through FCM for project {project}."),
         Some(Ok(None)) => println!(
-            "Push: off. Give the bridge a key with `enclos app push key <file>`; meanwhile a device gets what came at its next sync."
+            "Push: off. Give the bridge a key with `enclos app push key <file>` (how to make one: docs/push-setup.md); meanwhile a device gets what came at its next sync."
         ),
         Some(Err(why)) => println!("Push: off: {why}"),
         None => {}
