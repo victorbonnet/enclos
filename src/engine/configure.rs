@@ -451,8 +451,15 @@ impl Engine {
                 socket.display()
             )));
         }
-        // The agent's Home conversation, as the bridge names it (ADR 0044).
-        let home = crate::bridge::store::home_id(&format!("{name}/{agent}"));
+        // The agent's Home conversation, as the bridge names it (ADR 0044):
+        // a new one once it was forgotten, which this claims (ADR 0067,
+        // proposed). A dry run claims nothing.
+        let home = crate::bridge::store::setup_home(
+            &self.app_store_path(),
+            &format!("{name}/{agent}"),
+            confirm != Confirm::DryRun,
+        )
+        .map_err(|e| session(format!("cannot read the app bridge's database: {e}")))?;
         // The public key the plugin checks each runtime-approval decision
         // against (ADR 0060).
         let bridge_key = self.app_approval_public_key(confirm)?;

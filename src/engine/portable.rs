@@ -303,12 +303,20 @@ impl Engine {
                 return Err(failed("unsupported runtime export format"));
             }
         }
-        let conversations = state
-            .as_ref()
-            .map(|s| s.history.conversation_map(&format!("{name}/{agent}")))
-            .transpose()
-            .map_err(failed)?
-            .unwrap_or_default();
+        let conversations = match &state {
+            Some(s) => {
+                // The destination's Home: a new one if an agent of its name
+                // was forgotten (ADR 0067, proposed).
+                let home = crate::bridge::store::setup_home(
+                    &self.app_store_path(),
+                    &format!("{name}/{agent}"),
+                    !metadata_only,
+                )
+                .map_err(|e| failed(format!("cannot read the app bridge's database: {e}")))?;
+                s.history.conversation_map(&home).map_err(failed)?
+            }
+            None => Default::default(),
+        };
         let context =
             serde_json::json!({"source_agent":manifest.source_agent,"conversations":conversations})
                 .to_string();

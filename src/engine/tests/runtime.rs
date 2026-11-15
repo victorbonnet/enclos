@@ -3814,6 +3814,47 @@ fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
     );
 }
 
+/// An agent forgotten in the app and set up again gets a Home id never
+/// used (ADR 0067, proposed): `runtime configure` claims it in the
+/// bridge's database and gives it to the runtime; a dry run claims none.
+#[test]
+fn an_agent_forgotten_in_the_app_is_set_up_with_a_new_home() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let root = super::Root {
+        parent: "/tmp".into(),
+        leaf: "f".to_owned(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    grant_app_token(&lab, Confirm::Yes);
+    let bridge = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    bridge.claim_host("alice").unwrap();
+    bridge.ensure_home("home/default", "alice", true).unwrap();
+    let (forgotten, _) = bridge
+        .forget_agent("home/default", "alice", "phone")
+        .unwrap();
+    assert_eq!(forgotten, ["home.home.default"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let Planned::DryRun(_) = configure_app(&lab, &[], None, Confirm::DryRun).unwrap() else {
+        panic!("a dry run set the app channel up");
+    };
+    assert_eq!(bridge.home_of("home/default").unwrap(), None);
+    let Planned::Done(_) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
+        panic!("not a dry run");
+    };
+    assert!(
+        calls().contains("-p default config set MOBILE_APP_HOME_CHANNEL home.home.default.2\n"),
+        "{}",
+        calls()
+    );
+    assert_eq!(
+        bridge.home_of("home/default").unwrap().as_deref(),
+        Some("home.home.default.2")
+    );
+}
+
 /// The app channel's token granted only by the pending policy waits for
 /// it: nothing runs, and nothing is staged, before `policy apply`.
 #[test]

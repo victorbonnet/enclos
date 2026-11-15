@@ -32,6 +32,8 @@ mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
 #[path = "deletions.rs"]
 mod deletions;
+#[path = "forget.rs"]
+mod forget;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -73,10 +75,12 @@ use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
+#[cfg(test)]
+use super::store::home_id;
 use super::store::{
     Acked, Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
     PairingRequest, Store, StoredAttachment, attachment_mime, attachment_name, conversation_title,
-    home_id, is_home, now,
+    is_home, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
@@ -604,9 +608,18 @@ impl Hub {
         if open(self) {
             return Ok(());
         }
+        // The Home the bridge chose for it, which the runtime takes from
+        // the `hello` (ADR 0067, proposed): none once it was forgotten.
+        let home = self
+            .store()
+            .and_then(|store| store.home_of(agent).map_err(|e| e.to_string()))?
+            .ok_or_else(|| {
+                format!(
+                    "{agent} was forgotten in the app: set up its app channel again with `enclos runtime configure --channel app`"
+                )
+            })?;
         let (hello, mut reader, mut writer) =
-            connect(&endpoint.socket, &endpoint.token, &home_id(agent))
-                .map_err(|e| e.to_string())?;
+            connect(&endpoint.socket, &endpoint.token, &home).map_err(|e| e.to_string())?;
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
             && let Ok(name) = sandbox.parse()
@@ -2433,6 +2446,20 @@ fn run_session(
             FromDevice::ConversationDelete { conversation } => {
                 hub.request_deletion(device, message.id, conversation);
             }
+            FromDevice::AgentsRemoved => {
+                link.send(ToDevice::AgentsRemovedList {
+                    agents: hub.removed_agents(store, person),
+                })?;
+            }
+            FromDevice::AgentForget { agent } => {
+                match hub.forget_agent(store, device, person, &agent) {
+                    Ok(()) => link.send(ToDevice::Ack { of: message.id })?,
+                    Err(mut error) => {
+                        error.of = Some(message.id);
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
             FromDevice::ConversationArchive {
                 conversation,
                 archived,
@@ -3134,7 +3161,13 @@ fn destination(
     if own {
         return Ok(Some(conversation));
     }
-    let Ok(home) = ConversationId::new(home_id(agent)).inspect_err(|e| {
+    let Some(home) = store.home_of(agent).map_err(|e| e.to_string())? else {
+        eprintln!(
+            "enclos app: {agent}: a message for no conversation of its own is dropped: the agent was forgotten"
+        );
+        return Ok(None);
+    };
+    let Ok(home) = ConversationId::new(home).inspect_err(|e| {
         eprintln!(
             "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
         );

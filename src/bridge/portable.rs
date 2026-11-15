@@ -2,7 +2,7 @@
 //! and sequences, and never recreates a pending action or a paired identity.
 use super::ids::new_id;
 use super::server::{conversation_frame, fits_device, message_frame};
-use super::store::{Store, attachment_mime, attachment_name, conversation_title, home_id, is_home};
+use super::store::{Store, attachment_mime, attachment_name, conversation_title, is_home};
 use crate::model::secret::SecretValue;
 use enclos_protocol::device::{MAX_DEVICE_MESSAGE, ToDevice};
 use rusqlite::{OptionalExtension, params};
@@ -223,14 +223,15 @@ impl History {
         Ok(())
     }
     /// Runtime adapters receive this same map to rebase their own session keys.
-    pub fn conversation_map(&self, destination: &str) -> io::Result<BTreeMap<String, String>> {
+    /// A Home becomes `home`, the destination agent's ([`super::store::setup_home`]).
+    pub fn conversation_map(&self, home: &str) -> io::Result<BTreeMap<String, String>> {
         self.conversations
             .iter()
             .map(|c| {
                 Ok((
                     c.id.clone(),
                     if is_home(&c.id) {
-                        home_id(destination)
+                        home.to_owned()
                     } else {
                         new_id()?
                     },
@@ -515,7 +516,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::store::{From, StoredAttachment};
+    use crate::bridge::store::{From, StoredAttachment, home_id};
     fn source(dir: &Path) -> (Store, History) {
         let store = Store::open(&dir.join("source.db")).unwrap();
         store.set_host("source-person").unwrap();
@@ -593,7 +594,7 @@ mod tests {
             "reply",
         )
         .unwrap();
-        let map = history.conversation_map("new/renamed").unwrap();
+        let map = history.conversation_map(&home_id("new/renamed")).unwrap();
         let media = dir.path().join("dest-media");
         dest.import_history(&history, "new/renamed", &map, &media)
             .unwrap();
@@ -692,7 +693,7 @@ mod tests {
             history.validate().unwrap();
             let dest = Store::open(&each.join("dest.db")).unwrap();
             dest.set_host("destination-person").unwrap();
-            let map = history.conversation_map("new/renamed").unwrap();
+            let map = history.conversation_map(&home_id("new/renamed")).unwrap();
             let media = each.join("dest-media");
             assert!(
                 dest.import_history(&history, "new/renamed", &map, &media)
@@ -714,7 +715,7 @@ mod tests {
         let (_source, history) = source(dir.path());
         let dest = Store::open(&dir.path().join("dest.db")).unwrap();
         dest.set_host("destination-person").unwrap();
-        let map = history.conversation_map("new/renamed").unwrap();
+        let map = history.conversation_map(&home_id("new/renamed")).unwrap();
         dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
             .unwrap();
     }
@@ -757,7 +758,7 @@ mod tests {
         history.validate().unwrap();
         let dest = Store::open(&dir.path().join("dest.db")).unwrap();
         dest.set_host("destination-person").unwrap();
-        let map = history.conversation_map("new/renamed").unwrap();
+        let map = history.conversation_map(&home_id("new/renamed")).unwrap();
         dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
             .unwrap();
         let home = home_id("new/renamed");
@@ -802,7 +803,7 @@ mod tests {
         assert_eq!(history.attachments[0].name, kept);
         let dest = Store::open(&dir.path().join("dest.db")).unwrap();
         dest.set_host("destination-person").unwrap();
-        let map = history.conversation_map("new/renamed").unwrap();
+        let map = history.conversation_map(&home_id("new/renamed")).unwrap();
         dest.import_history(&history, "new/renamed", &map, &dir.path().join("media"))
             .unwrap();
         let name: String = dest
