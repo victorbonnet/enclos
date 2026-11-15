@@ -34,6 +34,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "conversation_delete",
         include_str!("fixtures/plugin/from_bridge_conversation_delete.json"),
     ),
+    (
+        "held_task_resume",
+        include_str!("fixtures/plugin/from_bridge_held_task_resume.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -88,6 +92,14 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "routine_response",
         include_str!("fixtures/plugin/from_plugin_routine_response.json"),
+    ),
+    (
+        "held_tasks",
+        include_str!("fixtures/plugin/from_plugin_held_tasks.json"),
+    ),
+    (
+        "held_task_resumed",
+        include_str!("fixtures/plugin/from_plugin_held_task_resumed.json"),
     ),
 ];
 

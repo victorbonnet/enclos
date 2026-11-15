@@ -16,7 +16,7 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
 FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "conversation.delete", "routine.request",
-                     "question.answer", "question.sync", "ack", "error")
+                     "question.answer", "question.sync", "held_task.resume", "ack", "error")
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
@@ -211,6 +211,9 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
                 raise ValueError("questions must contain at most 128 ids")
             for question_id in ids:
                 _check_id(question_id, "question")
+        elif kind == "held_task.resume":
+            for field in ("task", "revision", "person", "device"):
+                _check_id(message.get(field), field)
         elif kind == "ack":
             _check_id(message.get("of"), "of")
         elif kind == "error":

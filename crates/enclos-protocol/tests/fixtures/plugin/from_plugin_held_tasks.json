@@ -1,0 +1,1 @@
+{"v":1,"id":"held-1","type":"held_tasks","tasks":[{"task":"t_a1b2","title":"Write the weekly report","assignee":"writer","reason":"Gave up after 3 consecutive failures.","last_error":"rate limited by the provider","since":1763164800,"revision":"e:42","resume":"Runs it again with a fresh retry budget."}]}

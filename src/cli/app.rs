@@ -619,6 +619,7 @@ fn chat(
             .ok_or_else(|| failed("cannot make a message id".to_owned()))?;
         let whole = ConversationMessage {
             question: None,
+            held_task: None,
             conversation: conversation.clone(),
             agent: format!("{sandbox}/{agent}"),
             from: person.to_string(),
@@ -742,6 +743,7 @@ fn read_agent(
                     &message.id,
                     &ConversationMessage {
                         question: None,
+                        held_task: None,
                         conversation: conversation.clone(),
                         agent: format!("{sandbox}/{agent}"),
                         from: "agent".to_owned(),

@@ -229,6 +229,19 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
         writer.close()
 
+    async def test_a_held_task_resume_is_unsupported_not_a_second_hello(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(line("held_task.resume", task="t_1", revision="e:1", person="p@example.com", device="d1")
+                     .replace(b'"id": "', b'"id": "resume-', 1))
+        await writer.drain()
+        while True:
+            answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            if answer["type"] == "error" and answer.get("of", "").startswith("resume-"):
+                break
+        self.assertEqual(answer["code"], "unsupported")
+        writer.close()
+
     async def test_a_message_the_runtime_did_not_take_is_not_a_duplicate_when_sent_again(self):
         self.adapter.failures.append(RuntimeError("the runtime is busy"))
         again = line("message.in", conversation="c-1", person="alice@example.com", text="hi")

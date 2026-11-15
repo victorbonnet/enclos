@@ -330,6 +330,9 @@ class EnclosAdapter(BasePlatformAdapter):
             if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
                 # The bridge cannot read it: sent again, it would be refused again
                 logger.warning("[%s] Outbox: %s was refused by the bridge; it was set aside", self.name, of)
+        elif kind == "held_task.resume":
+            # This plugin announces no `held_tasks`: no task of its is held.
+            await self._write(protocol.error("unsupported", "This channel does not report held tasks.", message["id"]))
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
         return True

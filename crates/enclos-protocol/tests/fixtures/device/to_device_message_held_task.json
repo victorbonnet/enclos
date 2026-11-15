@@ -1,0 +1,1 @@
+{"v":1,"id":"m-7","type":"message","conversation":"home.lab.main","agent":"lab/main","from":"agent","text":"Held task: Write the weekly report\nGave up after 3 consecutive failures.","kind":"notify","time":1763164801,"seq":42,"held_task":"t_a1b2"}
