@@ -277,7 +277,7 @@ class ReporterTest(unittest.IsolatedAsyncioTestCase):
 class HermesBoardTest(unittest.TestCase):
     def test_a_hermes_without_a_board_has_no_tasks(self):
         with patch.dict(sys.modules, {"hermes_cli": None, "hermes_cli.kanban_db": None}):
-            self.assertIsNone(tasks.hermes_board(Path("/home/agent/.hermes"), "enclos"))
+            self.assertIsNone(tasks.hermes_board(Path("/home/alice/.hermes"), "enclos"))
         old = types.ModuleType("hermes_cli.kanban_db")
         old.list_tasks = lambda *a, **k: []  # no list_boards
         package = types.ModuleType("hermes_cli")
@@ -286,7 +286,7 @@ class HermesBoardTest(unittest.TestCase):
         constants.profile_name_for_home = lambda home: "engineer"
         with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": old,
                                       "hermes_constants": constants}):
-            self.assertIsNone(tasks.hermes_board(Path("/home/agent/.hermes"), "enclos"))
+            self.assertIsNone(tasks.hermes_board(Path("/home/alice/.hermes"), "enclos"))
 
 
 @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
