@@ -837,6 +837,7 @@ impl Hub {
                         };
                         let whole = ConversationMessage {
                             question: None,
+                            held_task: None,
                             conversation: conversation.clone(),
                             agent: agent.clone(),
                             from: "agent".to_owned(),
@@ -1235,6 +1236,7 @@ pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<T
         .collect();
     Ok(ToDevice::Message(ConversationMessage {
         question: m.question,
+        held_task: None,
         conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
         agent,
         from: match m.from {
@@ -3379,6 +3381,7 @@ fn send(
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
         question: None,
+        held_task: None,
         conversation: conversation.clone(),
         // A group is its sandbox's
         agent: if group { sandbox } else { name.clone() },

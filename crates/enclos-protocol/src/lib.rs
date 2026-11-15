@@ -10,6 +10,7 @@
 //!   paired device.
 //! - [`decision`]: the runtime-approval decisions the bridge signs for a
 //!   plugin.
+//! - [`held_task`]: a runtime's held tasks, on both legs.
 //! - [`visible`]: text checked for hidden characters before a person
 //!   reads it.
 
@@ -19,6 +20,7 @@ pub mod avatar;
 pub mod decision;
 pub mod device;
 mod envelope;
+pub mod held_task;
 mod ids;
 pub mod noise;
 pub mod pairing;
@@ -30,4 +32,4 @@ pub mod routine;
 pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
-pub use ids::{ConversationId, IdError, MessageId, Person, QuestionId};
+pub use ids::{ConversationId, HeldTaskId, IdError, MessageId, Person, QuestionId};

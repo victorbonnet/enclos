@@ -12,6 +12,7 @@ fn agent_text(text: &str) -> ConversationMessage {
         time: 0,
         seq: 0,
         question: None,
+        held_task: None,
         attachments: Vec::new(),
     }
 }
@@ -3126,6 +3127,7 @@ fn a_forgotten_device_is_unpaired_and_logged() {
 fn agent_says(text: &str) -> ConversationMessage {
     ConversationMessage {
         question: None,
+        held_task: None,
         conversation: ConversationId::new("c-1").unwrap(),
         agent: "lab/main".to_owned(),
         from: "agent".to_owned(),

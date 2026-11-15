@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode, encode_line};
-use crate::ids::{ConversationId, MAX_ID_BYTES, MessageId, QuestionId};
+use crate::ids::{ConversationId, HeldTaskId, MAX_ID_BYTES, MessageId, QuestionId};
 use crate::noise::MAX_NOISE_MESSAGE;
 use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
@@ -18,6 +18,14 @@ pub enum FromDevice {
         question: QuestionId,
         revision: u64,
         answer: crate::question::QuestionAnswer,
+    },
+    /// Resume a held task: the host's person, on a still-paired device,
+    /// at the card's current revision.
+    #[serde(rename = "held_task.resume")]
+    HeldTaskResume {
+        agent: String,
+        task: HeldTaskId,
+        revision: u64,
     },
     #[serde(rename = "agent.name.get")]
     AgentNameGet { agent: String },
@@ -160,6 +168,7 @@ pub const APPROVAL_CLOSE: &str = "approval.close";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.answer",
+    "held_task.resume",
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -206,6 +215,17 @@ pub enum ToDevice {
     QuestionResult {
         of: MessageId,
         question: crate::question::QuestionInfo,
+    },
+    /// A held task's card, at sync and whenever it changes.
+    #[serde(rename = "held_task")]
+    HeldTask {
+        held_task: crate::held_task::HeldTaskInfo,
+    },
+    /// The runtime resumed the task a `held_task.resume` named.
+    #[serde(rename = "held_task.result")]
+    HeldTaskResult {
+        of: MessageId,
+        held_task: crate::held_task::HeldTaskInfo,
     },
     #[serde(rename = "agent.name")]
     AgentName(crate::agent_name::AgentName),
@@ -320,6 +340,8 @@ pub const ATTACHMENT_CHUNK: usize = 45_000;
 pub const TO_DEVICE_TYPES: &[&str] = &[
     "question",
     "question.result",
+    "held_task",
+    "held_task.result",
     "agent.name",
     "routine.response",
     "agent.avatar",
@@ -553,6 +575,10 @@ pub struct ConversationMessage {
     /// Metadata arrives in a separate `question` frame before this message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<QuestionId>,
+    /// The held task this message is about, a card of the same agent:
+    /// metadata arrives in a separate `held_task` frame before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_task: Option<HeldTaskId>,
     /// Its files, which the device fetches with `attachment.get`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -625,6 +651,7 @@ mod tests {
     fn agent_text(text: &str) -> ConversationMessage {
         ConversationMessage {
             question: None,
+            held_task: None,
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
             from: "agent".into(),
@@ -833,6 +860,7 @@ mod tests {
             time: 1_800_000_000,
             seq: 7,
             question: None,
+            held_task: None,
             attachments: vec![Attachment {
                 id: "a-1".into(),
                 mime: "image/png".into(),
