@@ -231,13 +231,10 @@ impl Engine {
     ) -> Result<AgentList> {
         let tracked = self.state.agents(name)?;
         let found = runtime.agents_in(home);
-        // What the app bridge last heard each agent's plugin say it is
-        // doing: nothing without a bridge database, or one it cannot read.
-        let store = self.layout.app_store();
-        let activity = match store.exists() {
-            true => crate::bridge::store::Store::read_activity(&store).unwrap_or_default(),
-            false => Default::default(),
-        };
+        // What the running app bridge last heard each agent's plugin say it
+        // is doing: nothing without a bridge database or a bridge that runs,
+        // and said when either cannot be read.
+        let (activity, activity_unreadable) = bridge_activity(&self.layout.app_store());
         let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
         let mut names: Vec<RuntimeAgentName> = builtin.iter().cloned().collect();
         for n in tracked
@@ -294,7 +291,31 @@ impl Engine {
         Ok(AgentList {
             agents,
             unreadable: found.err().map(|why| why.to_string()),
+            activity_unreadable,
         })
+    }
+}
+
+/// What each agent (`<sandbox>/<agent>`) is doing, as the app bridge whose
+/// database is `store` recorded it, if that bridge runs; and why it could
+/// not be read, if it could not. A bridge that stopped or crashed left its
+/// last state behind, which says nothing now.
+fn bridge_activity(
+    store: &Path,
+) -> (
+    std::collections::HashMap<String, enclos_protocol::task::Activity>,
+    Option<String>,
+) {
+    if !store.exists() {
+        return Default::default();
+    }
+    let read = crate::bridge::store::bridge_runs(store).and_then(|runs| match runs {
+        true => crate::bridge::store::Store::read_activity(store).map_err(std::io::Error::other),
+        false => Ok(Default::default()),
+    });
+    match read {
+        Ok(activity) => (activity, None),
+        Err(e) => (Default::default(), Some(e.to_string())),
     }
 }
 

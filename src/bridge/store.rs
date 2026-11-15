@@ -18,7 +18,7 @@ pub use question_store::{
     MAX_PENDING_APPROVALS_PER_AGENT, MAX_PENDING_APPROVALS_PER_CONVERSATION, MAX_PENDING_PER_AGENT,
     MAX_PENDING_PER_CONVERSATION, QuestionChange, QuestionStoreError, Settlement, StoredQuestion,
 };
-pub use task_store::TaskChanges;
+pub use task_store::{TaskChanges, TaskKey, bridge_runs, hold_live, live_path};
 
 /// Who wrote a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
