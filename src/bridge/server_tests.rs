@@ -2744,6 +2744,164 @@ fn approval_a_refusal_counts_once_and_a_denial_is_not_asked_again() {
     ));
 }
 
+mod refusal_collection {
+    use super::*;
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    use crate::model::sandbox::SandboxName;
+    use crate::state::NetLogStore;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        crate::engine::Engine,
+        SandboxName,
+        Arc<Hub>,
+        Store,
+        Device,
+    ) {
+        let (dir, engine, name, mut hub, store, device) = sandbox_approval_hub();
+        Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+            name: format!("{name}/main"),
+            runtime: "hermes".into(),
+            socket: dir.path().join("not-connected.sock"),
+            token: "fixture".into(),
+        });
+        let policy = engine.mobile_policy(&name).unwrap();
+        let change = enclos_protocol::policy::PolicyChange {
+            field: "mode".into(),
+            before: Some("public".into()),
+            after: Some("allowlist".into()),
+        };
+        let preview = engine
+            .mobile_policy_preview(&name, &policy.base, &change)
+            .unwrap();
+        engine
+            .mobile_policy_apply(
+                &crate::model::audit::Actor {
+                    user: "alice".into(),
+                    host: "mac".into(),
+                },
+                &name,
+                &policy.base,
+                &preview.revision,
+                &change,
+            )
+            .unwrap();
+        // The log and request times below are explicit, independent of the clock.
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute("INSERT INTO approval_marks VALUES ('refusals', 50)", [])
+            .unwrap();
+        (dir, engine, name, hub, store, device)
+    }
+
+    fn refusal(hub: &Hub, name: &SandboxName, host: &str, port: u16, reason: Reason, at: i64) {
+        crate::state::sqlite::SqliteStateStore::new(
+            hub.layout.state_db(),
+            hub.layout.state_lock(),
+            crate::state::Wait::Command,
+        )
+        .record(&NetEvent {
+            at: crate::model::Timestamp::from_second(at).unwrap(),
+            sandbox: name.clone(),
+            host: host.into(),
+            port,
+            method: "CONNECT".into(),
+            address: None,
+            verdict: Verdict::Denied,
+            reason: Some(reason),
+            bytes_up: 0,
+            bytes_down: 0,
+            duration_ms: 0,
+            name_seen: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn old_https_refusals_stay_resolved_across_policy_changes_but_later_attempts_can_ask() {
+        for close in [false, true] {
+            let (_dir, engine, name, hub, store, device) = fixture();
+            refusal(&hub, &name, "example.com", 443, Reason::NotAllowed, 100);
+            hub.collect_refusals(&store).unwrap();
+            let mut request = store.approvals().unwrap().remove(0);
+            assert_eq!(request.access, network("example.com"));
+            assert!(request.agent.is_empty());
+            request.time = 110;
+            assert!(store.refresh_approval(&request).unwrap());
+            if close {
+                hub.close_access(&store, &device, &device.person, &request.request)
+                    .unwrap();
+            } else {
+                hub.decide_access(
+                    &store,
+                    &device,
+                    &device.person,
+                    &request.request,
+                    &request.revision,
+                    false,
+                )
+                .unwrap();
+            }
+            hub.collect_refusals(&store).unwrap();
+            assert_eq!(store.approvals().unwrap().len(), 1);
+
+            let previous = engine.policy(&name).unwrap().snapshot.id;
+            allow(&engine, &name, "unrelated.example.com");
+            assert_ne!(engine.policy(&name).unwrap().snapshot.id, previous);
+            hub.collect_refusals(&store).unwrap();
+            let resolved = store.approvals().unwrap();
+            assert_eq!(
+                resolved.len(),
+                1,
+                "an old :443 refusal must not recreate a {} request after a policy change",
+                if close { "closed" } else { "denied" }
+            );
+            assert_eq!(resolved[0].state, if close { "closed" } else { "denied" });
+            assert_eq!(engine.net_log(&name, None).unwrap().len(), 1);
+
+            refusal(&hub, &name, "example.com", 443, Reason::NotAllowed, 120);
+            hub.collect_refusals(&store).unwrap();
+            let requests = store.approvals().unwrap();
+            assert_eq!(requests.len(), 2);
+            let pending = requests.iter().find(|a| a.state == "pending").unwrap();
+            assert_eq!(pending.access, network("example.com"));
+            assert_ne!(pending.request, request.request);
+            hub.collect_refusals(&store).unwrap();
+            assert_eq!(store.approvals().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn collected_requests_keep_distinct_ports_and_private_address_opt_ins() {
+        let (_dir, _engine, name, hub, store, _device) = fixture();
+        for (port, reason) in [
+            (443, Reason::NotAllowed),
+            (8443, Reason::NotAllowed),
+            (443, Reason::PrivateAddress),
+        ] {
+            refusal(&hub, &name, "nas.local", port, reason, 100);
+        }
+        hub.collect_refusals(&store).unwrap();
+        let requests = store.approvals().unwrap();
+        assert_eq!(requests.len(), 3);
+        let mut access: Vec<_> = requests
+            .iter()
+            .map(|a| (a.access.target.as_str(), a.access.private))
+            .collect();
+        access.sort();
+        assert_eq!(
+            access,
+            [
+                ("nas.local", false),
+                ("nas.local", true),
+                ("nas.local:8443", false)
+            ]
+        );
+        hub.collect_refusals(&store).unwrap();
+        assert_eq!(store.approvals().unwrap().len(), 3);
+    }
+}
+
 #[test]
 fn approval_the_collector_reads_only_a_sandboxs_recent_requests() {
     let (_dir, _hub, store) = approval_hub();

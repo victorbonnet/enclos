@@ -375,11 +375,12 @@ impl Hub {
                 }
                 let target = crate::model::net::destination(&d.host, d.port);
                 let private = d.reason == Reason::PrivateAddress;
-                let access = Access {
+                // Match the spelling stored by request_access before counting old refusals.
+                let access = crate::engine::normalized(&Access {
                     kind: AccessKind::Network,
                     target: target.clone(),
                     private,
-                };
+                });
                 if refusal_counted(&known, sandbox, &access, d.last.as_second(), since) {
                     continue;
                 }
