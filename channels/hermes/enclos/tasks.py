@@ -1,5 +1,5 @@
 """The agent's tasks on Hermes's kanban board, and what the agent is doing
-(docs/protocol.md, Tasks and agent activity; ADR 0067, proposed).
+(docs/protocol.md, Tasks and agent activity; ADR 0068, proposed).
 
 Hermes's board hooks fire in whichever process wrote the board, and several
 changes fire none (docs/research/hermes-tasks.md), so the board itself is the

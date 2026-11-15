@@ -104,7 +104,7 @@ class EnclosAdapter(BasePlatformAdapter):
                                      os.environ.get("ENCLOS_SANDBOX", ""), self._agent))
         # By message id: a policy request's tool call waiting for the bridge.
         self._answers: dict[str, asyncio.Future] = {}
-        # What the agent is doing, and its tasks on Hermes's board (ADR 0067).
+        # What the agent is doing, and its tasks on Hermes's board (ADR 0068).
         self._reporter = tasks.Reporter(self._agent, self._write,
                                         tasks.hermes_board(self._conversation_home, PLATFORM))
 
