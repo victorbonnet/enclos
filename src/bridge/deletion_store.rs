@@ -136,7 +136,14 @@ impl Store {
             .query_map([id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(q);
-        for table in ["questions", "turns", "members", "attachments", "messages"] {
+        for table in [
+            "questions",
+            "turns",
+            "members",
+            "attachments",
+            "usage_hours",
+            "messages",
+        ] {
             tx.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND EXISTS (SELECT 1 FROM conversation_deletions WHERE id=?1 AND owner=?2)"), params![id,owner])?;
         }
         tx.execute(

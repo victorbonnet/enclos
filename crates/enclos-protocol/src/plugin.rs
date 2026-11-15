@@ -204,6 +204,10 @@ pub enum FromPlugin {
     /// A step of the agent's work on an answer: a tool it starts, or ends.
     #[serde(rename = "tool")]
     Tool(ToolStep),
+    /// What one model call of the agent consumed, or a few: only to a
+    /// bridge whose `hello` names [`Capability::Usage`].
+    #[serde(rename = "usage")]
+    Usage(crate::usage::CallUsage),
     /// The commands a person may type to the runtime (`/new`, `/model`),
     /// whole: after the `hello`, and again when they change.
     #[serde(rename = "commands")]
@@ -236,6 +240,7 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "typing",
     "conversation.title",
     "tool",
+    "usage",
     "commands",
     "agent.activity",
     "task.update",
@@ -343,6 +348,9 @@ pub enum Capability {
     Activity,
     /// It reports the agent's tasks (`task.update`, `tasks`).
     Tasks,
+    /// It reports what each model call of the agent consumed (`usage`); a
+    /// bridge that takes them names it in its own `hello`.
+    Usage,
     #[serde(other)]
     Unknown,
 }

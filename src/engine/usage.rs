@@ -9,7 +9,7 @@
 //! count is `null` (not provided), never 0.
 //!
 //! The numbers come from inside the sandbox, which the agent can change:
-//! usage is advisory, for finding an agent that spends a lot, not an
+//! usage is advisory, for finding an agent that uses a lot, not an
 //! account of what a provider bills.
 
 use std::fs::OpenOptions;

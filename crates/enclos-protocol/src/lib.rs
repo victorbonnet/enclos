@@ -31,6 +31,7 @@ pub mod preview;
 pub mod question;
 pub mod routine;
 pub mod task;
+pub mod usage;
 pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};

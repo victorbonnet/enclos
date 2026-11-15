@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use enclos_protocol::usage::{UsageTokens, UsageTotal};
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[path = "deletion_store.rs"]
@@ -264,6 +265,52 @@ fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {
     })
 }
 
+/// One usage bucket's counts, read from columns `at` on of `row`. A
+/// negative one, which the table's checks refuse, is an error, never 0.
+fn usage_row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<UsageTotal> {
+    let count = |i: usize| -> rusqlite::Result<Option<u64>> {
+        row.get::<_, Option<i64>>(at + i)?
+            .map(|n| {
+                u64::try_from(n).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(at + i, n))
+            })
+            .transpose()
+    };
+    Ok(UsageTotal {
+        calls: count(0)?.unwrap_or(0),
+        tokens: UsageTokens {
+            input: count(1)?,
+            output: count(2)?,
+            cache_read: count(3)?,
+            cache_write: count(4)?,
+            reasoning: count(5)?,
+        },
+    })
+}
+
+/// The sum of two usage totals, each count stopping at the most it can hold.
+fn plus(a: UsageTotal, b: UsageTotal) -> UsageTotal {
+    UsageTotal {
+        calls: a.calls.saturating_add(b.calls),
+        tokens: a.tokens.plus(b.tokens),
+    }
+}
+
+/// A conversation's usage total over all its buckets, read in `db` (a
+/// connection or a transaction of one). Summed here, not in SQL, whose
+/// `SUM` fails past the largest integer.
+fn usage_in(db: &Connection, conversation: &str) -> rusqlite::Result<Option<UsageTotal>> {
+    let mut query = db.prepare(
+        "SELECT calls, input, output, cache_read, cache_write, reasoning
+         FROM usage_hours WHERE conversation = ?1",
+    )?;
+    let rows = query.query_map(params![conversation], |row| usage_row(row, 0))?;
+    let mut total = None;
+    for row in rows {
+        total = Some(plus(total.unwrap_or_default(), row?));
+    }
+    Ok(total)
+}
+
 /// Brings a database made by an earlier bridge up to [`SCHEMA`]: columns
 /// added since, which `CREATE TABLE IF NOT EXISTS` does not add.
 fn upgrade(db: &Connection) -> rusqlite::Result<()> {
@@ -458,6 +505,18 @@ CREATE TABLE IF NOT EXISTS turns (
     seen INTEGER,
     error TEXT,
     at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_hours (
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    agent TEXT NOT NULL,
+    hour INTEGER NOT NULL CHECK(hour >= 0),
+    calls INTEGER NOT NULL CHECK(calls >= 0),
+    input INTEGER CHECK(input >= 0),
+    output INTEGER CHECK(output >= 0),
+    cache_read INTEGER CHECK(cache_read >= 0),
+    cache_write INTEGER CHECK(cache_write >= 0),
+    reasoning INTEGER CHECK(reasoning >= 0),
+    PRIMARY KEY (conversation, agent, hour)
 );
 CREATE TABLE IF NOT EXISTS log (
     at INTEGER NOT NULL,
@@ -1234,6 +1293,103 @@ impl Store {
                 attachment_row,
             )
             .optional()
+    }
+
+    /// Adds `agent`'s report of `calls` model calls in `conversation`, at
+    /// `at` (Unix seconds), to that hour's usage, and returns the
+    /// conversation's new total: in one write, so two reports at once both
+    /// count. Each count is bounded first ([`UsageTokens::bounded`]); a sum
+    /// that would not fit is kept at the most it can hold.
+    pub fn add_usage(
+        &self,
+        conversation: &str,
+        agent: &str,
+        at: i64,
+        calls: u32,
+        tokens: UsageTokens,
+    ) -> rusqlite::Result<UsageTotal> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let hour = at.max(0) / 3600;
+        let before = tx
+            .query_row(
+                "SELECT calls, input, output, cache_read, cache_write, reasoning
+                 FROM usage_hours WHERE conversation = ?1 AND agent = ?2 AND hour = ?3",
+                params![conversation, agent, hour],
+                |row| usage_row(row, 0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let bucket = plus(
+            before,
+            UsageTotal {
+                calls: u64::from(calls),
+                tokens: tokens.bounded(),
+            },
+        );
+        let stored = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let t = bucket.tokens;
+        tx.execute(
+            "INSERT INTO usage_hours
+                 (conversation, agent, hour, calls, input, output, cache_read, cache_write, reasoning)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(conversation, agent, hour) DO UPDATE SET calls = excluded.calls,
+                 input = excluded.input, output = excluded.output,
+                 cache_read = excluded.cache_read, cache_write = excluded.cache_write,
+                 reasoning = excluded.reasoning",
+            params![
+                conversation,
+                agent,
+                hour,
+                stored(Some(bucket.calls)),
+                stored(t.input),
+                stored(t.output),
+                stored(t.cache_read),
+                stored(t.cache_write),
+                stored(t.reasoning)
+            ],
+        )?;
+        let total = usage_in(&tx, conversation)?.unwrap_or_default();
+        tx.commit()?;
+        Ok(total)
+    }
+
+    /// What a conversation used, as its plugins reported it; `None` before
+    /// the first report.
+    pub fn usage(&self, conversation: &str) -> rusqlite::Result<Option<UsageTotal>> {
+        usage_in(&self.db, conversation)
+    }
+
+    /// What each agent used in `owner`'s conversations from the hour that
+    /// holds `since` (Unix seconds) on, as `(<sandbox>/<agent>, total)`,
+    /// sorted by agent: the bridge keeps usage by the hour, so a window
+    /// starts on the hour.
+    pub fn usage_since(
+        &self,
+        owner: &str,
+        since: i64,
+    ) -> rusqlite::Result<Vec<(String, UsageTotal)>> {
+        let mut query = self.db.prepare(
+            "SELECT c.sandbox, u.agent, u.calls, u.input, u.output, u.cache_read,
+                    u.cache_write, u.reasoning
+             FROM usage_hours u JOIN conversations c ON c.id = u.conversation
+             WHERE c.owner = ?1 AND u.hour >= ?2",
+        )?;
+        let rows = query.query_map(params![owner, since.max(0) / 3600], |row| {
+            Ok((
+                format!("{}/{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                usage_row(row, 2)?,
+            ))
+        })?;
+        let mut by_agent = std::collections::BTreeMap::<String, UsageTotal>::new();
+        for row in rows {
+            let (agent, bucket) = row?;
+            let sum = by_agent.entry(agent).or_default();
+            *sum = plus(*sum, bucket);
+        }
+        Ok(by_agent.into_iter().collect())
     }
 
     /// A known conversation, with its name.

@@ -127,6 +127,10 @@ class ToTheBridge(unittest.TestCase):
         self.assert_like_fixture(
             protocol.tool("c-42", "call_7Hq2", "web_search", "end", ok=True, duration_ms=1840),
             "from_plugin_tool_end.json")
+        self.assert_like_fixture(
+            protocol.usage("c-42", {"input": 2104, "output": 96, "cache_read": 31744,
+                                    "cache_write": 0, "reasoning": 32}, model="gpt-6.1-sol"),
+            "from_plugin_usage.json")
 
     def test_held_tasks_have_the_fixtures_shape(self):
         tasks = json.loads(fixture("from_plugin_held_tasks.json"))["tasks"]

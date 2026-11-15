@@ -192,11 +192,13 @@ mod tests {
             node: None,
         };
         store.add_device(&device).unwrap();
-        assert_eq!(
-            hub.capabilities("alice"),
-            vec!["audit", "approval.close", "agent.forget"]
-        );
-        assert!(hub.capabilities("guest").is_empty());
+        let host = hub.capabilities("alice");
+        for capability in ["usage", "audit", "approval.close", "agent.forget"] {
+            assert!(host.iter().any(|c| c == capability), "{host:?}");
+        }
+        assert_eq!(host.len(), 4, "{host:?}");
+        // Every person reads the usage of their own conversations.
+        assert_eq!(hub.capabilities("guest"), ["usage"]);
         let id = || MessageId::new("audit-request").unwrap();
         let reply = hub
             .host_audit(&store, &device, "alice", id(), None)
@@ -233,7 +235,7 @@ mod tests {
                 .code,
             ErrorCode::NotAllowed
         );
-        assert!(hub.capabilities("alice").is_empty());
+        assert_eq!(hub.capabilities("alice"), vec!["usage"]);
         store.set_host("alice").unwrap();
         store.remove_device(&device.id).unwrap();
         assert_eq!(

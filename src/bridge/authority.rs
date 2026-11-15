@@ -17,7 +17,7 @@ pub(super) fn device_actor(person: &str, device: &str, request: Option<&str>) ->
 impl Hub {
     /// Append each supported feature here so authentication has one capability list.
     pub(super) fn capabilities(&self, person: &str) -> Vec<String> {
-        let mut capabilities = Vec::new();
+        let mut capabilities = vec![enclos_protocol::device::USAGE.to_owned()];
         if self.known_host().as_deref() == Some(person) {
             capabilities.push("audit".to_owned());
             capabilities.push(enclos_protocol::device::APPROVAL_CLOSE.to_owned());

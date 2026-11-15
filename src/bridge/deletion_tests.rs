@@ -105,6 +105,9 @@ fn native_confirmation_precedes_removal_and_only_the_owners_devices_learn_it() {
     store
         .add("m1", "c-delete", &From::Agent, "history", "reply")
         .unwrap();
+    store
+        .add_usage("c-delete", "main", 1_800_000_000, 1, Default::default())
+        .unwrap();
     std::fs::create_dir(hub.media()).unwrap();
     std::fs::write(hub.media().join("f1"), b"file").unwrap();
     store
@@ -162,6 +165,7 @@ fn native_confirmation_precedes_removal_and_only_the_owners_devices_learn_it() {
     }
     assert!(guest.try_recv().is_err());
     assert!(store.conversation_info("c-delete").unwrap().is_none());
+    assert_eq!(store.usage("c-delete").unwrap(), None);
     assert!(!hub.media().join("f1").exists());
     assert!(
         destination(

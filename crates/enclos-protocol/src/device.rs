@@ -89,6 +89,11 @@ pub enum FromDevice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<u64>,
     },
+    /// What each agent used in the person's conversations since `since`
+    /// (Unix seconds), from the hour that holds it: answered `usage.report`,
+    /// by a bridge whose `authenticated` names [`USAGE`].
+    #[serde(rename = "usage.get")]
+    UsageGet { since: u64 },
     #[serde(rename = "agents")]
     Agents,
     /// Asks which of the person's agents the host confirmed removed: the
@@ -176,6 +181,8 @@ pub enum FromDevice {
 /// The host feature of closing a policy request: the message type a device
 /// sends to close one, advertised in `authenticated`'s capabilities.
 pub const APPROVAL_CLOSE: &str = "approval.close";
+/// The host capability that says the bridge answers `usage.get`.
+pub const USAGE: &str = "usage";
 
 /// The host feature of forgetting a removed agent (ADR 0067, proposed):
 /// the message type a device sends to forget one, advertised in
@@ -205,6 +212,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "sandbox.create",
     "runtime.install",
     "audit",
+    "usage.get",
     "conversation.new",
     "group.new",
     "group.stop",
@@ -276,6 +284,15 @@ pub enum ToDevice {
         entries: Vec<AuditEntryInfo>,
         next_before: Option<u64>,
     },
+    /// The answer to `usage.get` `of`: each agent the person's conversations
+    /// used since `since`, the hour that holds it, sorted by agent; at most
+    /// [`crate::usage::MAX_REPORT_AGENTS`].
+    #[serde(rename = "usage.report")]
+    UsageReport {
+        of: MessageId,
+        since: u64,
+        agents: Vec<crate::usage::AgentUsage>,
+    },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
     #[serde(rename = "pair.refused")]
@@ -329,6 +346,10 @@ pub enum ToDevice {
     /// leg, live, not kept.
     #[serde(rename = "tool")]
     Tool(ToolStep),
+    /// What a model call of an agent consumed, live, with its
+    /// conversation's new total; the total is synced, the call is not.
+    #[serde(rename = "usage")]
+    Usage(crate::usage::UsageUpdate),
     /// The commands a person may type to an agent's runtime, whole, as its
     /// plugin listed them ([`commands_for_devices`]): after `agents.list`,
     /// and again when they change.
@@ -398,6 +419,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "approval",
     "authenticated",
     "audit.list",
+    "usage.report",
     "pair.accepted",
     "pair.refused",
     "agents.list",
@@ -412,6 +434,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "message",
     "typing",
     "tool",
+    "usage",
     "commands",
     "agent.activity",
     "task",
@@ -562,6 +585,10 @@ pub struct ConversationInfo {
     /// a conversation with one agent. A group's `agent` is its sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+    /// What the conversation used, as the bridge summed its agents'
+    /// reports; none before the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::UsageTotal>,
 }
 
 fn revision_is_zero(revision: &u64) -> bool {
@@ -932,6 +959,7 @@ mod tests {
             revision: 0,
             home: false,
             members: Vec::new(),
+            usage: None,
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
@@ -947,6 +975,7 @@ mod tests {
             revision: 0,
             home: true,
             members: Vec::new(),
+            usage: None,
         });
         let line = encode_line(&Envelope::new(id(), home.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, home);
@@ -961,6 +990,7 @@ mod tests {
             revision: 0,
             home: false,
             members: vec!["lab/main".into(), "lab/coder".into()],
+            usage: None,
         });
         let line = encode_line(&Envelope::new(id(), group.clone()));
         assert!(String::from_utf8_lossy(&line).contains(r#""members":["lab/main","lab/coder"]"#));
@@ -1188,5 +1218,68 @@ mod audit_compatibility_tests {
         assert!(
             matches!(auth.body, ToDevice::Authenticated { capabilities, .. } if capabilities.is_empty())
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::usage::{AgentUsage, MAX_CALL_TOKENS, MAX_REPORT_AGENTS, UsageTokens, UsageTotal};
+
+    #[test]
+    fn a_usage_window_is_asked_and_answered_by_agent() {
+        let ask = decode_from_device(br#"{"v":1,"id":"u1","type":"usage.get","since":1800000000}"#)
+            .unwrap();
+        assert_eq!(
+            ask.body,
+            FromDevice::UsageGet {
+                since: 1_800_000_000
+            }
+        );
+        let report = ToDevice::UsageReport {
+            of: MessageId::new("u1").unwrap(),
+            since: 1_799_996_400,
+            agents: vec![AgentUsage {
+                agent: "lab/main".into(),
+                total: UsageTotal {
+                    calls: 26,
+                    tokens: UsageTokens {
+                        input: Some(83_087),
+                        output: Some(6_084),
+                        cache_read: Some(762_752),
+                        ..UsageTokens::default()
+                    },
+                },
+            }],
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report.clone()));
+        assert_eq!(decode_to_device(&wire).unwrap().body, report);
+    }
+
+    #[test]
+    fn the_largest_usage_report_fits_one_device_message() {
+        let big = Some(MAX_CALL_TOKENS * 1_000_000);
+        let report = ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            agents: (0..MAX_REPORT_AGENTS)
+                .map(|i| AgentUsage {
+                    // A sandbox and an agent name at their longest.
+                    agent: format!("{:a<40}/{:b<64}", i, i),
+                    total: UsageTotal {
+                        calls: u64::MAX,
+                        tokens: UsageTokens {
+                            input: big,
+                            output: big,
+                            cache_read: big,
+                            cache_write: big,
+                            reasoning: big,
+                        },
+                    },
+                })
+                .collect(),
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
+        assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
     }
 }

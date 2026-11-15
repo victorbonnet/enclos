@@ -67,6 +67,7 @@ use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
 };
+use enclos_protocol::usage::{CallUsage, MAX_CALLS, MAX_MODEL_CHARS, UsageUpdate};
 use enclos_protocol::{ConversationId, DecodeError, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
@@ -367,13 +368,24 @@ impl Hub {
     /// at once in a burst, else after a wait, in which its plugin's
     /// connection is not read.
     fn pace(&self, agent: &str) {
+        self.pace_as(agent.to_owned(), Pace::new)
+    }
+
+    /// [`Hub::pace`] for `agent`'s usage reports, in a bucket of their own
+    /// ([`Pace::usage`]), so that they hold up neither its messages nor
+    /// each other past a loop's worth.
+    fn pace_usage(&self, agent: &str) {
+        self.pace_as(format!("usage {agent}"), Pace::usage)
+    }
+
+    fn pace_as(&self, key: String, make: fn(std::time::Instant) -> Pace) {
         loop {
             let wait = {
                 let mut paces = self.paces.lock().expect("not poisoned");
                 let now = std::time::Instant::now();
                 match paces
-                    .entry(agent.to_owned())
-                    .or_insert_with(|| Pace::new(now))
+                    .entry(key.clone())
+                    .or_insert_with(|| make(now))
                     .take(now)
                 {
                     Ok(()) => return,
@@ -1107,6 +1119,17 @@ impl Hub {
                             break;
                         }
                     }
+                    FromPlugin::Usage(call) => {
+                        // Past a burst, at a pace of their own (Pace::usage).
+                        hub.pace_usage(&agent);
+                        match call_usage(&store, &agent, call, crate::bridge::store::now()) {
+                            Ok(Some((owner, update))) => {
+                                hub.deliver(&owner, ToDevice::Usage(update));
+                            }
+                            Ok(None) => {}
+                            Err(e) => eprintln!("enclos app: {agent}: usage not kept: {e}"),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1457,6 +1480,62 @@ fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, Tool
             ..step
         },
     ))
+}
+
+/// A plugin's report of a model call in a conversation of `agent`, added to
+/// the conversation's total, and the update for the person to send it to:
+/// `None` unless the conversation is one of `agent`'s own or a group it is
+/// a member of. The model's name
+/// comes from the sandbox, so the bridge cuts it to one short line, its
+/// hidden characters written out, as it does a tool's name; and a report
+/// of more calls than one message may sum counts as that many.
+fn call_usage(
+    store: &Store,
+    agent: &str,
+    call: CallUsage,
+    at: i64,
+) -> rusqlite::Result<Option<(String, UsageUpdate)>> {
+    let id = call.conversation.as_str();
+    let Some(c) = store.conversation_info(id)? else {
+        return Ok(None);
+    };
+    // The conversation's own agent, or, in a group, the member speaking:
+    // each member's calls are its own (`usage_hours.agent`).
+    let member = if format!("{}/{}", c.sandbox, c.agent) == agent {
+        c.agent.clone()
+    } else {
+        match store
+            .members(id)?
+            .into_iter()
+            .find(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
+        {
+            Some((m, _)) => m,
+            None => return Ok(None),
+        }
+    };
+    let Some(owner) = store.owner(id)? else {
+        return Ok(None);
+    };
+    let calls = call.calls.min(MAX_CALLS);
+    let tokens = call.tokens.bounded();
+    let total = store.add_usage(id, &member, at, calls, tokens)?;
+    let model = call.model.as_deref().map(|m| {
+        let words: Vec<&str> = m.split_whitespace().collect();
+        let cut: String = words.join(" ").chars().take(MAX_MODEL_CHARS).collect();
+        enclos_protocol::visible::revealed(&cut)
+    });
+    Ok(Some((
+        owner,
+        UsageUpdate {
+            call: CallUsage {
+                model,
+                calls,
+                tokens,
+                ..call
+            },
+            total,
+        },
+    )))
 }
 
 /// Serves on `127.0.0.1:port` until the process ends.
@@ -2273,6 +2352,34 @@ fn run_session(
             Err(Unread::Ended(why)) => return Err(why),
         };
         match message.body {
+            FromDevice::UsageGet { since } => {
+                let since = i64::try_from(since).unwrap_or(i64::MAX);
+                match store.usage_since(person, since) {
+                    Ok(mut agents) => {
+                        agents.truncate(enclos_protocol::usage::MAX_REPORT_AGENTS);
+                        link.send(ToDevice::UsageReport {
+                            of: message.id,
+                            // The hour that holds `since`, where the sums start.
+                            since: u64::try_from(since.max(0) / 3600 * 3600).unwrap_or(0),
+                            agents: agents
+                                .into_iter()
+                                .map(|(agent, total)| enclos_protocol::usage::AgentUsage {
+                                    agent,
+                                    total,
+                                })
+                                .collect(),
+                        })?;
+                    }
+                    Err(e) => {
+                        eprintln!("enclos app: usage could not be read: {e}");
+                        link.send(ToDevice::Error(ErrorBody {
+                            of: Some(message.id),
+                            code: ErrorCode::Internal,
+                            message: "The bridge could not read usage.".into(),
+                        }))?;
+                    }
+                }
+            }
             FromDevice::Audit { before } => {
                 let response = hub
                     .host_audit(store, device, person, message.id, before)
@@ -3379,6 +3486,11 @@ fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo>
         } else {
             c.sandbox.clone()
         },
+        usage: store.usage(&c.id).unwrap_or_else(|e| {
+            // Sent without: the device keeps the total it has.
+            eprintln!("enclos app: the usage of {} could not be read: {e}", c.id);
+            None
+        }),
         conversation: ConversationId::new(c.id).ok()?,
         title: c.title,
         titled_by: c.titled_by,
@@ -3972,7 +4084,8 @@ mod connection_end_tests {
         store.set_host("another@example.com").unwrap();
         let (_, first) = connect(&bridge, &phone);
         assert!(
-            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+            // Usage only: the person reads their own conversations' usage.
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if !capabilities.iter().any(|c| c == "sandboxes" || c == "audit"))
         );
         store.set_host(PERSON).unwrap();
         let (mut device, first) = connect(&bridge, &phone);
@@ -3990,7 +4103,7 @@ mod connection_end_tests {
         );
         let (_, first) = connect(&bridge, &phone);
         assert!(
-            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.is_empty())
+            matches!(first, Some(ToDevice::Authenticated { capabilities, .. }) if !capabilities.iter().any(|c| c == "sandboxes" || c == "audit"))
         );
     }
 
@@ -5632,6 +5745,228 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         .unwrap();
         assert_eq!(shown.name, "term⟨U+200B⟩inal");
         assert_eq!(shown.label.as_deref(), Some("rm -rf ~/⟨U+202E⟩txt. ls"));
+    }
+
+    fn call_usage_now(
+        store: &Store,
+        agent: &str,
+        call: CallUsage,
+    ) -> rusqlite::Result<Option<(String, UsageUpdate)>> {
+        call_usage(store, agent, call, 1_800_000_000)
+    }
+
+    fn call(conversation: &str, model: Option<&str>, calls: u32, input: u64) -> CallUsage {
+        CallUsage {
+            conversation: ConversationId::new(conversation).unwrap(),
+            model: model.map(str::to_owned),
+            background: false,
+            calls,
+            tokens: enclos_protocol::usage::UsageTokens {
+                input: Some(input),
+                cache_read: Some(1_000),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn usage_adds_up_in_the_agents_own_conversation_and_goes_to_its_owner() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-b", "lab", "b", "bob@example.com")
+            .unwrap();
+        let (owner, first) = call_usage_now(&store, "lab/a", call("c-a", Some("gpt"), 1, 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner, "alice@example.com");
+        assert_eq!(first.total.calls, 1);
+        let (_, second) = call_usage_now(&store, "lab/a", call("c-a", None, 2, 5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.total.calls, 3);
+        assert_eq!(second.total.tokens.input, Some(15));
+        assert_eq!(second.total.tokens.cache_read, Some(2_000));
+        // Never reported: still not counted, not 0.
+        assert_eq!(second.total.tokens.output, None);
+        assert_eq!(store.usage("c-a").unwrap(), Some(second.total));
+        // Agent lab/a adds nothing to lab/b's conversation, nor to one the
+        // bridge does not know.
+        assert_eq!(
+            call_usage_now(&store, "lab/a", call("c-b", None, 1, 1)).unwrap(),
+            None
+        );
+        assert_eq!(
+            call_usage_now(&store, "lab/a", call("c-x", None, 1, 1)).unwrap(),
+            None
+        );
+        assert_eq!(store.usage("c-b").unwrap(), None);
+        // The total reaches a device with the conversation.
+        let c = store.conversation_info("c-a").unwrap().unwrap();
+        let info = conversation_info(&store, c).unwrap();
+        assert_eq!(info.usage, Some(second.total));
+    }
+
+    #[test]
+    fn a_device_asks_for_its_persons_usage_over_a_window_and_gets_it_by_agent_from_the_hour() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-mine", "lab", "main", PERSON).unwrap();
+        store
+            .conversation("c-other", "lab", "main", "other@example.com")
+            .unwrap();
+        let now = crate::bridge::store::now();
+        for c in ["c-mine", "c-other"] {
+            call_usage(&store, "lab/main", call(c, None, 1, 10), now)
+                .unwrap()
+                .unwrap();
+        }
+        let (mut device, _) = connect(&bridge, &phone);
+        let since = u64::try_from(now - 3600 + 123).unwrap();
+        device.send("u1", FromDevice::UsageGet { since });
+        let Some(ToDevice::UsageReport {
+            of,
+            since: from,
+            agents,
+        }) = device.receive()
+        else {
+            panic!("a usage report")
+        };
+        assert_eq!(of.as_str(), "u1");
+        assert_eq!(from, since / 3600 * 3600);
+        // The person's own conversations alone.
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent, "lab/main");
+        assert_eq!(agents[0].total.tokens.input, Some(10));
+        // A window starting after any time: nothing, and no failure.
+        device.send("u2", FromDevice::UsageGet { since: u64::MAX });
+        assert!(
+            matches!(device.receive(), Some(ToDevice::UsageReport { of, agents, .. }) if of.as_str() == "u2" && agents.is_empty())
+        );
+        // More agents than one report lists: the first, by name.
+        let many = enclos_protocol::usage::MAX_REPORT_AGENTS + 1;
+        for i in 0..many {
+            let agent = format!("a{i:03}");
+            store
+                .conversation(&format!("c-{agent}"), "lab", &agent, PERSON)
+                .unwrap();
+            call_usage(
+                &store,
+                &format!("lab/{agent}"),
+                call(&format!("c-{agent}"), None, 1, 1),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        device.send("u3", FromDevice::UsageGet { since: 0 });
+        let Some(ToDevice::UsageReport { agents, .. }) = device.receive() else {
+            panic!("a usage report")
+        };
+        assert_eq!(agents.len(), enclos_protocol::usage::MAX_REPORT_AGENTS);
+        assert_eq!(agents[0].agent, "lab/a000");
+        assert!(agents.windows(2).all(|w| w[0].agent < w[1].agent));
+    }
+
+    #[test]
+    fn usage_over_a_window_sums_each_agents_hours_since_then_for_its_owner_alone() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-a2", "lab", "a", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-b", "lab", "b", "alice@example.com")
+            .unwrap();
+        store
+            .conversation("c-bob", "lab", "a", "bob@example.com")
+            .unwrap();
+        let now: i64 = 1_800_000_000;
+        let day = 24 * 3600;
+        for (agent, conversation, at, input) in [
+            ("lab/a", "c-a", now - 40 * day, 1_000),
+            ("lab/a", "c-a", now - 2 * day, 100),
+            ("lab/a", "c-a", now - 60, 10),
+            ("lab/a", "c-a2", now - 30, 1),
+            ("lab/b", "c-b", now - 3 * 3600, 5),
+            ("lab/a", "c-bob", now, 7),
+        ] {
+            call_usage(&store, agent, call(conversation, None, 1, input), at)
+                .unwrap()
+                .unwrap();
+        }
+        let input = |since: i64| -> Vec<(String, Option<u64>, u64)> {
+            store
+                .usage_since("alice@example.com", since)
+                .unwrap()
+                .into_iter()
+                .map(|(agent, t)| (agent, t.tokens.input, t.calls))
+                .collect()
+        };
+        // The last hour: both of lab/a's conversations, from the hour that
+        // holds the window's start.
+        assert_eq!(input(now - 3600), [("lab/a".into(), Some(11), 2)]);
+        // The last day: lab/b too; the last week: lab/a's call two days
+        // ago; all time: everything, and never bob's conversation.
+        assert_eq!(
+            input(now - day),
+            [("lab/a".into(), Some(11), 2), ("lab/b".into(), Some(5), 1)]
+        );
+        assert_eq!(input(now - 7 * day)[0], ("lab/a".into(), Some(111), 3));
+        assert_eq!(input(0)[0], ("lab/a".into(), Some(1_111), 4));
+        // A conversation's own total is all of its hours.
+        assert_eq!(
+            store.usage("c-a").unwrap().unwrap().tokens.input,
+            Some(1_110)
+        );
+    }
+
+    #[test]
+    fn a_usage_report_is_bounded_and_its_model_shows_its_hidden_characters() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-a", "lab", "a", "alice@example.com")
+            .unwrap();
+        let huge = "x".repeat(70_000);
+        let (_, update) = call_usage_now(
+            &store,
+            "lab/a",
+            call("c-a", Some(&huge), u32::MAX, u64::MAX),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(update.call.calls, MAX_CALLS);
+        assert_eq!(
+            update.call.tokens.input,
+            Some(enclos_protocol::usage::MAX_CALL_TOKENS)
+        );
+        assert_eq!(
+            update.call.model.as_deref().map(|m| m.chars().count()),
+            Some(MAX_MODEL_CHARS)
+        );
+        let (_, shown) = call_usage_now(&store, "lab/a", call("c-a", Some("gp\u{202E}t\nx"), 1, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.call.model.as_deref(), Some("gp⟨U+202E⟩t x"));
+        // A total no message could reach overflows nothing.
+        for _ in 0..3 {
+            call_usage_now(&store, "lab/a", call("c-a", None, u32::MAX, u64::MAX)).unwrap();
+        }
+        let total = store.usage("c-a").unwrap().unwrap();
+        assert_eq!(total.calls, 1 + 4 * u64::from(MAX_CALLS));
+        assert_eq!(
+            total.tokens.input,
+            Some(1 + 4 * enclos_protocol::usage::MAX_CALL_TOKENS)
+        );
     }
 
     #[test]
