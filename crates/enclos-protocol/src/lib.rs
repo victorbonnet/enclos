@@ -34,4 +34,6 @@ pub mod task;
 pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
-pub use ids::{ConversationId, HeldTaskId, IdError, MessageId, Person, QuestionId};
+pub use ids::{
+    ConversationId, HeldTaskId, HeldTaskRevision, IdError, MessageId, Person, QuestionId,
+};

@@ -41,14 +41,14 @@ pub enum FromBridge {
     #[serde(rename = "question.sync")]
     QuestionSync { questions: Vec<QuestionId> },
     /// Resume this held task with the runtime's own operation, only while
-    /// it is still held at `revision` (the runtime's, from the plugin's
-    /// last `held_tasks`). A live control from the host's person, never
-    /// queued: the plugin answers `held_task.resumed` or an `error`
-    /// (`conflict` when it is no longer held at that revision).
+    /// it is still held. `revision` is the runtime's, from the plugin's last
+    /// `held_tasks`: the plugin refuses (`conflict`) one that is no longer
+    /// current when it checks. A live control from the host's person,
+    /// never queued: the plugin answers `held_task.resumed` or an `error`.
     #[serde(rename = "held_task.resume")]
     HeldTaskResume {
         task: HeldTaskId,
-        revision: String,
+        revision: crate::ids::HeldTaskRevision,
         /// Who asked, from which of their paired devices, as the bridge
         /// authenticated them.
         person: Person,

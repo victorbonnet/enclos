@@ -2684,6 +2684,15 @@ fn run_session(
                 let _ = link.socket.flush();
                 return Ok(());
             }
+            // Decoded, but this bridge keeps no held tasks yet: answered,
+            // so the device does not wait for a result.
+            FromDevice::HeldTaskResume { .. } => {
+                link.send(ToDevice::Error(ErrorBody {
+                    of: Some(message.id),
+                    code: ErrorCode::Unsupported,
+                    message: "This host does not support held tasks.".into(),
+                }))?;
+            }
             _ => {}
         }
     }

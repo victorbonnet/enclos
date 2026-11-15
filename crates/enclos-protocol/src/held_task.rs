@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ConversationId, HeldTaskId};
+use crate::ids::{ConversationId, HeldTaskId, HeldTaskRevision};
 use crate::visible;
 
 /// The most held tasks one agent's plugin reports at once: every sync
@@ -43,8 +43,9 @@ pub struct HeldTask {
     /// Since when it is held, in seconds since the Unix epoch.
     pub since: i64,
     /// The runtime's opaque revision of this hold: a resume names it, and
-    /// the runtime changes nothing when the task moved on since.
-    pub revision: String,
+    /// the plugin refuses (`conflict`) one that is no longer current when
+    /// it checks. Not the bridge's card revision, a number.
+    pub revision: HeldTaskRevision,
     /// What resuming does for this runtime, one line ("Runs it again with
     /// a fresh retry budget.").
     pub resume: String,
@@ -57,7 +58,7 @@ impl HeldTask {
     /// bridge applies it to what the plugin, in the sandbox, sent, rather
     /// than trust the plugin's own cut.
     pub fn normalized(self) -> Self {
-        let title = cut(&visible::stripped(&self.title, false), MAX_TITLE_CHARS);
+        let title = cut(&one_line(&self.title), MAX_TITLE_CHARS);
         let reason = cut(&visible::stripped(&self.reason, true), MAX_REASON_CHARS);
         Self {
             title: if title.is_empty() {
@@ -67,7 +68,7 @@ impl HeldTask {
             },
             assignee: self
                 .assignee
-                .map(|name| cut(&visible::stripped(&name, false), MAX_ASSIGNEE_CHARS))
+                .map(|name| cut(&one_line(&name), MAX_ASSIGNEE_CHARS))
                 .filter(|name| !name.is_empty()),
             reason: if reason.is_empty() {
                 NO_REASON.to_owned()
@@ -78,7 +79,7 @@ impl HeldTask {
                 .last_error
                 .map(|error| cut(&visible::stripped(&error, true), MAX_ERROR_CHARS))
                 .filter(|error| !error.is_empty()),
-            resume: cut(&visible::stripped(&self.resume, false), MAX_RESUME_CHARS),
+            resume: cut(&one_line(&self.resume), MAX_RESUME_CHARS),
             ..self
         }
     }
@@ -86,6 +87,24 @@ impl HeldTask {
 
 /// An assignee's name, in characters.
 const MAX_ASSIGNEE_CHARS: usize = 64;
+
+/// `text` on one line: each run of white space, line breaks and tabs
+/// included, read as one space ("Fix build\nthen deploy" stays two
+/// words), then without hidden characters.
+fn one_line(text: &str) -> String {
+    let spaced: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    visible::stripped(
+        &spaced
+            .split(' ')
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        false,
+    )
+}
 
 /// `text` trimmed and cut to `max` characters.
 fn cut(text: &str, max: usize) -> String {
@@ -99,7 +118,8 @@ fn cut(text: &str, max: usize) -> String {
 
 /// Checks a plugin's `held_tasks`: at most [`MAX_HELD_TASKS`], each task
 /// once, and ids and revisions with no hidden character, so the one a
-/// device sends back is the one the runtime gave.
+/// device sends back is the one the runtime gave. (The id rule itself is
+/// checked when the message is decoded.)
 pub fn check_snapshot(tasks: &[HeldTask]) -> Result<(), String> {
     if tasks.len() > MAX_HELD_TASKS {
         return Err(format!("more than {MAX_HELD_TASKS} held tasks"));
@@ -109,15 +129,23 @@ pub fn check_snapshot(tasks: &[HeldTask]) -> Result<(), String> {
         if visible::has_hidden(task.task.as_str(), false) {
             return Err("a task id holds a hidden character".into());
         }
-        if crate::ids::check(&task.revision).is_err() || visible::has_hidden(&task.revision, false)
-        {
-            return Err("a task revision is not an id".into());
+        if visible::has_hidden(task.revision.as_str(), false) {
+            return Err("a task revision holds a hidden character".into());
         }
         if !seen.insert(task.task.as_str()) {
             return Err(format!("task {} is listed twice", task.task));
         }
     }
     Ok(())
+}
+
+/// A plugin's `held_tasks` as the bridge may keep them: [`check_snapshot`]
+/// first, which refuses the whole list, then each task
+/// [`HeldTask::normalized`]. The one way in, so a card is never stored
+/// unchecked or uncut.
+pub fn accept(tasks: Vec<HeldTask>) -> Result<Vec<HeldTask>, String> {
+    check_snapshot(&tasks)?;
+    Ok(tasks.into_iter().map(HeldTask::normalized).collect())
 }
 
 /// Where a card is. `held` is the only one with a Resume.
@@ -177,7 +205,7 @@ mod tests {
             reason: "Gave up after 3 failures".into(),
             last_error: Some("rate limited".into()),
             since: 1_763_000_000,
-            revision: "e:42".into(),
+            revision: HeldTaskRevision::new("e:42").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
         }
     }
@@ -206,7 +234,7 @@ mod tests {
             MessageId::new("r1").unwrap(),
             FromBridge::HeldTaskResume {
                 task: HeldTaskId::new("t_1").unwrap(),
-                revision: "e:42".into(),
+                revision: HeldTaskRevision::new("e:42").unwrap(),
                 person: Person::new("alice@example.com").unwrap(),
                 device: "d1".into(),
             },
@@ -301,7 +329,16 @@ mod tests {
         assert_eq!(held.assignee, None);
         assert_eq!(held.reason, "line one\nline two");
         assert_eq!(held.last_error, None);
-        assert_eq!(held.resume, "Runs againnow");
+        // A line break in a one-line field is a space, not a join.
+        assert_eq!(held.resume, "Runs again now");
+        let lines = HeldTask {
+            title: "Fix build\nthen\r\n\tdeploy".into(),
+            assignee: Some(format!("{}\nb", "a".repeat(80))),
+            ..task("t_1")
+        }
+        .normalized();
+        assert_eq!(lines.title, "Fix build then deploy");
+        assert_eq!(lines.assignee.unwrap().chars().count(), MAX_ASSIGNEE_CHARS);
 
         let blank = HeldTask {
             title: "\u{200B} ".into(),
@@ -332,43 +369,70 @@ mod tests {
         assert!(check_snapshot(&many).is_err());
         assert!(check_snapshot(&many[..MAX_HELD_TASKS]).is_ok());
         assert!(check_snapshot(&[task("t\u{200B}1")]).is_err());
-        for revision in ["", "e\u{202E}1", "e\n1"] {
-            let bad = HeldTask {
-                revision: revision.into(),
-                ..task("a")
-            };
-            assert!(check_snapshot(&[bad]).is_err(), "{revision:?}");
+        let hidden = HeldTask {
+            revision: HeldTaskRevision::new("e\u{202E}1").unwrap(),
+            ..task("a")
+        };
+        assert!(check_snapshot(&[hidden]).is_err());
+        // An empty, controlled or too long revision is refused when decoded.
+        for revision in [
+            String::new(),
+            "e\n1".into(),
+            "r".repeat(crate::ids::MAX_ID_BYTES + 1),
+        ] {
+            assert!(HeldTaskRevision::new(revision.clone()).is_err());
+            let line = serde_json::json!({"v":1,"id":"h","type":"held_tasks","tasks":[{
+                "task":"a","title":"t","reason":"r","since":1,"revision":revision,"resume":""}]});
+            assert!(decode_from_plugin(line.to_string().as_bytes()).is_err());
         }
-        assert!(
-            check_snapshot(&[HeldTask {
-                revision: "r".repeat(crate::ids::MAX_ID_BYTES + 1),
-                ..task("a")
-            }])
-            .is_err()
+    }
+
+    #[test]
+    fn accept_checks_the_whole_list_then_cuts_each_task() {
+        assert!(accept(vec![task("a"), task("a")]).is_err());
+        let kept = accept(vec![HeldTask {
+            title: "Deploy\nnow\u{202E}".into(),
+            ..task("a")
+        }])
+        .unwrap();
+        assert_eq!(kept[0].title, "Deploy now");
+    }
+
+    #[test]
+    fn the_capability_is_named_held_tasks_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(crate::plugin::Capability::HeldTasks).unwrap(),
+            "held_tasks"
         );
+        let read: crate::plugin::Capability = serde_json::from_str(r#""held_tasks""#).unwrap();
+        assert_eq!(read, crate::plugin::Capability::HeldTasks);
     }
 
     #[test]
     fn the_largest_card_fits_one_device_message() {
+        // The widest JSON per character: 4 bytes for a character outside
+        // the Basic Multilingual Plane, which serde_json does not escape
+        // (an escaped quote or line break is 2); an id's 128 bytes are
+        // widest as quotes, 256 once escaped.
         let wide = |n: usize| "\u{1F600}".repeat(n);
+        let quotes = || "\"".repeat(crate::ids::MAX_ID_BYTES);
         let info = HeldTaskInfo {
-            agent: format!("{}/{}", "s".repeat(63), "a".repeat(64)),
-            conversation: ConversationId::new("c".repeat(crate::ids::MAX_ID_BYTES)).unwrap(),
-            task: HeldTaskId::new("t".repeat(crate::ids::MAX_ID_BYTES)).unwrap(),
+            agent: format!("{}/{}", "\"".repeat(63), "\"".repeat(64)),
+            conversation: ConversationId::new(quotes()).unwrap(),
+            task: HeldTaskId::new(quotes()).unwrap(),
             title: wide(MAX_TITLE_CHARS),
             assignee: Some(wide(MAX_ASSIGNEE_CHARS)),
-            // Quotes double when escaped: the widest JSON per character.
-            reason: "\"".repeat(MAX_REASON_CHARS),
-            last_error: Some("\\".repeat(MAX_ERROR_CHARS)),
+            reason: wide(MAX_REASON_CHARS),
+            last_error: Some(wide(MAX_ERROR_CHARS)),
             since: i64::MIN,
             resume: wide(MAX_RESUME_CHARS),
             state: HeldTaskState::Released,
             revision: u64::MAX,
         };
         let frame = Envelope::new(
-            MessageId::new("m".repeat(crate::ids::MAX_ID_BYTES)).unwrap(),
+            MessageId::new(quotes()).unwrap(),
             ToDevice::HeldTaskResult {
-                of: MessageId::new("o".repeat(crate::ids::MAX_ID_BYTES)).unwrap(),
+                of: MessageId::new(quotes()).unwrap(),
                 held_task: info,
             },
         );
