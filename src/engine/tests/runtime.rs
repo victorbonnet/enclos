@@ -2247,6 +2247,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
         .ask_restart(
             &alice(),
             &service_session,
+            crate::engine::restart::ProgramAt::Root,
             crate::runtime::Signal::Usr1,
             &env,
         )
@@ -2263,6 +2264,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
@@ -2323,6 +2325,7 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
