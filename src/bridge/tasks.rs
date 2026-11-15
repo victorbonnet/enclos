@@ -105,6 +105,15 @@ impl Hub {
     /// Drops what the bridge keeps of `agent`'s tasks: its plugin no longer
     /// reports them.
     pub(super) fn tasks_unreported(&self, store: &Store, agent: &str) {
+        match store.has_tasks(agent) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                return eprintln!(
+                    "enclos app: {agent}: cannot read the tasks it no longer reports: {e}"
+                );
+            }
+        }
         let (sandbox, _) = agent.split_once('/').unwrap_or((agent, ""));
         match store.replace_tasks(sandbox, agent, &[], now()) {
             Ok(changes) => {

@@ -84,6 +84,17 @@ impl Store {
         Ok(changes)
     }
 
+    /// Whether the bridge keeps any task of `agent` (`<sandbox>/<agent>`):
+    /// read before dropping them, so a plugin's hello takes no write lock
+    /// when there is nothing to drop.
+    pub fn has_tasks(&self, agent: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE agent = ?1)",
+            params![agent],
+            |r| r.get(0),
+        )
+    }
+
     /// Every kept task, the ones still going first, then the most recent.
     /// Drops the ended ones past their 3 days first, returned as in
     /// [`TaskChanges::removed`].
