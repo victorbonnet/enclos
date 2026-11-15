@@ -436,7 +436,10 @@ fn lab_engine(
     use crate::audit::jsonl::JsonlAuditLog;
     use crate::backend::fake::FakeBackend;
     use crate::engine::{Engine, SandboxSpec};
+    use crate::model::agent::AgentRecord;
+    use crate::model::runtime::RuntimeKind;
     use crate::model::{audit::Actor, plan::Confirm, sandbox::BackendKind};
+    use crate::state::StateStore;
     use crate::state::sqlite::SqliteStateStore;
 
     let layout = crate::layout::Layout::at(dir.join("enclos"));
@@ -466,6 +469,26 @@ fn lab_engine(
                 template: "minimal".parse().unwrap(),
             },
             Confirm::Yes,
+        )
+        .unwrap();
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
+    let lock = state.lock().unwrap();
+    let lab = "lab".parse().unwrap();
+    let mut record = state.get(&lab).unwrap().unwrap();
+    record.runtime = Some(RuntimeKind::Hermes);
+    state.put(&lock, &record).unwrap();
+    state
+        .insert_agent(
+            &lock,
+            &lab,
+            &AgentRecord {
+                name: "main".parse().unwrap(),
+                created_at: crate::model::now(),
+            },
         )
         .unwrap();
     (engine, secrets, actor, layout)

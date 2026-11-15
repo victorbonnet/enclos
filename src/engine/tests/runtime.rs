@@ -912,6 +912,58 @@ fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
 }
 
 #[test]
+fn removing_an_agent_removes_it_from_the_app_inventory() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for keep_data in [false, true] {
+        check_removed_agent_app_inventory(keep_data);
+    }
+}
+
+fn check_removed_agent_app_inventory(keep_data: bool) {
+    let lab = Lab::with_secrets(Box::new(crate::secrets::InMemory::default()));
+    lab_with_profiles(&lab, &["main"]);
+    grant_app_token(&lab, Confirm::Yes);
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.main]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+        .unwrap();
+    let names = || {
+        lab.engine
+            .app_agents()
+            .unwrap()
+            .agents
+            .into_iter()
+            .map(|agent| agent.agent)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(), ["default", "main"]);
+    assert!(lab.engine.app_endpoint(&lab.name, "main").is_ok());
+    done(
+        lab.engine
+            .remove_agent(
+                &alice(),
+                &lab.name,
+                &"main".parse().unwrap(),
+                keep_data,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(lab.home.join(".hermes/profiles/main").exists(), keep_data);
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+    assert_eq!(
+        names(),
+        ["default"],
+        "a deleted agent must leave the Agents tab"
+    );
+    assert!(lab.engine.app_endpoint(&lab.name, "main").is_err());
+    assert!(lab.engine.app_endpoint(&lab.name, "default").is_ok());
+}
+
+#[test]
 fn an_agent_added_before_the_login_chose_a_provider_is_said_to_have_none() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
