@@ -703,8 +703,14 @@ impl Hub {
         let agent = agent.to_owned();
         // The plugin puts the files the agent sends in the sandbox home.
         let home = sandbox_home(&endpoint.socket);
+        // The reader's own database connection, opened before the reader
+        // starts: opening runs the schema, so one opened later could make
+        // again a table the database changed meanwhile, and the connection
+        // would read the plugin's first messages against a schema newer
+        // than this call returned with.
+        let reader_store = hub.store();
         std::thread::spawn(move || {
-            let store = match hub.store() {
+            let store = match reader_store {
                 Ok(store) => store,
                 Err(e) => return eprintln!("enclos app: {e}"),
             };
