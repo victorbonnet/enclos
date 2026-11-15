@@ -146,7 +146,7 @@ impl Hub {
     /// sandbox included, so no native chat is left to delete. When the
     /// engine cannot tell, it is not: said on stderr, and the deletion then
     /// needs the agent's channel.
-    fn deletion_target_absent(&self, target: &str) -> bool {
+    pub(super) fn deletion_target_absent(&self, target: &str) -> bool {
         let Some((sandbox, agent)) = target.split_once('/') else {
             return false;
         };

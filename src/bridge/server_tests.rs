@@ -3079,6 +3079,36 @@ fn an_agents_message_goes_to_its_own_conversation_else_to_its_home() {
     assert_eq!(store.conversation_info(&home_id(&long)).unwrap(), None);
 }
 
+/// A forgotten agent's message for no conversation of its own goes
+/// nowhere, and its deleted Home is not made again; once it is set up
+/// again, such a message goes to its new Home (ADR 0067, proposed).
+#[test]
+fn a_forgotten_agents_message_has_no_home_until_it_is_set_up_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let host = "victor@example.com";
+    store.claim_host(host).unwrap();
+    let id = |s: &str| ConversationId::new(s).unwrap();
+    assert_eq!(
+        destination(&store, Some(host), "lab/a", id("c-unknown")),
+        Ok(Some(id("home.lab.a")))
+    );
+    store.forget_agent("lab/a", host, "phone").unwrap();
+    for conversation in ["c-unknown", "home.lab.a"] {
+        assert_eq!(
+            destination(&store, Some(host), "lab/a", id(conversation)),
+            Ok(None)
+        );
+    }
+    assert_eq!(store.conversation_info("home.lab.a").unwrap(), None);
+    assert_eq!(store.claim_home("lab/a").unwrap(), "home.lab.a.2");
+    assert_eq!(
+        destination(&store, Some(host), "lab/a", id("c-unknown")),
+        Ok(Some(id("home.lab.a.2")))
+    );
+    assert_eq!(store.owner("home.lab.a.2").unwrap().as_deref(), Some(host));
+}
+
 #[test]
 fn a_forgotten_device_is_unpaired_and_logged() {
     let dir = tempfile::tempdir().unwrap();
