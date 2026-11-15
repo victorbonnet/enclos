@@ -4024,7 +4024,7 @@ fn pushing_hub(
             person: "alice@example.com".to_owned(),
             noise_key: vec![1; 32],
             device_key: vec![2; 32],
-            push_key: vec![7; 32],
+            push_key: super::super::push::test_push_key(),
             push_token: Some("token-phone".to_owned()),
             paired: 1,
             seen: None,
@@ -4064,7 +4064,7 @@ fn an_agent_message_reaches_an_away_owner_as_a_push_only_their_device_opens() {
         .decode(&payload.preview)
         .unwrap();
     let opened = enclos_protocol::preview::open(
-        &[7; 32],
+        &super::super::push::test_push_key(),
         &enclos_protocol::preview::PushFields { host: "mac", seq },
         &sealed,
     )

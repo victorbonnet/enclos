@@ -319,7 +319,7 @@ fn a_question_asked_while_its_owner_is_away_reaches_them_as_a_push() {
             person: OWNER.into(),
             noise_key: vec![1; 32],
             device_key: vec![],
-            push_key: vec![7; 32],
+            push_key: super::super::super::push::test_push_key(),
             push_token: Some("token-phone".into()),
             paired: now(),
             seen: None,

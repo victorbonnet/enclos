@@ -660,6 +660,14 @@ fn record(path: &Path, job: &Job, outcome: &Outcome) {
     }
 }
 
+/// A push key drawn once for the tests: none is written in the code.
+#[cfg(test)]
+pub(crate) fn test_push_key() -> Vec<u8> {
+    static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| super::ids::random_bytes(32).expect("random bytes"))
+        .clone()
+}
+
 #[cfg(test)]
 #[path = "push_tests.rs"]
 mod tests;

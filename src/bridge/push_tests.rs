@@ -226,7 +226,7 @@ fn job(device: &str, seq: i64) -> Job {
         device: device.to_owned(),
         person: "alice@example.com".to_owned(),
         token: format!("token-{device}"),
-        push_key: vec![7; 32],
+        push_key: test_push_key(),
         seq,
         preview: br#"{"agent":"lab/main","conversation":"c-1","text":"hi"}"#.to_vec(),
     }
@@ -267,13 +267,20 @@ fn a_push_carries_strings_alone_and_a_preview_only_its_device_opens() {
         seq: 42,
     };
     assert_eq!(
-        open(&[7; 32], &fields, &sealed).unwrap(),
+        open(&test_push_key(), &fields, &sealed).unwrap(),
         job("d-1", 42).preview
     );
-    assert!(open(&[8; 32], &fields, &sealed).is_err());
     assert!(
         open(
-            &[7; 32],
+            &crate::bridge::ids::random_bytes(32).unwrap(),
+            &fields,
+            &sealed
+        )
+        .is_err()
+    );
+    assert!(
+        open(
+            &test_push_key(),
             &PushFields {
                 host: "mac",
                 seq: 43
@@ -312,7 +319,7 @@ fn device(id: &str) -> Device {
         person: "alice@example.com".to_owned(),
         noise_key: vec![id.len() as u8; 32],
         device_key: vec![2; 32],
-        push_key: vec![7; 32],
+        push_key: test_push_key(),
         push_token: Some(format!("token-{id}")),
         paired: 1,
         seen: None,
