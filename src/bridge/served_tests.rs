@@ -244,6 +244,8 @@ fn a_rotated_token_is_used_without_a_restart() {
     let state = State::new(dir.path(), vec![endpoint(dir.path(), "main", "t0ken")]);
     let (hub, _device) = watching(dir.path(), &state);
     let events = plugin(&dir.path().join("main.sock"));
+    // Opened by this test alone, not by a pass of `open_plugins` too.
+    hub.opening_all.store(true, Ordering::SeqCst);
     hub.plugin("lab/main").unwrap();
     assert_eq!(next(&events), Seen::Opened("t0ken".to_owned()));
 
@@ -263,6 +265,9 @@ fn a_connection_opened_with_an_endpoint_changed_meanwhile_is_not_kept() {
     let state = State::new(dir.path(), vec![endpoint(dir.path(), "main", "t0ken")]);
     let (hub, _device) = watching(dir.path(), &state);
     let events = plugin(&dir.path().join("main.sock"));
+    // No pass of `open_plugins` opens it meanwhile with the new token: as
+    // if one were running already.
+    hub.opening_all.store(true, Ordering::SeqCst);
     // Another opening of the agent's holds its turn: this one looks the
     // endpoint up, then waits, while the token changes.
     let turn = Arc::new(Mutex::new(()));
