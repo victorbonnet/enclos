@@ -106,7 +106,7 @@ fn phone(hub: &Hub, store: &Store, id: &str, person: &str) -> (Device, Receiver<
 }
 
 fn native(hub: &Arc<Hub>, capabilities: Vec<Capability>) -> Native {
-    let listener = UnixListener::bind(&hub.agents[0].socket).unwrap();
+    let listener = UnixListener::bind(&hub.agents()[0].socket).unwrap();
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -884,7 +884,7 @@ fn a_channel_without_questions_expires_the_cards_it_left() {
     }
     // The channel comes back without the capability (its runtime lost the
     // native API, say): nothing could answer the card any more.
-    std::fs::remove_file(&hub.agents[0].socket).unwrap();
+    std::fs::remove_file(&hub.agents()[0].socket).unwrap();
     let _native = native(&hub, vec![]);
     assert!(
         matches!(next(&rx), ToDevice::Question { question } if question.definition.id == definition.id && question.state == QuestionState::Expired)
@@ -2204,7 +2204,7 @@ fn a_channel_without_runtime_approvals_expires_the_approvals_it_left() {
         );
         std::thread::yield_now();
     }
-    std::fs::remove_file(&hub.agents[0].socket).unwrap();
+    std::fs::remove_file(&hub.agents()[0].socket).unwrap();
     let _channel = native(&hub, vec![Capability::Questions]);
     assert!(
         matches!(next(&rx), ToDevice::Question { question } if question.definition.id == approval.id && question.state == QuestionState::Expired)

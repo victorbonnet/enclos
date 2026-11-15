@@ -14,7 +14,7 @@ use enclos::bridge::ids::{new_id, random_bytes};
 use enclos::bridge::keys::{approval_key, bridge_keypair};
 use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::provisioning::Host;
-use enclos::bridge::server::{self, AgentEndpoint};
+use enclos::bridge::server::{self, AgentSource, AgentWatch};
 use enclos::bridge::store::now;
 use enclos::bridge::store::{From, LogLine, Store};
 use enclos::bridge::transport::Transport;
@@ -233,24 +233,14 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
             "cannot read or make the bridge's key for runtime approvals: {e}"
         ))
     })?;
-    let mut agents = Vec::new();
-    for (sandbox, agent, runtime) in engine.app_agents()? {
-        match engine.app_endpoint(&sandbox, &agent) {
-            Ok(endpoint) => agents.push(AgentEndpoint {
-                name: format!("{sandbox}/{agent}"),
-                runtime,
-                socket: endpoint.socket,
-                token: endpoint.token.expose().to_owned(),
-            }),
-            Err(e) => eprintln!("enclos app: {sandbox}/{agent} left out: {e}"),
-        }
-    }
+    // Read again while the bridge runs, as enclos's state changes.
+    let watch = AgentWatch::start(AgentSource::of_state(engine.app_layout())).map_err(failed)?;
     eprintln!(
-        "The bridge serves {} agent(s) on 127.0.0.1:{port}, through {transport}. Put it on your network with:\n  {}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
-        agents.len(),
+        "The bridge serves {} agent(s) on 127.0.0.1:{port}, through {transport}, and follows the agents given or losing an app channel while it runs. Put it on your network with:\n  {}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
+        watch.agents().len(),
         transport.expose_hint(port)
     );
-    for agent in &agents {
+    for agent in watch.agents() {
         eprintln!("  {}", agent.name);
     }
     // The name each push carries, which the preview is bound to: the one
@@ -283,7 +273,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         engine.app_layout(),
         key.private.to_vec(),
         approvals,
-        agents,
+        watch,
         Host::new(engine.app_layout(), executable),
         server::Push {
             key: engine.app_push_key_path(),

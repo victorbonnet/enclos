@@ -112,7 +112,7 @@ impl Hub {
         self.host_authority(store, device, person)
             .map_err(|(_, message)| message)?;
         if !self
-            .agents
+            .agents()
             .iter()
             .any(|a| a.name.split('/').next() == Some(sandbox))
         {

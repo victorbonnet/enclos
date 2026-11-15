@@ -113,7 +113,7 @@ impl Hub {
     /// photo's or a name's reading, and their broadcasts share. Every paired person sees
     /// every listed agent until sharing (ADR 0043, proposed) narrows it.
     pub(super) fn sees_agent(&self, _person: &str, agent: &str) -> bool {
-        self.agents.iter().any(|a| a.name == agent)
+        self.serves(agent)
     }
 
     /// The agents `person` is shown, as `agents.list` sends them.
@@ -129,7 +129,7 @@ impl Hub {
         let host = store.host_person().ok().flatten();
         let plugins = self.plugins.lock().expect("not poisoned");
         Ok(self
-            .agents
+            .agents()
             .iter()
             .filter(|a| self.sees_agent(person, &a.name))
             .map(|a| {

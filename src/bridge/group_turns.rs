@@ -530,7 +530,7 @@ pub(super) fn new_group(
         let Some((s, n)) = m.split_once('/') else {
             continue;
         };
-        if hub.agents.iter().any(|a| &a.name == m)
+        if hub.serves(m)
             && sandbox.get_or_insert(s.to_owned()) == s
             && !names.iter().any(|x| x == n)
         {

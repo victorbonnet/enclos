@@ -832,7 +832,7 @@ mod tests {
         hub: &Arc<Hub>,
         capabilities: Vec<Capability>,
     ) -> (UnixStream, Receiver<Envelope<FromBridge>>) {
-        let listener = UnixListener::bind(&hub.agents[0].socket).unwrap();
+        let listener = UnixListener::bind(&hub.agents()[0].socket).unwrap();
         let (frames, received) = channel();
         let accepted = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();

@@ -474,7 +474,7 @@ mod tests {
                 state: "created".into()
             }]
         );
-        assert!(engine.app_agents().unwrap().is_empty());
+        assert!(engine.app_agents().unwrap().agents.is_empty());
         let view = engine.show_sandbox(&"lab".parse().unwrap()).unwrap();
         assert_eq!(view.record.backend, BackendKind::Seatbelt);
         assert_eq!(view.template.as_str(), "minimal");
