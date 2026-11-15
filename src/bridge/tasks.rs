@@ -1,5 +1,5 @@
 //! Tasks and agent activity, as an agent's plugin reports them
-//! (`docs/protocol.md`, Tasks and agent activity; ADR 0067, proposed):
+//! (`docs/protocol.md`, Tasks and agent activity; ADR 0068, proposed):
 //! checked against the connection, cleaned, kept and passed on.
 use super::*;
 use enclos_protocol::task::{Activity, Task};

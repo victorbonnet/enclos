@@ -187,7 +187,7 @@ struct Hub {
     /// connects again without the `commands` capability.
     commands: Mutex<HashMap<String, Vec<Command>>>,
     /// What each agent not idle is doing, as its plugin last said (ADR
-    /// 0067, proposed): kept while its plugin is connected.
+    /// 0068, proposed): kept while its plugin is connected.
     activity: Mutex<HashMap<String, enclos_protocol::task::Activity>>,
     /// Each group's discussion, while one runs or since the last ended
     /// (ADR 0045, proposed); its turns are also in the database.
@@ -1028,7 +1028,7 @@ impl Hub {
                         }
                     }
                     // What the agent is doing: kept while it is connected,
-                    // passed on live (ADR 0067, proposed).
+                    // passed on live (ADR 0068, proposed).
                     FromPlugin::Activity(activity) if reports_activity => {
                         let activity = activity
                             .cleaned(now(), |c| approvals::speaks_in(&store, &agent, c.as_str()));
@@ -2546,7 +2546,7 @@ fn run_session(
                             log_too_large(store, &device.id, person, &what, &body);
                         }
                     }
-                    // Every kept task, whatever `since` (ADR 0067, proposed)
+                    // Every kept task, whatever `since` (ADR 0068, proposed)
                     for task in hub.tasks_for_sync(store, person)? {
                         let what = format!("task {}", task.id);
                         let body = ToDevice::Task { task };
