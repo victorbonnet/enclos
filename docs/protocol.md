@@ -417,7 +417,7 @@ Hermes revision comparison and mutation share its native reentrant jobs lock. It
 
 ## Tasks and agent activity
 
-[ADR 0067](adr/0067-tasks-and-agent-activity-are-reported-not-controlled.md), proposed. Two optional capabilities, each announced in both the bridge's and the plugin's `hello`: a plugin sends neither message to a bridge that does not list the capability, and the bridge reads neither from a plugin that did not announce it. Neither carries authority: like a `tool` step, they are what the runtime reports, and no control comes back.
+[ADR 0068](adr/0068-tasks-and-agent-activity-are-reported-not-controlled.md), proposed. Two optional capabilities, each announced in both the bridge's and the plugin's `hello`: a plugin sends neither message to a bridge that does not list the capability, and the bridge reads neither from a plugin that did not announce it. Neither carries authority: like a `tool` step, they are what the runtime reports, and no control comes back.
 
 **Agent activity** (`activity`). `agent.activity` says what the agent is doing, whole: `doing` is a list, empty when it is idle, of at most 16 entries, each one of
 
@@ -449,6 +449,8 @@ A task (`tasks`) is work an agent does outside a conversation's answer, which it
 **Only the host's person sees them**, live and at `sync`, as with [policy requests](#sandbox-policy-requests): a task can hold repository paths and internal plans. One task is one device message; its bounds keep it far within 65,519 bytes. After a sync, a device drops the tasks it kept for that host that the sync did not send. Sharing agents ([ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md), proposed) is outside this.
 
 **Hermes.** The task's turn runs in the assignee's own gateway, where its plugin is loaded, but Hermes's board hooks fire in whichever process wrote the board and several changes fire none ([source findings](research/hermes-tasks.md)). So the adapter reads the board itself, read-only, for the tasks assigned to its profile, and watches its event log every few seconds, a hook being only a cue to read sooner. `triage`, `todo`, `scheduled` and `ready` are `queued` (a retry after a crash or a timeout goes back to `ready`); `running` is `running`; `blocked` and `review` are `blocked`; `done` is `done`, its result the summary; an archived task is left out of the next `tasks`. The conversation is the `enclos` subscription Hermes records for the chat that created the task. The plugin announces `tasks` only when the Hermes it runs in has the board's functions, and `activity` always: answering from its turns in enclos conversations, and a task from the board's running tasks assigned to it. It reports no routine yet: Hermes gives plugins no hook around a scheduled run, and whether its session hooks fire for one is to verify (design §14).
+
+**Held tasks.** A task that waits for a person is reported as `blocked`, like any other. Resuming it is not part of this capability: that is the `held_tasks` card of [ADR 0066](adr/0066-held-tasks-stay-with-the-runtime.md), proposed.
 
 **OpenClaw** announces neither yet: its 2026.11.2 release has no task board (its Tasks and TaskFlow registry was removed), and whether its background subagents fit a task is to verify. Nothing in these messages names a Hermes concept.
 

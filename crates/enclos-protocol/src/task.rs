@@ -1,6 +1,6 @@
 //! Tasks and agent activity: work an agent does outside a conversation's
 //! answer, and what it is doing right now, as its runtime reports them
-//! (`docs/protocol.md`, Tasks and agent activity; ADR 0067, proposed).
+//! (`docs/protocol.md`, Tasks and agent activity; ADR 0068, proposed).
 //!
 //! Neither carries authority. Every field comes from the sandbox, so the
 //! bridge cleans and cuts it itself ([`Task::cleaned`],
