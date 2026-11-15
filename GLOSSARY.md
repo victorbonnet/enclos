@@ -178,6 +178,14 @@ _Avoid_: command alone (enclos's own), shortcut, action
 A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
 _Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
 
+**Task**:
+Work an agent does outside a conversation's answer, which its runtime tracks from the moment it is asked for until it ends. Another agent, or a person, asks for it; the runtime keeps it, and the app shows it.
+_Avoid_: job, ticket, card, kanban item (except when naming a runtime's own feature, such as a task on Hermes's kanban board)
+
+**Agent activity**:
+What an agent is doing right now: answering in a conversation, running a routine or working on a task, several at once, or nothing (idle).
+_Avoid_: busy state, presence, status (enclos's own)
+
 **Question**:
 An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
 _Avoid_: runtime approval, policy request (different authority)

@@ -182,6 +182,15 @@ pub enum FromPlugin {
     /// whole: after the `hello`, and again when they change.
     #[serde(rename = "commands")]
     Commands { commands: Vec<Command> },
+    /// What the agent is doing, whole (`activity`).
+    #[serde(rename = "agent.activity")]
+    Activity(crate::task::Activity),
+    /// One of the agent's tasks, when it changes (`tasks`).
+    #[serde(rename = "task.update")]
+    TaskUpdate { task: crate::task::Task },
+    /// Every task of the agent's the runtime still has (`tasks`).
+    #[serde(rename = "tasks")]
+    Tasks { tasks: Vec<crate::task::Task> },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -200,6 +209,9 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "conversation.title",
     "tool",
     "commands",
+    "agent.activity",
+    "task.update",
+    "tasks",
     "ack",
     "error",
 ];
@@ -296,6 +308,10 @@ pub enum Capability {
     RuntimeApprovals,
     /// It permanently deletes a conversation's native session history.
     ConversationDelete,
+    /// It reports what the agent is doing (`agent.activity`).
+    Activity,
+    /// It reports the agent's tasks (`task.update`, `tasks`).
+    Tasks,
     #[serde(other)]
     Unknown,
 }
