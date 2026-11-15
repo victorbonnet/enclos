@@ -179,7 +179,7 @@ A task an agent's runtime keeps and runs on a schedule, with instructions and an
 _Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
 
 **Task**:
-Work an agent does outside a conversation's answer, which its runtime tracks from the moment it is asked for until it ends. Another agent, or a person, asks for it; the runtime keeps it, and the app shows it.
+Work an agent does outside a conversation's answer, which its runtime tracks from the moment it is asked for until it ends. Another agent, or a person, asks for it.
 _Avoid_: job, ticket, card, kanban item (except when naming a runtime's own feature, such as a task on Hermes's kanban board)
 
 **Agent activity**:
