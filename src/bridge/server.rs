@@ -32,6 +32,8 @@ mod avatars;
 pub(crate) use avatars::normalize as normalize_photo;
 #[path = "deletions.rs"]
 mod deletions;
+#[path = "forget.rs"]
+mod forget;
 #[path = "group_turns.rs"]
 mod group_turns;
 #[path = "policy.rs"]
@@ -73,10 +75,12 @@ use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
 use super::plugin::{PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
+#[cfg(test)]
+use super::store::home_id;
 use super::store::{
     Acked, Added, BY_AGENT, BY_PERSON, Conversation, Device, From, MAX_ATTACHMENT_NAME_CHARS,
     PairingRequest, Store, StoredAttachment, attachment_mime, attachment_name, conversation_title,
-    home_id, is_home, now,
+    is_home, now,
 };
 use super::text::plain;
 use super::transport::{Caller, Transport, caller_address};
@@ -604,9 +608,18 @@ impl Hub {
         if open(self) {
             return Ok(());
         }
+        // The Home the bridge chose for it, which the runtime takes from
+        // the `hello` (ADR 0067, proposed): none once it was forgotten.
+        let home = self
+            .store()
+            .and_then(|store| store.home_of(agent).map_err(|e| e.to_string()))?
+            .ok_or_else(|| {
+                format!(
+                    "{agent} was forgotten in the app: set up its app channel again with `enclos runtime configure --channel app`"
+                )
+            })?;
         let (hello, mut reader, mut writer) =
-            connect(&endpoint.socket, &endpoint.token, &home_id(agent))
-                .map_err(|e| e.to_string())?;
+            connect(&endpoint.socket, &endpoint.token, &home).map_err(|e| e.to_string())?;
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
             && let Ok(name) = sandbox.parse()
@@ -2433,6 +2446,27 @@ fn run_session(
             FromDevice::ConversationDelete { conversation } => {
                 hub.request_deletion(device, message.id, conversation);
             }
+            FromDevice::AgentsRemoved => match hub.removed_agents(store, person) {
+                Ok(agents) => link.send(ToDevice::AgentsRemovedList { agents })?,
+                Err(mut error) => {
+                    error.of = Some(message.id);
+                    link.send(ToDevice::Error(error))?;
+                }
+            },
+            FromDevice::AgentForget { agent } => {
+                match hub.forget_agent(store, device, person, &agent) {
+                    Ok(()) => {
+                        // Its `conversation.deleted`, in this device's outbox
+                        // with the others', precede the `ack`.
+                        drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
+                        link.send(ToDevice::Ack { of: message.id })?;
+                    }
+                    Err(mut error) => {
+                        error.of = Some(message.id);
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
             FromDevice::ConversationArchive {
                 conversation,
                 archived,
@@ -3134,7 +3168,13 @@ fn destination(
     if own {
         return Ok(Some(conversation));
     }
-    let Ok(home) = ConversationId::new(home_id(agent)).inspect_err(|e| {
+    let Some(home) = store.home_of(agent).map_err(|e| e.to_string())? else {
+        eprintln!(
+            "enclos app: {agent}: a message for no conversation of its own is dropped: the agent was forgotten"
+        );
+        return Ok(None);
+    };
+    let Ok(home) = ConversationId::new(home).inspect_err(|e| {
         eprintln!(
             "enclos app: {agent}: a message for no conversation of its own is dropped: its Home's id is refused ({e})"
         );
@@ -5598,5 +5638,96 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 None => panic!("the deletion completion closed this socket"),
             }
         }
+    }
+
+    /// The `conversation.deleted` of a forget reach the device that asked
+    /// before its `ack` (ADR 0067, proposed), and again at its next sync.
+    #[test]
+    fn a_forget_tells_the_asking_device_of_each_deletion_before_its_ack() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        // A state database with no record of sandbox `gone`, and no folder
+        // of it: its agents are confirmed removed.
+        let layout = crate::layout::Layout::at(folder.path().join("enclos"));
+        std::fs::create_dir_all(layout.data()).unwrap();
+        let state = crate::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
+        {
+            use crate::state::StateStore;
+            let lock = state.lock().unwrap();
+            state.migrate(&lock).unwrap();
+        }
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, _) = connect(&bridge, &phone);
+        let store = Store::open(&bridge.store).unwrap();
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(PERSON));
+        store.ensure_home("gone/coder", PERSON, true).unwrap();
+        store
+            .conversation("c-gone", "gone", "coder", PERSON)
+            .unwrap();
+        let answer = |device: &mut PhoneLink, of: &str| loop {
+            match device.receive() {
+                Some(ToDevice::AgentsRemovedList { agents }) => break Ok(agents),
+                Some(ToDevice::Error(e)) if e.of.as_ref().is_some_and(|o| o.as_str() == of) => {
+                    break Err(e.code);
+                }
+                Some(_) => {}
+                None => panic!("no answer to {of}"),
+            }
+        };
+        device.send("removed-1", FromDevice::AgentsRemoved);
+        // `lab/main` too: this bridge serves it, but no sandbox `lab` exists.
+        let gone = "gone/coder".to_owned();
+        assert!(answer(&mut device, "removed-1").unwrap().contains(&gone));
+        // Not an agent's name: refused, answering the request.
+        device.send(
+            "forget-bad",
+            FromDevice::AgentForget {
+                agent: "Gone/coder".into(),
+            },
+        );
+        assert_eq!(
+            answer(&mut device, "forget-bad"),
+            Err(ErrorCode::BadMessage)
+        );
+        device.send(
+            "forget-1",
+            FromDevice::AgentForget {
+                agent: "gone/coder".into(),
+            },
+        );
+        let mut deleted = Vec::new();
+        loop {
+            match device.receive() {
+                Some(ToDevice::ConversationDeleted { conversation }) => {
+                    deleted.push(conversation.to_string())
+                }
+                Some(ToDevice::Ack { of }) if of.as_str() == "forget-1" => break,
+                Some(ToDevice::Error(e)) => panic!("forget refused: {}", e.message),
+                Some(_) => {}
+                None => panic!("no ack to the forget"),
+            }
+        }
+        assert_eq!(deleted, ["c-gone", "home.gone.coder"]);
+        // A device that was away hears of them at sync.
+        device.send("sync-after-forget", FromDevice::Sync { since: 0 });
+        let mut synced = Vec::new();
+        loop {
+            match device.receive() {
+                Some(ToDevice::ConversationDeleted { conversation }) => {
+                    synced.push(conversation.to_string())
+                }
+                Some(ToDevice::Synced { .. }) => break,
+                Some(_) => {}
+                None => panic!("no sync after the forget"),
+            }
+        }
+        assert!(synced.contains(&"c-gone".to_owned()), "{synced:?}");
+        assert!(synced.contains(&"home.gone.coder".to_owned()), "{synced:?}");
+        device.send("removed-2", FromDevice::AgentsRemoved);
+        assert!(!answer(&mut device, "removed-2").unwrap().contains(&gone));
     }
 }

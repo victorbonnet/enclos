@@ -10,6 +10,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 #[path = "deletion_store.rs"]
 mod deletion_store;
+#[path = "forget_store.rs"]
+mod forget_store;
+pub use forget_store::{Forget, setup_home};
 #[path = "question_store.rs"]
 mod question_store;
 pub use question_store::{
@@ -126,10 +129,12 @@ pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
 pub const BY_PERSON: &str = "person";
 
-/// The id of agent `<sandbox>/<agent>`'s Home conversation, where what has
-/// no conversation of its own goes (ADR 0044). Fixed, so the bridge and the
-/// runtime, which `runtime configure` tells, agree on it without asking;
-/// without `:` or `/`, which runtimes put in their own keys.
+/// The id of agent `<sandbox>/<agent>`'s first Home conversation, where
+/// what has no conversation of its own goes (ADR 0044). Fixed, so the
+/// bridge and the runtime, which `runtime configure` tells, agree on it
+/// without asking; without `:` or `/`, which runtimes put in their own
+/// keys. An agent made again after it was forgotten gets another
+/// ([`Store::home_of`], ADR 0067, proposed).
 pub fn home_id(agent: &str) -> String {
     format!("home.{}", agent.replace('/', "."))
 }
@@ -439,6 +444,10 @@ BEGIN SELECT RAISE(ABORT, 'conversation deletion pending'); END;
 CREATE TRIGGER IF NOT EXISTS deleted_conversation_question BEFORE INSERT ON questions
 WHEN EXISTS (SELECT 1 FROM conversation_deletions WHERE id = NEW.conversation)
 BEGIN SELECT RAISE(ABORT, 'conversation deletion pending'); END;
+CREATE TABLE IF NOT EXISTS homes (
+    agent TEXT PRIMARY KEY,
+    id TEXT UNIQUE
+);
 CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1222,7 +1231,10 @@ impl Store {
         let Some((sandbox, name)) = agent.split_once('/') else {
             return Ok(false);
         };
-        let id = home_id(agent);
+        let Some(id) = self.home_of(agent)? else {
+            // Forgotten, and not set up again: it has no Home.
+            return Ok(false);
+        };
         if let Some((s, a, _)) = self.conversation_of(&id)? {
             // Not this agent's: a device chose the id, before the bridge
             // kept `home.` for itself. It is not Home, and keeps its owner.

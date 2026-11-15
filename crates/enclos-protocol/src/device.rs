@@ -83,6 +83,17 @@ pub enum FromDevice {
     },
     #[serde(rename = "agents")]
     Agents,
+    /// Asks which of the person's agents the host confirmed removed: the
+    /// bridge answers `agents.removed.list` (ADR 0067, proposed).
+    #[serde(rename = "agents.removed")]
+    AgentsRemoved,
+    /// Forgets a removed agent: its Home and every direct conversation of
+    /// the host's person with it are deleted (ADR 0067, proposed).
+    #[serde(rename = "agent.forget")]
+    AgentForget {
+        /// `<sandbox>/<agent>`.
+        agent: String,
+    },
     #[serde(rename = "sandboxes")]
     Sandboxes,
     #[serde(rename = "runtimes")]
@@ -158,6 +169,11 @@ pub enum FromDevice {
 /// sends to close one, advertised in `authenticated`'s capabilities.
 pub const APPROVAL_CLOSE: &str = "approval.close";
 
+/// The host feature of forgetting a removed agent (ADR 0067, proposed):
+/// the message type a device sends to forget one, advertised in
+/// `authenticated`'s capabilities.
+pub const AGENT_FORGET: &str = "agent.forget";
+
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.answer",
     "agent.name.get",
@@ -173,6 +189,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "approval.decide",
     APPROVAL_CLOSE,
     "agents",
+    "agents.removed",
+    AGENT_FORGET,
     "sandboxes",
     "runtimes",
     "sandbox.create",
@@ -244,6 +262,15 @@ pub enum ToDevice {
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
+    /// The agents the host confirmed removed, with no runtime identity or
+    /// data left, that the person has a Home or a direct conversation
+    /// with: `agent.forget` accepts each. Empty for anyone but the host's
+    /// person.
+    #[serde(rename = "agents.removed.list")]
+    AgentsRemovedList {
+        /// `<sandbox>/<agent>` each.
+        agents: Vec<String>,
+    },
     #[serde(rename = "sandboxes.list")]
     SandboxesList { sandboxes: Vec<SandboxInfo> },
     #[serde(rename = "runtimes.list")]
@@ -331,6 +358,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "pair.accepted",
     "pair.refused",
     "agents.list",
+    "agents.removed.list",
     "sandboxes.list",
     "runtimes.list",
     "operation.progress",
@@ -1058,6 +1086,30 @@ mod tests {
         assert!(
             matches!(decode_to_device(response).unwrap().body, ToDevice::ConversationDeleted { conversation } if conversation.as_str()=="c-1")
         );
+    }
+
+    #[test]
+    fn forgetting_names_one_agent_and_the_removed_list_names_each() {
+        let request = br#"{"v":1,"id":"f1","type":"agent.forget","agent":"lab/coder"}"#;
+        assert_eq!(
+            decode_from_device(request).unwrap().body,
+            FromDevice::AgentForget {
+                agent: "lab/coder".into()
+            }
+        );
+        assert!(decode_from_device(br#"{"v":1,"id":"f1","type":"agent.forget"}"#).is_err());
+        assert_eq!(
+            decode_from_device(br#"{"v":1,"id":"r1","type":"agents.removed"}"#)
+                .unwrap()
+                .body,
+            FromDevice::AgentsRemoved
+        );
+        let list = ToDevice::AgentsRemovedList {
+            agents: vec!["lab/coder".into(), "lab/main".into()],
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r2").unwrap(), list.clone()));
+        assert_eq!(decode_to_device(&wire).unwrap().body, list);
+        assert_eq!(AGENT_FORGET, "agent.forget");
     }
 }
 
