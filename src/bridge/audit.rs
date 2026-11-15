@@ -192,7 +192,10 @@ mod tests {
             node: None,
         };
         store.add_device(&device).unwrap();
-        assert_eq!(hub.capabilities("alice"), vec!["audit", "approval.close"]);
+        assert_eq!(
+            hub.capabilities("alice"),
+            vec!["audit", "approval.close", "agent.forget"]
+        );
         assert!(hub.capabilities("guest").is_empty());
         let id = || MessageId::new("audit-request").unwrap();
         let reply = hub

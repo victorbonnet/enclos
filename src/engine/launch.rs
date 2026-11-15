@@ -152,6 +152,12 @@ impl Engine {
         // services a version of enclos without it installed, is installed.
         self.ensure_holder(&record)?;
         let mut watch = self.settings_watch(name, kind, service);
+        // A backend with a namespace holder runs each session in a PID
+        // namespace of its own, below `enclos holder join` (design §5).
+        let program_at = match self.holder_of(record.backend) {
+            Some(_) => super::restart::ProgramAt::PidNamespace,
+            None => super::restart::ProgramAt::Root,
+        };
         let summary = |(started, replaced): &(Started<()>, Vec<SessionId>)| {
             let session = started.session.id;
             match replaced_earlier(service, replaced) {
@@ -213,7 +219,7 @@ impl Engine {
             };
             let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
             let files = files.join(", ");
-            let why = match self.ask_restart(by, &session, *signal, &changed) {
+            let why = match self.ask_restart(by, &session, program_at, *signal, &changed) {
                 Ok(None) => return,
                 Ok(Some(Ok(()))) => {
                     restarting = true;

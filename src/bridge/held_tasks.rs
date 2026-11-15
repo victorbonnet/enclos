@@ -3,13 +3,13 @@
 //! resume from the host's person, passed live to the plugin and never
 //! queued.
 use super::*;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use super::super::store::{HeldTaskChange, StoredHeldTask};
-use enclos_protocol::HeldTaskId;
-use enclos_protocol::held_task::{HeldTask, HeldTaskState, check_snapshot};
+use enclos_protocol::held_task::{HeldTask, HeldTaskInfo, HeldTaskState, accept};
 use enclos_protocol::plugin::{ErrorBody, ErrorCode};
+use enclos_protocol::{HeldTaskId, HeldTaskRevision};
 use sha2::{Digest, Sha256};
 
 /// Resumes in flight, for all agents together.
@@ -19,7 +19,7 @@ const MAX_COMPLETED: usize = 64;
 const TIMEOUT: Duration = Duration::from_secs(25);
 
 const NOT_READ: &str =
-    "The bridge could not read its database, so nothing was sent to the agent. Try again.";
+    "The bridge could not read or write its database, so nothing was sent to the agent. Try again.";
 const UNCONFIRMED: &str = "The agent may have resumed the task, but did not confirm it. Its card shows what happened after the next sync.";
 
 /// What a device asked: resume `task` of `agent`, at card `revision`.
@@ -36,6 +36,8 @@ struct Pending {
     connection: String,
     original: MessageId,
     request: ResumeRequest,
+    /// The runtime's revision the resume was sent at.
+    sent: HeldTaskRevision,
     started: Instant,
 }
 
@@ -44,9 +46,19 @@ pub(super) struct HeldTaskRequests {
     /// Each agent's current plugin connection, as `held_task_connected` saw it.
     connections: HashMap<String, String>,
     pending: HashMap<String, Pending>,
-    /// Answered resumes: a device that sends the same request again gets the
-    /// same answer, and the runtime is not asked twice.
+    /// Answered resumes, unconfirmed ones included: a device that sends the
+    /// same request again gets the same answer, and the runtime is not
+    /// asked twice.
     completed: VecDeque<(String, ResumeRequest, ToDevice)>,
+    /// Resumes that timed out, by plugin request id: a confirmation that
+    /// comes late is still recorded.
+    late: VecDeque<(String, Pending)>,
+    /// Resumes the runtime confirmed that the bridge could not record yet:
+    /// recorded at its next chance, so the card does not read as released.
+    unrecorded: HashSet<(String, String, HeldTaskRevision)>,
+    /// Agents whose channel connected without `held_tasks` and whose cards
+    /// could not be expired then: tried again.
+    expiring: HashSet<String>,
 }
 
 fn failure(of: MessageId, code: ErrorCode, message: impl Into<String>) -> ErrorBody {
@@ -66,23 +78,28 @@ fn rpc_id(device: &str, person: &str, request: &MessageId) -> MessageId {
     MessageId::new(format!("held-{suffix}")).expect("bounded digest")
 }
 
-/// Records a resume in the bridge's log: once when it is sent, once with
-/// its outcome. The work runs again, unattended, after the person's tap.
-fn audit(store: &Store, pending: &Pending, outcome: &str) {
+/// Records a resume in the bridge's log: once before it is sent, which
+/// must succeed for it to be sent, and once with its outcome. The work
+/// runs again, unattended, after the person's tap. Whether it was written.
+fn audit(store: &Store, pending: &Pending, outcome: &str) -> bool {
     let reason = format!(
         "{} {} {outcome}",
         pending.request.agent, pending.request.task
     );
-    if let Err(e) = store.log(
+    match store.log(
         Some(&pending.device),
         Some(&pending.person),
         "held_task.resume",
         Some(&reason),
     ) {
-        eprintln!(
-            "enclos app: cannot log a held task's resume for {}: {e}",
-            pending.request.agent
-        );
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "enclos app: cannot log a held task's resume for {}: {e}",
+                pending.request.agent
+            );
+            false
+        }
     }
 }
 
@@ -93,9 +110,19 @@ fn code_name(code: ErrorCode) -> String {
         .unwrap_or_default()
 }
 
+/// The `of` of a resume's answer.
+fn answer_of(answer: &ToDevice) -> Option<MessageId> {
+    match answer {
+        ToDevice::HeldTaskResult { of, .. } => Some(of.clone()),
+        ToDevice::Error(error) => error.of.clone(),
+        _ => None,
+    }
+}
+
 impl Hub {
     /// An agent's channel connected on `connection`. One without
-    /// `held_tasks` can neither report nor resume: its held cards expire.
+    /// `held_tasks` can neither report nor resume: its held cards expire,
+    /// now or, should that fail, at the next sweep.
     pub(super) fn held_task_connected(
         &self,
         store: Option<&Store>,
@@ -103,17 +130,39 @@ impl Hub {
         connection: &str,
         capabilities: &[Capability],
     ) {
-        self.held_tasks
-            .lock()
-            .expect("not poisoned")
-            .connections
-            .insert(agent.into(), connection.into());
-        let Some(store) = store else { return };
-        if !capabilities.contains(&Capability::HeldTasks) {
-            match store.expire_held_tasks(agent) {
-                Ok(changes) => self.publish_held(store, changes),
-                Err(e) => eprintln!("enclos app: {agent}'s held tasks could not expire: {e}"),
+        let reports = capabilities.contains(&Capability::HeldTasks);
+        {
+            let mut requests = self.held_tasks.lock().expect("not poisoned");
+            requests.connections.insert(agent.into(), connection.into());
+            if reports {
+                requests.expiring.remove(agent);
+            } else {
+                requests.expiring.insert(agent.into());
             }
+        }
+        if reports {
+            return;
+        }
+        match store {
+            Some(store) => self.expire_held(store, agent),
+            None => eprintln!(
+                "enclos app: {agent}'s held tasks expire once the bridge's database opens"
+            ),
+        }
+    }
+
+    /// Expires `agent`'s held cards, and stops trying once that worked.
+    fn expire_held(&self, store: &Store, agent: &str) {
+        match store.expire_held_tasks(agent) {
+            Ok(changes) => {
+                self.held_tasks
+                    .lock()
+                    .expect("not poisoned")
+                    .expiring
+                    .remove(agent);
+                self.publish_held(store, changes);
+            }
+            Err(e) => eprintln!("enclos app: {agent}'s held tasks could not expire yet: {e}"),
         }
     }
 
@@ -139,36 +188,62 @@ impl Hub {
                 "Held tasks need the held_tasks capability in the plugin's hello.".into(),
             ));
         }
-        check_snapshot(&tasks).map_err(|why| (ErrorCode::BadMessage, why))?;
-        let tasks: Vec<HeldTask> = tasks.into_iter().map(HeldTask::normalized).collect();
-        let home = ConversationId::new(home_id(agent)).map_err(|e| {
-            (
-                ErrorCode::BadMessage,
-                format!("its Home's id is refused: {e}"),
-            )
-        })?;
-        let host = store.host_person().map_err(|e| {
-            eprintln!("enclos app: {agent}'s held tasks: {e}");
+        let tasks = accept(tasks).map_err(|why| (ErrorCode::BadMessage, why))?;
+        let internal = |e: rusqlite::Error| {
+            eprintln!("enclos app: {agent}'s held tasks could not be stored: {e}");
             (
                 ErrorCode::Internal,
                 "The bridge could not store the held tasks.".to_owned(),
             )
+        };
+        // Forgotten (ADR 0067): no Home to hold a card until it is set up again.
+        let home = store.home_of(agent).map_err(internal)?.ok_or_else(|| {
+            (
+                ErrorCode::NotAllowed,
+                "This agent was forgotten on the host and has no Home.".to_owned(),
+            )
         })?;
+        let host = store.host_person().map_err(internal)?;
         // A Home not made would hide the cards from every device.
-        let changes = store
+        store
             .ensure_home(agent, host.as_deref().unwrap_or(""), host.is_some())
-            .and_then(|_| store.report_held_tasks(agent, home.as_str(), &tasks))
-            .map_err(|e| {
-                eprintln!("enclos app: {agent}'s held tasks could not be stored: {e}");
-                (
-                    ErrorCode::Internal,
-                    "The bridge could not store the held tasks.".to_owned(),
-                )
-            })?;
-        // A task held waits for the person: an archived Home cannot be (ADR
-        // 0049), so nothing to bring back.
+            .map_err(internal)?;
+        self.record_unrecorded(store, Some(agent));
+        let changes = store
+            .report_held_tasks(agent, &home, &tasks)
+            .map_err(internal)?;
         self.publish_held(store, changes);
         Ok(())
+    }
+
+    /// Records the resumes the runtime confirmed and the bridge could not
+    /// record then, those of `agent` or of every agent.
+    fn record_unrecorded(&self, store: &Store, agent: Option<&str>) {
+        let waiting: Vec<_> = self
+            .held_tasks
+            .lock()
+            .expect("not poisoned")
+            .unrecorded
+            .iter()
+            .filter(|(a, _, _)| agent.is_none_or(|agent| a == agent))
+            .cloned()
+            .collect();
+        for key in waiting {
+            let (agent, task, sent) = &key;
+            match store.resume_held_task(agent, task, sent) {
+                Ok(change) => {
+                    self.held_tasks
+                        .lock()
+                        .expect("not poisoned")
+                        .unrecorded
+                        .remove(&key);
+                    self.publish_held(store, change.into_iter().collect());
+                }
+                Err(e) => {
+                    eprintln!("enclos app: {agent}'s resumed task {task} is not recorded yet: {e}")
+                }
+            }
+        }
     }
 
     /// Sends each changed card, then its history message, to the paired
@@ -198,13 +273,20 @@ impl Hub {
                     Err(e) => eprintln!("enclos app: a held task's message could not be read: {e}"),
                 }
             }
+            frames.retain(|frame| {
+                let fits = fits_device(frame);
+                if !fits {
+                    eprintln!(
+                        "enclos app: a held task's frame is too large for a device: not sent"
+                    );
+                }
+                fits
+            });
             let devices = self.devices.lock().expect("not poisoned");
             for (device, (person, sender, _)) in devices.iter() {
                 if *person == owner && paired.iter().any(|d| d.id == *device && d.person == owner) {
                     for frame in &frames {
-                        if fits_device(frame) {
-                            let _ = sender.send(frame.clone());
-                        }
+                        let _ = sender.send(frame.clone());
                     }
                 }
             }
@@ -272,7 +354,7 @@ impl Hub {
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e.to_string()))?;
         // Opened if it is not: a resume is live, but the connection may
         // simply not be open yet.
-        let _ = self.plugin(&request.agent);
+        let opened = self.plugin(&request.agent);
         let found = {
             let plugins = self.plugins.lock().expect("not poisoned");
             plugins.get(&request.agent).map(|plugin| {
@@ -287,15 +369,16 @@ impl Hub {
             Some((_, false)) => {
                 return Err(failure(
                     original,
-                    ErrorCode::AgentUnavailable,
-                    "The agent's channel no longer reports held tasks.",
+                    ErrorCode::Unsupported,
+                    "The agent's channel does not report held tasks. Nothing was sent.",
                 ));
             }
             None => {
+                let why = opened.err().unwrap_or_else(|| "it closed".into());
                 return Err(failure(
                     original,
                     ErrorCode::AgentUnavailable,
-                    "The agent's channel is disconnected. Nothing was sent.",
+                    format!("The agent's channel cannot be reached ({why}). Nothing was sent."),
                 ));
             }
         };
@@ -333,9 +416,14 @@ impl Hub {
             connection,
             original: original.clone(),
             request: request.clone(),
+            sent: card.runtime_revision.clone(),
             started: Instant::now(),
         };
-        audit(store, &pending, "requested");
+        // No resume the log cannot name: the runtime would change with no
+        // record of who asked.
+        if !audit(store, &pending, "requested") {
+            return Err(failure(original, ErrorCode::Internal, NOT_READ));
+        }
         requests.pending.insert(rpc.to_string(), pending);
         drop(requests);
         let sent = out.lock().expect("not poisoned").writer.send_with_id(
@@ -348,20 +436,17 @@ impl Hub {
             },
         );
         if let Err(e) = sent {
-            let pending = self
-                .held_tasks
-                .lock()
-                .expect("not poisoned")
-                .pending
-                .remove(rpc.as_str());
-            if let Some(pending) = pending {
+            let taken = self.take_pending(&request.agent, None, &rpc);
+            if let Some((key, pending)) = taken {
                 audit(store, &pending, "unknown: not sent");
+                let answer = ToDevice::Error(failure(
+                    original,
+                    ErrorCode::Unconfirmed,
+                    format!("{e}. {UNCONFIRMED}"),
+                ));
+                self.complete(key, &pending, &answer);
+                self.deliver_held_device(store, &pending.device, &pending.person, answer);
             }
-            return Err(failure(
-                original,
-                ErrorCode::Unconfirmed,
-                format!("{e}. {UNCONFIRMED}"),
-            ));
         }
         Ok(())
     }
@@ -375,38 +460,48 @@ impl Hub {
         request: &ResumeRequest,
         original: &MessageId,
     ) -> Result<Option<ToDevice>, ErrorBody> {
-        let same_id = |key: &str| key == rpc.as_str();
+        let other = || {
+            failure(
+                original.clone(),
+                ErrorCode::Conflict,
+                "This request id names another resume.",
+            )
+        };
         if let Some(pending) = requests.pending.get(rpc.as_str())
             && pending.request != *request
         {
-            return Err(failure(
-                original.clone(),
-                ErrorCode::Conflict,
-                "This request id names another resume.",
-            ));
+            return Err(other());
         }
-        match requests.completed.iter().find(|(key, _, _)| same_id(key)) {
-            Some((_, done, _)) if done != request => Err(failure(
-                original.clone(),
-                ErrorCode::Conflict,
-                "This request id names another resume.",
-            )),
+        match requests
+            .completed
+            .iter()
+            .find(|(key, _, _)| key == rpc.as_str())
+        {
+            Some((_, done, _)) if done != request => Err(other()),
             Some((_, _, answer)) => Ok(Some(answer.clone())),
             None => Ok(None),
         }
     }
 
     /// Sends a resume's answer to the device that asked, if it is still
-    /// paired to the same person.
+    /// paired to the same person. When the pairing cannot be read, the
+    /// connected device, which the bridge authenticated, is told only that
+    /// the outcome is not confirmed, never what the runtime answered.
     fn deliver_held_device(&self, store: &Store, device: &str, person: &str, answer: ToDevice) {
-        match store.devices() {
-            Ok(devices) if devices.iter().any(|d| d.id == device && d.person == person) => {}
+        let answer = match store.devices() {
+            Ok(devices) if devices.iter().any(|d| d.id == device && d.person == person) => answer,
             Ok(_) => return,
             Err(e) => {
                 eprintln!("enclos app: cannot read the paired devices to answer {device}: {e}");
-                return;
+                ToDevice::Error(ErrorBody {
+                    of: answer_of(&answer),
+                    code: ErrorCode::Unconfirmed,
+                    message: format!(
+                        "The bridge could not check this device's pairing. {UNCONFIRMED}"
+                    ),
+                })
             }
-        }
+        };
         if let Some((owner, sender, _)) = self.devices.lock().expect("not poisoned").get(device)
             && owner == person
         {
@@ -414,19 +509,18 @@ impl Hub {
         }
     }
 
-    /// Takes the pending resume `of` names, if it was sent on `connection`
-    /// to `agent`.
+    /// Takes the pending resume `of` names, if it was sent to `agent` (on
+    /// `connection`, when given).
     fn take_pending(
         &self,
         agent: &str,
-        connection: &str,
+        connection: Option<&str>,
         of: &MessageId,
     ) -> Option<(String, Pending)> {
         let mut requests = self.held_tasks.lock().expect("not poisoned");
-        let ours = requests
-            .pending
-            .get(of.as_str())
-            .is_some_and(|p| p.request.agent == agent && p.connection == connection);
+        let ours = requests.pending.get(of.as_str()).is_some_and(|p| {
+            p.request.agent == agent && connection.is_none_or(|c| p.connection == c)
+        });
         if !ours {
             return None;
         }
@@ -444,6 +538,40 @@ impl Hub {
         }
     }
 
+    /// Records a resume the runtime confirmed: the card, `resumed`, and
+    /// its line to the person's devices. The card as the devices should
+    /// read it, `None` when it cannot be read. When the store cannot be
+    /// written, the resume is remembered and recorded at the next chance,
+    /// and the card read as resumed meanwhile.
+    fn record_resume(&self, store: &Store, agent: &str, pending: &Pending) -> Option<HeldTaskInfo> {
+        let task = pending.request.task.as_str();
+        match store.resume_held_task(agent, task, &pending.sent) {
+            Ok(Some(change)) => {
+                let card = change.card.info.clone();
+                self.publish_held(store, vec![change]);
+                Some(card)
+            }
+            // Resumed already, or held again since: the card as it is.
+            Ok(None) => store.held_task(agent, task).ok().flatten().map(|c| c.info),
+            Err(e) => {
+                eprintln!(
+                    "enclos app: {agent}'s resumed task {task} could not be recorded yet: {e}"
+                );
+                self.held_tasks
+                    .lock()
+                    .expect("not poisoned")
+                    .unrecorded
+                    .insert((agent.into(), task.into(), pending.sent.clone()));
+                store.held_task(agent, task).ok().flatten().map(|c| {
+                    let mut info = c.info;
+                    info.state = HeldTaskState::Resumed;
+                    info.revision += 1;
+                    info
+                })
+            }
+        }
+    }
+
     /// The plugin's `held_task.resumed`: the runtime resumed the task.
     pub(super) fn held_task_resumed(
         &self,
@@ -452,32 +580,12 @@ impl Hub {
         connection: &str,
         of: &MessageId,
     ) {
-        let Some((key, pending)) = self.take_pending(agent, connection, of) else {
+        let Some((key, pending)) = self.take_pending(agent, Some(connection), of) else {
+            self.late_resumed(store, agent, connection, of);
             return;
         };
-        let change = match store.resume_held_task(agent, pending.request.task.as_str()) {
-            Ok(change) => change,
-            Err(e) => {
-                eprintln!("enclos app: {agent}'s resumed task could not be recorded: {e}");
-                None
-            }
-        };
         audit(store, &pending, "confirmed");
-        let card = match change {
-            Some(change) => {
-                let card = change.card.info.clone();
-                self.publish_held(store, vec![change]);
-                Some(card)
-            }
-            // Resumed already, or the card cannot be read: the runtime's
-            // answer stands, and the card is sent as it is.
-            None => store
-                .held_task(agent, pending.request.task.as_str())
-                .ok()
-                .flatten()
-                .map(|card| card.info),
-        };
-        let answer = match card {
+        let answer = match self.record_resume(store, agent, &pending) {
             Some(held_task) => ToDevice::HeldTaskResult {
                 of: pending.original.clone(),
                 held_task,
@@ -492,6 +600,25 @@ impl Hub {
         self.deliver_held_device(store, &pending.device, &pending.person, answer);
     }
 
+    /// A confirmation that came after the resume timed out: the device was
+    /// told `unconfirmed`; the card and the log still say what happened.
+    fn late_resumed(&self, store: &Store, agent: &str, connection: &str, of: &MessageId) {
+        let late = {
+            let mut requests = self.held_tasks.lock().expect("not poisoned");
+            let found = requests.late.iter().position(|(key, p)| {
+                key == of.as_str() && p.request.agent == agent && p.connection == connection
+            });
+            found.and_then(|n| requests.late.remove(n))
+        };
+        let Some((_, pending)) = late else { return };
+        eprintln!(
+            "enclos app: {agent} confirmed the resume of {} after it timed out",
+            pending.request.task
+        );
+        audit(store, &pending, "confirmed late");
+        self.record_resume(store, agent, &pending);
+    }
+
     /// A plugin's `error` naming a resume: passed on to the device with its
     /// code, its message bounded. Whether it named one.
     pub(super) fn held_task_error(
@@ -502,7 +629,7 @@ impl Hub {
         error: &ErrorBody,
     ) -> bool {
         let Some(of) = &error.of else { return false };
-        let Some((key, pending)) = self.take_pending(agent, connection, of) else {
+        let Some((key, pending)) = self.take_pending(agent, Some(connection), of) else {
             return false;
         };
         audit(
@@ -518,6 +645,19 @@ impl Hub {
         self.complete(key, &pending, &answer);
         self.deliver_held_device(store, &pending.device, &pending.person, answer);
         true
+    }
+
+    /// Ends `pending` as unconfirmed: logged, kept as the answer to a
+    /// replay, and told to the device.
+    fn unconfirmed(&self, store: &Store, key: String, pending: &Pending, outcome: &str, why: &str) {
+        audit(store, pending, outcome);
+        let answer = ToDevice::Error(failure(
+            pending.original.clone(),
+            ErrorCode::Unconfirmed,
+            format!("{why} {UNCONFIRMED}"),
+        ));
+        self.complete(key, pending, &answer);
+        self.deliver_held_device(store, &pending.device, &pending.person, answer);
     }
 
     /// The agent's channel closed: a resume sent on it may have run.
@@ -538,21 +678,23 @@ impl Hub {
             .collect();
         let pending: Vec<_> = keys
             .into_iter()
-            .filter_map(|k| requests.pending.remove(&k))
+            .filter_map(|k| requests.pending.remove(&k).map(|p| (k, p)))
             .collect();
         drop(requests);
-        for p in pending {
-            audit(store, &p, "unknown: disconnected");
-            let answer = ToDevice::Error(failure(
-                p.original.clone(),
-                ErrorCode::Unconfirmed,
-                format!("The agent disconnected. {UNCONFIRMED}"),
-            ));
-            self.deliver_held_device(store, &p.device, &p.person, answer);
+        for (key, p) in pending {
+            self.unconfirmed(
+                store,
+                key,
+                &p,
+                "unknown: disconnected",
+                "The agent disconnected.",
+            );
         }
     }
 
-    /// Ends the resumes the runtime left unanswered.
+    /// Every second: ends the resumes the runtime left unanswered, and
+    /// tries again what could not be done when it should have been
+    /// (expiring an agent's cards, recording a confirmed resume).
     pub(super) fn expire_held_resumes(&self, store: &Store) {
         let mut requests = self.held_tasks.lock().expect("not poisoned");
         let keys: Vec<_> = requests
@@ -563,17 +705,30 @@ impl Hub {
             .collect();
         let pending: Vec<_> = keys
             .into_iter()
-            .filter_map(|k| requests.pending.remove(&k))
+            .filter_map(|k| requests.pending.remove(&k).map(|p| (k, p)))
             .collect();
+        let expiring: Vec<String> = requests.expiring.iter().cloned().collect();
+        let unrecorded = !requests.unrecorded.is_empty();
         drop(requests);
-        for p in pending {
-            audit(store, &p, "unknown: timed out");
-            let answer = ToDevice::Error(failure(
-                p.original.clone(),
-                ErrorCode::Unconfirmed,
-                format!("The agent did not answer in time. {UNCONFIRMED}"),
-            ));
-            self.deliver_held_device(store, &p.device, &p.person, answer);
+        for (key, p) in pending {
+            self.unconfirmed(
+                store,
+                key.clone(),
+                &p,
+                "unknown: timed out",
+                "The agent did not answer in time.",
+            );
+            let mut requests = self.held_tasks.lock().expect("not poisoned");
+            requests.late.push_back((key, p));
+            while requests.late.len() > MAX_COMPLETED {
+                requests.late.pop_front();
+            }
+        }
+        for agent in expiring {
+            self.expire_held(store, &agent);
+        }
+        if unrecorded {
+            self.record_unrecorded(store, None);
         }
     }
 }
@@ -666,7 +821,7 @@ mod tests {
             reason: "Gave up after 3 failures".into(),
             last_error: None,
             since: 1_763_000_000,
-            revision: "e:7".into(),
+            revision: HeldTaskRevision::new("e:7").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
         }
     }
@@ -1033,8 +1188,8 @@ mod tests {
 
     #[test]
     fn a_report_beyond_the_bound_or_naming_a_task_twice_changes_nothing() {
-        let (_dir, hub, store, _phone, _rx) = fixture();
-        let (mut plugin, from_bridge) = fake_plugin(&hub, vec![Capability::HeldTasks]);
+        let (_dir, hub, store, _phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
         say(
             &mut plugin,
             "twice",
@@ -1054,7 +1209,15 @@ mod tests {
             panic!("refused");
         };
         assert_eq!(error.code, ErrorCode::BadMessage);
-        assert!(store.held_tasks_for(OWNER).unwrap().is_empty());
+        // The card held before either report is as it was, and no device
+        // heard of a change.
+        let kept = store.held_tasks_for(OWNER).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].info.task.as_str(), kept[0].info.revision),
+            ("t1", 0)
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     #[test]
@@ -1194,5 +1357,382 @@ mod tests {
             store.held_tasks_for(OWNER).unwrap()[0].info.title,
             held.title
         );
+    }
+
+    fn state(store: &Store, task: &str) -> HeldTaskState {
+        store.held_task(AGENT, task).unwrap().unwrap().info.state
+    }
+
+    /// Makes the bridge's database refuse to change held cards, as a full
+    /// disk would, until [`unblock_writes`].
+    fn block_writes(hub: &Hub) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER held_full BEFORE UPDATE ON held_tasks BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+    }
+
+    fn unblock_writes(hub: &Hub) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER held_full;")
+            .unwrap();
+    }
+
+    fn break_table(hub: &Hub, table: &str) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF; DROP TABLE {table}; CREATE TABLE {table} (broken INTEGER);"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_channel_that_reconnects_with_held_tasks_expires_nothing() {
+        let (_dir, hub, store, _phone, rx) = fixture();
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[task("t1")])
+            .unwrap();
+        let (_plugin, _from_bridge) = fake_plugin(&hub, vec![Capability::HeldTasks]);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap().info;
+        assert_eq!((card.state, card.revision), (HeldTaskState::Held, 0));
+    }
+
+    #[test]
+    fn a_confirmation_from_another_agent_or_an_old_connection_changes_nothing() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        let connection = hub.held_tasks.lock().unwrap().connections[AGENT].clone();
+        hub.held_task_resumed(&store, "lab/other", &connection, &sent);
+        hub.held_task_resumed(&store, AGENT, "an-old-connection", &sent);
+        let forged = ErrorBody {
+            of: Some(sent.clone()),
+            code: ErrorCode::Conflict,
+            message: "forged".into(),
+        };
+        assert!(!hub.held_task_error(&store, "lab/other", &connection, &forged));
+        assert!(!hub.held_task_error(&store, AGENT, "an-old-connection", &forged));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(state(&store, "t1"), HeldTaskState::Held);
+        // The real one still settles it.
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Resumed);
+    }
+
+    #[test]
+    fn cards_reach_only_the_home_owners_paired_devices() {
+        let (_dir, hub, store, _phone, rx) = fixture();
+        let guest = device("guest-phone", GUEST);
+        store.add_device(&guest).unwrap();
+        let (guest_tx, guest_rx) = channel();
+        let (unpaired_tx, unpaired_rx) = channel();
+        let (second_tx, second_rx) = channel();
+        let second = device("tablet", OWNER);
+        store.add_device(&second).unwrap();
+        {
+            let mut devices = hub.devices.lock().unwrap();
+            devices.insert(guest.id.clone(), (GUEST.into(), guest_tx, 2));
+            // Connected, and unpaired since.
+            devices.insert("gone-phone".into(), (OWNER.into(), unpaired_tx, 3));
+            devices.insert(second.id.clone(), (OWNER.into(), second_tx, 4));
+        }
+        let _plugin = reported(&hub, &rx);
+        assert!(matches!(next(&second_rx), ToDevice::HeldTask { .. }));
+        assert!(guest_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(unpaired_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_persons_other_devices_get_the_resumed_card_too() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let second = device("tablet", OWNER);
+        store.add_device(&second).unwrap();
+        let (second_tx, second_rx) = channel();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        hub.devices
+            .lock()
+            .unwrap()
+            .insert(second.id.clone(), (OWNER.into(), second_tx, 2));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        say(
+            &mut plugin,
+            "resumed",
+            FromPlugin::HeldTaskResumed { of: sent },
+        );
+        let resumed = card(next(&second_rx));
+        assert_eq!(resumed.state, HeldTaskState::Resumed);
+        // The receipt is the asking device's alone.
+        assert!(matches!(next(&second_rx), ToDevice::Message(_)));
+        assert!(second_rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn a_card_no_longer_held_cannot_be_resumed() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        say(
+            &mut plugin,
+            "report-2",
+            FromPlugin::HeldTasks { tasks: vec![] },
+        );
+        plugin_frame(&from_bridge);
+        let released = card(next(&rx));
+        assert_eq!(released.state, HeldTaskState::Released);
+        let error = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", released.revision),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_same_request_while_pending_and_after_unconfirmed_reaches_the_runtime_once() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        let tap = MessageId::new("tap").unwrap();
+        hub.held_task_resume(&store, &phone, OWNER, tap.clone(), resume("t1", 0))
+            .unwrap();
+        hub.held_task_resume(&store, &phone, OWNER, tap.clone(), resume("t1", 0))
+            .unwrap();
+        plugin_frame(&from_bridge);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        for pending in hub.held_tasks.lock().unwrap().pending.values_mut() {
+            pending.started -= TIMEOUT;
+        }
+        hub.expire_held_resumes(&store);
+        let first = next(&rx);
+        assert!(matches!(&first, ToDevice::Error(e) if e.code == ErrorCode::Unconfirmed));
+        // Sent again by the device: the same answer, nothing to the runtime.
+        hub.held_task_resume(&store, &phone, OWNER, tap, resume("t1", 0))
+            .unwrap();
+        assert_eq!(next(&rx), first);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_confirmation_after_the_timeout_is_still_recorded() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        for pending in hub.held_tasks.lock().unwrap().pending.values_mut() {
+            pending.started -= TIMEOUT;
+        }
+        hub.expire_held_resumes(&store);
+        assert!(matches!(next(&rx), ToDevice::Error(e) if e.code == ErrorCode::Unconfirmed));
+        say(
+            &mut plugin,
+            "late",
+            FromPlugin::HeldTaskResumed { of: sent },
+        );
+        assert_eq!(card(next(&rx)).state, HeldTaskState::Resumed);
+        assert_eq!(
+            resume_lines(&store),
+            [
+                "lab/main t1 requested",
+                "lab/main t1 unknown: timed out",
+                "lab/main t1 confirmed late"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_answer_is_not_dropped_when_the_paired_devices_cannot_be_read() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        break_table(&hub, "devices");
+        say(
+            &mut plugin,
+            "refused",
+            FromPlugin::Error(ErrorBody {
+                of: Some(sent),
+                code: ErrorCode::Conflict,
+                message: "no longer blocked".into(),
+            }),
+        );
+        let ToDevice::Error(error) = next(&rx) else {
+            panic!("an answer");
+        };
+        assert_eq!(
+            (error.of.unwrap().as_str(), error.code),
+            ("tap", ErrorCode::Unconfirmed)
+        );
+    }
+
+    #[test]
+    fn a_resume_the_log_cannot_record_is_not_sent() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        break_table(&hub, "log");
+        let error = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_resume_the_bridge_cannot_record_reads_resumed_and_is_recorded_later() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        block_writes(&hub);
+        say(
+            &mut plugin,
+            "resumed",
+            FromPlugin::HeldTaskResumed { of: sent },
+        );
+        let ToDevice::HeldTaskResult { held_task, .. } = next(&rx) else {
+            panic!("a result");
+        };
+        assert_eq!(held_task.state, HeldTaskState::Resumed);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Held, "not written yet");
+        unblock_writes(&hub);
+        // The plugin's next report, without the task, does not release it:
+        // the resume is recorded first.
+        say(
+            &mut plugin,
+            "report-2",
+            FromPlugin::HeldTasks { tasks: vec![] },
+        );
+        plugin_frame(&from_bridge);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Resumed);
+        assert!(hub.held_tasks.lock().unwrap().unrecorded.is_empty());
+    }
+
+    #[test]
+    fn cards_that_could_not_expire_expire_at_the_next_sweep() {
+        let (_dir, hub, store, _phone, rx) = fixture();
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[task("t1")])
+            .unwrap();
+        block_writes(&hub);
+        let _plugin = fake_plugin(&hub, vec![Capability::Typing]);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Held);
+        unblock_writes(&hub);
+        hub.expire_held_resumes(&store);
+        assert_eq!(card(next(&rx)).state, HeldTaskState::Expired);
+        assert!(hub.held_tasks.lock().unwrap().expiring.is_empty());
+    }
+
+    #[test]
+    fn a_channel_without_held_tasks_answers_a_resume_unsupported() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[task("t1")])
+            .unwrap();
+        // Expiry fails, so the card is still held when the person taps.
+        block_writes(&hub);
+        let (_plugin, from_bridge) = fake_plugin(&hub, vec![Capability::Typing]);
+        unblock_writes(&hub);
+        let error = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn a_forgotten_agents_report_is_refused() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        store.forget_agent(AGENT, OWNER, &phone.id).unwrap();
+        say(
+            &mut plugin,
+            "report-2",
+            FromPlugin::HeldTasks {
+                tasks: vec![task("t1")],
+            },
+        );
+        let FromBridge::Error(error) = plugin_frame(&from_bridge).body else {
+            panic!("refused");
+        };
+        assert_eq!(error.code, ErrorCode::NotAllowed);
+        assert!(store.held_task(AGENT, "t1").unwrap().is_none());
     }
 }

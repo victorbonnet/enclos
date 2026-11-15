@@ -9,7 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -229,6 +229,19 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
         writer.close()
 
+    async def test_a_held_task_resume_is_unsupported_not_a_second_hello(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(line("held_task.resume", task="t_1", revision="e:1", person="p@example.com", device="d1")
+                     .replace(b'"id": "', b'"id": "resume-', 1))
+        await writer.drain()
+        while True:
+            answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            if answer["type"] == "error" and answer.get("of", "").startswith("resume-"):
+                break
+        self.assertEqual(answer["code"], "unsupported")
+        writer.close()
+
     async def test_a_message_the_runtime_did_not_take_is_not_a_duplicate_when_sent_again(self):
         self.adapter.failures.append(RuntimeError("the runtime is busy"))
         again = line("message.in", conversation="c-1", person="alice@example.com", text="hi")
@@ -292,6 +305,80 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         await self.adapter.send("c-1", "second", None)
         sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual(sent["text"], "second")
+        writer.close()
+
+    async def test_activity_follows_typing_for_a_bridge_that_reads_it(self):
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["activity", "tasks"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        # No board in this Hermes: activity, and no tasks
+        self.assertIn("activity", hello["capabilities"])
+        self.assertNotIn("tasks", hello["capabilities"])
+        idle = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((idle["type"], idle["doing"], idle["since"]), ("agent.activity", [], 0))
+        await self.adapter.send_typing("c-1")
+        typing, activity = [json.loads(await asyncio.wait_for(reader.readline(), 5)) for _ in range(2)]
+        self.assertEqual((typing["type"], typing["on"]), ("typing", True))
+        self.assertEqual(activity["doing"], [{"kind": "answering", "conversation": "c-1"}])
+        # The bridge acknowledges it, which changes nothing
+        writer.write(line("ack", of=activity["id"]))
+        await writer.drain()
+        await self.adapter.stop_typing("c-1")
+        typing, activity = [json.loads(await asyncio.wait_for(reader.readline(), 5)) for _ in range(2)]
+        self.assertEqual((typing["on"], activity["doing"], activity["since"]), (False, [], 0))
+        writer.close()
+
+    async def test_an_older_bridge_gets_no_activity(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        await self.adapter.send_typing("c-1")
+        await self.adapter.stop_typing("c-1")
+        sent = [json.loads(await asyncio.wait_for(reader.readline(), 5))["type"] for _ in range(2)]
+        self.assertEqual(sent, ["typing", "typing"])
+        writer.close()
+
+    async def test_the_board_hooks_hermes_knows_are_registered_as_cues(self):
+        adapter_module = sys.modules[EnclosAdapter.__module__]
+        plugins = types.ModuleType("hermes_cli.plugins")
+        # An older Hermes: two of the board's hooks, and not the others.
+        plugins.VALID_HOOKS = {"pre_tool_call", "post_tool_call", "kanban_task_claimed", "on_kanban_task_updated"}
+        package = types.ModuleType("hermes_cli")
+        package.plugins = plugins
+        ctx = Mock()
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.plugins": plugins}):
+            adapter_module.register(ctx)
+        board_hooks = [c.args[0] for c in ctx.register_hook.call_args_list
+                       if c.args[1] is adapter_module._board_changed]
+        self.assertEqual(board_hooks, ["kanban_task_claimed", "on_kanban_task_updated"])
+        self.assertTrue(set(board_hooks) <= set(adapter_module.tasks.HOOKS))
+
+    async def test_a_board_hook_cues_each_connected_adapters_reporter(self):
+        adapter_module = sys.modules[EnclosAdapter.__module__]
+        self.assertFalse(self.adapter._reporter._cue.is_set())
+        # From the thread that wrote the board, as Hermes calls it.
+        await asyncio.to_thread(adapter_module._board_changed, task_id="t-1")
+        for _ in range(100):
+            if self.adapter._reporter._cue.is_set():
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(self.adapter._reporter._cue.is_set())
+
+    async def test_a_bridge_error_for_a_task_message_has_it_sent_again(self):
+        reporter = self.adapter._reporter
+        reporter._unanswered["m-1"] = ["t-1"]
+        reporter._sent["t-1"] = {"id": "t-1"}
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        with self.assertLogs("enclos.adapter", "WARNING"):
+            writer.write(line("error", of="m-1", code="bad_message", message="the sandbox already has 100 tasks"))
+            writer.write(line("ack", of="m-1"))
+            await writer.drain()
+            for _ in range(100):
+                if "m-1" not in reporter._unanswered:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertNotIn("t-1", reporter._sent)
         writer.close()
 
     async def test_a_kept_message_the_bridge_could_not_read_is_set_aside_not_sent(self):
