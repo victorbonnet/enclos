@@ -123,6 +123,9 @@ impl Hub {
                 ),
             }
         }
+        // Its tasks too (ADR 0068, proposed): no plugin is left to report
+        // them, and they would count in its sandbox's bound.
+        self.tasks_unreported(store, agent);
         Ok(())
     }
 

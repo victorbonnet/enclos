@@ -269,3 +269,40 @@ fn the_plugin_hears_the_claimed_home_and_a_forgotten_agent_is_not_connected() {
     let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(hello["home"], "home.lab.main.2");
 }
+
+#[test]
+fn forgetting_an_agent_drops_the_tasks_kept_for_it() {
+    let (_dir, hub, store) = fixture();
+    let (device, rx) = phone(&hub, &store, "phone", "alice");
+    store.ensure_home("gone/coder", "alice", true).unwrap();
+    let task = |id: &str, agent: &str| enclos_protocol::task::Task {
+        id: id.into(),
+        title: "Fix it".into(),
+        assignee: agent.into(),
+        asked_by: None,
+        conversation: None,
+        state: enclos_protocol::task::TaskState::Running,
+        since: 1,
+        summary: None,
+    };
+    store
+        .put_task("gone", &task("t1", "gone/coder"), 1)
+        .unwrap();
+    store.put_task("gone", &task("t2", "gone/lead"), 1).unwrap();
+    hub.forget_agent(&store, &device, "alice", "gone/coder")
+        .unwrap();
+    let removed: Vec<ToDevice> = rx
+        .try_iter()
+        .filter(|m| matches!(m, ToDevice::TaskRemoved { .. }))
+        .collect();
+    assert_eq!(
+        removed,
+        [ToDevice::TaskRemoved {
+            agent: "gone/coder".into(),
+            task: "t1".into()
+        }]
+    );
+    let (kept, _) = store.tasks(2).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, "t2");
+}

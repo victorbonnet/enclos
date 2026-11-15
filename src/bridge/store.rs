@@ -15,10 +15,13 @@ mod forget_store;
 pub use forget_store::{Forget, setup_home};
 #[path = "question_store.rs"]
 mod question_store;
+#[path = "task_store.rs"]
+mod task_store;
 pub use question_store::{
     MAX_PENDING_APPROVALS_PER_AGENT, MAX_PENDING_APPROVALS_PER_CONVERSATION, MAX_PENDING_PER_AGENT,
     MAX_PENDING_PER_CONVERSATION, QuestionChange, QuestionStoreError, Settlement, StoredQuestion,
 };
+pub use task_store::{TaskChanges, TaskKey, bridge_runs, hold_live, live_path};
 
 /// Who wrote a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +455,15 @@ CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tasks (
+    sandbox TEXT NOT NULL,
+    id TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    body TEXT NOT NULL,
+    ended INTEGER,
+    PRIMARY KEY (sandbox, id)
+);
+CREATE TABLE IF NOT EXISTS agent_activity (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
 ";
 
 /// The `settings` row naming the host's person (ADR 0044).

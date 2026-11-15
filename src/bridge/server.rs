@@ -42,6 +42,8 @@ mod policy;
 mod questions;
 #[path = "routines.rs"]
 mod routines;
+#[path = "tasks.rs"]
+mod tasks;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -188,6 +190,12 @@ struct Hub {
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
     commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// What each agent not idle is doing, as its plugin last said (ADR
+    /// 0068, proposed): kept while its plugin is connected.
+    activity: Mutex<HashMap<String, (u64, enclos_protocol::task::Activity)>>,
+    /// The lock that tells `enclos status` a bridge runs, held while the
+    /// hub lives (`store::live_path`).
+    _live: Option<std::fs::File>,
     /// Each group's discussion, while one runs or since the last ended
     /// (ADR 0045, proposed); its turns are also in the database.
     groups: Mutex<HashMap<String, Discussion>>,
@@ -391,6 +399,16 @@ impl Hub {
         {
             let _ = store.claim_host(host);
         }
+        // What an agent was doing when the bridge last stopped is not known
+        // now: each plugin says again when it connects.
+        if let Ok(store) = Store::open(&store_path)
+            && let Err(e) = store.clear_activity()
+        {
+            eprintln!("enclos app: cannot clear the agents' activity: {e}");
+        }
+        // Held while the bridge runs: `enclos status` shows the activity
+        // recorded only while a bridge holds it.
+        let live = super::store::hold_live(&store_path);
         let opening = agents
             .iter()
             .map(|a| (a.name.clone(), Mutex::new(())))
@@ -413,6 +431,8 @@ impl Hub {
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
+            activity: Mutex::new(HashMap::new()),
+            _live: live,
             paces: Mutex::new(HashMap::new()),
             unstored: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
@@ -521,6 +541,8 @@ impl Hub {
                 });
             }
         }
+        drop(commands);
+        answer.extend(self.activities_for(store, person));
         Ok(Ok(answer))
     }
 
@@ -644,6 +666,8 @@ impl Hub {
             self.sync_questions(store, agent, &mut writer)?;
         }
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
+        let reports_activity = hello.capabilities.contains(&Capability::Activity);
+        let reports_tasks = hello.capabilities.contains(&Capability::Tasks);
         {
             let mut plugins = self.plugins.lock().expect("not poisoned");
             if plugins.contains_key(agent) {
@@ -679,12 +703,27 @@ impl Hub {
                 commands: Vec::new(),
             });
         }
+        // A plugin that no longer reports activity: idle, as far as the
+        // bridge can tell.
+        if !reports_activity {
+            self.set_activity(store.as_ref(), agent, generation, Default::default());
+        }
+        // Nor its tasks: what the bridge kept of them is dropped.
+        if !reports_tasks && let Some(store) = &store {
+            self.tasks_unreported(store, agent);
+        }
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
         // The plugin puts the files the agent sends in the sandbox home.
         let home = sandbox_home(&endpoint.socket);
+        // The reader's own database connection, opened before the reader
+        // starts: opening runs the schema, so one opened later could make
+        // again a table the database changed meanwhile, and the connection
+        // would read the plugin's first messages against a schema newer
+        // than this call returned with.
+        let reader_store = hub.store();
         std::thread::spawn(move || {
-            let store = match hub.store() {
+            let store = match reader_store {
                 Ok(store) => store,
                 Err(e) => return eprintln!("enclos app: {e}"),
             };
@@ -1018,6 +1057,29 @@ impl Hub {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
+                    // What the agent is doing: kept while it is connected,
+                    // passed on live (ADR 0068, proposed).
+                    FromPlugin::Activity(activity) if reports_activity => {
+                        let activity = activity
+                            .cleaned(now(), |c| approvals::speaks_in(&store, &agent, c.as_str()));
+                        hub.set_activity(Some(&store), &agent, generation, activity);
+                    }
+                    // Its tasks: kept, for the host's person. Refused, the
+                    // plugin is told why and the task acknowledged; not
+                    // stored, the connection ends and the plugin's next
+                    // `tasks` list brings it again.
+                    FromPlugin::TaskUpdate { task } if reports_tasks => {
+                        let result = hub.task_reported(&store, &agent, task);
+                        if !answer_tasks(&hub, &agent, &mut acks, message.id, result) {
+                            break;
+                        }
+                    }
+                    FromPlugin::Tasks { tasks } if reports_tasks => {
+                        let result = hub.tasks_reported(&store, &agent, tasks);
+                        if !answer_tasks(&hub, &agent, &mut acks, message.id, result) {
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1032,6 +1094,9 @@ impl Hub {
                 plugins.remove(&agent);
             }
             drop(plugins);
+            // No plugin left to say the agent stopped: what this connection
+            // reported ends with it, however it closed.
+            hub.end_activity(Some(&store), &agent, generation);
             // Not when a newer connection is the agent's: the turn running
             // may be one sent on it
             if current {
@@ -1300,6 +1365,38 @@ const MAX_TOOL_LABEL_CHARS: usize = 120;
 const MAX_TOOL_NAME_CHARS: usize = 64;
 /// The longest call id passed on, in characters.
 const MAX_TOOL_CALL_CHARS: usize = 128;
+
+/// Answers a plugin's `task.update` or `tasks`: acknowledged once stored,
+/// and when refused after an `error` saying why. `false` when the bridge's
+/// database failed: not acknowledged, and the connection ends.
+fn answer_tasks(
+    hub: &Hub,
+    agent: &str,
+    acks: &mut PluginWriter,
+    id: MessageId,
+    result: Result<(), tasks::TaskRefusal>,
+) -> bool {
+    match result {
+        Ok(()) => {
+            let _ = acks.send(FromBridge::Ack { of: id });
+            true
+        }
+        Err(tasks::TaskRefusal::Bad(why)) => {
+            eprintln!("enclos app: {agent}: a task is refused: {why}");
+            let _ = acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
+                of: Some(id.clone()),
+                code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                message: why,
+            }));
+            let _ = acks.send(FromBridge::Ack { of: id });
+            true
+        }
+        Err(tasks::TaskRefusal::Store(why)) => {
+            hub.kept_by_plugin(agent, acks, &why);
+            false
+        }
+    }
+}
 
 /// A tool step from `agent`'s plugin as the bridge passes it on, with the
 /// person to send it to: `None` unless its conversation is one of `agent`'s
@@ -2499,6 +2596,16 @@ fn run_session(
                             log_too_large(store, &device.id, person, &what, &body);
                         }
                     }
+                    // Every kept task, whatever `since` (ADR 0068, proposed)
+                    for task in hub.tasks_for_sync(store, person)? {
+                        let what = format!("task {}", task.id);
+                        let body = ToDevice::Task { task };
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, &what, &body);
+                        }
+                    }
                 }
                 // Every conversation first, archived or active, named or empty,
                 // then the messages. Metadata does not depend on `since`.
@@ -3589,6 +3696,11 @@ mod connection_end_tests {
     }
 
     fn paired(bridge: &Bridge, node: &str) -> Phone {
+        paired_as(bridge, node, PERSON)
+    }
+
+    /// A device paired for `person`.
+    fn paired_as(bridge: &Bridge, node: &str, person: &str) -> Phone {
         let noise = generate_keypair().unwrap();
         let signing = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let id = new_id().unwrap();
@@ -3597,7 +3709,7 @@ mod connection_end_tests {
             .add_device(&Device {
                 id: id.clone(),
                 name: "Pixel".to_owned(),
-                person: PERSON.to_owned(),
+                person: person.to_owned(),
                 noise_key: noise.public,
                 device_key: signing
                     .verifying_key()
@@ -4288,6 +4400,59 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 .as_deref(),
             Some("bob@example.com")
         );
+    }
+
+    /// The tasks a sync from 0 sends `device`, up to `synced`.
+    fn synced_tasks(device: &mut PhoneLink) -> Vec<enclos_protocol::task::Task> {
+        device.send("sync-tasks", FromDevice::Sync { since: 0 });
+        let mut tasks = Vec::new();
+        loop {
+            match device.receive() {
+                Some(ToDevice::Task { task }) => tasks.push(task),
+                Some(ToDevice::Synced { .. }) => return tasks,
+                Some(_) => {}
+                None => panic!("the bridge closed the connection"),
+            }
+        }
+    }
+
+    /// A device of the host's person gets the kept tasks at its sync, and
+    /// another person's device none: tasks can hold internal plans.
+    #[test]
+    fn a_sync_gives_the_hosts_person_the_kept_tasks_and_another_person_none() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let host = paired(&bridge, "n-pixel");
+        let guest = paired_as(&bridge, "n-other", "guest@example.com");
+        Store::open(&bridge.store)
+            .unwrap()
+            .put_task(
+                "lab",
+                &enclos_protocol::task::Task {
+                    id: "t1".into(),
+                    title: "Fix the login page".into(),
+                    assignee: "lab/main".into(),
+                    asked_by: None,
+                    conversation: None,
+                    state: enclos_protocol::task::TaskState::Running,
+                    since: 1,
+                    summary: None,
+                },
+                now(),
+            )
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &host);
+        let tasks = synced_tasks(&mut device);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            (tasks[0].id.as_str(), tasks[0].assignee.as_str()),
+            ("t1", "lab/main")
+        );
+
+        *bridge.whois_login.lock().unwrap() = "guest@example.com".to_owned();
+        *bridge.node.lock().unwrap() = "n-other".to_owned();
+        let (mut other, _) = connect_as(&bridge, &guest, "guest@example.com");
+        assert!(synced_tasks(&mut other).is_empty());
     }
 
     fn start_conversation(device: &mut PhoneLink) {
