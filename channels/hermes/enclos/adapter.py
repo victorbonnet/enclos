@@ -39,6 +39,7 @@ from . import held_tasks
 from . import routines
 from . import questions
 from . import runtime_approvals
+from . import tasks
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
-        # Routine controls in progress, kept so that none is collected early.
+        # Work beside the connection (routine controls, deletions, the report
+        # after a hello), kept so that none is collected early.
         self._routine_tasks: set[asyncio.Task] = set()
         self._conversation_home = conversations.capture_home()
         self._routines = routines.Manager(self._path)
@@ -106,6 +108,9 @@ class EnclosAdapter(BasePlatformAdapter):
         # This agent's blocked tasks on Hermes's kanban board (ADR 0066): the
         # agent is the Hermes profile its socket names.
         self._held = held_tasks.Manager(self._agent, self._write)
+        # What the agent is doing, and its tasks on Hermes's board (ADR 0068).
+        self._reporter = tasks.Reporter(self._agent, self._write,
+                                        tasks.hermes_board(self._conversation_home, PLATFORM))
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -133,12 +138,14 @@ class EnclosAdapter(BasePlatformAdapter):
         self._mark_connected()
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
+        self._reporter.start()
         self._wire_plugin_handlers(None)
         logger.info("[%s] Listening for the bridge", self.name)
         return True
 
     async def disconnect(self) -> None:
         _ADAPTERS.discard(self)
+        await self._reporter.stop()
         await self._questions.close()
         await self._held.close()
         self._mark_disconnected()
@@ -180,6 +187,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._questions.bridge_supports = "questions" in hello.get("capabilities", [])
         self._questions.bridge_runtime_supports = "runtime_approvals" in hello.get("capabilities", [])
         self._held.bridge_supports = "held_tasks" in hello.get("capabilities", [])
+        self._reporter.bridge = frozenset(hello.get("capabilities", []))
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
@@ -193,6 +201,7 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("runtime_approvals")
             if self._held.native:
                 capabilities.append("held_tasks")
+            capabilities.extend(self._reporter.capabilities)
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
@@ -208,7 +217,13 @@ class EnclosAdapter(BasePlatformAdapter):
                     continue
                 await self._write(message)
             await self._questions.fallback_cards()
-            # The whole list now, when the bridge takes it, then on changes.
+            # The board is read beside the connection, so the bridge's
+            # messages are read meanwhile.
+            report = asyncio.create_task(self._reporter.connected())
+            self._routine_tasks.add(report)
+            report.add_done_callback(self._routine_tasks.discard)
+            # The agent's held tasks, the whole list now when the bridge takes
+            # them, then on changes.
             self._held.start()
             while True:
                 try:
@@ -291,6 +306,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._outbox.acknowledge(message["of"])
             self._questions.acknowledge(message["of"])
             approvals.answered(self._answers, message)
+            self._reporter.acknowledged(message["of"])
         elif kind == "policy.context":
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
@@ -322,6 +338,8 @@ class EnclosAdapter(BasePlatformAdapter):
             task.add_done_callback(self._held.tasks.discard)
         elif kind == "error":
             approvals.answered(self._answers, message)
+            # A task it refused is sent again at the board's next reading.
+            self._reporter.refused(message.get("of"))
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
             # A question or runtime approval the bridge refused would wait unseen: a
             # question goes as text, an approval is denied or sent as text.
@@ -653,11 +671,16 @@ class EnclosAdapter(BasePlatformAdapter):
             # database: the app shows the bridge's name all the same.
             logger.info("[%s] The session keeps its title: %s", self.name, e)
 
+    # Hermes keeps a turn's typing on until the turn ends, which is also what
+    # the agent's activity says of the conversation.
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         await self._write(protocol.typing(chat_id, True))
+        await self._reporter.answering(chat_id, True)
 
     async def stop_typing(self, chat_id: str) -> None:
         await self._write(protocol.typing(chat_id, False))
+        await self._reporter.answering(chat_id, False)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
@@ -728,26 +751,27 @@ def _tool_step(phase: str, tool_name: str = "", args: Any = None, tool_call_id: 
     return None
 
 
+def _board_changed(**_: Any) -> None:
+    """A kanban hook, in whichever thread wrote the board: a cue for each
+    adapter to read it now. The board, not the hook, says what changed."""
+    for adapter in list(_ADAPTERS):
+        adapter._loop.call_soon_threadsafe(adapter._reporter.cue)
+        adapter._loop.call_soon_threadsafe(adapter._held.poke)
+    return None
+
+
 def _kanban_ticked(**_: Any) -> None:
     """Hermes's kanban dispatcher ticked, in whichever thread runs it: each
-    connected adapter reads its held tasks again, on its own loop. No block
-    fires a hook in the gateway (a worker's runs in the worker), so this and
-    the adapter's timer are what notice one. Returns at once."""
+    connected adapter reads its held tasks again, on its own loop. A task the
+    dispatcher gave up on fires no hook (docs/research/hermes-tasks.md), and a
+    worker's block fires its hook in the worker, so this and the held tasks'
+    timer are what notice one. Returns at once."""
     for adapter in list(_ADAPTERS):
         try:
             adapter._loop.call_soon_threadsafe(adapter._held.poke)
         except Exception:
             logger.debug("[enclos] A kanban tick was not passed on", exc_info=True)
     return None
-
-
-def _hook_known(name: str) -> bool:
-    """Whether this Hermes fires the plugin hook `name` (an older one warns of an unknown name)."""
-    try:
-        from hermes_cli.plugins import VALID_HOOKS
-        return name in VALID_HOOKS
-    except Exception:
-        return False
 
 
 def _env_enablement() -> dict | None:
@@ -778,7 +802,15 @@ def register(ctx) -> None:
         platform_hint=protocol.PLATFORM_HINT)
     ctx.register_hook("pre_tool_call", lambda **kwargs: _tool_step("start", **kwargs))
     ctx.register_hook("post_tool_call", lambda **kwargs: _tool_step("end", **kwargs))
-    if _hook_known("on_kanban_dispatch_tick"):
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except Exception:
+        VALID_HOOKS = ()
+    for hook in tasks.HOOKS:
+        # A Hermes without the board, or an older one, has not these hooks.
+        if hook in VALID_HOOKS:
+            ctx.register_hook(hook, _board_changed)
+    if "on_kanban_dispatch_tick" in VALID_HOOKS:
         ctx.register_hook("on_kanban_dispatch_tick", _kanban_ticked)
     else:
         logger.info("[enclos] This Hermes has no kanban dispatch hook; held tasks are read on a timer only")

@@ -41,14 +41,14 @@ pub enum FromBridge {
     #[serde(rename = "question.sync")]
     QuestionSync { questions: Vec<QuestionId> },
     /// Resume this held task with the runtime's own operation, only while
-    /// it is still held at `revision` (the runtime's, from the plugin's
-    /// last `held_tasks`). A live control from the host's person, never
-    /// queued: the plugin answers `held_task.resumed` or an `error`
-    /// (`conflict` when it is no longer held at that revision).
+    /// it is still held. `revision` is the runtime's, from the plugin's last
+    /// `held_tasks`: the plugin refuses (`conflict`) one that is no longer
+    /// current when it checks. A live control from the host's person,
+    /// never queued: the plugin answers `held_task.resumed` or an `error`.
     #[serde(rename = "held_task.resume")]
     HeldTaskResume {
         task: HeldTaskId,
-        revision: String,
+        revision: crate::ids::HeldTaskRevision,
         /// Who asked, from which of their paired devices, as the bridge
         /// authenticated them.
         person: Person,
@@ -208,6 +208,15 @@ pub enum FromPlugin {
     /// whole: after the `hello`, and again when they change.
     #[serde(rename = "commands")]
     Commands { commands: Vec<Command> },
+    /// What the agent is doing, whole (`activity`).
+    #[serde(rename = "agent.activity")]
+    Activity(crate::task::Activity),
+    /// One of the agent's tasks, when it changes (`tasks`).
+    #[serde(rename = "task.update")]
+    TaskUpdate { task: crate::task::Task },
+    /// Every task of the agent's the runtime still has (`tasks`).
+    #[serde(rename = "tasks")]
+    Tasks { tasks: Vec<crate::task::Task> },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -228,6 +237,9 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "conversation.title",
     "tool",
     "commands",
+    "agent.activity",
+    "task.update",
+    "tasks",
     "ack",
     "error",
 ];
@@ -327,6 +339,10 @@ pub enum Capability {
     /// It reports its runtime's held tasks and resumes one (`held_tasks`,
     /// `held_task.resume`); requires the bridge's matching hello capability.
     HeldTasks,
+    /// It reports what the agent is doing (`agent.activity`).
+    Activity,
+    /// It reports the agent's tasks (`task.update`, `tasks`).
+    Tasks,
     #[serde(other)]
     Unknown,
 }

@@ -32,6 +32,11 @@ class FromTheBridge(unittest.TestCase):
         cases = [
             (b'{"v":1,"id":"m1","type":"message.edit"}', "unknown_type"),
             (b'{"v":1,"id":"m1","type":"message.in","text":"no conversation"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"t","person":"p","device":"d"}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"t","revision":"e\\n1","person":"p","device":"d"}',
+             "bad_message"),
+            (b'{"v":1,"id":"m1","type":"held_task.resume","task":"","revision":"e:1","person":"p","device":"d"}',
+             "bad_message"),
             (b'{"v":2,"id":"m1","type":"ack","of":"m0"}', "version"),
             (b'{"id":"m1","type":"ack","of":"m0"}', "bad_message"),
             (b'{"v":1,"id":"","type":"ack","of":"m0"}', "bad_message"),

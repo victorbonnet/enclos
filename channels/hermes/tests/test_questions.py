@@ -188,9 +188,11 @@ class AdapterControls(unittest.IsolatedAsyncioTestCase):
             adapter._outbox = types.SimpleNamespace(set_aside=lambda of: False)
             adapter._answers = {}
             adapter._held = Mock()
+            adapter._reporter = types.SimpleNamespace(refused=Mock())
             refusal = protocol.error("bad_message", "Too many questions are waiting.", "ask-1")
             await adapter._on_line(protocol.encode_line(refusal))
             adapter._questions.refused.assert_awaited_once_with("ask-1", "bad_message")
+            adapter._reporter.refused.assert_called_once_with("ask-1")  # in case it carried tasks
         sys.modules.pop("enclos.adapter", None)
 
 
