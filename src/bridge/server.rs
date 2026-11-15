@@ -36,6 +36,8 @@ mod deletions;
 mod forget;
 #[path = "group_turns.rs"]
 mod group_turns;
+#[path = "held_tasks.rs"]
+mod held_tasks;
 #[path = "policy.rs"]
 mod policy;
 #[path = "questions.rs"]
@@ -180,6 +182,8 @@ struct Hub {
     deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     deletion_jobs: Mutex<HashSet<(String, String)>>,
     questions: Mutex<questions::QuestionRequests>,
+    /// Resumes of held tasks sent to plugins, and each agent's connection.
+    held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
     /// callers that need that agent, not the bridge.
@@ -430,6 +434,7 @@ impl Hub {
             opening,
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
+            held_tasks: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
             _live: live,
@@ -659,6 +664,12 @@ impl Hub {
         };
         let store = self.store().ok();
         self.question_connected(store.as_ref(), origin, &hello.capabilities);
+        self.held_task_connected(
+            store.as_ref(),
+            agent,
+            &routine_connection,
+            &hello.capabilities,
+        );
         if (hello.capabilities.contains(&Capability::Questions)
             || hello.capabilities.contains(&Capability::RuntimeApprovals))
             && let Some(store) = &store
@@ -757,6 +768,9 @@ impl Hub {
                         ) {
                             continue;
                         }
+                        if hub.held_task_error(&store, &agent, &routine_connection, &error) {
+                            continue;
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -766,6 +780,18 @@ impl Hub {
                             hub.fail_turns(&store, &agent, Some(of.as_str()), &why);
                         }
                         hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
+                    // Every task the runtime holds now, whole: the cards in
+                    // the agent's Home follow it (ADR 0066, proposed).
+                    FromPlugin::HeldTasks { tasks } => {
+                        let result = hub.held_tasks_report(&store, &agent, tasks);
+                        if let Err((_, why)) = &result {
+                            eprintln!("enclos app: {agent}'s held tasks refused: {why}");
+                        }
+                        held_tasks::acknowledge_report(&mut acks, &message.id, result);
+                    }
+                    FromPlugin::HeldTaskResumed { of } => {
+                        hub.held_task_resumed(&store, &agent, &routine_connection, &of);
                     }
                     FromPlugin::QuestionAsk {
                         conversation,
@@ -1087,6 +1113,7 @@ impl Hub {
             hub.delete_disconnected(&agent, generation);
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
+            hub.held_task_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
             // turn it was running gets no reply on this connection.
             let mut plugins = hub.plugins.lock().expect("not poisoned");
@@ -1314,7 +1341,7 @@ pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<T
         .collect();
     Ok(ToDevice::Message(ConversationMessage {
         question: m.question,
-        held_task: None,
+        held_task: m.held_task,
         conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
         agent,
         from: match m.from {
@@ -2293,6 +2320,21 @@ fn run_session(
                     link.send(ToDevice::Error(error))?;
                 }
             }
+            FromDevice::HeldTaskResume {
+                agent,
+                task,
+                revision,
+            } => {
+                let request = held_tasks::ResumeRequest {
+                    agent,
+                    task,
+                    revision,
+                };
+                if let Err(error) = hub.held_task_resume(store, device, person, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
@@ -2633,6 +2675,16 @@ fn run_session(
                         })?;
                     }
                 }
+                // Held tasks' cards still held, whatever `since`: a card's
+                // first message may predate it.
+                for card in store.held_tasks_for(person).map_err(|e| e.to_string())? {
+                    let body = ToDevice::HeldTask {
+                        held_task: card.info,
+                    };
+                    if fits_device(&body) {
+                        link.send(body)?;
+                    }
+                }
                 // Where each group's discussion is, before its messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(state) = hub.group_state(store, &c.id) {
@@ -2683,15 +2735,6 @@ fn run_session(
                 let _ = link.socket.close(None);
                 let _ = link.socket.flush();
                 return Ok(());
-            }
-            // Decoded, but this bridge keeps no held tasks yet: answered,
-            // so the device does not wait for a result.
-            FromDevice::HeldTaskResume { .. } => {
-                link.send(ToDevice::Error(ErrorBody {
-                    of: Some(message.id),
-                    code: ErrorCode::Unsupported,
-                    message: "This host does not support held tasks.".into(),
-                }))?;
             }
             _ => {}
         }
@@ -2756,6 +2799,19 @@ fn send_history(
             link.send(ToDevice::Question {
                 question: current.info,
             })?;
+        }
+        if let Some(task) = &m.held_task
+            && let Some(card) = store
+                .held_task_in(&m.conversation, task.as_str())
+                .map_err(|e| e.to_string())?
+            && card.owner == person
+        {
+            let body = ToDevice::HeldTask {
+                held_task: card.info,
+            };
+            if fits_device(&body) {
+                link.send(body)?;
+            }
         }
         let what = format!("message {} of conversation {}", m.id, m.conversation);
         let body = message_frame(store, m)?;

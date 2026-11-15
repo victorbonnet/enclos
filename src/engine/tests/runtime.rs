@@ -5177,3 +5177,168 @@ fn review_resume_failure_reports_that_presentation_was_already_restored() {
         Some("Recovered name")
     );
 }
+
+#[test]
+fn usage_reads_each_agents_records_inside_the_sandbox_and_removes_its_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // `scout` is listed, and was never used: no `state.db` of its own.
+    let scout = lab.home.join(".hermes/profiles/scout");
+    std::fs::create_dir_all(&scout).unwrap();
+    std::fs::write(scout.join("config.yaml"), "").unwrap();
+    // Hermes's table, without `cache_write_tokens`: an older Hermes's.
+    let db = rusqlite::Connection::open(lab.home.join(".hermes/state.db")).unwrap();
+    db.execute_batch(
+        "create table sessions(id text, source text, model text, title text, started_at real,
+             last_activity_at real, api_call_count integer, input_tokens integer,
+             output_tokens integer, cache_read_tokens integer, cost_status text,
+             estimated_cost_usd real);
+         insert into sessions values
+             ('s1', 'enclos', 'gpt', 'Weather', 4102444800, 4102444800, 26, 83087, 6084,
+              762752, 'included', 0.0),
+             ('old', 'cli', 'gpt', 'Old', 1, 1, 1, 9, 9, 9, 'included', 0.0);",
+    )
+    .unwrap();
+    drop(db);
+
+    let since = crate::model::Timestamp::from_second(1_000_000).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert_eq!(sandbox.runtime, Some("Hermes"));
+    let Fact::Known(agents) = &sandbox.agents else {
+        panic!("{sandbox:?}")
+    };
+    let by_name = |n: &str| &agents.iter().find(|a| a.agent == n).unwrap().usage;
+    let Fact::Known(records) = by_name("default") else {
+        panic!("{agents:?}")
+    };
+    let [model] = records.models.as_slice() else {
+        panic!("{records:?}")
+    };
+    // The old chat is outside the window, and a count the table does not
+    // keep is not provided, never 0.
+    assert_eq!(model.chats, 1);
+    assert_eq!(model.calls, Some(26));
+    assert_eq!(model.tokens.input, Some(83087));
+    assert_eq!(model.tokens.cache_read, Some(762752));
+    assert_eq!(model.tokens.cache_write, None);
+    assert_eq!(model.cost.kind, crate::engine::CostKind::Included);
+    assert_eq!(records.top[0].title.as_deref(), Some("Weather"));
+    assert_eq!(by_name("scout"), &Fact::Absent);
+    let left = std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        });
+    assert!(!left, "the report stayed in the home");
+    assert!(lab.audit().contains("usage session"), "{}", lab.audit());
+}
+
+/// A stand-in for Hermes's own Python, where the usage reader looks for
+/// it: `body` runs with the reader's words (`-I -c <script> <report> ...`),
+/// the report's path in `$4`.
+fn usage_python(lab: &Lab, body: &str) {
+    let bin = lab.home.join(".hermes/tools/python-stub/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::test_scripts::write_script(&bin.join("python3"), body);
+}
+
+fn usage_of(lab: &Lab) -> Fact<Vec<crate::engine::AgentUsage>> {
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    view.sandboxes.into_iter().next().unwrap().agents
+}
+
+fn report_left(lab: &Lab) -> bool {
+    std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        })
+}
+
+#[test]
+fn a_usage_reader_that_fails_says_how_and_leaves_no_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // It exits non-zero without a word: how it ended.
+    usage_python(&lab, "exit 3");
+    assert_eq!(
+        usage_of(&lab),
+        Fact::CannotTell("Hermes's usage reader exited with 3".into())
+    );
+    // It wrote a report, then failed: the report goes all the same.
+    usage_python(&lab, "printf '{}' > \"$4\"; exit 1");
+    assert!(matches!(usage_of(&lab), Fact::CannotTell(why) if why.contains("exited with 1")));
+    assert!(!report_left(&lab));
+    // It wrote what is not a report.
+    usage_python(&lab, "printf 'not json' > \"$4\"");
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert!(why.starts_with("the usage report is not valid"), "{why}");
+    assert!(!report_left(&lab));
+    // It could not read at all, and said why, escaped.
+    usage_python(
+        &lab,
+        "printf '{\"format\":1,\"agents\":[],\"error\":\"OSError: \\\\u001b[2J gone\"}' > \"$4\"",
+    );
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert_eq!(
+        why,
+        "Hermes's usage reader could not read: OSError: \\u{1b}[2J gone"
+    );
+    // Nothing it prints reaches enclos's output: it goes nowhere.
+    usage_python(
+        &lab,
+        "echo printed; echo said >&2; printf '{\"format\":1,\"agents\":[]}' > \"$4\"",
+    );
+    assert!(matches!(usage_of(&lab), Fact::Known(_)));
+}
+
+#[test]
+fn usage_of_every_sandbox_leaves_one_not_running_unread_and_runs_nothing_in_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let sessions_before = lab.audit().matches("usage session").count();
+    lab.engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = lab.engine.state.get(&lab.name)?.unwrap();
+                record.state = crate::model::sandbox::SandboxState::Stopped;
+                lab.engine.state.put(lock, &record)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), None, since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert!(
+        matches!(&sandbox.agents, Fact::CannotTell(why) if why.starts_with("not running; `enclos usage home`")),
+        "{sandbox:?}"
+    );
+    assert_eq!(
+        lab.audit().matches("usage session").count(),
+        sessions_before
+    );
+}

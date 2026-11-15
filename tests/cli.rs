@@ -3020,6 +3020,40 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
     );
 }
 
+#[test]
+fn usage_without_sandboxes_says_so_and_refuses_a_bad_window() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["usage"]);
+    assert_eq!(out.ok().stdout(), "No sandboxes yet.\n");
+    let out = home.run(&["usage", "--since", "soon"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("not a duration"), "{}", out.stderr());
+    let out = home.run(&["usage", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
+    );
+}
+
+// Making a sandbox needs its backend, which only macOS has on every runner.
+#[cfg(target_os = "macos")]
+#[test]
+fn usage_of_a_sandbox_without_a_runtime_runs_nothing_in_it() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "lab", "--template", "minimal"])
+        .ok();
+    let out = home.run(&["usage", "lab", "--json", "--since", "30d"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["sandboxes"][0]["name"], "lab");
+    assert_eq!(json["sandboxes"][0]["agents"], "absent");
+    assert_eq!(json["sandboxes"][0]["runtime"], serde_json::Value::Null);
+    assert!(!home.run(&["audit"]).ok().stdout().contains("usage session"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn status_shows_each_sandbox_its_agents_and_what_to_do() {
