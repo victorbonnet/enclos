@@ -102,7 +102,8 @@ fn a_runtime_that_names_nothing_gets_sizes_no_agents_and_suggestions() {
         status.agents,
         Some(AgentList {
             agents: Vec::new(),
-            unreadable: None
+            unreadable: None,
+            activity_unreadable: None,
         })
     );
     let rt = status.runtime.as_ref().unwrap();
@@ -639,9 +640,11 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                     model: Fact::NotProvided,
                     provider: Fact::NotProvided,
                     choose_provider: None,
+                    working: Vec::new(),
                 })
                 .collect(),
             unreadable: None,
+            activity_unreadable: None,
         }),
         ..base.clone()
     };
@@ -765,4 +768,46 @@ fn the_json_view_names_each_state_and_fact() {
             "command": "enclos connect home -- hermes -p default setup"
         })
     );
+}
+
+#[test]
+fn an_agent_the_bridge_heard_working_is_said_to_be_working_while_it_runs() {
+    let (_dir, engine, name) = with_runtime();
+    let agents = |engine: &Engine| {
+        engine.status(None).unwrap().sandboxes[0]
+            .agents
+            .clone()
+            .unwrap()
+    };
+    // No bridge database: nobody is said to be working
+    assert!(agents(&engine).agents[0].working.is_empty());
+    let path = engine.layout.app_store();
+    let store = crate::bridge::store::Store::open(&path).unwrap();
+    store
+        .set_activity(
+            &format!("{name}/default"),
+            &enclos_protocol::task::Activity {
+                doing: vec![enclos_protocol::task::Doing::Task { task: "t1".into() }],
+                since: 1,
+            },
+        )
+        .unwrap();
+    // What a bridge that stopped recorded says nothing now
+    let stopped = agents(&engine);
+    assert!(stopped.agents[0].working.is_empty());
+    assert_eq!(stopped.activity_unreadable, None);
+    // A bridge that runs holds its lock
+    let live = crate::bridge::store::hold_live(&path).unwrap();
+    let list = agents(&engine);
+    assert_eq!(
+        (list.agents[0].name.as_str(), list.agents[0].working.clone()),
+        ("default", vec!["task"])
+    );
+    // A database that cannot be read is said, not taken for idle
+    std::fs::write(&path, "not a database").unwrap();
+    let unreadable = agents(&engine);
+    assert!(unreadable.agents[0].working.is_empty());
+    assert!(unreadable.activity_unreadable.is_some());
+    drop(live);
+    assert_eq!(agents(&engine).activity_unreadable, None);
 }

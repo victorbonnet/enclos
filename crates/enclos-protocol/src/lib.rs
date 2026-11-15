@@ -11,6 +11,7 @@
 //! - [`decision`]: the runtime-approval decisions the bridge signs for a
 //!   plugin.
 //! - [`held_task`]: a runtime's held tasks, on both legs.
+//! - [`task`]: tasks and agent activity, as a runtime reports them.
 //! - [`visible`]: text checked for hidden characters before a person
 //!   reads it.
 
@@ -29,6 +30,7 @@ pub mod policy;
 pub mod preview;
 pub mod question;
 pub mod routine;
+pub mod task;
 pub mod visible;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};

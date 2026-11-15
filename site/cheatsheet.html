@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#fafaf8">
+    <meta name="description" content="Every enclos command on one page: sandboxes, runtimes and agents, policy and network, secrets, the mobile app, and the host's health.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; form-action 'none'">
+    <meta name="color-scheme" content="light dark">
+    <link rel="canonical" href="https://enclos.dev/cheatsheet.html">
+    <title>Command cheatsheet — enclos</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="wordmark" href="./" aria-label="enclos, home"><svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M12 4H4v8m16-8h8v8M4 20v8h8m16-8v8h-8" stroke="currentColor" stroke-width="3"/><path d="M12 12h8v8h-8z" fill="currentColor"/></svg>enclos<span class="wordmark-dot">.</span></a>
+      <nav aria-label="Main navigation">
+        <a href="./getting-started.html">Get started</a>
+        <a href="./policy-compilation.html">Policy</a>
+        <a href="https://github.com/victorbonnet/enclos">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main" class="doc wrap">
+      <h1>Command cheatsheet</h1>
+      <p class="lead">Every enclos command on one page. <code>lab</code> stands for a sandbox, <code>lab/main</code> for one of its agents. <code>enclos &lt;command&gt; --help</code> gives the full text.</p>
+
+      <h2 id="quick-start">Quick start</h2>
+      <p>From install to talking to a Hermes agent. The commands are the same on macOS and Linux; the <a href="./getting-started.html">getting started guide</a> explains each step.</p>
+      <div class="terminal"><pre><code><span class="command">curl -fsSL https://enclos.dev/install.sh | bash</span>
+<span class="command">enclos init</span>
+<span class="command">enclos sandbox create lab --template assistant</span>
+<span class="command">enclos runtime install hermes --sandbox lab</span>
+<span class="command">enclos connect lab -- hermes -p default setup</span>
+<span class="command">enclos --yes agent add lab/main</span>
+<span class="command">enclos policy test lab</span>
+<span class="command">enclos sandbox start lab</span>
+<span class="command">enclos connect lab -- main</span>
+<span class="command">enclos net log lab</span></code></pre></div>
+
+      <h2 id="sandboxes">Sandboxes</h2>
+      <p>Each sandbox has its own home, policy and proxy. <code>start</code>, <code>stop</code> and <code>restart</code> take several names at once.</p>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos sandbox create lab --template minimal</code></dt><dd>Create a sandbox. The template is required: <code>minimal</code> reaches only what is listed and its runtime’s hosts, <code>assistant</code> the public web. <code>--backend</code> picks <code>seatbelt</code> or <code>bubblewrap</code> instead of the host’s default</dd></div>
+        <div><dt><code>enclos sandbox list</code></dt><dd>Every sandbox, its policy version and state</dd></div>
+        <div><dt><code>enclos sandbox show lab</code></dt><dd>Its state, policy version, sessions and their processes</dd></div>
+        <div><dt><code>enclos sandbox start lab</code></dt><dd>Run its proxy and its runtime’s services in the background, now and at each login</dd></div>
+        <div><dt><code>enclos sandbox stop lab</code></dt><dd>Stop every service, session and process</dd></div>
+        <div><dt><code>enclos sandbox restart lab</code></dt><dd>Stop, then start again under the active policy</dd></div>
+        <div><dt><code>enclos sandbox rm lab</code></dt><dd>Remove a stopped sandbox, its secrets and its home; <code>--keep-data</code> keeps the home</dd></div>
+      </dl>
+
+      <h2 id="agents">Runtimes, agents and sessions</h2>
+      <p>The runtime, Hermes today, runs inside the sandbox. enclos installs it, tracks its agents and opens sessions there.</p>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos runtime install hermes --sandbox lab</code></dt><dd>Install a runtime with its own installer, inside the sandbox</dd></div>
+        <div><dt><code>enclos runtime configure lab/main --set KEY=VALUE</code></dt><dd>Change an agent’s settings with the runtime’s own commands; a secret only as <code>${VAR}</code>. Repeat <code>--set</code> for each setting</dd></div>
+        <div><dt><code>enclos runtime configure lab/main --channel telegram --allow-user &lt;id&gt;</code></dt><dd>Give an agent a bot, its token a secret the policy grants it. <code>--channel app</code> connects the agent to the mobile app</dd></div>
+        <div><dt><code>enclos agent add lab/main</code></dt><dd>Create an agent, or track one the runtime already has; <code>--from &lt;archive&gt;</code> imports the runtime’s own export</dd></div>
+        <div><dt><code>enclos agent list lab</code></dt><dd>Every agent, and the ones made inside the sandbox that enclos does not track</dd></div>
+        <div><dt><code>enclos agent rm lab/main</code></dt><dd>Remove an agent and its files; <code>--keep-data</code> keeps the files</dd></div>
+        <div><dt><code>enclos agent export lab/main --to &lt;file&gt;</code></dt><dd>Export an agent’s runtime data, credentials, presentation and conversation history to a private file</dd></div>
+        <div><dt><code>enclos agent import lab/main --from &lt;file&gt;</code></dt><dd>Import an export; <code>--metadata-only</code> restores only the name and image of an existing agent</dd></div>
+        <div><dt><code>enclos connect lab</code></dt><dd>A shell inside the sandbox</dd></div>
+        <div><dt><code>enclos connect lab -- main</code></dt><dd>Run a command inside it, such as the runtime’s own to talk to an agent</dd></div>
+        <div><dt><code>enclos exec lab -- &lt;command&gt;</code></dt><dd>Run one command for a script; exits with its code</dd></div>
+        <div><dt><code>enclos dashboard lab</code></dt><dd>Open the runtime’s dashboard to you alone, until Ctrl-C</dd></div>
+      </dl>
+
+      <h2 id="policy">Policy and network</h2>
+      <p>A change applies at once, or waits as the pending policy while sessions run under rules it changes. Every version is kept. <a href="./policy-compilation.html">How a policy compiles</a> explains which is which.</p>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos policy show lab</code></dt><dd>The active policy and the pending change; <code>--pending</code> shows the pending policy in full, <code>--compiled</code> what the backend runs</dd></div>
+        <div><dt><code>enclos policy allow lab api.example.com</code></dt><dd>Let the sandbox reach a host, <code>host:port</code> or <code>*.domain</code>, without a restart</dd></div>
+        <div><dt><code>enclos policy edit lab</code></dt><dd>Edit <code>policy.toml</code> in your editor, then apply it</dd></div>
+        <div><dt><code>enclos policy apply lab</code></dt><dd>Restart the sandbox into its pending policy</dd></div>
+        <div><dt><code>enclos policy discard lab</code></dt><dd>Drop the pending policy, and any edit not applied</dd></div>
+        <div><dt><code>enclos policy history lab</code></dt><dd>Every version of the policy</dd></div>
+        <div><dt><code>enclos policy diff lab</code></dt><dd>The pending policy against the active one; <code>--from</code> and <code>--to</code> pick versions</dd></div>
+        <div><dt><code>enclos policy rollback lab --to &lt;version&gt;</code></dt><dd>Bring an earlier version back, as a new version</dd></div>
+        <div><dt><code>enclos policy refresh lab</code></dt><dd>Resolve the policy again against this enclos’s templates and defaults; <code>--yes</code> applies what changes</dd></div>
+        <div><dt><code>enclos policy test lab</code></dt><dd>Escape probes from inside the sandbox: every one must fail</dd></div>
+        <div><dt><code>enclos net log lab</code></dt><dd>Every connection, one row per HTTPS tunnel, never its contents; <code>--since 12h</code></dd></div>
+        <div><dt><code>enclos net denied lab</code></dt><dd>What was refused, to allow what you trust</dd></div>
+      </dl>
+
+      <h2 id="secrets">Secrets</h2>
+      <p>Secrets are kept in the secret store, your Keychain on macOS; the policy decides which agent gets each one. The <a href="./getting-started.html">getting started guide</a> grants a Telegram token step by step.</p>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos secret set lab/main-telegram</code></dt><dd>Store a secret: typed without echo, or piped in</dd></div>
+        <div><dt><code>enclos secret list lab</code></dt><dd>Every secret and how the policy gives it; never a value</dd></div>
+        <div><dt><code>enclos secret rm lab/main-telegram</code></dt><dd>Remove a secret</dd></div>
+      </dl>
+
+      <h2 id="app">Mobile app</h2>
+      <p>The bridge serves the enclos app’s paired devices on this host’s loopback; Tailscale puts it on your network.</p>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos app serve</code></dt><dd>Run the bridge in this terminal; <code>--port</code> defaults to 47100</dd></div>
+        <div><dt><code>enclos app pair</code></dt><dd>Show a QR code for the app to scan, then confirm the device that used it</dd></div>
+        <div><dt><code>enclos app devices</code></dt><dd>Every paired device</dd></div>
+        <div><dt><code>enclos app unpair &lt;device&gt;</code></dt><dd>Remove a device: it can no longer connect</dd></div>
+        <div><dt><code>enclos app host</code></dt><dd>The host’s person, whom each agent’s Home conversation belongs to; name a person to make it them</dd></div>
+        <div><dt><code>enclos app status</code></dt><dd>Who can reach the agents, from which devices, and when each was last seen</dd></div>
+        <div><dt><code>enclos app log</code></dt><dd>Connections, disconnections and refusals; <code>-n</code> sets how many lines</dd></div>
+        <div><dt><code>enclos app chat lab/main</code></dt><dd>Talk to an agent through its app channel from this terminal; <code>--conversation</code> goes on with one</dd></div>
+      </dl>
+
+      <h2 id="host">Host, logs and audit</h2>
+      <dl class="commands cheatsheet">
+        <div><dt><code>enclos init</code></dt><dd>Create enclos’s folders, state database and audit log, and pick the host’s backend. Safe to run again</dd></div>
+        <div><dt><code>enclos status</code></dt><dd>What is on this host, what it costs on disk, and what you could do; name a sandbox for only that one</dd></div>
+        <div><dt><code>enclos doctor</code></dt><dd>Whether this host runs each backend and each sandbox’s policy compiles</dd></div>
+        <div><dt><code>enclos state check</code></dt><dd>Where enclos’s records and the host differ; changes nothing</dd></div>
+        <div><dt><code>enclos state repair</code></dt><dd>Fix what <code>state check</code> found, and name what is left for you</dd></div>
+        <div><dt><code>enclos logs lab -f</code></dt><dd>The background services’ logs, followed as they write</dd></div>
+        <div><dt><code>enclos audit</code></dt><dd>Every change made through enclos; <code>--since 7d</code></dd></div>
+        <div><dt><code>enclos audit verify</code></dt><dd>Check that no line of the audit log was edited, deleted or reordered</dd></div>
+      </dl>
+
+      <h2 id="flags">Flags for every command</h2>
+      <dl class="commands cheatsheet">
+        <div><dt><code>--yes</code></dt><dd>Make changes without asking for confirmation</dd></div>
+        <div><dt><code>--dry-run</code></dt><dd>Show what would change, and change nothing</dd></div>
+        <div><dt><code>--json</code></dt><dd>Print JSON, also in a terminal. It is the default when the output is piped, except for <code>connect</code>, <code>exec</code> and <code>logs</code></dd></div>
+        <div><dt><code>--text</code></dt><dd>Print readable text, also when the output is piped</dd></div>
+      </dl>
+    </main>
+
+    <footer class="site-footer wrap"><span>French for an enclosure. Said “ahn-KLOH.”</span><div><a href="https://github.com/victorbonnet/enclos">Source</a><a href="https://github.com/victorbonnet/enclos/blob/main/SECURITY.md">Security</a><a href="https://github.com/victorbonnet/enclos/blob/main/LICENSE">MIT license</a></div></footer>
+  </body>
+</html>
