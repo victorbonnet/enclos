@@ -422,6 +422,23 @@ pub trait RuntimeAdapter {
         None
     }
 
+    /// The runtime's own command that reports what each of `agents` used
+    /// of its model providers in native chats active since `since` (Unix
+    /// seconds), run in the sandbox by `enclos usage`. It reads the
+    /// runtime's records inside the sandbox, so the host never opens what
+    /// the agent can write, and creates `report`, a new file in the sandbox
+    /// home, holding enclos's runtime-neutral usage report
+    /// (`engine::usage`, design §11). `None` (the default): the runtime
+    /// keeps no usage enclos can read.
+    fn usage(
+        &self,
+        _agents: &[RuntimeAgentName],
+        _since: i64,
+        _report: &Path,
+    ) -> Option<SandboxCommand> {
+        None
+    }
+
     // What `enclos status` shows. Each answer may be "cannot
     // tell", and a runtime that names nothing still gets sizes.
 

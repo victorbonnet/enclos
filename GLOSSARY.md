@@ -111,6 +111,14 @@ _Avoid_: run, job, instance
 A session whose end is not recorded though none of its members runs any more, because nothing was left to record it, as after a crash or a restart of the Mac.
 _Avoid_: stale session, zombie session
 
+**Native chat**:
+The runtime's own record of one exchange with an agent, whatever started it: a conversation in the app, a talk in the sandbox, a routine's run. Hermes calls it a session.
+_Avoid_: session (a sandbox's word), thread
+
+**Usage**:
+What an agent's model calls consumed, as its runtime counts them: requests, input, output, cache-read, cache-write and reasoning tokens, and cost. A runtime counts it inside the sandbox, so it guides, and bills nothing.
+_Avoid_: consumption, spend, billing, quota (a provider's limit)
+
 **Secret**:
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key

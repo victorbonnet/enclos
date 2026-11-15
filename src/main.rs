@@ -78,6 +78,13 @@ enum Command {
     /// from a sandbox is `{"known": …}`, `"absent"`, `{"cannot_tell": why}`
     /// or `"not_provided"`.
     Status(cli::status::StatusArgs),
+    /// What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them.
+    ///
+    /// Reads the runtime's records inside the sandbox, as an exec session.
+    /// In JSON, each count the runtime does not keep is `null`, and each
+    /// read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or
+    /// `"not_provided"`.
+    Usage(cli::usage::UsageArgs),
     /// Run one of a sandbox's runtime services; started by the service manager.
     #[command(hide = true)]
     Launch(cli::launch::LaunchArgs),
@@ -350,6 +357,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Dashboard(args) => cli::dashboard::run(&engine, &current_actor(), args),
         Command::Status(args) => cli::status::run(&engine, args),
+        Command::Usage(args) => cli::usage::run(&engine, &current_actor(), args),
     }
 }
 
@@ -394,6 +402,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Holder(_)
         | Command::Launch(_)
         | Command::Dashboard(_)
+        | Command::Usage(_)
         | Command::Logs(_) => false,
     }
 }
@@ -424,6 +433,7 @@ fn writes_wait(command: &Command) -> Wait {
         | Command::Runtime(_)
         | Command::Inside(_)
         | Command::Dashboard(_)
+        | Command::Usage(_)
         | Command::Logs(_)
         | Command::App(_) => Wait::Command,
     }

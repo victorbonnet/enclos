@@ -404,6 +404,33 @@ impl RuntimeAdapter for Hermes {
         }
     }
 
+    fn usage(
+        &self,
+        agents: &[RuntimeAgentName],
+        since: i64,
+        report: &Path,
+    ) -> Option<SandboxCommand> {
+        // Hermes keeps each agent's sessions, with their token counts and
+        // cost, in its own `state.db` (`hermes_state.py`); its own Python,
+        // which its installer puts in `~/.hermes/tools/python-<version>/`
+        // (seen with the install of 2026-11), reads them read-only inside
+        // the sandbox, else the sandbox's `python3`. Isolated (`-I`), so no
+        // file the agent planted in its site folders or here runs; and its
+        // output goes nowhere, so nothing it prints reaches the host's
+        // terminal or JSON unescaped: what it has to say is in the report.
+        let mut words: Vec<OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "python=python3; for candidate in \"$HOME\"/.hermes/tools/python-*/bin/python3; do if [ -x \"$candidate\" ]; then python=\"$candidate\"; fi; done; script=\"$1\"; shift; exec \"$python\" -I -c \"$script\" \"$@\" </dev/null >/dev/null 2>&1".into(),
+            "enclos-hermes-usage".into(),
+            include_str!("hermes/usage.py").into(),
+            report.as_os_str().to_owned(),
+            since.to_string().into(),
+        ];
+        words.extend(agents.iter().map(|a| OsString::from(a.as_str())));
+        Some(SandboxCommand::new(words))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
