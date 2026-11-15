@@ -129,14 +129,13 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         ))
     })?;
     // Read again while the bridge runs, as enclos's state changes.
-    let (watch, agents) =
-        AgentWatch::start(AgentSource::of_state(engine.app_layout())).map_err(failed)?;
+    let watch = AgentWatch::start(AgentSource::of_state(engine.app_layout())).map_err(failed)?;
     eprintln!(
         "The bridge serves {} agent(s) on 127.0.0.1:{port}, through {transport}, and follows the agents given or losing an app channel while it runs. Put it on your network with:\n  {}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
-        agents.len(),
+        watch.agents().len(),
         transport.expose_hint(port)
     );
-    for agent in &agents {
+    for agent in watch.agents() {
         eprintln!("  {}", agent.name);
     }
     let executable = std::env::current_exe().map_err(|e| {
@@ -151,7 +150,6 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         engine.app_layout(),
         key.private.to_vec(),
         approvals,
-        agents,
         watch,
         Host::new(engine.app_layout(), executable),
     )

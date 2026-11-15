@@ -19,10 +19,17 @@ pub struct AppEndpoint {
 /// The agents given an app channel, as [`Engine::app_agents`] reads them.
 #[derive(Default)]
 pub struct AppAgents {
-    /// `(sandbox, agent, runtime)`.
-    pub agents: Vec<(SandboxName, String, String)>,
-    /// Each sandbox whose policy could not be read, and why.
+    pub agents: Vec<AppAgent>,
+    /// Each sandbox whose policy or runtime could not be read, and why.
     pub unreadable: Vec<(SandboxName, String)>,
+}
+
+/// An agent whose active policy grants it an app channel token.
+pub struct AppAgent {
+    pub sandbox: SandboxName,
+    pub agent: String,
+    /// The sandbox's runtime; empty while none is installed.
+    pub runtime: String,
 }
 
 impl Engine {
@@ -107,30 +114,35 @@ impl Engine {
     }
 
     /// Every agent of every sandbox whose active policy grants it an app
-    /// channel token, and each sandbox whose policy could not be read, with
-    /// why: its agents are not known, not shown to have none.
+    /// channel token, and each sandbox whose policy or runtime could not be
+    /// read, with why: its agents are not known, not shown to have none.
     pub fn app_agents(&self) -> Result<AppAgents> {
         let variable = Channel::App.token_variable();
         let mut found = AppAgents::default();
         for view in self.list_sandboxes()? {
             let name = view.record.name.clone();
-            let policy = match self.policy(&name) {
-                Ok(policy) => policy,
-                // Removed since it was listed: it has none.
-                Err(Error::NoSuchSandbox { .. }) => continue,
+            let read = self.policy(&name).and_then(|policy| {
+                let runtime = self.runtime(&name)?;
+                Ok((policy, runtime))
+            });
+            let (policy, runtime) = match read {
+                Ok(read) => read,
+                // Removed since it was listed, or never given a policy: it
+                // has no agent to serve.
+                Err(Error::NoSuchSandbox { .. } | Error::NoPolicy { .. }) => continue,
                 Err(e) => {
                     found.unreadable.push((name, e.to_string()));
                     continue;
                 }
             };
-            let agents = &mut found.agents;
-            let runtime = self
-                .runtime_of(&name)
-                .map(|k| k.to_string())
-                .unwrap_or_default();
+            let runtime = runtime.map(|k| k.to_string()).unwrap_or_default();
             for (agent, grants) in &policy.snapshot.policy.agent_secrets {
                 if grants.contains_key(variable) {
-                    agents.push((name.clone(), agent.as_str().to_owned(), runtime.clone()));
+                    found.agents.push(AppAgent {
+                        sandbox: name.clone(),
+                        agent: agent.as_str().to_owned(),
+                        runtime: runtime.clone(),
+                    });
                 }
             }
         }

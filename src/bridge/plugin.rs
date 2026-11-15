@@ -239,6 +239,24 @@ impl PluginWriter {
         // Already closed by the plugin is as good as closed here.
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
+
+    /// What ends this connection and sends nothing on it: held apart from
+    /// the writer, it ends the connection while a write holds the writer.
+    pub fn closer(&self) -> std::io::Result<PluginCloser> {
+        Ok(PluginCloser(self.stream.try_clone()?))
+    }
+}
+
+/// Ends a plugin connection ([`PluginWriter::closer`]), and can do
+/// nothing else: no line goes past the writer's lock through it.
+pub struct PluginCloser(UnixStream);
+
+impl PluginCloser {
+    /// As [`PluginWriter::shutdown`]: for every clone of the connection,
+    /// at once.
+    pub fn shutdown(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// Refuses a socket whose folder, or which itself, is a link

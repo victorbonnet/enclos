@@ -47,7 +47,7 @@ mod usage;
 
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
-pub use app::{AppAgents, AppEndpoint};
+pub use app::{AppAgent, AppAgents, AppEndpoint};
 pub use approvals::{AccessPlan, normalized};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use dashboard::{DashboardEnd, DashboardOpen};

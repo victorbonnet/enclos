@@ -76,14 +76,19 @@ impl State {
 /// A hub watching `state`, whose host's person has one connected device:
 /// what it receives.
 fn watching(dir: &Path, state: &State) -> (Arc<Hub>, Receiver<ToDevice>) {
-    let (watch, agents) = AgentWatch::start(state.source()).unwrap();
+    hub_for(dir, AgentWatch::start(state.source()).unwrap())
+}
+
+/// A hub serving `watch`'s agents, whose host's person has one connected
+/// device: what it receives.
+fn hub_for(dir: &Path, watch: AgentWatch) -> (Arc<Hub>, Receiver<ToDevice>) {
     let hub = Hub::new(
         Transport::Tailscale,
         Arc::new(|_: &str| Err("no transport in this test".to_owned())),
         dir.join("bridge.db"),
         crate::layout::Layout::at(dir.join("enclos")),
         vec![7; 32],
-        agents,
+        Vec::new(),
         Some(HOST.to_owned()),
         Duration::from_secs(75),
     )
@@ -98,6 +103,12 @@ fn watching(dir: &Path, state: &State) -> (Arc<Hub>, Receiver<ToDevice>) {
 
 fn served(hub: &Hub) -> Vec<String> {
     hub.agents().iter().map(|a| a.name.clone()).collect()
+}
+
+/// As if `hub` had just read its agents: a retry is not due yet, however
+/// slow the test runs.
+fn just_read(hub: &Hub) {
+    hub.watch.as_ref().unwrap().seen.lock().unwrap().read_at = Instant::now();
 }
 
 /// The names of the next agents' list `device` is sent, within 5 seconds.
@@ -201,7 +212,8 @@ fn an_agent_given_an_app_channel_is_served_with_its_home_and_listed_to_devices()
             |line| line.event == "agent served" && line.reason.as_deref() == Some("lab/helper")
         )
     );
-    // Read again with nothing changed: nothing is sent again.
+    // Read again after an audited change that changes no agent: nothing
+    // is sent again.
     state.audited();
     hub.refresh_agents();
     assert!(device.try_recv().is_err());
@@ -278,7 +290,9 @@ fn a_connection_opened_with_an_endpoint_changed_meanwhile_is_not_kept() {
     let held = turn.lock().unwrap();
     let opener = Arc::clone(&hub);
     let opening = std::thread::spawn(move || opener.plugin("lab/main"));
-    std::thread::sleep(Duration::from_millis(200));
+    // It holds the lock it waits on once it has looked the endpoint up:
+    // the map's, the test's, and its own.
+    until(|| Arc::strong_count(&turn) == 3);
     state.set(vec![endpoint(dir.path(), "main", "n3w-t0ken")]);
     hub.refresh_agents();
     drop(held);
@@ -307,6 +321,7 @@ fn a_reading_that_fails_keeps_the_agents_served_and_is_tried_again() {
         agents: vec![main, endpoint(dir.path(), "helper", "t0ken")],
         left_out: Vec::new(),
     }));
+    just_read(&hub);
     hub.refresh_agents();
     assert_eq!(served(&hub), ["lab/main"]);
     std::thread::sleep(RETRY_UNREAD);
@@ -320,7 +335,7 @@ fn a_token_that_cannot_be_read_now_keeps_its_agent_served_as_it_was() {
     let main = endpoint(dir.path(), "main", "t0ken");
     let state = State::new(dir.path(), vec![main.clone()]);
     let (hub, device) = watching(dir.path(), &state);
-    let left = |unreadable| LeftOut {
+    let left = |unreadable| LeftOut::Agent {
         agent: "lab/main".to_owned(),
         why: "the Keychain did not answer".to_owned(),
         unreadable,
@@ -408,21 +423,23 @@ impl crate::secrets::SecretStore for Unanswering {
     }
 }
 
-/// The engine's side, with a secret store standing for the Keychain: an
-/// agent granted an app channel is read with its token; a store that does
-/// not answer leaves it out as unreadable; a token not set, or a grant
-/// dropped, leaves it out as gone. Each change is an audited write.
-#[test]
-fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out() {
+/// An engine in `dir` whose secret store stands for the Keychain, with
+/// sandbox `lab` made by `actor`.
+fn lab_engine(
+    dir: &Path,
+) -> (
+    crate::engine::Engine,
+    std::rc::Rc<Unanswering>,
+    crate::model::audit::Actor,
+    crate::layout::Layout,
+) {
     use crate::audit::jsonl::JsonlAuditLog;
     use crate::backend::fake::FakeBackend;
     use crate::engine::{Engine, SandboxSpec};
-    use crate::model::secret::{SecretRef, SecretValue};
     use crate::model::{audit::Actor, plan::Confirm, sandbox::BackendKind};
     use crate::state::sqlite::SqliteStateStore;
 
-    let dir = tempfile::tempdir().unwrap();
-    let layout = crate::layout::Layout::at(dir.path().join("enclos"));
+    let layout = crate::layout::Layout::at(dir.join("enclos"));
     let secrets = std::rc::Rc::new(Unanswering(Default::default(), Default::default()));
     let engine = Engine::new(
         layout.clone(),
@@ -440,7 +457,6 @@ fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out()
         host: "test".into(),
     };
     engine.init(&actor, Confirm::Yes).unwrap();
-    let lab = "lab".parse().unwrap();
     engine
         .create_sandbox(
             &actor,
@@ -452,6 +468,21 @@ fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out()
             Confirm::Yes,
         )
         .unwrap();
+    (engine, secrets, actor, layout)
+}
+
+/// The engine's side, with a secret store standing for the Keychain: an
+/// agent granted an app channel is read with its token; a store that does
+/// not answer leaves it out as unreadable; a token not set, or a grant
+/// dropped, leaves it out as gone. Each change is an audited write.
+#[test]
+fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out() {
+    use crate::model::plan::Confirm;
+    use crate::model::secret::{SecretRef, SecretValue};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, secrets, actor, layout) = lab_engine(dir.path());
+    let lab = "lab".parse().unwrap();
     let names = |served: &Served| -> Vec<(String, String)> {
         served
             .agents
@@ -461,7 +492,12 @@ fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out()
     };
     assert!(names(&super::served(&engine).unwrap()).is_empty());
 
-    // Granted before its token is set: left out, as the user left it.
+    let gone = |read: &Served| {
+        matches!(
+            read.left_out.as_slice(),
+            [LeftOut::Agent { agent, unreadable: false, .. }] if agent == "lab/main"
+        )
+    };
     let marked = mark(&layout.audit_log());
     let before = layout.read_policy("lab").unwrap();
     let granted = format!(
@@ -487,6 +523,13 @@ fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out()
     assert_eq!(read.agents.len(), 1);
     assert_eq!(names(&read), [("lab/main".to_owned(), "t0ken".to_owned())]);
 
+    // Its token's value gone from the store: left out as gone, not kept.
+    let kept = std::mem::take(&mut *secrets.0.0.borrow_mut());
+    let read = super::served(&engine).unwrap();
+    assert!(read.agents.is_empty());
+    assert!(gone(&read), "not gone");
+    *secrets.0.0.borrow_mut() = kept;
+
     // Rotated: read with its new value, after an audited write.
     let marked = mark(&layout.audit_log());
     set("n3w-t0ken");
@@ -500,8 +543,16 @@ fn the_state_gives_each_agent_with_an_app_channel_and_says_why_one_is_left_out()
     secrets.1.set(true);
     let read = super::served(&engine).unwrap();
     assert!(read.agents.is_empty());
-    assert_eq!(read.left_out.len(), 1);
-    assert!(read.left_out[0].unreadable, "{}", read.left_out[0].why);
+    assert!(
+        matches!(
+            read.left_out.as_slice(),
+            [LeftOut::Agent {
+                unreadable: true,
+                ..
+            }]
+        ),
+        "not unreadable"
+    );
     secrets.1.set(false);
 
     // The grant dropped: not listed at all, after an audited write.
@@ -528,10 +579,9 @@ fn a_sandbox_whose_policy_cannot_be_read_keeps_its_agents_served() {
     // agent stays served, `prod`'s does not.
     state.quietly(Ok(Served {
         agents: Vec::new(),
-        left_out: vec![LeftOut {
-            agent: "lab".to_owned(),
+        left_out: vec![LeftOut::Sandbox {
+            sandbox: "lab".to_owned(),
             why: "its policy cannot be read: database is locked".to_owned(),
-            unreadable: true,
         }],
     }));
     state.audited();
@@ -546,4 +596,155 @@ fn a_sandbox_whose_policy_cannot_be_read_keeps_its_agents_served() {
     std::thread::sleep(RETRY_UNREAD);
     hub.refresh_agents();
     assert_eq!(served(&hub), ["lab/helper", "lab/main"]);
+}
+
+/// A policy that cannot be read is never taken for one that grants no app
+/// channel: the reading fails, and the bridge serves its agents as they
+/// were. (Listing the sandboxes reads their policies too, so a damaged one
+/// fails the listing; one that fails after it, `LeftOut::Sandbox`, is
+/// served as it was too: `a_sandbox_whose_policy_cannot_be_read_...`.)
+#[test]
+fn a_policy_that_cannot_be_read_fails_the_reading_rather_than_drop_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _secrets, _actor, layout) = lab_engine(dir.path());
+    let db = rusqlite::Connection::open(layout.state_db()).unwrap();
+    db.execute("UPDATE policy_snapshots SET policy = 'not a policy'", [])
+        .unwrap();
+    let Err(why) = super::served(&engine) else {
+        panic!("read as a sandbox with no agent");
+    };
+    assert!(why.contains("cannot read"), "{why}");
+}
+
+#[test]
+fn an_unreadable_sandbox_covers_its_own_agents_alone() {
+    let lab = LeftOut::Sandbox {
+        sandbox: "lab".to_owned(),
+        why: String::new(),
+    };
+    assert!(lab.covers("lab/main"));
+    for other in ["lab2/main", "labs/x", "prod/lab", "lab"] {
+        assert!(!lab.covers(other), "{other}");
+    }
+    let agent = LeftOut::Agent {
+        agent: "lab/main".to_owned(),
+        why: String::new(),
+        unreadable: true,
+    };
+    assert!(agent.covers("lab/main"));
+    assert!(!agent.covers("lab/mainly"));
+}
+
+/// A change made while the first reading ran is read on the next pass.
+#[test]
+fn a_change_during_the_first_reading_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let changes = dir.path().join("audit.jsonl");
+    std::fs::write(&changes, "").unwrap();
+    let main = endpoint(dir.path(), "main", "t0ken");
+    let helper = endpoint(dir.path(), "helper", "t0ken");
+    let readings = std::sync::atomic::AtomicUsize::new(0);
+    let log = changes.clone();
+    let source = AgentSource::new(changes, move || {
+        let mut agents = vec![main.clone()];
+        if readings.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Audited while this first reading runs.
+            let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(file, "{{}}").unwrap();
+        } else {
+            agents.push(helper.clone());
+        }
+        Ok(Served {
+            agents,
+            left_out: Vec::new(),
+        })
+    });
+    let watch = AgentWatch::start(source).unwrap();
+    assert_eq!(watch.agents().len(), 1);
+    let (hub, _device) = hub_for(dir.path(), watch);
+    assert_eq!(served(&hub), ["lab/main"]);
+    hub.refresh_agents();
+    assert_eq!(served(&hub), ["lab/helper", "lab/main"]);
+}
+
+/// Each person connected is sent the list as they are shown it: the
+/// host's person may name the agents, another person may not.
+#[test]
+fn every_connected_person_is_sent_the_list_as_they_are_shown_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = endpoint(dir.path(), "main", "t0ken");
+    let state = State::new(dir.path(), vec![main.clone()]);
+    let (hub, host) = watching(dir.path(), &state);
+    let (sender, guest) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("d-2".to_owned(), ("bob@example.com".to_owned(), sender, 2));
+    state.set(vec![main, endpoint(dir.path(), "helper", "t0ken")]);
+    hub.refresh_agents();
+    for (device, host_person) in [(&host, true), (&guest, false)] {
+        let agents = loop {
+            if let ToDevice::AgentsList { agents } =
+                device.recv_timeout(Duration::from_secs(5)).unwrap()
+            {
+                break agents;
+            }
+        };
+        let names: Vec<&str> = agents.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(names, ["lab/helper", "lab/main"]);
+        assert!(agents.iter().all(|a| a.can_edit_name == host_person));
+    }
+}
+
+/// A connection is ended at once, though a write to its plugin holds its
+/// writer: no pass waits on a plugin that does not read.
+#[test]
+fn a_dropped_agent_is_closed_while_a_write_to_it_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = endpoint(dir.path(), "main", "t0ken");
+    let helper = endpoint(dir.path(), "helper", "t0ken");
+    let state = State::new(dir.path(), vec![main.clone(), helper.clone()]);
+    let (hub, _device) = watching(dir.path(), &state);
+    let events = plugin(&helper.socket);
+    hub.plugin("lab/helper").unwrap();
+    assert_eq!(next(&events), Seen::Opened("t0ken".to_owned()));
+    let out = Arc::clone(&hub.plugins.lock().unwrap()["lab/helper"].out);
+    let writing = out.lock().unwrap();
+
+    state.set(vec![main]);
+    let (done, passed) = channel();
+    let refreshing = Arc::clone(&hub);
+    std::thread::spawn(move || {
+        refreshing.refresh_agents();
+        let _ = done.send(());
+    });
+    passed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(next(&events), Seen::Closed("t0ken".to_owned()));
+    drop(writing);
+}
+
+/// The bridge's database failing as the agents change: nothing changes,
+/// and once it opens again, a while later, they are served and listed.
+#[test]
+fn a_change_the_bridge_cannot_store_is_served_once_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = endpoint(dir.path(), "main", "t0ken");
+    let state = State::new(dir.path(), vec![main.clone()]);
+    let (hub, device) = watching(dir.path(), &state);
+    let db = dir.path().join("bridge.db");
+    let aside = dir.path().join("bridge.db.aside");
+    std::fs::rename(&db, &aside).unwrap();
+    std::fs::create_dir(&db).unwrap();
+
+    state.set(vec![main, endpoint(dir.path(), "helper", "t0ken")]);
+    hub.refresh_agents();
+    assert_eq!(served(&hub), ["lab/main"]);
+    assert!(device.try_recv().is_err());
+
+    std::fs::remove_dir(&db).unwrap();
+    std::fs::rename(&aside, &db).unwrap();
+    std::thread::sleep(RETRY_UNREAD);
+    hub.refresh_agents();
+    assert_eq!(served(&hub), ["lab/helper", "lab/main"]);
+    assert_eq!(listed(&device), ["lab/helper", "lab/main"]);
 }

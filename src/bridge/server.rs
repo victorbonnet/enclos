@@ -80,7 +80,7 @@ use super::groups::{
 };
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
-use super::plugin::{PluginWriter, connect};
+use super::plugin::{PluginCloser, PluginWriter, connect};
 use super::provisioning::{Completed, Host, Operation};
 #[cfg(test)]
 use super::store::home_id;
@@ -129,7 +129,9 @@ const NAME_CHARS: usize = 64;
 /// Who is at an address, as the transport says.
 type Whois = Arc<dyn Fn(&str) -> Result<Caller, String> + Send + Sync>;
 
-pub use served::{AgentSource, AgentWatch, LeftOut, Served};
+#[cfg(test)]
+use served::Served;
+pub use served::{AgentSource, AgentWatch};
 
 /// One agent the bridge serves, with what opens its app channel.
 #[derive(Clone, PartialEq, Eq)]
@@ -152,7 +154,7 @@ struct Plugin {
     /// Ends the connection without waiting for `out`, which a write to a
     /// plugin that does not read holds: when the agent is no longer served
     /// as it was opened ([`Hub::serve_agents`]).
-    closer: PluginWriter,
+    closer: PluginCloser,
 }
 
 /// What the bridge writes to a plugin, and what it gave it already.
@@ -445,7 +447,7 @@ impl Hub {
             store_path,
             layout,
             bridge_private,
-            agents: RwLock::new(Arc::new(agents)),
+            agents: RwLock::new(Arc::new(served::sorted(agents))),
             watch: None,
             provisioning: None,
             provisioning_busy: Mutex::new(HashSet::new()),
@@ -501,7 +503,7 @@ impl Hub {
         let mut agents = self.agents.write().expect("not poisoned");
         let mut list = agents.as_ref().clone();
         list.extend(more);
-        *agents = Arc::new(list);
+        *agents = Arc::new(served::sorted(list));
     }
 
     fn store(&self) -> Result<Store, String> {
@@ -696,6 +698,14 @@ impl Hub {
             })?;
         let (hello, mut reader, mut writer) =
             connect(&endpoint.socket, &endpoint.token, &home).map_err(|e| e.to_string())?;
+        // Changed while it connected: given up before anything is told of
+        // this connection. Checked again below, where it counts.
+        if !self.agents().contains(&endpoint) {
+            writer.shutdown();
+            return Err(format!(
+                "{agent}'s app channel changed while it was being opened"
+            ));
+        }
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
             && let Ok(name) = sandbox.parse()
@@ -706,7 +716,7 @@ impl Hub {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
-        let closer = writer.try_clone().map_err(|e| e.to_string())?;
+        let closer = writer.closer().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
         let origin = questions::Origin {
             agent,
@@ -1606,8 +1616,8 @@ fn call_usage(
     )))
 }
 
-/// Serves on `127.0.0.1:port` until the process ends: `agents` first,
-/// then as `watch` reads them again.
+/// Serves on `127.0.0.1:port` until the process ends: the agents `watch`
+/// read first, then as it reads them again.
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     transport: Transport,
@@ -1616,7 +1626,6 @@ pub fn serve(
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     approval_key: enclos_protocol::decision::DecisionKey,
-    agents: Vec<AgentEndpoint>,
     watch: AgentWatch,
     provisioning: Host,
 ) -> std::io::Result<()> {
@@ -1635,7 +1644,7 @@ pub fn serve(
             store_path,
             layout,
             bridge_private,
-            agents,
+            Vec::new(),
             None,
             SILENCE,
         )
@@ -1675,8 +1684,14 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
             loop {
-                hub.refresh_agents();
-                std::thread::sleep(Duration::from_secs(3));
+                // A reading that panics is said, and the next one is tried:
+                // the bridge would otherwise stop following its agents.
+                let pass =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hub.refresh_agents()));
+                if pass.is_err() {
+                    eprintln!("enclos app: reading the agents again failed; it is tried again");
+                }
+                std::thread::sleep(served::LOOK_EVERY);
             }
         });
     }
@@ -5274,10 +5289,14 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         };
         let state = Arc::new(Mutex::new(vec![endpoint("main")]));
         let read = Arc::clone(&state);
-        // Held, a reading waits: a secret store that does not answer.
+        // Held, a reading waits: a secret store that does not answer. Each
+        // reading says it started.
         let gate = Arc::new(Mutex::new(()));
         let waits = Arc::clone(&gate);
-        let (watch, agents) = AgentWatch::start(AgentSource::new(changes.clone(), move || {
+        let (started, readings) = std::sync::mpsc::channel();
+        let started = Mutex::new(started);
+        let watch = AgentWatch::start(AgentSource::new(changes.clone(), move || {
+            let _ = started.lock().unwrap().send(());
             let _open = waits.lock().unwrap();
             Ok(Served {
                 agents: read.lock().unwrap().clone(),
@@ -5292,7 +5311,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 crate::layout::Layout::at(folder.path().join("enclos")),
                 "/unused/enclos".into(),
             ),
-            agents,
+            Vec::new(),
             Some(watch),
         );
         let phone = paired(&bridge, "n-pixel");
@@ -5327,9 +5346,11 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         // A reading held up holds up no device: asked meanwhile, the
         // bridge answers with the agents served, then sends the new list.
         let held = gate.lock().unwrap();
+        while readings.try_recv().is_ok() {}
         state.lock().unwrap().push(endpoint("main"));
         changed();
-        std::thread::sleep(Duration::from_secs(4));
+        // The reading has started, and waits.
+        readings.recv_timeout(Duration::from_secs(10)).unwrap();
         device.send("a-2", FromDevice::Agents);
         assert_eq!(listed(&mut device), ["lab/helper"]);
         drop(held);
