@@ -2988,6 +2988,134 @@ fn app_devices_status_and_log_print_a_document_when_piped() {
     );
 }
 
+/// A service-account key file for project `enclos-test`, its RSA key made
+/// by `openssl` for the test: no private key is kept in the repository.
+fn service_account_key(at: &Path) {
+    let made = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+        ])
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let json = serde_json::json!({
+        "type": "service_account",
+        "project_id": "enclos-test",
+        "private_key": String::from_utf8(made.stdout).unwrap(),
+        "client_email": "push@enclos-test.iam.gserviceaccount.com",
+    });
+    std::fs::write(at, json.to_string()).unwrap();
+}
+
+#[test]
+fn app_push_key_keeps_a_copy_for_the_user_alone_audited_and_push_off_removes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new();
+    home.init(1);
+    let kept = home.root.join("app-push-key.json");
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push: off. Give the bridge a key"),
+        "{}",
+        out.stdout()
+    );
+
+    // Not a key: refused before anything is written or audited.
+    let audited = home.audit_lines().len();
+    let wrong = home.root.join("not-a-key.json");
+    std::fs::write(&wrong, r#"{"type":"authorized_user"}"#).unwrap();
+    let out = home.run(&["app", "push", "key", wrong.to_str().unwrap()]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("not `service_account`"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!kept.exists());
+    assert_eq!(home.audit_lines().len(), audited);
+
+    let given = home.root.join("downloaded.json");
+    service_account_key(&given);
+    let out = home.run(&["app", "push", "key", given.to_str().unwrap()]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push on: the bridge sends through FCM as push@enclos-test.iam.gserviceaccount.com, for project enclos-test"),
+        "{}",
+        out.stdout()
+    );
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        std::fs::read(&given).unwrap()
+    );
+    assert_eq!(
+        std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let audit = home.audit_lines().join("\n");
+    assert!(audit.contains("\"command\":\"app push key\""), "{audit}");
+    assert!(audit.contains("\"target\":\"enclos-test\""), "{audit}");
+    // The key itself never reaches the audit log.
+    assert!(!audit.contains("PRIVATE KEY"), "{audit}");
+
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push: on, through FCM for project enclos-test."),
+        "{}",
+        out.stdout()
+    );
+    let (_, json) = home.json(&["app", "status"]);
+    assert_eq!(
+        json["push"],
+        serde_json::json!({"on": true, "project": "enclos-test"})
+    );
+    // `app devices` says nothing of push.
+    let (_, json) = home.json(&["app", "devices"]);
+    assert!(json.get("push").is_none(), "{json}");
+
+    let out = home.run(&["app", "push", "off"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Push off: the bridge sends no push from now on.\n"
+    );
+    assert!(!kept.exists());
+    assert!(
+        home.audit_lines()
+            .join("\n")
+            .contains("\"command\":\"app push off\"")
+    );
+    let out = home.run(&["app", "push", "off"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Push was off already: the bridge has no push key.\n"
+    );
+    // A key file that cannot be used: push is off, and status says why.
+    std::fs::write(&kept, "{}").unwrap();
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok().stdout().starts_with("Push: off: "),
+        "{}",
+        out.stdout()
+    );
+    let (_, json) = home.json(&["app", "status"]);
+    assert_eq!(json["push"]["on"], false);
+    assert!(
+        json["push"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not `service_account`"),
+        "{json}"
+    );
+}
+
 #[test]
 fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() {
     let home = Home::new();

@@ -147,6 +147,10 @@ _Avoid_: tunnel (the proxy's word), front, VPN (one kind of transport)
 A phone or other device that a bridge accepts, because the host's user paired it there and it holds the key it was paired with.
 _Avoid_: client, session (a sandbox's word)
 
+**Push**:
+A message the bridge sends a paired device through its platform's push service while none of its person's devices is connected, holding a preview of what came that only that device can open.
+_Avoid_: notification (what the phone shows), alert, wake-up
+
 **Person**:
 Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
 _Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest

@@ -10,6 +10,7 @@ pub mod pace;
 pub mod page;
 pub mod plugin;
 pub mod provisioning;
+pub mod push;
 pub mod server;
 pub mod store;
 pub mod text;

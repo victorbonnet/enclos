@@ -3978,3 +3978,241 @@ fn a_plugin_that_no_longer_reports_tasks_has_its_kept_tasks_dropped() {
     );
     plugin.send(None).unwrap();
 }
+
+/// A push service that records what it is asked to send.
+struct Recorder(std::sync::mpsc::Sender<(String, super::super::push::Payload)>);
+
+impl super::super::push::PushService for Recorder {
+    fn send(
+        &mut self,
+        token: &str,
+        payload: &super::super::push::Payload,
+    ) -> Option<super::super::push::Outcome> {
+        let _ = self.0.send((token.to_owned(), payload.clone()));
+        Some(super::super::push::Outcome::Sent)
+    }
+}
+
+/// A hub pushing through a [`Recorder`], with `connected` people's devices
+/// connected, and a device of Alice's with a push token paired.
+fn pushing_hub(
+    dir: &std::path::Path,
+    connected: &[&str],
+) -> (
+    Hub,
+    std::sync::mpsc::Receiver<(String, super::super::push::Payload)>,
+) {
+    let (hub, _) = hub_with(dir, connected);
+    let (sent, pushed) = channel();
+    let pusher = super::super::push::Pusher::start(
+        Box::new(Recorder(sent)),
+        "mac".to_owned(),
+        dir.join("app.db"),
+    );
+    let hub = hub.with_push(pusher, "mac".to_owned());
+    let store = hub.store().unwrap();
+    store
+        .add_device(&super::super::store::Device {
+            id: "phone".to_owned(),
+            name: "Pixel".to_owned(),
+            person: "alice@example.com".to_owned(),
+            noise_key: vec![1; 32],
+            device_key: vec![2; 32],
+            push_key: super::super::push::test_push_key(),
+            push_token: Some("token-phone".to_owned()),
+            paired: 1,
+            seen: None,
+            node: None,
+        })
+        .unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    (hub, pushed)
+}
+
+#[test]
+fn an_agent_message_reaches_an_away_owner_as_a_push_only_their_device_opens() {
+    use base64::Engine as _;
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, pushed) = pushing_hub(dir.path(), &[]);
+    let store = hub.store().unwrap();
+    let text = format!("**The weather** in Lyon:\n\n{}", "sunny ".repeat(40));
+    let seq = hub
+        .store_agent_text(
+            &store,
+            &MessageId::new("m-1").unwrap(),
+            agent_says(&text),
+            &[],
+            &home,
+            &From::Agent,
+        )
+        .unwrap()
+        .unwrap();
+    let (token, payload) = pushed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        (token.as_str(), payload.host.as_str(), payload.seq),
+        ("token-phone", "mac", seq)
+    );
+    let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&payload.preview)
+        .unwrap();
+    let opened = enclos_protocol::preview::open(
+        &super::super::push::test_push_key(),
+        &enclos_protocol::preview::PushFields { host: "mac", seq },
+        &sealed,
+    )
+    .unwrap();
+    let preview: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(preview["agent"], "lab/main");
+    assert_eq!(preview["conversation"], "c-1");
+    let shown = preview["text"].as_str().unwrap();
+    assert!(
+        shown.starts_with("**The weather** in Lyon: sunny"),
+        "{shown}"
+    );
+    assert_eq!(
+        shown.chars().count(),
+        crate::bridge::store::MAX_PREVIEW_CHARS
+    );
+}
+
+/// A device of `person`'s, paired with a push token.
+fn pushable(id: &str, person: &str) -> super::super::store::Device {
+    super::super::store::Device {
+        id: id.to_owned(),
+        name: "Pixel".to_owned(),
+        person: person.to_owned(),
+        noise_key: id.as_bytes().to_vec(),
+        device_key: vec![2; 32],
+        push_key: super::super::push::test_push_key(),
+        push_token: Some(format!("token-{id}")),
+        paired: 1,
+        seen: None,
+        node: None,
+    }
+}
+
+/// A hub whose pushes wait in a queue the test reads, nothing sent: with
+/// `connected` people's devices connected, a device of Alice's and one of
+/// Bob's with a push token paired, and Alice's conversation `c-1`.
+fn queued_hub(
+    dir: &std::path::Path,
+    connected: &[&str],
+) -> (Hub, std::sync::mpsc::Receiver<super::super::push::Job>) {
+    let (hub, _) = hub_with(dir, connected);
+    let (pusher, queue) = super::super::push::Pusher::queued();
+    let hub = hub.with_push(pusher, "mac".to_owned());
+    let store = hub.store().unwrap();
+    store
+        .add_device(&pushable("alice-phone", "alice@example.com"))
+        .unwrap();
+    store
+        .add_device(&pushable("bob-phone", "bob@example.com"))
+        .unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    (hub, queue)
+}
+
+fn agent_stores(
+    hub: &Hub,
+    home: &std::path::Path,
+    id: &str,
+    message: ConversationMessage,
+) -> Option<i64> {
+    hub.store_agent_text(
+        &hub.store().unwrap(),
+        &MessageId::new(id).unwrap(),
+        message,
+        &[],
+        home,
+        &From::Agent,
+    )
+    .unwrap()
+}
+
+#[test]
+fn no_push_while_a_device_of_the_owner_is_connected() {
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, queue) = queued_hub(dir.path(), &["alice@example.com"]);
+    agent_stores(&hub, &home, "m-1", agent_says("hello")).unwrap();
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn an_away_owners_message_is_pushed_to_their_devices_alone() {
+    let (dir, home, _inbox, _media) = folders();
+    // Bob connected neither holds Alice's push back nor gets it.
+    let (hub, queue) = queued_hub(dir.path(), &["bob@example.com"]);
+    let seq = agent_stores(&hub, &home, "m-1", agent_says("hello")).unwrap();
+    let job = queue.try_recv().unwrap();
+    assert_eq!(
+        (job.device.as_str(), job.token.as_str(), job.seq),
+        ("alice-phone", "token-alice-phone", seq)
+    );
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn a_message_in_pieces_is_pushed_once_with_its_last_seq_and_not_again() {
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, queue) = queued_hub(dir.path(), &[]);
+    let long = agent_says(&"word ".repeat(30_000));
+    let id = MessageId::new("m-1").unwrap();
+    assert!(pieces(&id, &long).unwrap().len() > 1);
+    let last = agent_stores(&hub, &home, "m-1", long.clone()).unwrap();
+    assert_eq!(queue.try_recv().unwrap().seq, last);
+    assert!(queue.try_recv().is_err());
+    // Sent again by the plugin (its ack lost): stored once, pushed once.
+    assert_eq!(agent_stores(&hub, &home, "m-1", long), None);
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn a_runtime_status_line_is_not_pushed() {
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, queue) = queued_hub(dir.path(), &[]);
+    let status = ConversationMessage {
+        kind: "status".to_owned(),
+        ..agent_says("Hermes is restarting")
+    };
+    agent_stores(&hub, &home, "m-1", status).unwrap();
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn only_an_fcm_token_is_kept_and_any_other_is_logged_as_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    let token = |kind: &str, token: &str| enclos_protocol::device::PushToken {
+        kind: kind.to_owned(),
+        token: token.to_owned(),
+    };
+    assert_eq!(
+        kept_token(
+            &store,
+            "d-1",
+            "alice@example.com",
+            token("fcm", "abc:DEF-1_2.3")
+        ),
+        Some("abc:DEF-1_2.3".to_owned())
+    );
+    assert!(store.log_lines(10).unwrap().is_empty());
+    for refused in [
+        token("apns", "abc"),
+        token("fcm", "has space"),
+        token("fcm", ""),
+    ] {
+        assert_eq!(
+            kept_token(&store, "d-1", "alice@example.com", refused),
+            None
+        );
+    }
+    let lines = store.log_lines(10).unwrap();
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().all(|l| l.event == "push token refused"
+        && l.device.as_deref() == Some("d-1")
+        && l.reason.as_deref() == Some("not an FCM token")));
+}

@@ -140,6 +140,7 @@ codex plugin marketplace add victorbonnet/enclos && codex plugin add enclos@encl
 
 - [Website](https://enclos.dev/): what enclos does, how to install it and its limits ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
+- [Setting up push](docs/push-setup.md): a Firebase project and a key for each host, so the mobile app gets notifications while closed.
 - [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [The enclos plugin](plugins/enclos/README.md): enclos from Claude Code or Codex, and the allow rule each needs.

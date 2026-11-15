@@ -160,6 +160,12 @@ impl Engine {
         self.layout.app_approval_key()
     }
 
+    /// The file of the key the bridge pushes through FCM with (ADR 0065,
+    /// proposed).
+    pub fn app_push_key_path(&self) -> PathBuf {
+        self.layout.app_push_key()
+    }
+
     /// The public key (SEC1, base64url) the bridge signs runtime-approval
     /// decisions with, which `runtime configure --channel app` gives the
     /// plugin (ADR 0060, proposed): made when the bridge has none yet. A
