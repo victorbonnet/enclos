@@ -805,9 +805,12 @@ impl Hub {
             })
         });
         // A question or a runtime approval waits for the person: one asked
-        // while they are away reaches them as a push. Its later states do not.
+        // while they are away reaches them as a push. Its later states do not,
+        // nor does an ask the channel sends again once it is closed; one sent
+        // again while it waits has the same `seq`, which the app shows once.
         if let Some(ToDevice::Message(m)) = &message
             && matches!(m.kind.as_str(), "question" | "runtime_approval")
+            && current.info.state == QuestionState::Pending
         {
             self.push_if_away(
                 store,

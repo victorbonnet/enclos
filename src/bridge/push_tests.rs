@@ -317,7 +317,7 @@ fn device(id: &str) -> Device {
         id: id.to_owned(),
         name: "Pixel".to_owned(),
         person: "alice@example.com".to_owned(),
-        noise_key: vec![id.len() as u8; 32],
+        noise_key: id.as_bytes().to_vec(),
         device_key: vec![2; 32],
         push_key: test_push_key(),
         push_token: Some(format!("token-{id}")),
@@ -328,7 +328,8 @@ fn device(id: &str) -> Device {
 }
 
 fn eventually(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..200 {
+    // Up to 10 s: each outcome opens the database to be recorded.
+    for _ in 0..1_000 {
         if done() {
             return true;
         }
@@ -427,13 +428,26 @@ fn the_same_token_given_again_keeps_why_it_failed_and_a_new_one_clears_it() {
 }
 
 #[test]
-fn pushes_waiting_together_go_once_per_device_the_newest_each() {
+fn pushes_waiting_together_go_once_per_device_the_newest_each_to_devices_still_paired() {
     let folder = tempfile::tempdir().unwrap();
     let path = folder.path().join("app.db");
-    Store::open(&path).unwrap();
+    let store = Store::open(&path).unwrap();
+    store.add_device(&device("d-1")).unwrap();
+    store.add_device(&device("d-2")).unwrap();
+    // Paired again with another token while its push waited.
+    store.add_device(&device("d-3")).unwrap();
+    store.set_push_token("d-3", "token-new").unwrap();
     let sent = Arc::new(Mutex::new(Vec::new()));
     let (jobs, waiting) = channel();
-    for (d, seq) in [("d-1", 3), ("d-2", 1), ("d-1", 5), ("d-1", 4)] {
+    // d-4 was unpaired while its push waited.
+    for (d, seq) in [
+        ("d-1", 3),
+        ("d-2", 1),
+        ("d-1", 5),
+        ("d-1", 4),
+        ("d-3", 6),
+        ("d-4", 7),
+    ] {
         jobs.send(job(d, seq)).unwrap();
     }
     drop(jobs);
@@ -477,4 +491,189 @@ fn a_running_bridge_takes_a_key_given_replaced_or_removed_without_a_restart() {
     // A file that is no key is a failure to show, not push turned off.
     std::fs::write(&path, b"{}").unwrap();
     assert!(fcm.current_key().is_err());
+}
+
+/// A stand-in for Google's token endpoint and FCM over plain HTTP: it
+/// answers each request with the next of `answers`, then stops listening,
+/// and keeps what it was asked: each request's path and `Authorization`.
+struct Google {
+    base: String,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+fn google(answers: Vec<(u16, String)>) -> Google {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&asked);
+    std::thread::spawn(move || {
+        for ((status, body), stream) in answers.into_iter().zip(listener.incoming()) {
+            let mut stream = stream.unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let (mut authorization, mut length) = (String::new(), 0);
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let Some((name, value)) = header.trim_end().split_once(':') else {
+                    break;
+                };
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => authorization = value.trim().to_owned(),
+                    "content-length" => length = value.trim().parse().unwrap(),
+                    _ => {}
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).unwrap();
+            kept.lock().unwrap().push((path, authorization));
+            write!(
+                stream,
+                "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    Google { base, asked }
+}
+
+fn access(token: &str) -> (u16, String) {
+    (
+        200,
+        serde_json::json!({"access_token": token, "expires_in": 3600, "token_type": "Bearer"})
+            .to_string(),
+    )
+}
+
+fn sent() -> (u16, String) {
+    (
+        200,
+        r#"{"name":"projects/enclos-test/messages/1"}"#.to_owned(),
+    )
+}
+
+fn unauthenticated() -> (u16, String) {
+    (
+        401,
+        r#"{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}"#
+            .to_owned(),
+    )
+}
+
+const SEND: &str = "/projects/enclos-test/messages:send";
+
+fn asked(google: &Google) -> Vec<(String, String)> {
+    google.asked.lock().unwrap().clone()
+}
+
+fn pair(path: &str, authorization: &str) -> (String, String) {
+    (path.to_owned(), authorization.to_owned())
+}
+
+#[test]
+fn an_access_token_is_asked_once_used_until_its_end_and_dropped_with_its_key() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("app-push-key.json");
+    write_key(&path, &key_json(pem())).unwrap();
+    let google = google(vec![access("a-1"), sent(), sent(), access("a-2"), sent()]);
+    let mut fcm = Fcm::at(path.clone(), &google.base);
+    let push = payload("mac", &job("d-1", 1)).unwrap();
+    assert_eq!(fcm.send("t", &push), Some(Outcome::Sent));
+    assert_eq!(fcm.send("t", &push), Some(Outcome::Sent));
+    assert_eq!(
+        asked(&google),
+        [
+            pair("/token", ""),
+            pair(SEND, "Bearer a-1"),
+            pair(SEND, "Bearer a-1")
+        ]
+    );
+    // Another key: its own access token, for its own project.
+    write_key(&path, &with("project_id", "enclos-other".into())).unwrap();
+    assert_eq!(fcm.send("t", &push), Some(Outcome::Sent));
+    assert_eq!(
+        asked(&google)[3..],
+        [
+            pair("/token", ""),
+            pair("/projects/enclos-other/messages:send", "Bearer a-2")
+        ]
+    );
+}
+
+#[test]
+fn a_refused_access_token_is_replaced_once_and_only_once() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("app-push-key.json");
+    write_key(&path, &key_json(pem())).unwrap();
+    let push = payload("mac", &job("d-1", 1)).unwrap();
+
+    let google_once = google(vec![
+        access("a-1"),
+        unauthenticated(),
+        access("a-2"),
+        sent(),
+    ]);
+    let mut fcm = Fcm::at(path.clone(), &google_once.base);
+    assert_eq!(fcm.send("t", &push), Some(Outcome::Sent));
+    assert_eq!(
+        asked(&google_once),
+        [
+            pair("/token", ""),
+            pair(SEND, "Bearer a-1"),
+            pair("/token", ""),
+            pair(SEND, "Bearer a-2")
+        ]
+    );
+
+    let google_twice = google(vec![
+        access("a-1"),
+        unauthenticated(),
+        access("a-2"),
+        unauthenticated(),
+    ]);
+    let mut fcm = Fcm::at(path, &google_twice.base);
+    let Some(Outcome::Failed(why)) = fcm.send("t", &push) else {
+        panic!()
+    };
+    assert!(why.starts_with("FCM answered 401 UNAUTHENTICATED"), "{why}");
+    // Not a third time.
+    assert_eq!(asked(&google_twice).len(), 4);
+}
+
+#[test]
+fn a_token_endpoint_that_is_unavailable_is_not_a_refused_key() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("app-push-key.json");
+    write_key(&path, &key_json(pem())).unwrap();
+    let push = payload("mac", &job("d-1", 1)).unwrap();
+    let google = google(vec![
+        (503, "<html>unavailable</html>".to_owned()),
+        (
+            400,
+            r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#.to_owned(),
+        ),
+        (200, "{}".to_owned()),
+    ]);
+    let mut fcm = Fcm::at(path, &google.base);
+    let failed = |fcm: &mut Fcm| match fcm.send("t", &push) {
+        Some(Outcome::Failed(why)) => why,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        failed(&mut fcm),
+        "Google's token endpoint is unavailable (503)"
+    );
+    assert_eq!(
+        failed(&mut fcm),
+        "Google refused the push key (400): Invalid JWT Signature."
+    );
+    assert_eq!(failed(&mut fcm), "Google gave no access token (200)");
 }

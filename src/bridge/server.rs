@@ -1309,7 +1309,11 @@ impl Hub {
         let last = seqs.last().copied();
         let mut files: Vec<Attachment> = stored.into_iter().map(attachment_info).collect();
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
-            if let Some(last) = last {
+            // A runtime's `status` line is a quiet line about itself, which an
+            // agent can also write: it waits for the next sync, unannounced.
+            if let Some(last) = last
+                && whole.kind != "status"
+            {
                 self.push_if_away(store, &owner, &whole.agent, conversation, last, &whole.text);
             }
             for ((_, text), seq) in pieces.into_iter().zip(seqs) {
@@ -2385,18 +2389,17 @@ fn pair(
     if decision != "accept" {
         return Err(refused(link, "declined"));
     }
+    let id = new_id().map_err(|e| e.to_string())?;
     let device = Device {
-        id: new_id().map_err(|e| e.to_string())?,
+        // A token of another kind, or not an FCM token, is not kept: the
+        // device can give one later with `push.token`.
+        push_token: push.and_then(|p| kept_token(store, &id, person, p)),
+        id,
         name,
         person: person.to_owned(),
         noise_key: noise_key.to_vec(),
         device_key,
         push_key: random_bytes(32).map_err(|e| e.to_string())?,
-        // A token of another kind, or not an FCM token, is not kept: the
-        // device can give one later with `push.token`.
-        push_token: push
-            .filter(|p| super::push::token_ok(&p.kind, &p.token))
-            .map(|p| p.token),
         paired: now(),
         seen: None,
         node: Some(caller.node_id.clone()),
@@ -2425,6 +2428,27 @@ fn pair(
     }
     let _ = store.settle_pairing(&code, "paired", Some(&device.id));
     Ok(device)
+}
+
+/// The token a device gave, at pairing or with `push.token`, when the bridge
+/// keeps it: an FCM token (`push::token_ok`). Any other is refused, and the
+/// bridge's log says so.
+pub(super) fn kept_token(
+    store: &Store,
+    device: &str,
+    person: &str,
+    push: enclos_protocol::device::PushToken,
+) -> Option<String> {
+    if super::push::token_ok(&push.kind, &push.token) {
+        return Some(push.token);
+    }
+    let _ = store.log(
+        Some(device),
+        Some(person),
+        "push token refused",
+        Some("not an FCM token"),
+    );
+    None
 }
 
 fn run_session(
@@ -2993,20 +3017,12 @@ fn run_session(
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
             }
-            FromDevice::PushTokenUpdate(push)
-                if !super::push::token_ok(&push.kind, &push.token) =>
-            {
-                let _ = store.log(
-                    Some(&device.id),
-                    Some(person),
-                    "push token refused",
-                    Some("not an FCM token"),
-                );
-            }
             FromDevice::PushTokenUpdate(push) => {
-                store
-                    .set_push_token(&device.id, &push.token)
-                    .map_err(|e| e.to_string())?;
+                if let Some(token) = kept_token(store, &device.id, person, push) {
+                    store
+                        .set_push_token(&device.id, &token)
+                        .map_err(|e| e.to_string())?;
+                }
             }
             // The person forgot this host on the device: unpaired, as
             // `enclos app unpair` does, then the connection ends. The

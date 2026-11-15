@@ -3097,6 +3097,23 @@ fn app_push_key_keeps_a_copy_for_the_user_alone_audited_and_push_off_removes_it(
         out.ok().stdout(),
         "Push was off already: the bridge has no push key.\n"
     );
+    // A key file that cannot be used: push is off, and status says why.
+    std::fs::write(&kept, "{}").unwrap();
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok().stdout().starts_with("Push: off: "),
+        "{}",
+        out.stdout()
+    );
+    let (_, json) = home.json(&["app", "status"]);
+    assert_eq!(json["push"]["on"], false);
+    assert!(
+        json["push"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not `service_account`"),
+        "{json}"
+    );
 }
 
 #[test]

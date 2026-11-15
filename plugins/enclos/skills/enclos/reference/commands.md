@@ -306,7 +306,7 @@ enclos agent rm [OPTIONS] <AGENT>
 
 ### `enclos app`
 
-The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, push notifications, or chat with an agent through its app channel
+The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, push, or chat with an agent through its app channel
 
 #### `enclos app chat`
 
@@ -389,7 +389,7 @@ enclos app log [OPTIONS]
 
 #### `enclos app push`
 
-Notifications on paired devices through FCM (ADR 0065): give the bridge a key to send with, or take it away
+Push to paired devices through FCM (ADR 0065, proposed): give the bridge a key to send with, or take it away
 
 ##### `enclos app push key`
 

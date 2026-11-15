@@ -2252,6 +2252,14 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets why each device's last push failed: the key it failed with
+    /// was replaced or removed.
+    pub fn clear_push_failures(&self) -> rusqlite::Result<()> {
+        self.db
+            .execute("UPDATE devices SET push_failure = NULL", [])?;
+        Ok(())
+    }
+
     pub fn log(
         &self,
         device: Option<&str>,

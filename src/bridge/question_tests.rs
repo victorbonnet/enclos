@@ -338,6 +338,43 @@ fn a_question_asked_while_its_owner_is_away_reaches_them_as_a_push() {
     let (token, seq) = pushed.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(token, "token-phone");
     assert_eq!(seq, store.newest_seq().unwrap());
+
+    // Answered: its status line is not pushed, nor is the same ask sent
+    // again by the channel once it is closed.
+    native.send(
+        "answered",
+        FromPlugin::QuestionUpdate {
+            question: definition("q-away").id,
+            state: QuestionState::Answered,
+            answer: Some(QuestionAnswer::Choices { indices: vec![0] }),
+            of: None,
+        },
+    );
+    native.ack("answered");
+    native.send(
+        "ask-again",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("q-away"),
+        },
+    );
+    native.ack("ask-again");
+    // Waited for apart: the worker keeps the newest of pushes that wait
+    // together, which would hide one here.
+    assert!(pushed.recv_timeout(Duration::from_millis(500)).is_err());
+    // The next push is the next question's, and nothing came before it.
+    native.send(
+        "next",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition("q-next"),
+        },
+    );
+    native.ack("next");
+    let (_, next) = pushed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(next, store.newest_seq().unwrap());
+    assert!(next > seq);
+    assert!(pushed.try_recv().is_err());
 }
 
 #[test]

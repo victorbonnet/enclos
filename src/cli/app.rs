@@ -94,7 +94,7 @@ enum AppVerb {
         #[arg(short = 'n', default_value_t = 50)]
         lines: i64,
     },
-    /// Notifications on paired devices through FCM (ADR 0065): give the
+    /// Push to paired devices through FCM (ADR 0065, proposed): give the
     /// bridge a key to send with, or take it away.
     Push {
         #[command(subcommand)]
@@ -153,7 +153,11 @@ fn push_key(engine: &Engine, by: &Actor, file: &std::path::Path) -> Result<u8> {
         "app push key",
         project,
         |key: &push::PushKey| format!("pushes go through FCM as {}", key.email()),
-        || push::write_key(&engine.app_push_key_path(), &json).map_err(failed),
+        || {
+            let key = push::write_key(&engine.app_push_key_path(), &json).map_err(failed)?;
+            forget_push_failures(engine)?;
+            Ok(key)
+        },
     )?;
     match output::json() {
         true => output::emit(&json!({
@@ -182,8 +186,10 @@ fn push_off(engine: &Engine, by: &Actor) -> Result<u8> {
             false => "no push key to remove".to_owned(),
         },
         || {
-            enclos::bridge::push::remove_key(&path)
-                .map_err(|e| failed(format!("cannot remove {}: {e}", path.display())))
+            let removed = enclos::bridge::push::remove_key(&path)
+                .map_err(|e| failed(format!("cannot remove {}: {e}", path.display())))?;
+            forget_push_failures(engine)?;
+            Ok(removed)
         },
     )?;
     match output::json() {
@@ -192,6 +198,14 @@ fn push_off(engine: &Engine, by: &Actor) -> Result<u8> {
         false => println!("Push was off already: the bridge has no push key."),
     }
     Ok(exit::OK)
+}
+
+/// Forgets why each device's last push failed, once the key it failed with
+/// is replaced or removed: `app status` then says nothing of an old key.
+fn forget_push_failures(engine: &Engine) -> Result<()> {
+    open_store(engine)?
+        .clear_push_failures()
+        .map_err(|e| failed(format!("cannot clear the devices' push failures: {e}")))
 }
 
 /// Whether the bridge pushes, as `app status` shows it: the key's project,
@@ -238,6 +252,17 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     for agent in &agents {
         eprintln!("  {}", agent.name);
     }
+    // The name each push carries, which the preview is bound to: the one
+    // `app pair` gives the host when it reads the address from the transport.
+    let host = transport
+        .address()
+        .map(|address| link_host(&address))
+        .unwrap_or_else(|| FALLBACK_HOST.to_owned());
+    if host == FALLBACK_HOST {
+        eprintln!(
+            "Pushes call this host `{FALLBACK_HOST}`: the bridge's address could not be read from {transport} as it started. Previews still open on paired devices."
+        );
+    }
     match push_state(engine) {
         Ok(Some(project)) => eprintln!("Push: on, through FCM for project {project}."),
         Ok(None) => eprintln!(
@@ -261,9 +286,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         Host::new(engine.app_layout(), executable),
         server::Push {
             key: engine.app_push_key_path(),
-            // The name `app pair` gives the host in its link, from the same
-            // address.
-            host: link_host(&transport.address().unwrap_or_default()),
+            host,
         },
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
@@ -534,14 +557,17 @@ fn instant(seconds: i64) -> Value {
 fn device_push(
     store: &Store,
     device: &enclos::bridge::store::Device,
-) -> (&'static str, Option<String>) {
+) -> Result<(&'static str, Option<String>)> {
     if device.push_token.is_none() {
-        return ("none", None);
+        return Ok(("none", None));
     }
-    match store.push_failure(&device.id).ok().flatten() {
+    let failure = store
+        .push_failure(&device.id)
+        .map_err(|e| failed(format!("cannot read how {}'s pushes went: {e}", device.id)))?;
+    Ok(match failure {
         Some(why) => ("failing", Some(why)),
         None => ("ready", None),
-    }
+    })
 }
 
 /// `app devices`, and with `status`, whether the bridge pushes and how
@@ -550,9 +576,17 @@ fn devices(engine: &Engine, status: bool) -> Result<u8> {
     let store = open_store(engine)?;
     let devices = store.devices().map_err(|e| failed(e.to_string()))?;
     let push = status.then(|| push_state(engine));
+    // Each device's push, for `app status`: none for `app devices`.
+    let pushes = match status {
+        true => devices
+            .iter()
+            .map(|d| device_push(&store, d).map(Some))
+            .collect::<Result<Vec<_>>>()?,
+        false => vec![None; devices.len()],
+    };
     if output::json() {
         let mut out = json!({
-            "devices": devices.iter().map(|d| {
+            "devices": devices.iter().zip(&pushes).map(|(d, pushes)| {
                 let mut device = json!({
                     "device": d.id,
                     "name": d.name,
@@ -560,8 +594,7 @@ fn devices(engine: &Engine, status: bool) -> Result<u8> {
                     "paired_at": instant(d.paired),
                     "seen_at": d.seen.map(instant),
                 });
-                if status {
-                    let (state, why) = device_push(&store, d);
+                if let Some((state, why)) = pushes {
                     device["push"] = json!(state);
                     device["push_failure"] = json!(why);
                 }
@@ -588,8 +621,8 @@ fn devices(engine: &Engine, status: bool) -> Result<u8> {
     if devices.is_empty() {
         println!("No paired device: pair one with `enclos app pair`.");
     }
-    for d in devices {
-        let pushes = match status.then(|| device_push(&store, &d)) {
+    for (d, pushes) in devices.into_iter().zip(pushes) {
+        let pushes = match pushes {
             Some((state, Some(why))) => format!(", push {state}: {}", shown(&why)),
             Some((state, None)) => format!(", push {state}"),
             None => String::new(),

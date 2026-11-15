@@ -1,6 +1,7 @@
 //! Push through FCM (ADR 0065, proposed; `docs/protocol.md`,
-//! Notifications): when a message reaches a person with no device
-//! connected, the bridge sends each of their devices a data message that
+//! Notifications): when an agent's message, a question or a runtime
+//! approval reaches a person with none of their devices connected, the
+//! bridge sends each of their devices that gave a token a data message that
 //! holds the preview sealed for that device alone.
 //!
 //! The bridge signs in to Google as a service account whose key the host's
@@ -16,6 +17,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,7 +87,7 @@ impl std::fmt::Debug for PushKey {
 
 impl PushKey {
     /// Reads a service-account key file's JSON. Refuses anything else: a
-    /// key of another type, an id that is not a Firebase project's, or a
+    /// key of another type, an id that is not a Google Cloud project id, or a
     /// private key ring does not take as an RSA key of 2048 bits or more.
     pub fn parse(json: &[u8]) -> Result<PushKey, String> {
         // The fields the bridge uses; serde leaves the others. The private
@@ -343,11 +345,30 @@ fn reason(text: &str) -> String {
     }
 }
 
+/// Why Google's token endpoint gave no access token: the key refused
+/// (400, 401 or 403: revoked, deleted, or not this project's), or the
+/// endpoint unavailable, which says nothing of the key.
+fn token_refusal(status: u16, answer: &serde_json::Value) -> String {
+    let why = answer["error_description"]
+        .as_str()
+        .or_else(|| answer["error"].as_str());
+    let why = why.map(|w| format!(": {w}")).unwrap_or_default();
+    reason(&match status {
+        200 => format!("Google gave no access token (200){why}"),
+        400 | 401 | 403 => format!("Google refused the push key ({status}){why}"),
+        _ => format!("Google's token endpoint is unavailable ({status}){why}"),
+    })
+}
+
 /// FCM, signed in with the key at a path, read again whenever the file
 /// changes.
 pub struct Fcm {
     path: PathBuf,
     agent: ureq::Agent,
+    /// Google's token endpoint and FCM's projects, [`TOKEN_URL`] and
+    /// [`FCM_URL`] but in tests, which answer from a stand-in.
+    token_url: String,
+    fcm_url: String,
     /// The key as last read, with what identified the file then.
     key: Option<(FileStamp, Arc<PushKey>)>,
     /// An access token and when to stop using it.
@@ -379,8 +400,20 @@ impl Fcm {
         Fcm {
             path,
             agent,
+            token_url: TOKEN_URL.to_owned(),
+            fcm_url: FCM_URL.to_owned(),
             key: None,
             access: None,
+        }
+    }
+
+    /// FCM at `base` (`<base>/token`, `<base>/projects`): a stand-in.
+    #[cfg(test)]
+    fn at(path: PathBuf, base: &str) -> Fcm {
+        Fcm {
+            token_url: format!("{base}/token"),
+            fcm_url: format!("{base}/projects"),
+            ..Fcm::new(path)
         }
     }
 
@@ -433,7 +466,7 @@ impl Fcm {
         let assertion = Zeroizing::new(key.assertion(now)?);
         let mut answer = self
             .agent
-            .post(TOKEN_URL)
+            .post(&self.token_url)
             .send_form([
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
@@ -449,14 +482,8 @@ impl Fcm {
                 .map_err(|e| reason(&format!("cannot read Google's answer: {e}")))?,
         );
         let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        let (Some(token), true) = (value["access_token"].as_str(), status == 200) else {
-            let why = value["error_description"]
-                .as_str()
-                .or_else(|| value["error"].as_str())
-                .unwrap_or("no access token in its answer");
-            return Err(reason(&format!(
-                "Google refused the push key ({status}): {why}"
-            )));
+        let (Some(token), 200) = (value["access_token"].as_str(), status) else {
+            return Err(token_refusal(status, &value));
         };
         let lasts = Duration::from_secs(value["expires_in"].as_u64().unwrap_or(0));
         let until = Instant::now() + lasts.saturating_sub(TOKEN_MARGIN);
@@ -469,7 +496,7 @@ impl Fcm {
             Ok(access) => Zeroizing::new(access),
             Err(why) => return (Outcome::Failed(why), 0),
         };
-        let url = format!("{FCM_URL}/{}/messages:send", key.project());
+        let url = format!("{}/{}/messages:send", self.fcm_url, key.project());
         let answer = self
             .agent
             .post(&url)
@@ -486,13 +513,20 @@ impl Fcm {
             }
         };
         let status = answer.status().as_u16();
-        let body = answer
+        match answer
             .body_mut()
             .with_config()
             .limit(MAX_ANSWER_BYTES)
             .read_to_string()
-            .unwrap_or_default();
-        (outcome(status, &body), status)
+        {
+            Ok(body) => (outcome(status, &body), status),
+            Err(e) => (
+                Outcome::Failed(reason(&format!(
+                    "FCM answered {status}, but its answer cannot be read: {e}"
+                ))),
+                status,
+            ),
+        }
     }
 }
 
@@ -540,6 +574,8 @@ impl std::fmt::Debug for Job {
 #[derive(Clone)]
 pub struct Pusher {
     jobs: Sender<Job>,
+    /// Whether it was said that the worker is gone: once.
+    gone: Arc<AtomicBool>,
 }
 
 impl Pusher {
@@ -552,11 +588,32 @@ impl Pusher {
             .name("enclos-push".to_owned())
             .spawn(move || work(waiting, service, &host, &store_path))
             .expect("a thread starts");
-        Pusher { jobs }
+        Pusher {
+            jobs,
+            gone: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A pusher with no worker, and the queue it fills: for tests that look
+    /// at what is pushed, with nothing sent.
+    #[cfg(test)]
+    pub(crate) fn queued() -> (Pusher, Receiver<Job>) {
+        let (jobs, waiting) = channel();
+        let pusher = Pusher {
+            jobs,
+            gone: Arc::new(AtomicBool::new(false)),
+        };
+        (pusher, waiting)
     }
 
     pub fn push(&self, job: Job) {
-        let _ = self.jobs.send(job);
+        // The worker catches what goes wrong with one push; should it be gone
+        // all the same, the bridge says so once, as it cannot push any more.
+        if self.jobs.send(job).is_err() && !self.gone.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "enclos app: the push worker stopped: no push is sent until the bridge restarts"
+            );
+        }
     }
 }
 
@@ -574,13 +631,42 @@ fn work(waiting: Receiver<Job>, mut service: Box<dyn PushService>, host: &str, s
             }
         }
         for job in newest.into_values() {
-            let outcome = match payload(host, &job) {
-                Ok(payload) => service.send(&job.token, &payload),
-                Err(why) => Some(Outcome::Failed(why)),
-            };
+            // A device unpaired, or that gave another token, while its push
+            // waited gets none: the push was for the device as it was.
+            if !still_paired(store, &job) {
+                continue;
+            }
+            let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match payload(host, &job) {
+                    Ok(payload) => service.send(&job.token, &payload),
+                    Err(why) => Some(Outcome::Failed(why)),
+                }
+            }));
+            let outcome = sent.unwrap_or_else(|_| {
+                Some(Outcome::Failed(
+                    "the push failed in the bridge: see its output".to_owned(),
+                ))
+            });
             if let Some(outcome) = outcome {
                 record(store, &job, &outcome);
             }
+        }
+    }
+}
+
+/// Whether `job`'s device is still paired, with the token the job carries.
+/// A database that cannot be read says no: nothing goes to a device the
+/// bridge cannot vouch for.
+fn still_paired(path: &Path, job: &Job) -> bool {
+    match Store::open(path).and_then(|store| store.device(&job.device)) {
+        Ok(Some(device)) => device.push_token.as_deref() == Some(job.token.as_str()),
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!(
+                "enclos app: no push to {}: the bridge's database cannot be read: {e}",
+                job.device
+            );
+            false
         }
     }
 }
@@ -615,6 +701,8 @@ fn record(path: &Path, job: &Job, outcome: &Outcome) {
             return;
         }
     };
+    // Unread, the reason before is taken as none: at worst one more line in
+    // the log.
     let before = store.push_failure(&job.device).ok().flatten();
     let result = match outcome {
         Outcome::Sent => store.set_push_failure(&job.device, None).and_then(|()| {
