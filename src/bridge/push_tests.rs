@@ -403,6 +403,23 @@ fn a_token_the_device_replaced_meanwhile_is_not_dropped() {
 }
 
 #[test]
+fn the_same_token_given_again_keeps_why_it_failed_and_a_new_one_clears_it() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open(&folder.path().join("app.db")).unwrap();
+    store.add_device(&device("d-1")).unwrap();
+    store
+        .set_push_failure("d-1", Some("FCM answered 503"))
+        .unwrap();
+    store.set_push_token("d-1", "token-d-1").unwrap();
+    assert_eq!(
+        store.push_failure("d-1").unwrap().as_deref(),
+        Some("FCM answered 503")
+    );
+    store.set_push_token("d-1", "token-new").unwrap();
+    assert_eq!(store.push_failure("d-1").unwrap(), None);
+}
+
+#[test]
 fn pushes_waiting_together_go_once_per_device_the_newest_each() {
     let folder = tempfile::tempdir().unwrap();
     let path = folder.path().join("app.db");

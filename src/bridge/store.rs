@@ -2211,10 +2211,11 @@ impl Store {
     }
 
     /// Keeps the push token a device gave, in place of its last: a new
-    /// token has not failed yet.
+    /// token has not failed yet, while the same one given again (a device
+    /// gives it at each connection) keeps why it last failed.
     pub fn set_push_token(&self, id: &str, token: &str) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE devices SET push_token = ?2, push_failure = NULL WHERE id = ?1",
+            "UPDATE devices SET push_failure = CASE WHEN push_token IS ?2 THEN push_failure END, push_token = ?2 WHERE id = ?1",
             params![id, token],
         )?;
         Ok(())
