@@ -231,6 +231,13 @@ impl Engine {
     ) -> Result<AgentList> {
         let tracked = self.state.agents(name)?;
         let found = runtime.agents_in(home);
+        // What the app bridge last heard each agent's plugin say it is
+        // doing: nothing without a bridge database, or one it cannot read.
+        let store = self.layout.app_store();
+        let activity = match store.exists() {
+            true => crate::bridge::store::Store::read_activity(&store).unwrap_or_default(),
+            false => Default::default(),
+        };
         let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
         let mut names: Vec<RuntimeAgentName> = builtin.iter().cloned().collect();
         for n in tracked
@@ -267,6 +274,10 @@ impl Engine {
                 let facts = runtime.agent_facts(&agent);
                 let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
                 AgentStatus {
+                    working: activity
+                        .get(&format!("{name}/{}", agent.as_str()))
+                        .map(|a| a.kinds())
+                        .unwrap_or_default(),
                     provider,
                     choose_provider,
                     kind,

@@ -230,6 +230,11 @@ pub struct AgentStatus {
     /// and may find none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choose_provider: Option<String>,
+    /// What the agent is doing, as the app bridge last heard from its
+    /// plugin (`answering`, `routine`, `task`): empty when idle, or when
+    /// no bridge runs (ADR 0067, proposed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub working: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

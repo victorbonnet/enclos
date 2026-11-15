@@ -40,6 +40,8 @@ mod policy;
 mod questions;
 #[path = "routines.rs"]
 mod routines;
+#[path = "tasks.rs"]
+mod tasks;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -184,6 +186,9 @@ struct Hub {
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
     commands: Mutex<HashMap<String, Vec<Command>>>,
+    /// What each agent not idle is doing, as its plugin last said (ADR
+    /// 0067, proposed): kept while its plugin is connected.
+    activity: Mutex<HashMap<String, enclos_protocol::task::Activity>>,
     /// Each group's discussion, while one runs or since the last ended
     /// (ADR 0045, proposed); its turns are also in the database.
     groups: Mutex<HashMap<String, Discussion>>,
@@ -387,6 +392,13 @@ impl Hub {
         {
             let _ = store.claim_host(host);
         }
+        // What an agent was doing when the bridge last stopped is not known
+        // now: each plugin says again when it connects.
+        if let Ok(store) = Store::open(&store_path)
+            && let Err(e) = store.clear_activity()
+        {
+            eprintln!("enclos app: cannot clear the agents' activity: {e}");
+        }
         let opening = agents
             .iter()
             .map(|a| (a.name.clone(), Mutex::new(())))
@@ -409,6 +421,7 @@ impl Hub {
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
+            activity: Mutex::new(HashMap::new()),
             paces: Mutex::new(HashMap::new()),
             unstored: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
@@ -517,6 +530,8 @@ impl Hub {
                 });
             }
         }
+        drop(commands);
+        answer.extend(self.activities_for(store, person));
         Ok(Ok(answer))
     }
 
@@ -631,6 +646,8 @@ impl Hub {
             self.sync_questions(store, agent, &mut writer)?;
         }
         let lists_commands = hello.capabilities.contains(&Capability::Commands);
+        let reports_activity = hello.capabilities.contains(&Capability::Activity);
+        let reports_tasks = hello.capabilities.contains(&Capability::Tasks);
         {
             let mut plugins = self.plugins.lock().expect("not poisoned");
             if plugins.contains_key(agent) {
@@ -665,6 +682,11 @@ impl Hub {
                 agent: agent.to_owned(),
                 commands: Vec::new(),
             });
+        }
+        // A plugin that no longer reports activity: idle, as far as the
+        // bridge can tell.
+        if !reports_activity {
+            self.set_activity(store.as_ref(), agent, Default::default());
         }
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
@@ -1005,6 +1027,29 @@ impl Hub {
                             hub.deliver(&owner, ToDevice::Tool(step));
                         }
                     }
+                    // What the agent is doing: kept while it is connected,
+                    // passed on live (ADR 0067, proposed).
+                    FromPlugin::Activity(activity) if reports_activity => {
+                        let activity = activity
+                            .cleaned(now(), |c| approvals::speaks_in(&store, &agent, c.as_str()));
+                        hub.set_activity(Some(&store), &agent, activity);
+                    }
+                    // Its tasks: kept, for the host's person. Refused, the
+                    // plugin is told why and the task acknowledged; not
+                    // stored, the connection ends and the plugin's next
+                    // `tasks` list brings it again.
+                    FromPlugin::TaskUpdate { task } if reports_tasks => {
+                        let result = hub.task_reported(&store, &agent, task);
+                        if !answer_tasks(&hub, &agent, &mut acks, message.id, result) {
+                            break;
+                        }
+                    }
+                    FromPlugin::Tasks { tasks } if reports_tasks => {
+                        let result = hub.tasks_reported(&store, &agent, tasks);
+                        if !answer_tasks(&hub, &agent, &mut acks, message.id, result) {
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1019,6 +1064,10 @@ impl Hub {
                 plugins.remove(&agent);
             }
             drop(plugins);
+            // No plugin left to say the agent stopped: it is idle.
+            if current {
+                hub.set_activity(Some(&store), &agent, Default::default());
+            }
             // Not when a newer connection is the agent's: the turn running
             // may be one sent on it
             if current {
@@ -1295,6 +1344,38 @@ const MAX_TOOL_CALL_CHARS: usize = 128;
 /// and the label and name with their hidden characters written out
 /// ([`enclos_protocol::visible::revealed`]), so what the person reads is
 /// what ran.
+/// Answers a plugin's `task.update` or `tasks`: acknowledged once stored,
+/// and when refused after an `error` saying why. `false` when the bridge's
+/// database failed: not acknowledged, and the connection ends.
+fn answer_tasks(
+    hub: &Hub,
+    agent: &str,
+    acks: &mut PluginWriter,
+    id: MessageId,
+    result: Result<(), tasks::TaskRefusal>,
+) -> bool {
+    match result {
+        Ok(()) => {
+            let _ = acks.send(FromBridge::Ack { of: id });
+            true
+        }
+        Err(tasks::TaskRefusal::Bad(why)) => {
+            eprintln!("enclos app: {agent}: a task is refused: {why}");
+            let _ = acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
+                of: Some(id.clone()),
+                code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                message: why,
+            }));
+            let _ = acks.send(FromBridge::Ack { of: id });
+            true
+        }
+        Err(tasks::TaskRefusal::Store(why)) => {
+            hub.kept_by_plugin(agent, acks, &why);
+            false
+        }
+    }
+}
+
 fn tool_step(store: &Store, agent: &str, step: ToolStep) -> Option<(String, ToolStep)> {
     let c = store.conversation_info(step.conversation.as_str()).ok()??;
     if format!("{}/{}", c.sandbox, c.agent) != agent {
@@ -2459,6 +2540,16 @@ fn run_session(
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         let what = format!("policy request {}", a.request);
                         let body = ToDevice::Approval(a);
+                        if fits_device(&body) {
+                            link.send(body)?;
+                        } else {
+                            log_too_large(store, &device.id, person, &what, &body);
+                        }
+                    }
+                    // Every kept task, whatever `since` (ADR 0067, proposed)
+                    for task in hub.tasks_for_sync(store, person)? {
+                        let what = format!("task {}", task.id);
+                        let body = ToDevice::Task { task };
                         if fits_device(&body) {
                             link.send(body)?;
                         } else {

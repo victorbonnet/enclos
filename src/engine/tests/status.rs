@@ -639,6 +639,7 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                     model: Fact::NotProvided,
                     provider: Fact::NotProvided,
                     choose_provider: None,
+                    working: Vec::new(),
                 })
                 .collect(),
             unreadable: None,
@@ -764,5 +765,38 @@ fn the_json_view_names_each_state_and_fact() {
             "reason": "Hermes is not logged in",
             "command": "enclos connect home -- hermes -p default setup"
         })
+    );
+}
+
+#[test]
+fn an_agent_the_bridge_heard_working_is_said_to_be_working() {
+    let (_dir, engine, name) = with_runtime();
+    // No bridge database: nobody is said to be working
+    let view = engine.status(None).unwrap();
+    let idle = &view.sandboxes[0].agents.as_ref().unwrap().agents[0];
+    assert!(idle.working.is_empty());
+    let store = crate::bridge::store::Store::open(&engine.layout.app_store()).unwrap();
+    store
+        .set_activity(
+            &format!("{name}/default"),
+            &enclos_protocol::task::Activity {
+                doing: vec![enclos_protocol::task::Doing::Task { task: "t1".into() }],
+                since: 1,
+            },
+        )
+        .unwrap();
+    let view = engine.status(None).unwrap();
+    let agent = &view.sandboxes[0].agents.as_ref().unwrap().agents[0];
+    assert_eq!(
+        (agent.name.as_str(), agent.working.clone()),
+        ("default", vec!["task"])
+    );
+    // A bridge that starts again forgets it
+    store.clear_activity().unwrap();
+    let view = engine.status(None).unwrap();
+    assert!(
+        view.sandboxes[0].agents.as_ref().unwrap().agents[0]
+            .working
+            .is_empty()
     );
 }

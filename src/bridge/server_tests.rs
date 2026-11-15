@@ -3603,3 +3603,262 @@ fn an_edit_is_measured_against_the_policy_it_would_make() {
         &of
     ));
 }
+
+/// A stand-in plugin at `socket` that says hello with `capabilities`, then
+/// sends what the test gives it (`None` closes the connection), and passes
+/// on what the bridge sends it.
+fn scripted_plugin(
+    socket: &std::path::Path,
+    capabilities: Vec<Capability>,
+) -> (
+    std::sync::mpsc::Sender<Option<FromPlugin>>,
+    std::sync::mpsc::Receiver<FromBridge>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let (script, lines) = channel::<Option<FromPlugin>>();
+    let (heard, from_bridge) = channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).unwrap();
+        let mut send = |body: FromPlugin| {
+            let id = MessageId::new(new_id().unwrap()).unwrap();
+            out.write_all(&encode_line(&Envelope::new(id, body)))
+                .unwrap();
+        };
+        send(FromPlugin::Hello {
+            runtime: "hermes".into(),
+            agent: "main".into(),
+            capabilities,
+        });
+        std::thread::spawn(move || {
+            loop {
+                let mut line = Vec::new();
+                if reader.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Ok(message) = enclos_protocol::plugin::decode_from_bridge(&line) {
+                    let _ = heard.send(message.body);
+                }
+            }
+        });
+        while let Ok(Some(body)) = lines.recv() {
+            send(body);
+        }
+        let _ = out.shutdown(std::net::Shutdown::Both);
+    });
+    (script, from_bridge)
+}
+
+fn reported(
+    id: &str,
+    assignee: &str,
+    state: enclos_protocol::task::TaskState,
+) -> enclos_protocol::task::Task {
+    enclos_protocol::task::Task {
+        id: id.into(),
+        title: format!("Task {id}"),
+        assignee: assignee.into(),
+        asked_by: None,
+        conversation: None,
+        state,
+        since: 1,
+        summary: None,
+    }
+}
+
+/// The next message to a device that is not `except`, within 5 seconds.
+fn next_except(
+    device: &std::sync::mpsc::Receiver<ToDevice>,
+    skip: impl Fn(&ToDevice) -> bool,
+) -> ToDevice {
+    loop {
+        let got = device.recv_timeout(Duration::from_secs(5)).unwrap();
+        if !skip(&got) {
+            return got;
+        }
+    }
+}
+
+#[test]
+fn tasks_from_the_assignees_plugin_reach_the_hosts_person_only_and_a_list_replaces_them() {
+    use enclos_protocol::task::TaskState;
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["main"]);
+    let (plugin, from_bridge) = scripted_plugin(
+        &dir.path().join("main.sock"),
+        vec![Capability::Activity, Capability::Tasks],
+    );
+    let (alice, from_alice) = channel();
+    let (bob, from_bob) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("d-1".to_owned(), ("alice@example.com".to_owned(), alice, 1));
+        devices.insert("d-2".to_owned(), ("bob@example.com".to_owned(), bob, 2));
+    }
+    hub.plugin("lab/main").unwrap();
+    // The plugin's first word, idle, changes nothing for the devices
+    let activity = |m: &ToDevice| matches!(m, ToDevice::AgentActivity { .. });
+
+    // Another agent's task: refused, and acknowledged so it is not sent again
+    plugin
+        .send(Some(FromPlugin::TaskUpdate {
+            task: reported("t0", "lead", TaskState::Running),
+        }))
+        .unwrap();
+    let error = from_bridge.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        error,
+        FromBridge::Error(ErrorBody { code: ErrorCode::BadMessage, ref message, .. }) if message.contains("main")
+    ));
+    assert!(matches!(
+        from_bridge.recv_timeout(Duration::from_secs(5)).unwrap(),
+        FromBridge::Ack { .. }
+    ));
+
+    plugin
+        .send(Some(FromPlugin::Tasks {
+            tasks: vec![
+                reported("t1", "main", TaskState::Running),
+                reported("t2", "main", TaskState::Queued),
+            ],
+        }))
+        .unwrap();
+    assert!(matches!(
+        from_bridge.recv_timeout(Duration::from_secs(5)).unwrap(),
+        FromBridge::Ack { .. }
+    ));
+    for id in ["t1", "t2"] {
+        let got = next_except(&from_alice, activity);
+        assert!(
+            matches!(&got, ToDevice::Task { task } if task.id == id && task.assignee == "lab/main"),
+            "{got:?}"
+        );
+    }
+    // A list without t1: the runtime no longer has it
+    plugin
+        .send(Some(FromPlugin::Tasks {
+            tasks: vec![reported("t2", "main", TaskState::Done)],
+        }))
+        .unwrap();
+    assert_eq!(
+        next_except(&from_alice, activity),
+        ToDevice::TaskRemoved {
+            agent: "lab/main".into(),
+            task: "t1".into()
+        }
+    );
+    assert!(matches!(
+        next_except(&from_alice, activity),
+        ToDevice::Task { task } if task.id == "t2" && task.state == TaskState::Done
+    ));
+    // Another person never gets a task
+    while let Ok(got) = from_bob.recv_timeout(Duration::from_millis(200)) {
+        assert!(activity(&got), "{got:?}");
+    }
+    // A device that was away gets what is kept at its sync
+    let kept = hub
+        .tasks_for_sync(&hub.store().unwrap(), "alice@example.com")
+        .unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, "t2");
+    plugin.send(None).unwrap();
+}
+
+#[test]
+fn activity_is_shown_as_each_person_may_see_it_and_ends_with_the_plugins_connection() {
+    use enclos_protocol::task::{Activity, Doing};
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["main"]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-main", "lab", "main", "alice@example.com")
+        .unwrap();
+    let (plugin, _from_bridge) =
+        scripted_plugin(&dir.path().join("main.sock"), vec![Capability::Activity]);
+    let (alice, from_alice) = channel();
+    let (bob, from_bob) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("d-1".to_owned(), ("alice@example.com".to_owned(), alice, 1));
+        devices.insert("d-2".to_owned(), ("bob@example.com".to_owned(), bob, 2));
+    }
+    hub.plugin("lab/main").unwrap();
+    let conversation = |id: &str| ConversationId::new(id).unwrap();
+    plugin
+        .send(Some(FromPlugin::Activity(Activity {
+            doing: vec![
+                Doing::Answering {
+                    conversation: conversation("c-main"),
+                },
+                // Not one of its conversations: left out
+                Doing::Answering {
+                    conversation: conversation("c-elsewhere"),
+                },
+                Doing::Task { task: "t1".into() },
+            ],
+            since: 1,
+        })))
+        .unwrap();
+    let working = Activity {
+        doing: vec![
+            Doing::Answering {
+                conversation: conversation("c-main"),
+            },
+            Doing::Task { task: "t1".into() },
+        ],
+        since: 1,
+    };
+    assert_eq!(
+        from_alice.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ToDevice::AgentActivity {
+            agent: "lab/main".into(),
+            activity: working.clone()
+        }
+    );
+    // Bob owns neither the conversation nor the host: nothing of it
+    assert_eq!(
+        from_bob.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ToDevice::AgentActivity {
+            agent: "lab/main".into(),
+            activity: Activity::default()
+        }
+    );
+    // Given after the agents' list, and recorded for `enclos status`
+    let answer = hub
+        .agents_answer(&store, "alice@example.com")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        answer.last(),
+        Some(&ToDevice::AgentActivity {
+            agent: "lab/main".into(),
+            activity: working.clone()
+        })
+    );
+    let bobs = hub
+        .agents_answer(&store, "bob@example.com")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !bobs
+            .iter()
+            .any(|m| matches!(m, ToDevice::AgentActivity { .. }))
+    );
+    let path = dir.path().join("bridge.db");
+    assert_eq!(Store::read_activity(&path).unwrap()["lab/main"], working);
+
+    // The plugin's connection ends: idle
+    plugin.send(None).unwrap();
+    assert_eq!(
+        from_alice.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ToDevice::AgentActivity {
+            agent: "lab/main".into(),
+            activity: Activity::default()
+        }
+    );
+    assert!(Store::read_activity(&path).unwrap().is_empty());
+}
