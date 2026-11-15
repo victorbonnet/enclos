@@ -208,6 +208,9 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
         if !list.agents.is_empty() {
             print_agents(&list.agents, complete, now);
         }
+        if let Some(why) = &list.activity_unreadable {
+            println!("  enclos cannot tell which agents are working: {why}");
+        }
     }
 
     let d = &s.disk;

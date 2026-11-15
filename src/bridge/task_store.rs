@@ -17,7 +17,20 @@ pub struct TaskChanges {
 type Tx<'a> = rusqlite::Transaction<'a>;
 
 /// A task as devices know it: its assignee (`<sandbox>/<agent>`) and id.
-pub type TaskKey = (String, String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskKey {
+    pub agent: String,
+    pub task: String,
+}
+
+impl TaskKey {
+    pub fn new(agent: impl Into<String>, task: impl Into<String>) -> TaskKey {
+        TaskKey {
+            agent: agent.into(),
+            task: task.into(),
+        }
+    }
+}
 
 impl Store {
     /// Keeps `task` of `sandbox`, its `assignee` already `<sandbox>/<agent>`
@@ -61,7 +74,7 @@ impl Store {
                     "DELETE FROM tasks WHERE sandbox = ?1 AND id = ?2",
                     params![sandbox, id],
                 )?;
-                changes.removed.push((agent.to_owned(), id));
+                changes.removed.push(TaskKey::new(agent, id));
             }
         }
         for task in tasks.iter().take(MAX_TASKS) {
@@ -69,6 +82,17 @@ impl Store {
         }
         tx.commit()?;
         Ok(changes)
+    }
+
+    /// Whether the bridge keeps any task of `agent` (`<sandbox>/<agent>`):
+    /// read before dropping them, so a plugin's hello takes no write lock
+    /// when there is nothing to drop.
+    pub fn has_tasks(&self, agent: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE agent = ?1)",
+            params![agent],
+            |r| r.get(0),
+        )
     }
 
     /// Every kept task, the ones still going first, then the most recent.
@@ -148,13 +172,62 @@ impl Store {
     }
 }
 
+/// The file a running bridge holds a shared lock on, beside its database
+/// (`app.db.live`): what tells `enclos status` that the activity recorded
+/// is a running bridge's, not a stopped or crashed one's.
+pub fn live_path(store: &Path) -> std::path::PathBuf {
+    let mut name = store.file_name().unwrap_or_default().to_owned();
+    name.push(".live");
+    store.with_file_name(name)
+}
+
+/// Takes the running bridge's lock ([`live_path`]), held while the
+/// returned file is open; `None`, said on stderr, when it cannot.
+pub fn hold_live(store: &Path) -> Option<std::fs::File> {
+    let path = live_path(store);
+    let taken = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .and_then(|file| {
+            file.try_lock_shared().map_err(std::io::Error::from)?;
+            Ok(file)
+        });
+    match taken {
+        Ok(file) => Some(file),
+        Err(e) => {
+            eprintln!(
+                "enclos app: cannot lock {}: `enclos status` will not show what agents are doing: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Whether a bridge holds its lock beside the database at `store`: no lock
+/// file, or one nobody holds, is no bridge running.
+pub fn bridge_runs(store: &Path) -> std::io::Result<bool> {
+    let file = match std::fs::File::open(live_path(store)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// Drops the tasks that ended more than 3 days ago.
 fn prune(tx: &Tx, now: i64) -> rusqlite::Result<Vec<TaskKey>> {
     let mut query =
         tx.prepare("DELETE FROM tasks WHERE ended IS NOT NULL AND ended < ?1 RETURNING agent, id")?;
     query
         .query_map(params![now - ENDED_RETENTION_SECS], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok(TaskKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .collect()
 }
@@ -182,7 +255,9 @@ fn put(
         Some((_, old, was)) if *old == body && *was == ended => return Ok(()),
         // Given to another agent: devices know it under the one before
         Some((agent, ..)) if *agent != task.assignee => {
-            changes.removed.push((agent.clone(), task.id.clone()));
+            changes
+                .removed
+                .push(TaskKey::new(agent.clone(), task.id.clone()));
         }
         Some(_) => {}
         None => {
@@ -207,7 +282,7 @@ fn put(
                     "DELETE FROM tasks WHERE sandbox = ?1 AND id = ?2",
                     params![sandbox, id],
                 )?;
-                changes.removed.push((agent, id));
+                changes.removed.push(TaskKey::new(agent, id));
             }
         }
     }
@@ -269,7 +344,7 @@ mod tests {
         assert_eq!(s.tasks(1_000 + ENDED_RETENTION_SECS).unwrap().0.len(), 1);
         let (kept, removed) = s.tasks(1_001 + ENDED_RETENTION_SECS).unwrap();
         assert!(kept.is_empty());
-        assert_eq!(removed, vec![("lab/eng".to_owned(), "t1".to_owned())]);
+        assert_eq!(removed, vec![TaskKey::new("lab/eng", "t1")]);
     }
 
     #[test]
@@ -299,10 +374,7 @@ mod tests {
         let made_room = s
             .put_task("lab", &task("new", "lab/eng", TaskState::Queued, 1), 500)
             .unwrap();
-        assert_eq!(
-            made_room.removed,
-            vec![("lab/eng".to_owned(), "t0".to_owned())]
-        );
+        assert_eq!(made_room.removed, vec![TaskKey::new("lab/eng", "t0")]);
         assert_eq!(ids(&made_room.stored), ["new"]);
         s.put_task("lab", &task("new2", "lab/eng", TaskState::Queued, 1), 500)
             .unwrap();
@@ -338,10 +410,7 @@ mod tests {
                 20,
             )
             .unwrap();
-        assert_eq!(
-            changes.removed,
-            vec![("lab/eng".to_owned(), "a".to_owned())]
-        );
+        assert_eq!(changes.removed, vec![TaskKey::new("lab/eng", "a")]);
         assert_eq!(ids(&changes.stored), ["b", "d"]);
         let (kept, _) = s.tasks(30).unwrap();
         // Going first, the newest first, then the ended ones
@@ -356,7 +425,7 @@ mod tests {
         let moved = s
             .put_task("lab", &task("a", "lab/ops", TaskState::Queued, 2), 11)
             .unwrap();
-        assert_eq!(moved.removed, vec![("lab/eng".to_owned(), "a".to_owned())]);
+        assert_eq!(moved.removed, vec![TaskKey::new("lab/eng", "a")]);
         // The first agent's list no longer drops it
         let list = s.replace_tasks("lab", "lab/eng", &[], 12).unwrap();
         assert!(list.removed.is_empty());
@@ -380,6 +449,19 @@ mod tests {
         assert_eq!(read["lab/eng"], busy);
         s.clear_activity().unwrap();
         assert!(Store::read_activity(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bridge_runs_while_it_holds_its_lock_and_not_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        assert!(!bridge_runs(&path).unwrap());
+        let held = hold_live(&path).unwrap();
+        assert!(bridge_runs(&path).unwrap());
+        // A check does not take the lock from the bridge
+        assert!(bridge_runs(&path).unwrap());
+        drop(held);
+        assert!(!bridge_runs(&path).unwrap());
     }
 
     #[test]

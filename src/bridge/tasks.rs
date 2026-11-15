@@ -16,22 +16,63 @@ pub(super) enum TaskRefusal {
 }
 
 impl Hub {
-    /// Records what `agent` (`<sandbox>/<agent>`) is doing and tells each
-    /// connected device what its person may see of it, when it changed.
-    pub(super) fn set_activity(&self, store: Option<&Store>, agent: &str, activity: Activity) {
-        {
+    /// Records what `agent` (`<sandbox>/<agent>`) is doing, as the plugin
+    /// connection `generation` reported it, and tells each connected device
+    /// what its person may see of it, when that changed. A report from a
+    /// connection older than the one the bridge holds is not taken.
+    pub(super) fn set_activity(
+        &self,
+        store: Option<&Store>,
+        agent: &str,
+        generation: u64,
+        activity: Activity,
+    ) {
+        let before = {
             let mut current = self.activity.lock().expect("not poisoned");
+            if current.get(agent).is_some_and(|(g, _)| *g > generation) {
+                return;
+            }
             let before = if activity.idle() {
                 current.remove(agent)
             } else {
-                current.insert(agent.to_owned(), activity.clone())
-            };
-            if before.unwrap_or_default() == activity {
+                current.insert(agent.to_owned(), (generation, activity.clone()))
+            }
+            .map(|(_, a)| a)
+            .unwrap_or_default();
+            if before == activity {
                 return;
             }
-        }
+            before
+        };
+        self.activity_changed(store, agent, &before, &activity);
+    }
+
+    /// Makes `agent` idle when the activity the bridge holds is the one
+    /// connection `generation` reported: that connection closed, however
+    /// it closed, and no plugin is left to say the agent stopped.
+    pub(super) fn end_activity(&self, store: Option<&Store>, agent: &str, generation: u64) {
+        let before = {
+            let mut current = self.activity.lock().expect("not poisoned");
+            if current.get(agent).is_none_or(|(g, _)| *g != generation) {
+                return;
+            }
+            current.remove(agent).map(|(_, a)| a).unwrap_or_default()
+        };
+        self.activity_changed(store, agent, &before, &Activity::default());
+    }
+
+    /// Records `agent`'s new activity for `enclos status`, and sends each
+    /// person who sees the agent what they may see of it, when that part
+    /// changed: a guest learns nothing of the host's view changing.
+    fn activity_changed(
+        &self,
+        store: Option<&Store>,
+        agent: &str,
+        before: &Activity,
+        after: &Activity,
+    ) {
         if let Some(store) = store
-            && let Err(e) = store.set_activity(agent, &activity)
+            && let Err(e) = store.set_activity(agent, after)
         {
             eprintln!("enclos app: {agent}: cannot record its activity: {e}");
         }
@@ -47,7 +88,10 @@ impl Hub {
             if !self.sees_agent(&person, agent) {
                 continue;
             }
-            let seen = seen_by(store, &activity, host.as_deref(), &person);
+            let seen = seen_by(store, after, host.as_deref(), &person);
+            if seen == seen_by(store, before, host.as_deref(), &person) {
+                continue;
+            }
             self.deliver(
                 &person,
                 ToDevice::AgentActivity {
@@ -58,11 +102,41 @@ impl Hub {
         }
     }
 
+    /// Drops what the bridge keeps of `agent`'s tasks: its plugin no longer
+    /// reports them.
+    pub(super) fn tasks_unreported(&self, store: &Store, agent: &str) {
+        match store.has_tasks(agent) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                return eprintln!(
+                    "enclos app: {agent}: cannot read the tasks it no longer reports: {e}"
+                );
+            }
+        }
+        let (sandbox, _) = agent.split_once('/').unwrap_or((agent, ""));
+        match store.replace_tasks(sandbox, agent, &[], now()) {
+            Ok(changes) => {
+                let host = store.host_person().ok().flatten();
+                self.deliver_tasks(host.as_deref(), &changes);
+            }
+            Err(e) => {
+                eprintln!("enclos app: {agent}: cannot drop the tasks it no longer reports: {e}")
+            }
+        }
+    }
+
     /// What `person` is sent after `agents.list`: the activity of each
     /// agent they are shown that is not idle, as they may see it.
     pub(super) fn activities_for(&self, store: &Store, person: &str) -> Vec<ToDevice> {
         let host = self.known_host();
-        let current = self.activity.lock().expect("not poisoned").clone();
+        let current: Vec<(String, Activity)> = self
+            .activity
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|(agent, (_, activity))| (agent.clone(), activity.clone()))
+            .collect();
         let mut out: Vec<ToDevice> = current
             .into_iter()
             .filter(|(agent, _)| self.sees_agent(person, agent))
@@ -96,14 +170,14 @@ impl Hub {
             .map_err(|e| TaskRefusal::Store(e.to_string()))?;
         self.deliver_tasks(host.as_deref(), &changes);
         if changes.full > 0 {
-            return Err(TaskRefusal::Bad(FULL.into()));
+            return Err(TaskRefusal::Bad(full()));
         }
         Ok(())
     }
 
     /// Makes what the bridge keeps of `agent`'s tasks the list its plugin
-    /// sent. A task in it the bridge refuses is left out, and named in the
-    /// answer.
+    /// sent. A task in it the bridge refuses is left out; the answer counts
+    /// them and gives the first one's reason.
     pub(super) fn tasks_reported(
         &self,
         store: &Store,
@@ -129,7 +203,7 @@ impl Hub {
             .map_err(|e| TaskRefusal::Store(e.to_string()))?;
         self.deliver_tasks(host.as_deref(), &changes);
         if changes.full > 0 {
-            refused.push(FULL.into());
+            refused.push(full());
         }
         match refused.first() {
             Some(first) => Err(TaskRefusal::Bad(format!(
@@ -142,7 +216,7 @@ impl Hub {
 
     /// The kept tasks, for a sync of the host's person; the ones that
     /// passed their 3 days meanwhile are dropped, and the host's person's
-    /// other devices told.
+    /// devices told.
     pub(super) fn tasks_for_sync(&self, store: &Store, host: &str) -> Result<Vec<Task>, String> {
         let (tasks, removed) = store.tasks(now()).map_err(|e| e.to_string())?;
         self.deliver_tasks(
@@ -160,12 +234,12 @@ impl Hub {
         let Some(host) = host else {
             return;
         };
-        for (agent, task) in &changes.removed {
+        for key in &changes.removed {
             self.deliver(
                 host,
                 ToDevice::TaskRemoved {
-                    agent: agent.clone(),
-                    task: task.clone(),
+                    agent: key.agent.clone(),
+                    task: key.task.clone(),
                 },
             );
         }
@@ -175,8 +249,14 @@ impl Hub {
     }
 }
 
-const FULL: &str =
-    "the sandbox already has 100 tasks still going; this one is not kept until one ends";
+/// Why a task past the sandbox's [`MAX_TASKS`](enclos_protocol::task::MAX_TASKS)
+/// still going is refused: the plugin sends it again with its next change.
+fn full() -> String {
+    format!(
+        "the sandbox already has {} tasks still going; this one is not kept, and is taken when sent again once one has ended",
+        enclos_protocol::task::MAX_TASKS
+    )
+}
 
 /// `activity` as `person` may see it: all of it for the host's person, the
 /// answering in their own conversations for anyone else.
@@ -215,7 +295,13 @@ fn kept_form(
         .cleaned(now)
         .map_err(|e| TaskRefusal::Bad(e.to_string()))?;
     task.assignee = agent.to_owned();
-    task.asked_by = task.asked_by.map(|a| format!("{sandbox}/{a}"));
+    // Written `sandbox/agent`, it must still be a name a device takes: one
+    // `/`, and the id rule's 128 bytes.
+    task.asked_by = task
+        .asked_by
+        .filter(|a| !a.contains('/'))
+        .map(|a| format!("{sandbox}/{a}"))
+        .filter(|a| a.len() <= enclos_protocol::routine::MAX_ID_BYTES);
     if let Some(conversation) = &task.conversation {
         let id = conversation.as_str();
         let same_sandbox = store
@@ -264,10 +350,61 @@ mod tests {
             kept_form(&s, "lab/engineer", Some("host@example.com"), task("lead"), 10),
             Err(TaskRefusal::Bad(why)) if why.contains("engineer")
         ));
+        // Named the way the bridge names it, `sandbox/agent`, it is not the
+        // plugin's own name for it either
         assert!(matches!(
-            kept_form(&s, "lab/engineer", None, task("lab/engineer"), 10),
-            Err(TaskRefusal::Bad(_))
+            kept_form(&s, "lab/engineer", Some("host@example.com"), task("lab/engineer"), 10),
+            Err(TaskRefusal::Bad(why)) if why.contains("engineer")
         ));
+    }
+
+    #[test]
+    fn an_asked_by_that_would_not_be_a_name_is_dropped() {
+        let (_d, s) = store();
+        let asked = |by: &str| {
+            let mut t = task("engineer");
+            t.asked_by = Some(by.into());
+            kept_form(&s, "lab/engineer", Some("host@example.com"), t, 10)
+                .unwrap()
+                .asked_by
+        };
+        assert_eq!(asked("other/lead"), None);
+        assert_eq!(asked(&"l".repeat(128)), None);
+        assert_eq!(asked(&"l".repeat(124)).map(|a| a.len()), Some(128));
+    }
+
+    #[test]
+    fn activity_ends_only_with_the_connection_that_reported_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = super::super::tests::hub(dir.path(), &["main"]);
+        let store = hub.store().unwrap();
+        let busy = |task: &str| Activity {
+            doing: vec![enclos_protocol::task::Doing::Task { task: task.into() }],
+            since: 1,
+        };
+        let held = |hub: &Hub| {
+            hub.activity
+                .lock()
+                .unwrap()
+                .get("lab/main")
+                .map(|(_, a)| a.clone())
+        };
+        hub.set_activity(Some(&store), "lab/main", 1, busy("old"));
+        hub.set_activity(Some(&store), "lab/main", 2, busy("new"));
+        // The old connection, closing late, leaves the new one's
+        hub.end_activity(Some(&store), "lab/main", 1);
+        assert_eq!(held(&hub), Some(busy("new")));
+        // A late report from it is not taken either
+        hub.set_activity(Some(&store), "lab/main", 1, busy("late"));
+        assert_eq!(held(&hub), Some(busy("new")));
+        // Its own connection closing, however it closed, ends it
+        hub.end_activity(Some(&store), "lab/main", 2);
+        assert_eq!(held(&hub), None);
+        assert!(
+            Store::read_activity(&dir.path().join("bridge.db"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ Read from Hermes's default branch at `8b4c5343` (2026-11-15), for [ADR 0068](../
 - Plugins load lazily in every Hermes process, the CLI included (`hermes_cli/plugins.py:982-1012`).
 - No hook fires for a crash, timeout or orphan put back to `ready` (`kanban_db_dispatch.py:888`), giving up (`1476-1491`), `unblock_task` (`kanban_db.py:3557`), `archive_task` (`3789`), `promote_task` (`3478`) or `recompute_ready` (`2036`).
 
-So a plugin cannot follow a task from hooks alone. Hermes's own notifier reads `task_events` above a cursor every 5 s (`gateway/kanban_watchers.py:60-121`); the enclos adapter does the same, read-only (a `mode=ro` URI, as `gateway/session_kanban.py:30` does: `kanban_db_connect.connect()` creates and migrates the database).
+So a plugin cannot follow a task from hooks alone. Hermes's own notifier reads `task_events` above a cursor every 5 s (`gateway/kanban_watchers.py:60-121`); the enclos adapter looks at the newest event's id every 5 s instead and, when it moved, reads the agent's tasks again, read-only (a `mode=ro` URI, as `gateway/session_kanban.py:30` does: `kanban_db_connect.connect()` creates and migrates the database).
 
 ## What a task holds
 

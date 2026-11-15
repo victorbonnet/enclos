@@ -572,12 +572,17 @@ fn chat(
     )
     .map_err(failed)?;
     let plugin_error = |e: PluginError| failed(e.to_string());
-    let (hello, mut reader, mut writer) = connect(
-        &endpoint.socket,
-        endpoint.token.expose(),
-        &enclos::bridge::store::home_id(&format!("{sandbox}/{agent}")),
-    )
-    .map_err(plugin_error)?;
+    // The Home the bridge chose for the agent (ADR 0067, proposed).
+    let home = store
+        .home_of(&format!("{sandbox}/{agent}"))
+        .map_err(|e| failed(format!("cannot read the bridge's database: {e}")))?
+        .ok_or_else(|| {
+            failed(format!(
+                "{sandbox}/{agent} was forgotten in the app: set up its app channel again with `enclos runtime configure --channel app`"
+            ))
+        })?;
+    let (hello, mut reader, mut writer) =
+        connect(&endpoint.socket, endpoint.token.expose(), &home).map_err(plugin_error)?;
     eprintln!(
         "Talking to {sandbox}/{agent} ({}) in conversation {conversation}; Ctrl-D to stop.",
         printable_line(&hello.runtime)

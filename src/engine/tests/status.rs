@@ -102,7 +102,8 @@ fn a_runtime_that_names_nothing_gets_sizes_no_agents_and_suggestions() {
         status.agents,
         Some(AgentList {
             agents: Vec::new(),
-            unreadable: None
+            unreadable: None,
+            activity_unreadable: None,
         })
     );
     let rt = status.runtime.as_ref().unwrap();
@@ -643,6 +644,7 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                 })
                 .collect(),
             unreadable: None,
+            activity_unreadable: None,
         }),
         ..base.clone()
     };
@@ -769,13 +771,18 @@ fn the_json_view_names_each_state_and_fact() {
 }
 
 #[test]
-fn an_agent_the_bridge_heard_working_is_said_to_be_working() {
+fn an_agent_the_bridge_heard_working_is_said_to_be_working_while_it_runs() {
     let (_dir, engine, name) = with_runtime();
+    let agents = |engine: &Engine| {
+        engine.status(None).unwrap().sandboxes[0]
+            .agents
+            .clone()
+            .unwrap()
+    };
     // No bridge database: nobody is said to be working
-    let view = engine.status(None).unwrap();
-    let idle = &view.sandboxes[0].agents.as_ref().unwrap().agents[0];
-    assert!(idle.working.is_empty());
-    let store = crate::bridge::store::Store::open(&engine.layout.app_store()).unwrap();
+    assert!(agents(&engine).agents[0].working.is_empty());
+    let path = engine.layout.app_store();
+    let store = crate::bridge::store::Store::open(&path).unwrap();
     store
         .set_activity(
             &format!("{name}/default"),
@@ -785,18 +792,22 @@ fn an_agent_the_bridge_heard_working_is_said_to_be_working() {
             },
         )
         .unwrap();
-    let view = engine.status(None).unwrap();
-    let agent = &view.sandboxes[0].agents.as_ref().unwrap().agents[0];
+    // What a bridge that stopped recorded says nothing now
+    let stopped = agents(&engine);
+    assert!(stopped.agents[0].working.is_empty());
+    assert_eq!(stopped.activity_unreadable, None);
+    // A bridge that runs holds its lock
+    let live = crate::bridge::store::hold_live(&path).unwrap();
+    let list = agents(&engine);
     assert_eq!(
-        (agent.name.as_str(), agent.working.clone()),
+        (list.agents[0].name.as_str(), list.agents[0].working.clone()),
         ("default", vec!["task"])
     );
-    // A bridge that starts again forgets it
-    store.clear_activity().unwrap();
-    let view = engine.status(None).unwrap();
-    assert!(
-        view.sandboxes[0].agents.as_ref().unwrap().agents[0]
-            .working
-            .is_empty()
-    );
+    // A database that cannot be read is said, not taken for idle
+    std::fs::write(&path, "not a database").unwrap();
+    let unreadable = agents(&engine);
+    assert!(unreadable.agents[0].working.is_empty());
+    assert!(unreadable.activity_unreadable.is_some());
+    drop(live);
+    assert_eq!(agents(&engine).activity_unreadable, None);
 }

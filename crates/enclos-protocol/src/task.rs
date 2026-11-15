@@ -167,6 +167,18 @@ pub enum Doing {
     Unknown,
 }
 
+impl Doing {
+    /// Its `kind` on the wire; `None` for one a later version added.
+    pub fn kind(&self) -> Option<&'static str> {
+        match self {
+            Doing::Answering { .. } => Some("answering"),
+            Doing::Routine { .. } => Some("routine"),
+            Doing::Task { .. } => Some("task"),
+            Doing::Unknown => None,
+        }
+    }
+}
+
 /// What an agent is doing, whole: empty when it is idle.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Activity {
@@ -232,19 +244,10 @@ impl Activity {
     /// The kinds it is doing, once each, in a fixed order: what `enclos
     /// status` prints.
     pub fn kinds(&self) -> Vec<&'static str> {
-        ["answering", "routine", "task"]
-            .into_iter()
-            .filter(|kind| {
-                self.doing.iter().any(|d| {
-                    matches!(
-                        (d, *kind),
-                        (Doing::Answering { .. }, "answering")
-                            | (Doing::Routine { .. }, "routine")
-                            | (Doing::Task { .. }, "task")
-                    )
-                })
-            })
-            .collect()
+        let mut kinds: Vec<&'static str> = self.doing.iter().filter_map(Doing::kind).collect();
+        kinds.sort_by_key(|k| ["answering", "routine", "task"].iter().position(|o| o == k));
+        kinds.dedup();
+        kinds
     }
 }
 

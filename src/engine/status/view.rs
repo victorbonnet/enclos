@@ -213,6 +213,11 @@ pub struct AgentList {
     /// the built-in agent and enclos's records are known, and none of them
     /// can be said present or gone.
     pub unreadable: Option<String>,
+    /// Why what the app bridge heard the agents are doing could not be
+    /// read (its database, or the lock that says it runs): `working` is
+    /// then empty, which says nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_unreadable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -230,9 +235,10 @@ pub struct AgentStatus {
     /// and may find none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choose_provider: Option<String>,
-    /// What the agent is doing, as the app bridge last heard from its
-    /// plugin (`answering`, `routine`, `task`): empty when idle, or when
-    /// no bridge runs (ADR 0068, proposed).
+    /// What the agent is doing, as the running app bridge last heard from
+    /// its plugin (`answering`, `routine`, `task`): empty when idle, when no
+    /// bridge runs, or when that cannot be read (see
+    /// [`AgentList::activity_unreadable`]) (ADR 0068, proposed).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub working: Vec<&'static str>,
 }
