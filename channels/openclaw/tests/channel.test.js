@@ -138,7 +138,7 @@ async function start(t, channel, cfg, account) {
 test('only the tested native version is accepted and accounts are explicit', t => {
   const one = accountFixture(t, 'main'), two = accountFixture(t, 'scout');
   const cfg = configured(one, two);
-  assert.throws(() => createChannel().setRuntime({ version: '2026.11.3' }), /matching enclos channel/);
+  assert.throws(() => createChannel().setRuntime({ version: '2026.11.2' }), /matching enclos channel/);
   assert.throws(() => resolveAccount(cfg), /explicit configured account/);
   assert.equal(resolveAccount(configured(one)).agentId, 'main');
   assert.equal(resolveAccount(cfg, 'scout').tokenFile, two.tokenFile);
