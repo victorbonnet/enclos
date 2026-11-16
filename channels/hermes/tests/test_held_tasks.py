@@ -750,6 +750,26 @@ class NativeHermesHeldTasks(unittest.TestCase):
         self.assertEqual((native.status, native.consecutive_failures), ("ready", 0))
         self.assertEqual(self.board.read("main"), [])
 
+    def test_a_task_hermes_moved_to_triage_for_a_block_loop_is_still_held_with_its_latest_reason(self):
+        # Hermes's loop breaker: blocked again for the same kind after an
+        # unblock, BLOCK_RECURRENCE_LIMIT times, the task goes to `triage`
+        # with a `block_loop_detected` event, not to `blocked`.
+        task_id = self.kb.create_task(self.conn, title="Write the weekly report", assignee="writer",
+                                      created_by="main")
+        reasons = [f"Which client? (asked {n + 1} times)" for n in range(self.kb.BLOCK_RECURRENCE_LIMIT)]
+        for n, reason in enumerate(reasons):
+            if n:
+                self.assertTrue(self.kb.unblock_task(self.conn, task_id))
+            self.assertTrue(self.kb.block_task(self.conn, task_id, reason=reason, kind="needs_input"))
+        self.assertEqual(self.kb.get_task(self.conn, task_id).status, "triage")
+        events = self.kb.list_events(self.conn, task_id)
+        [loop] = [event for event in events if event.kind == "block_loop_detected"]
+        tasks = self.board.read("main")
+        self.assertEqual([task["task"] for task in tasks], [task_id])
+        self.assertEqual({k: tasks[0].get(k) for k in ("title", "assignee", "reason", "since", "revision")}, {
+            "title": "Write the weekly report", "assignee": "writer", "reason": reasons[-1],
+            "since": loop.created_at, "revision": self.latest(self.conn, task_id)})
+
     def test_a_stale_revision_is_a_conflict_and_another_agent_s_task_is_not_found(self):
         task_id = self.held()
         stale = self.board.read("main")[0]["revision"]
