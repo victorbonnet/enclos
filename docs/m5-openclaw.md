@@ -106,3 +106,19 @@ Keep a working Hermes sandbox and use two independently installed OpenClaw sandb
 - Verify authenticated dashboard handoff, status/doctor/logs, proxy allow/deny, unauthorized socket/device refusal, audit verification and reload/restart/member cleanup within documented lifecycle guarantees. Preserve the corresponding Hermes workflow.
 
 Until those manual gates pass, report **macOS acceptance incomplete; Linux pending**. Only then can macOS be accepted independently. Repeat on the new Linux host with real bubblewrap/systemd, shared namespace/relay, secret store, dashboard/auth/socket/proxy and configured lingering across logout/reboot. Inconclusive probes stay inconclusive. M5 remains open until both gates and the agreed scope have evidence; #225/#226 stay explicit follow-ups rather than hidden or fabricated capabilities.
+
+## Alignment with current Hermes (2026-11-16)
+
+[The current parity analysis](research/m5-current-hermes-parity.md) compares the
+published stack with current core and Android main. M5-14 integrates current
+main while preserving native scope negotiation, read-only routines and exact
+cancellation. M5-15 adds OpenClaw answering activity through the existing native
+channel dispatch lifecycle. It establishes no native task board or scheduler
+activity feed.
+
+Further gaps are complete agent export/import, native channel-session deletion,
+removed-agent data-absence proof, CLI/live usage accounting, and possible native
+task/held-task equivalents. Android #45/#46 still need integration with current
+app main. Questions #225 and routine mutations #226 retain their agreed scope.
+The existing M5-13 Linux gate remains last; these follow-ups do not complete
+manual macOS or Linux acceptance.

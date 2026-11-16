@@ -8,6 +8,7 @@ import { RoutineInventory } from './routines.js';
 import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
+import { createActivity } from './activity.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -88,9 +89,9 @@ export function createChannel(sdk = {}) {
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
     if (hasMedia) mediaFolder(account);
-    let transport, titles, approvals;
+    let transport, titles, approvals, activity;
     const turns = createNativeTurns(() => assertCurrent(ctx.cfg, account, transport));
-    const controllers = () => [turns, titles, approvals].filter(Boolean);
+    const controllers = () => [turns, titles, approvals, activity].filter(Boolean);
     const sessionKeyFor = (conversation, person) => {
       const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
       if (!saved) return undefined;
@@ -178,6 +179,7 @@ export function createChannel(sdk = {}) {
           channelIngress: ingress,
         });
         const typing = on => { if (!transport.closed) transport.write(message('typing', { conversation: incoming.conversation, on })); };
+        const finishActivity = activity.begin(incoming);
         try { await channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
@@ -198,10 +200,11 @@ export function createChannel(sdk = {}) {
                 { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
             });
           } },
-        }); } finally { typing(false); void titles?.refresh(incoming.conversation); }
+        }); } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
         } finally { execution.finish(); }
       },
     });
+    activity = createActivity(transport, () => assertCurrent(ctx.cfg, account, transport));
     running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });
     const stop = async () => {
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
