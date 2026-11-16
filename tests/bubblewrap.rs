@@ -325,6 +325,46 @@ fn on_a_runner_a_bubblewrap_sandbox_is_created_and_runs_a_session() {
     assert!(list.contains("bubblewrap"), "{list}");
 }
 
+/// Native Codex requires a visible process group when inspecting its Gateway.
+/// A group inherited from outside this PID namespace is reported as zero.
+#[test]
+fn on_a_runner_the_openclaw_gateway_has_a_visible_process_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let home = lab.sandbox_home();
+    let native = home.join(".local/share/openclaw/bin/openclaw");
+    std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+    std::fs::write(
+        &native,
+        "#!/usr/bin/python3\nimport json, os, sys\nprint(json.dumps({'pgid': os.getpgrp(), 'sid': os.getsid(0), 'args': sys.argv[1:]}))\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let wrapper = home.join("openclaw-command");
+    std::fs::write(&wrapper, include_str!("../src/runtime/openclaw/command")).unwrap();
+    let out = lab.connect("/bin/sh \"$HOME/openclaw-command\" gateway run --fixture 'two words'");
+    assert!(out.status.success(), "{out:?}");
+    let identity: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(identity["pgid"].as_u64().unwrap() > 0, "{identity}");
+    assert!(identity["sid"].as_u64().unwrap() > 0, "{identity}");
+    assert_eq!(
+        identity["args"],
+        serde_json::json!([
+            "gateway",
+            "run",
+            "--bind",
+            "loopback",
+            "--port",
+            (lab.proxy_port("lab") + 2000).to_string(),
+            "--fixture",
+            "two words"
+        ])
+    );
+}
+
 #[test]
 fn on_a_runner_ssh_is_hidden_and_a_write_in_the_home_works() {
     if !on_a_runner() {

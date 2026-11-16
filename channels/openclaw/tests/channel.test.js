@@ -37,6 +37,28 @@ function configured(...accounts) {
     bindings: accounts.map(a => ({ agentId: a.agentId, match: { channel: 'enclos', accountId: a.accountId } })) };
 }
 
+test('a native dispatch error becomes one correlated reply without leaking diagnostics', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg);
+  native.api.channel.inbound.dispatch = async params => {
+    const error = new Error('ProcessInspectionError: SENSITIVE_NATIVE_DIAGNOSTIC');
+    await params.delivery.onError?.(error, { kind: 'final' });
+    await params.delivery.onError?.(error, { kind: 'final' });
+    return { queuedFinal: false, counts: { final: 0 } };
+  };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input);
+  const reply = await owner.next('message.out');
+  assert.equal(reply.reply_to, input.id);
+  assert.equal(reply.kind, 'reply');
+  assert.match(reply.text, /could not respond/);
+  assert.equal(reply.text.includes('SENSITIVE_NATIVE_DIAGNOSTIC'), false);
+  await owner.next('ack', input.id);
+  assert.equal(channel.running.get(account.accountId).transport.state.outbox.length, 1);
+});
+
 test('a native service-backed routine response is live, agent-bound and read-only', async t => {
   const account = accountFixture(t), cfg = configured(account), channel = createChannel();
   const native = nativeHarness(cfg); let service;
