@@ -544,6 +544,10 @@ impl RuntimeAdapter for OpenClaw {
                 (format!("channels.enclos.accounts.{agent}"), account),
                 ("plugins.entries.enclos.enabled".into(), "true".into()),
                 (
+                    "plugins.entries.enclos.hooks.allowConversationAccess".into(),
+                    "true".into(),
+                ),
+                (
                     format!("channels.enclos.accounts.{agent}.enabled"),
                     "true".into(),
                 ),
@@ -1144,6 +1148,14 @@ mod tests {
                 "true".into()
             )
         );
+        let policy_hook = app
+            .settings
+            .iter()
+            .position(|(key, value)| {
+                key == "plugins.entries.enclos.hooks.allowConversationAccess" && value == "true"
+            })
+            .expect("the native SDK must admit the policy hook before account activation");
+        assert!(policy_hook < app.settings.len() - 1);
         let activate = OpenClaw
             .set_setting(&first, &app.settings.last().unwrap().0, "true")
             .unwrap()
