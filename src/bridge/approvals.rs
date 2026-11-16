@@ -1,9 +1,134 @@
 //! Approval requests cross the trust boundary as data. Only the host's person decides.
 use super::*;
+use crate::bridge::store::ApprovalHistory;
 use crate::model::net::DeniedDestination;
+use crate::proxy::decide::Destination;
 use crate::{engine::Engine, model::sandbox::SandboxName};
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 use std::collections::HashMap;
+
+/// Access in the spelling used by stored policy requests. Only these
+/// constructors may turn a request or a logged destination into this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NormalizedAccess(Access);
+
+impl NormalizedAccess {
+    pub(super) fn new(access: &Access) -> Self {
+        Self(crate::engine::normalized(access))
+    }
+
+    pub(super) fn network(
+        host: &str,
+        port: u16,
+        private: bool,
+    ) -> Result<(Self, Destination), crate::model::net::Reason> {
+        use crate::net::host::{AllowEntry, HostPattern};
+        if port == 0 {
+            return Err(crate::model::net::Reason::BadRequest);
+        }
+        let destination = Destination::parse(host, port)?;
+        let entry = AllowEntry {
+            host: match destination.ip {
+                Some(ip) => HostPattern::Ip(ip),
+                None => HostPattern::Exact(destination.host.clone()),
+            },
+            port,
+        };
+        let target = match destination.ip {
+            Some(ip)
+                if matches!(
+                    crate::net::addr::classify(ip),
+                    crate::net::addr::AddrClass::Blocked(_)
+                ) =>
+            {
+                crate::model::net::destination(&destination.host, port)
+            }
+            _ => entry.to_string(),
+        };
+        Ok((
+            Self(Access {
+                kind: AccessKind::Network,
+                target,
+                private,
+            }),
+            destination,
+        ))
+    }
+
+    pub(super) fn as_access(&self) -> &Access {
+        &self.0
+    }
+
+    /// Older network rows may predate canonical spelling. Never resolve an
+    /// old writable path again: its symlinks may have changed since approval.
+    pub(super) fn matches_stored(&self, stored: &Access) -> bool {
+        self.as_access() == stored
+            || (self.0.kind == AccessKind::Network
+                && stored.kind == AccessKind::Network
+                && self.0.private == stored.private
+                && self.0 == crate::engine::normalized(stored))
+    }
+
+    fn legacy_spellings(
+        &self,
+        store: &Store,
+        sandbox: &str,
+        known: &[Approval],
+    ) -> Result<Vec<Access>, String> {
+        if self.0.kind != AccessKind::Network {
+            return Ok(vec![]);
+        }
+        let mut spellings = Vec::new();
+        let mut add = |access: Access| {
+            if access != self.0 && !spellings.contains(&access) {
+                spellings.push(access);
+            }
+        };
+        for old in known {
+            if old.sandbox == sandbox && self.matches_stored(&old.access) {
+                add(old.access.clone());
+            }
+        }
+        // Blocked-IP requests kept arbitrary raw spellings, including expanded
+        // IPv6. Their original ids still apply outside the inbox history window.
+        if let Some(destination) = request_destination(&self.0.target)
+            && let Some(ip) = destination.ip
+            && matches!(
+                crate::net::addr::classify(ip),
+                crate::net::addr::AddrClass::Blocked(_)
+            )
+        {
+            for history in store
+                .approval_history_since(sandbox, i64::MIN)
+                .map_err(|e| e.to_string())?
+            {
+                if self.matches_stored(&history.approval.access) {
+                    add(history.approval.access);
+                }
+            }
+            if destination.port == crate::net::host::DEFAULT_PORT {
+                let mut bare = self.0.clone();
+                bare.target = destination.host.clone();
+                add(bare);
+                if ip.is_ipv6() {
+                    let mut bracketed = self.0.clone();
+                    bracketed.target = format!("[{}]", destination.host);
+                    add(bracketed);
+                }
+            }
+        }
+        Ok(spellings)
+    }
+
+    pub(super) fn into_access(self) -> Access {
+        self.0
+    }
+}
+
+fn request_destination(target: &str) -> Option<Destination> {
+    let (host, port) = crate::net::host::split_port(target.trim()).ok()?;
+    Destination::parse(host, port).ok()
+}
 
 /// Why request `a` cannot be closed yet, if it cannot: a failed application
 /// may have left a pending policy change (`pending` says whether its
@@ -41,30 +166,34 @@ fn scope_key(engine: &Engine, sandbox: &str, access: &Access) -> Result<String, 
 
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
-        && crate::net::host::AllowEntry::parse(&access.target)
-            .is_ok_and(|entry| entry.host_text() == crate::probes::POLICY_PROBE_HOST)
+        && request_destination(&access.target)
+            .is_some_and(|destination| destination.host == crate::probes::POLICY_PROBE_HOST)
 }
 
 /// The most pending requests one sandbox may have: an agent that keeps
 /// asking for new targets fills neither the inbox nor the bridge's store.
 pub(super) const MAX_PENDING: usize = 50;
 
-/// Whether a proxy refusal of `access`, last seen at `last` (seconds), has
-/// already had its chance: it is older than the bridge's first collection
-/// (`since`), or a request for the same scope was made after it. Then a
-/// denial stays a denial when the policy later changes for another reason;
-/// only a refusal after the request asks again.
+/// Whether a proxy refusal has already been handled. Times are milliseconds:
+/// pending or applying requests cover every retry for their access; completed
+/// requests cover refusals at or before their recorded completion. Only a
+/// strictly later millisecond can ask again, including within the same second.
+/// The input type ensures different spellings share one stored form.
 pub(super) fn refusal_counted(
-    known: &[Approval],
+    known: &[ApprovalHistory],
     sandbox: &str,
-    access: &Access,
-    last: i64,
-    since: i64,
+    access: &NormalizedAccess,
+    last_ms: i64,
+    since_ms: i64,
 ) -> bool {
-    last < since
-        || known
-            .iter()
-            .any(|a| a.sandbox == sandbox && &a.access == access && a.time >= last)
+    last_ms < since_ms
+        || known.iter().any(|history| {
+            let a = &history.approval;
+            a.sandbox == sandbox
+                && access.matches_stored(&a.access)
+                && (matches!(a.state.as_str(), "pending" | "applying")
+                    || last_ms <= history.through_ms)
+        })
 }
 
 /// Whether `agent` (`<sandbox>/<agent>`, as its connection names it) may
@@ -104,16 +233,14 @@ pub(super) fn only_probe_events(a: &Approval, (all, ordinary): &Refusals) -> boo
     if !from_the_proxy(a) {
         return false;
     }
-    let Ok(target) = crate::net::host::AllowEntry::parse(&a.access.target) else {
+    let Some(target) = request_destination(&a.access.target) else {
         return false;
     };
     let matches = |d: &DeniedDestination| {
-        d.host == target.host_text()
-            && d.port == target.port
-            && matches!(
-                d.reason,
-                crate::model::net::Reason::NotAllowed | crate::model::net::Reason::PrivateAddress
-            )
+        matches!(
+            d.reason,
+            crate::model::net::Reason::NotAllowed | crate::model::net::Reason::PrivateAddress
+        ) && Destination::parse(&d.host, d.port).is_ok_and(|destination| destination == target)
     };
     all.iter().any(matches) && !ordinary.iter().any(matches)
 }
@@ -157,7 +284,6 @@ impl Hub {
                 Ok(())
             };
         }
-        let sandbox = agent.split('/').next().unwrap_or(agent);
         // Bounds apply before storage or display. No tool arguments or output are copied.
         if access.target.is_empty()
             || access.target.len() > 4096
@@ -165,8 +291,25 @@ impl Hub {
         {
             return Err("invalid access target".into());
         }
-        // One request per scope, however the agent spells it
-        let access = crate::engine::normalized(&access);
+        self.request_access_normalized(
+            store,
+            agent,
+            conversation,
+            NormalizedAccess::new(&access),
+            action,
+        )
+    }
+
+    fn request_access_normalized(
+        &self,
+        store: &Store,
+        agent: &str,
+        conversation: Option<&str>,
+        normalized: NormalizedAccess,
+        action: &str,
+    ) -> Result<(), String> {
+        let sandbox = agent.split('/').next().unwrap_or(agent);
+        let access = normalized.as_access();
         let open = store.approvals().map_err(|e| e.to_string())?;
         // A request for a scope already open adds nothing: no cap. A proxy's
         // becomes the agent's explicit one, as #209 does.
@@ -174,7 +317,7 @@ impl Hub {
             .iter()
             .find(|a| {
                 a.sandbox == sandbox
-                    && a.access == access
+                    && normalized.matches_stored(&a.access)
                     && (a.state == "pending" || a.state == "applying")
             })
             .cloned()
@@ -192,7 +335,13 @@ impl Hub {
                     .refresh_approval(&existing)
                     .map_err(|e| e.to_string())?
                 {
-                    return self.request_access(store, agent, conversation, access, action);
+                    return self.request_access_normalized(
+                        store,
+                        agent,
+                        conversation,
+                        normalized,
+                        action,
+                    );
                 }
                 if let Some(person) = self.known_host() {
                     self.deliver(&person, ToDevice::Approval(existing));
@@ -216,11 +365,11 @@ impl Hub {
             };
         }
         let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
-        let mut key = scope_key(&engine, sandbox, &access)?;
+        let mut key = scope_key(&engine, sandbox, access)?;
         // Decided or closed under this policy: not asked again until it
         // changes. An agent is told so, not left waiting for a request
-        // nobody sees. One that failed (the bridge stopped mid-decision,
-        // the state lock was busy) changed nothing: it is asked again
+        // nobody sees. A failed request may be reopened by an explicit agent
+        // request, or by a proxy refusal after that failure was recorded.
         let known = |state: &str| {
             if agent.contains('/') && !matches!(state, "pending" | "applying") {
                 Err(format!(
@@ -232,16 +381,38 @@ impl Hub {
         };
         // Closed under this policy, though it may have been asked under an
         // earlier one, whose id this key is not.
-        if store.scope_closed(&key).map_err(|e| e.to_string())? {
-            return known("closed");
+        let mut scope_keys = vec![key.clone()];
+        for old in normalized.legacy_spellings(store, sandbox, &open)? {
+            let old_key = scope_key(&engine, sandbox, &old)?;
+            if !scope_keys.contains(&old_key) {
+                scope_keys.push(old_key);
+            }
         }
-        let mut old = store.approval(&key).map_err(|e| e.to_string())?;
+        for scope in &scope_keys {
+            if store.scope_closed(scope).map_err(|e| e.to_string())? {
+                return known("closed");
+            }
+        }
+        let mut old = None;
+        for scope in scope_keys {
+            if let Some(stored) = store.approval(&scope).map_err(|e| e.to_string())? {
+                key = scope;
+                old = Some(stored);
+                break;
+            }
+        }
         if old.as_ref().is_some_and(|k| k.state == "diagnostic") {
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
             key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
             old = store.approval(&key).map_err(|e| e.to_string())?;
         }
-        let reopen = old.as_ref().is_some_and(|k| k.state == "failed");
+        // A legacy id was hashed from its original access. Keep that spelling
+        // on a reopened row so later lookups can still recover the same id.
+        let reopened_access = old
+            .as_ref()
+            .filter(|k| k.state == "failed")
+            .map(|k| k.access.clone());
+        let reopen = reopened_access.is_some();
         if let Some(old) = old.filter(|_| !reopen) {
             return known(&old.state);
         }
@@ -254,7 +425,7 @@ impl Hub {
                 String::new()
             },
             conversation: conversation.map(str::to_owned),
-            access,
+            access: reopened_access.unwrap_or_else(|| normalized.into_access()),
             action: enclos_protocol::visible::stripped(action, false)
                 .chars()
                 .take(240)
@@ -316,13 +487,15 @@ impl Hub {
     }
 
     /// Turns the proxies' recent refusals into policy requests. A refusal
-    /// counts once: one older than the bridge's first collection, or seen
-    /// last before a request for the same scope was made, already had its
-    /// chance, so a denial is not asked again after an unrelated policy
-    /// change; only a new refusal after it is.
+    /// counts once: pending and applying requests cover their retries, and
+    /// completion covers every refusal at or before its millisecond cutoff.
+    /// A later policy change alone cannot ask again; a later refusal can.
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         self.dismiss_probe_requests(store)?;
-        let since = store.refusals_since().map_err(|e| e.to_string())?;
+        let since = store
+            .refusals_since()
+            .map_err(|e| e.to_string())?
+            .saturating_mul(1000);
         let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
         let agents = self.agents();
         let sandboxes: std::collections::HashSet<_> = agents
@@ -346,16 +519,16 @@ impl Hub {
             };
             let denied: Vec<_> = denied.into_iter().take(200).collect();
             // Only the requests a refusal still to be counted can match:
-            // this sandbox's, made since the oldest of them was last seen.
+            // this sandbox's waiting requests or completions covering that time.
             let Some(from) = denied
                 .iter()
-                .map(|d| d.last.as_second())
+                .map(|d| d.last.as_millisecond())
                 .filter(|&last| last >= since)
                 .min()
             else {
                 continue;
             };
-            let known = match store.approvals_since(sandbox, from) {
+            let known = match store.approval_history_since(sandbox, from) {
                 Ok(known) => known,
                 Err(e) => {
                     eprintln!("enclos app approvals: {sandbox}: {e}");
@@ -373,33 +546,24 @@ impl Hub {
                 if !matches!(d.reason, Reason::NotAllowed | Reason::PrivateAddress) {
                     continue;
                 }
-                let target = crate::model::net::destination(&d.host, d.port);
                 let private = d.reason == Reason::PrivateAddress;
-                let access = Access {
-                    kind: AccessKind::Network,
-                    target: target.clone(),
-                    private,
+                let Ok((access, destination)) = NormalizedAccess::network(&d.host, d.port, private)
+                else {
+                    continue;
                 };
-                if refusal_counted(&known, sandbox, &access, d.last.as_second(), since) {
+                if refusal_counted(&known, sandbox, &access, d.last.as_millisecond(), since) {
                     continue;
                 }
-                if let Ok(dest) = crate::proxy::decide::Destination::parse(&d.host, d.port) {
-                    let allowed = crate::proxy::decide::allowed(&policy, &dest);
-                    if allowed
-                        && (d.reason != Reason::PrivateAddress
-                            || policy.net.private.contains(&d.host))
-                    {
-                        continue;
-                    }
+                let allowed = crate::proxy::decide::allowed(&policy, &destination);
+                if allowed
+                    && (d.reason != Reason::PrivateAddress
+                        || policy.net.private.contains(&destination.host))
+                {
+                    continue;
                 }
                 // The log is sandbox-wide: do not invent a requesting agent or conversation.
-                self.request_access(
-                    store,
-                    sandbox,
-                    None,
-                    access,
-                    &format!("Connect to {target}"),
-                )?;
+                let action = format!("Connect to {}", access.as_access().target);
+                self.request_access_normalized(store, sandbox, None, access, &action)?;
             }
         }
         Ok(())
@@ -597,5 +761,112 @@ impl Hub {
             }
         }
         self.open_plugins();
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_requests_and_logged_destinations_share_one_spelling() {
+        for (raw, host, port, target, canonical_host) in [
+            (
+                "API.EXAMPLE.COM.:443",
+                "API.EXAMPLE.COM.",
+                443,
+                "api.example.com",
+                "api.example.com",
+            ),
+            (
+                "api.example.com:8443",
+                "api.example.com",
+                8443,
+                "api.example.com:8443",
+                "api.example.com",
+            ),
+            (
+                "[FC00:0000:0:0:0:0:0:1]:443",
+                "FC00:0000:0:0:0:0:0:1",
+                443,
+                "fc00::1",
+                "fc00::1",
+            ),
+            (
+                "[fc00::1]:8443",
+                "[FC00:0000:0:0:0:0:0:1]",
+                8443,
+                "[fc00::1]:8443",
+                "fc00::1",
+            ),
+            ("127.0.0.1", "127.0.0.1", 443, "127.0.0.1:443", "127.0.0.1"),
+            ("[0:0:0:0:0:0:0:1]", "[::1]", 443, "[::1]:443", "::1"),
+            (
+                "169.254.169.254:8443",
+                "169.254.169.254",
+                8443,
+                "169.254.169.254:8443",
+                "169.254.169.254",
+            ),
+        ] {
+            for private in [false, true] {
+                let explicit = NormalizedAccess::new(&Access {
+                    kind: AccessKind::Network,
+                    target: raw.into(),
+                    private,
+                });
+                let (collected, destination) =
+                    NormalizedAccess::network(host, port, private).unwrap();
+                assert_eq!(explicit, collected, "{raw}, {host}:{port}");
+                assert_eq!(collected.as_access().target, target);
+                assert_eq!(collected.as_access().private, private);
+                assert_eq!(destination.host, canonical_host);
+                assert_eq!(destination.port, port);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_network_spellings_match_without_resolving_old_write_paths() {
+        let (network, _) = NormalizedAccess::network("127.0.0.1", 443, false).unwrap();
+        let mut stored = Access {
+            kind: AccessKind::Network,
+            target: "127.0.0.1".into(),
+            private: false,
+        };
+        assert!(network.matches_stored(&stored));
+        stored.private = true;
+        assert!(!network.matches_stored(&stored));
+        stored.private = false;
+        stored.target = "127.0.0.1:8443".into();
+        assert!(!network.matches_stored(&stored));
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut stored = Access {
+            kind: AccessKind::Write,
+            target: real.display().to_string(),
+            private: false,
+        };
+        let current = NormalizedAccess::new(&stored);
+        stored.target = alias.display().to_string();
+        assert!(!current.matches_stored(&stored));
+    }
+
+    #[test]
+    fn invalid_logged_destinations_cannot_become_normalized_network_access() {
+        for host in ["", "localhost", "*.example.com", "not a host"] {
+            assert_eq!(
+                NormalizedAccess::network(host, 443, false).unwrap_err(),
+                crate::model::net::Reason::BadRequest
+            );
+        }
+        assert_eq!(
+            NormalizedAccess::network("example.com", 0, false).unwrap_err(),
+            crate::model::net::Reason::BadRequest
+        );
     }
 }

@@ -1406,6 +1406,44 @@ fn diagnostic_probe_requests_are_matched_against_one_read_of_the_log() {
 }
 
 #[test]
+fn diagnostic_provenance_matches_canonical_hosts_and_ports() {
+    use crate::model::net::{DeniedDestination, Reason};
+    let denied = |host: &str, port| DeniedDestination {
+        host: host.into(),
+        port,
+        reason: Reason::NotAllowed,
+        count: 1,
+        first: jiff::Timestamp::UNIX_EPOCH,
+        last: jiff::Timestamp::UNIX_EPOCH,
+    };
+    for (target, logged) in [
+        ("NAS.LOCAL.:443", "nas.local"),
+        ("nas.local", "NAS.LOCAL."),
+        ("[FC00:0:0:0:0:0:0:1]:443", "fc00::1"),
+        ("fc00::1", "FC00:0000:0:0:0:0:0:1"),
+        ("127.0.0.1:443", "127.0.0.1"),
+        ("[::1]:443", "0:0:0:0:0:0:0:1"),
+    ] {
+        let mut request = approval_sample();
+        request.agent.clear();
+        request.access.target = target.into();
+        let all = vec![denied(logged, 443)];
+        assert!(
+            approvals::only_probe_events(&request, &(all.clone(), vec![])),
+            "verified diagnostic traffic for {target} logged as {logged}"
+        );
+        assert!(
+            !approvals::only_probe_events(&request, &(all.clone(), vec![denied(logged, 443)])),
+            "ordinary traffic for the same canonical destination remains eligible"
+        );
+        assert!(
+            approvals::only_probe_events(&request, &(all, vec![denied(logged, 8443)])),
+            "ordinary traffic on a different port is another destination"
+        );
+    }
+}
+
+#[test]
 fn diagnostic_probe_existing_pending_notification_is_dismissed_and_broadcast() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let (tx, rx) = channel();
@@ -2711,31 +2749,558 @@ fn approval_an_agent_asking_again_for_a_decided_scope_is_told_so() {
 
 #[test]
 fn approval_a_refusal_counts_once_and_a_denial_is_not_asked_again() {
+    let counted = |known: &[crate::bridge::store::ApprovalHistory],
+                   sandbox: &str,
+                   access: &enclos_protocol::approval::Access,
+                   last,
+                   since| {
+        approvals::refusal_counted(
+            known,
+            sandbox,
+            &approvals::NormalizedAccess::new(access),
+            last,
+            since,
+        )
+    };
     let mut denied = approval_sample();
     denied.state = "denied".into();
-    denied.time = 100;
-    let known = [denied.clone()];
+    denied.time = 0;
+    let known = [crate::bridge::store::ApprovalHistory {
+        approval: denied.clone(),
+        through_ms: 100,
+    }];
     let access = &denied.access;
     // Older than the bridge's first collection: never asked.
-    assert!(approvals::refusal_counted(&[], "lab", access, 40, 50));
-    // Seen before the request was made: that request had it, whatever the
-    // policy became since.
-    assert!(approvals::refusal_counted(&known, "lab", access, 90, 50));
-    assert!(approvals::refusal_counted(&known, "lab", access, 100, 50));
-    // Tried again after it: a new refusal.
-    assert!(!approvals::refusal_counted(&known, "lab", access, 101, 50));
+    assert!(counted(&[], "lab", access, 40, 50));
+    // Completion covers pending retries, whatever the policy became since.
+    assert!(counted(&known, "lab", access, 90, 50));
+    assert!(counted(&known, "lab", access, 100, 50));
+    // The proxy's explicit default port is the stored destination's other spelling.
+    assert!(counted(&known, "lab", &network("example.com:443"), 90, 50));
+    assert!(!counted(
+        &known,
+        "lab",
+        &network("example.com:8443"),
+        90,
+        50
+    ));
+    // The next millisecond in the same second is a new refusal.
+    assert!(!counted(&known, "lab", access, 101, 50));
     // Another sandbox, scope or opt-in is another request.
-    assert!(!approvals::refusal_counted(&known, "other", access, 90, 50));
-    let mut private = access.clone();
+    assert!(!counted(&known, "other", access, 90, 50));
+    let mut private = network("example.com:443");
     private.private = true;
-    assert!(!approvals::refusal_counted(&known, "lab", &private, 90, 50));
-    assert!(!approvals::refusal_counted(
+    assert!(!counted(&known, "lab", &private, 90, 50));
+    assert!(!counted(
         &known,
         "lab",
         &network("other.example.com"),
         90,
         50
     ));
+    for state in ["pending", "applying"] {
+        let mut waiting = known[0].clone();
+        waiting.approval.state = state.into();
+        assert!(counted(&[waiting], "lab", access, 500, 50));
+    }
+}
+
+mod refusal_collection {
+    use super::*;
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    use crate::model::sandbox::SandboxName;
+    use crate::state::NetLogStore;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        crate::engine::Engine,
+        SandboxName,
+        Arc<Hub>,
+        Store,
+        Device,
+    ) {
+        let (dir, engine, name) = crate::engine::tests::policy::with_sandbox();
+        let hub = Arc::new(Hub::new(
+            Transport::Tailscale,
+            no_whois(),
+            dir.path().join("app.db"),
+            crate::layout::Layout::at(dir.path().join("enclos")),
+            vec![],
+            vec![AgentEndpoint {
+                name: format!("{name}/main"),
+                runtime: "hermes".into(),
+                socket: dir.path().join("not-connected.sock"),
+                token: "fixture".into(),
+            }],
+            Some("owner@example.com".into()),
+            SILENCE,
+        ));
+        let store = hub.store().unwrap();
+        let device = avatar_device("phone", "owner@example.com");
+        store.add_device(&device).unwrap();
+        let policy = engine.mobile_policy(&name).unwrap();
+        let change = enclos_protocol::policy::PolicyChange {
+            field: "mode".into(),
+            before: Some("public".into()),
+            after: Some("allowlist".into()),
+        };
+        let preview = engine
+            .mobile_policy_preview(&name, &policy.base, &change)
+            .unwrap();
+        engine
+            .mobile_policy_apply(
+                &crate::model::audit::Actor {
+                    user: "alice".into(),
+                    host: "mac".into(),
+                },
+                &name,
+                &policy.base,
+                &preview.revision,
+                &change,
+            )
+            .unwrap();
+        // The log and request times below are explicit, independent of the clock.
+        store.set_refusals_since(50).unwrap();
+        (dir, engine, name, hub, store, device)
+    }
+
+    fn refusal(hub: &Hub, name: &SandboxName, host: &str, port: u16, reason: Reason, at: i64) {
+        refusal_at(
+            hub,
+            name,
+            host,
+            port,
+            reason,
+            crate::model::Timestamp::from_second(at).unwrap(),
+        );
+    }
+
+    fn refusal_at(
+        hub: &Hub,
+        name: &SandboxName,
+        host: &str,
+        port: u16,
+        reason: Reason,
+        at: crate::model::Timestamp,
+    ) {
+        crate::state::sqlite::SqliteStateStore::new(
+            hub.layout.state_db(),
+            hub.layout.state_lock(),
+            crate::state::Wait::Command,
+        )
+        .record(&NetEvent {
+            at,
+            sandbox: name.clone(),
+            host: host.into(),
+            port,
+            method: "CONNECT".into(),
+            address: None,
+            verdict: Verdict::Denied,
+            reason: Some(reason),
+            bytes_up: 0,
+            bytes_down: 0,
+            duration_ms: 0,
+            name_seen: None,
+        })
+        .unwrap();
+    }
+
+    fn cutoff(store: &Store, name: &SandboxName, request: &str) -> i64 {
+        store
+            .approval_history_since(name.as_str(), 0)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.approval.request == request)
+            .unwrap()
+            .through_ms
+    }
+
+    #[test]
+    fn retries_while_pending_are_covered_by_the_later_decision() {
+        let (_dir, engine, name, hub, store, device) = fixture();
+        refusal(
+            &hub,
+            &name,
+            "example.com",
+            443,
+            Reason::NotAllowed,
+            crate::model::Timestamp::now().as_second(),
+        );
+        hub.collect_refusals(&store).unwrap();
+        let request = store.approvals().unwrap().remove(0);
+        // Cross the creation second without changing the request's stored time.
+        let waiting = std::time::Instant::now();
+        while crate::model::Timestamp::now().as_second() <= request.time {
+            assert!(waiting.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        refusal(
+            &hub,
+            &name,
+            "example.com",
+            443,
+            Reason::NotAllowed,
+            crate::model::Timestamp::now().as_second(),
+        );
+        hub.collect_refusals(&store).unwrap();
+        assert_eq!(store.approvals().unwrap().len(), 1);
+        hub.decide_access(
+            &store,
+            &device,
+            &device.person,
+            &request.request,
+            &request.revision,
+            false,
+        )
+        .unwrap();
+        let before = engine.policy(&name).unwrap().snapshot.id;
+        allow(&engine, &name, "unrelated.example.com");
+        assert_ne!(engine.policy(&name).unwrap().snapshot.id, before);
+        hub.collect_refusals(&store).unwrap();
+        let requests = store.approvals().unwrap();
+        assert_eq!(requests.len(), 1, "pending retries belong to the denial");
+        assert_eq!(requests[0].state, "denied");
+    }
+
+    #[test]
+    fn old_https_refusals_stay_resolved_across_policy_changes_but_later_attempts_can_ask() {
+        for close in [false, true] {
+            let (_dir, engine, name, hub, store, device) = fixture();
+            refusal_at(
+                &hub,
+                &name,
+                "example.com",
+                443,
+                Reason::NotAllowed,
+                crate::model::Timestamp::now(),
+            );
+            hub.collect_refusals(&store).unwrap();
+            let request = store.approvals().unwrap().remove(0);
+            assert_eq!(request.access, network("example.com"));
+            assert_eq!(request.action, "Connect to example.com");
+            assert!(request.agent.is_empty());
+            if close {
+                hub.close_access(&store, &device, &device.person, &request.request)
+                    .unwrap();
+            } else {
+                hub.decide_access(
+                    &store,
+                    &device,
+                    &device.person,
+                    &request.request,
+                    &request.revision,
+                    false,
+                )
+                .unwrap();
+            }
+            hub.collect_refusals(&store).unwrap();
+            assert_eq!(store.approvals().unwrap().len(), 1);
+
+            let previous = engine.policy(&name).unwrap().snapshot.id;
+            allow(&engine, &name, "unrelated.example.com");
+            assert_ne!(engine.policy(&name).unwrap().snapshot.id, previous);
+            hub.collect_refusals(&store).unwrap();
+            let resolved = store.approvals().unwrap();
+            assert_eq!(
+                resolved.len(),
+                1,
+                "an old :443 refusal must not recreate a {} request after a policy change",
+                if close { "closed" } else { "denied" }
+            );
+            assert_eq!(resolved[0].state, if close { "closed" } else { "denied" });
+            assert_eq!(engine.net_log(&name, None).unwrap().len(), 1);
+
+            refusal_at(
+                &hub,
+                &name,
+                "example.com",
+                443,
+                Reason::NotAllowed,
+                crate::model::Timestamp::from_millisecond(
+                    cutoff(&store, &name, &request.request) + 1,
+                )
+                .unwrap(),
+            );
+            hub.collect_refusals(&store).unwrap();
+            let requests = store.approvals().unwrap();
+            assert_eq!(requests.len(), 2);
+            let pending = requests.iter().find(|a| a.state == "pending").unwrap();
+            assert_eq!(pending.access, network("example.com"));
+            assert_ne!(pending.request, request.request);
+            hub.collect_refusals(&store).unwrap();
+            assert_eq!(store.approvals().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn failed_requests_wait_for_a_later_refusal_but_explicit_retries_can_reopen() {
+        let (_dir, _engine, name, hub, store, _device) = fixture();
+        refusal_at(
+            &hub,
+            &name,
+            "example.com",
+            443,
+            Reason::NotAllowed,
+            crate::model::Timestamp::now(),
+        );
+        hub.collect_refusals(&store).unwrap();
+        let mut request = store.approvals().unwrap().remove(0);
+        assert!(store.claim_approval(&request.request).unwrap());
+        request.state = "failed".into();
+        store.put_approval(&request).unwrap();
+        let failed_at = cutoff(&store, &name, &request.request);
+        // Equality belongs to the failed request, including retries within its millisecond.
+        refusal_at(
+            &hub,
+            &name,
+            "example.com",
+            443,
+            Reason::NotAllowed,
+            crate::model::Timestamp::from_millisecond(failed_at).unwrap(),
+        );
+        hub.collect_refusals(&store).unwrap();
+        assert_eq!(
+            store.approval(&request.request).unwrap().unwrap().state,
+            "failed"
+        );
+        refusal_at(
+            &hub,
+            &name,
+            "example.com",
+            443,
+            Reason::NotAllowed,
+            crate::model::Timestamp::from_millisecond(failed_at + 1).unwrap(),
+        );
+        hub.collect_refusals(&store).unwrap();
+        assert_eq!(
+            store.approval(&request.request).unwrap().unwrap().state,
+            "pending"
+        );
+        assert_eq!(store.approvals().unwrap().len(), 1);
+        // Explicit authenticated retries do not have to cause another proxy refusal first.
+        assert!(store.claim_approval(&request.request).unwrap());
+        request.state = "failed".into();
+        store.put_approval(&request).unwrap();
+        let agent = format!("{name}/main");
+        hub.request_access(&store, &agent, None, network("example.com"), "Retry")
+            .unwrap();
+        let reopened = store.approval(&request.request).unwrap().unwrap();
+        assert_eq!(reopened.state, "pending");
+        assert_eq!(reopened.agent, agent);
+    }
+
+    #[test]
+    fn legacy_blocked_pending_requests_are_reused_by_raw_requests_and_collection() {
+        for collect in [false, true] {
+            let (_dir, _engine, name, hub, store, _device) = fixture();
+            let mut legacy = approval_sample();
+            legacy.request = "legacy-pending".into();
+            legacy.sandbox = name.to_string();
+            legacy.agent.clear();
+            legacy.access = network("127.0.0.1");
+            store.create_approval(&legacy).unwrap();
+            if collect {
+                refusal(&hub, &name, "127.0.0.1", 443, Reason::NotAllowed, 100);
+                hub.collect_refusals(&store).unwrap();
+            } else {
+                hub.request_access(&store, name.as_str(), None, network("127.0.0.1"), "Retry")
+                    .unwrap();
+            }
+            let requests = store.approvals().unwrap();
+            assert_eq!(requests.len(), 1, "collect={collect}");
+            assert_eq!(requests[0].request, legacy.request);
+            assert_eq!(requests[0].access, legacy.access);
+        }
+    }
+
+    #[test]
+    fn legacy_blocked_completed_history_is_counted_after_a_policy_change() {
+        let (_dir, engine, name, hub, store, _device) = fixture();
+        let mut legacy = approval_sample();
+        legacy.request = "legacy-denied".into();
+        legacy.sandbox = name.to_string();
+        legacy.agent.clear();
+        legacy.access = network("127.0.0.1");
+        store.create_approval(&legacy).unwrap();
+        assert!(store.claim_approval(&legacy.request).unwrap());
+        legacy.state = "denied".into();
+        store.put_approval(&legacy).unwrap();
+        refusal(&hub, &name, "127.0.0.1", 443, Reason::NotAllowed, 100);
+        allow(&engine, &name, "unrelated.example.com");
+        hub.collect_refusals(&store).unwrap();
+        let requests = store.approvals().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request, legacy.request);
+        assert_eq!(requests[0].state, "denied");
+    }
+
+    #[test]
+    fn legacy_blocked_decisions_keep_their_original_scope_keys() {
+        for state in ["denied", "closed", "failed"] {
+            let (_dir, engine, name, hub, store, device) = fixture();
+            let access = network("127.0.0.1");
+            let policy = engine.policy(&name).unwrap().snapshot.id;
+            let key = crate::policy::sha256_hex(
+                format!(
+                    "{name}:{policy}:{}",
+                    serde_json::to_string(&access).unwrap()
+                )
+                .as_bytes(),
+            );
+            let mut legacy = approval_sample();
+            legacy.request = key.clone();
+            legacy.sandbox = name.to_string();
+            legacy.agent.clear();
+            legacy.access = access;
+            store.create_approval(&legacy).unwrap();
+            if state == "closed" {
+                store
+                    .close_approval(&key, "pending", &key, &device.id, &device.person)
+                    .unwrap();
+            } else {
+                assert!(store.claim_approval(&key).unwrap());
+                legacy.state = state.into();
+                store.put_approval(&legacy).unwrap();
+            }
+            for target in ["127.0.0.1", "127.0.0.1:443"] {
+                hub.request_access(&store, name.as_str(), None, network(target), "Retry")
+                    .unwrap();
+                let requests = store.approvals().unwrap();
+                assert_eq!(requests.len(), 1, "{state}, {target}");
+                let stored = &requests[0];
+                assert_eq!(stored.request, key);
+                assert_eq!(stored.access.target, "127.0.0.1");
+                assert_eq!(
+                    stored.state,
+                    if state == "failed" { "pending" } else { state }
+                );
+                if state == "failed" {
+                    assert!(store.claim_approval(&key).unwrap());
+                    let mut failed = stored.clone();
+                    failed.state = "failed".into();
+                    store.put_approval(&failed).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_blocked_ipv6_decisions_outside_the_inbox_window_keep_their_scope_keys() {
+        for state in ["denied", "closed"] {
+            let (_dir, engine, name, hub, store, device) = fixture();
+            let raw = "[0:0:0:0:0:0:0:1]";
+            let access = network(raw);
+            let policy = engine.policy(&name).unwrap().snapshot.id;
+            let key = crate::policy::sha256_hex(
+                format!(
+                    "{name}:{policy}:{}",
+                    serde_json::to_string(&access).unwrap()
+                )
+                .as_bytes(),
+            );
+            let mut legacy = approval_sample();
+            legacy.request = key.clone();
+            legacy.sandbox = name.to_string();
+            legacy.agent.clear();
+            legacy.access = access;
+            store.create_approval(&legacy).unwrap();
+            if state == "closed" {
+                assert!(
+                    store
+                        .close_approval(&key, "pending", &key, &device.id, &device.person)
+                        .unwrap()
+                );
+            } else {
+                assert!(store.claim_approval(&key).unwrap());
+                legacy.state = state.into();
+                store.put_approval(&legacy).unwrap();
+            }
+            for index in 0..201 {
+                let mut later = approval_sample();
+                later.request = format!("filler-{index}");
+                later.sandbox = name.to_string();
+                later.access = network("other.example.com");
+                later.state = "approved".into();
+                store.create_approval(&later).unwrap();
+            }
+            assert!(store.approvals().unwrap().iter().all(|a| a.request != key));
+            let told = hub
+                .request_access(
+                    &store,
+                    &format!("{name}/main"),
+                    None,
+                    network(raw),
+                    "Retry the same legacy request",
+                )
+                .unwrap_err();
+            assert!(told.contains(&format!("already {state}")), "{told}");
+            assert_eq!(store.approval(&key).unwrap().unwrap().state, state);
+            assert!(
+                store
+                    .approvals()
+                    .unwrap()
+                    .iter()
+                    .all(|a| a.state != "pending")
+            );
+        }
+    }
+
+    #[test]
+    fn approved_private_hosts_do_not_request_access_for_logged_aliases() {
+        let (_dir, engine, name, hub, store, _device) = fixture();
+        for host in ["NAS.local", "nas.local."] {
+            refusal(&hub, &name, host, 443, Reason::PrivateAddress, 100);
+        }
+        let mut access = network("nas.local");
+        access.private = true;
+        let plan = engine.access_plan(&name, &access).unwrap();
+        engine
+            .approve_access(
+                &crate::model::audit::Actor {
+                    user: "alice".into(),
+                    host: "mac".into(),
+                },
+                &name,
+                &access,
+                &plan.revision,
+            )
+            .unwrap();
+        hub.collect_refusals(&store).unwrap();
+        assert!(
+            store.approvals().unwrap().is_empty(),
+            "approved canonical private host covers logged aliases"
+        );
+    }
+
+    #[test]
+    fn collected_requests_keep_distinct_ports_and_private_address_opt_ins() {
+        let (_dir, _engine, name, hub, store, _device) = fixture();
+        for (port, reason) in [
+            (443, Reason::NotAllowed),
+            (8443, Reason::NotAllowed),
+            (443, Reason::PrivateAddress),
+        ] {
+            refusal(&hub, &name, "nas.local", port, reason, 100);
+        }
+        hub.collect_refusals(&store).unwrap();
+        let requests = store.approvals().unwrap();
+        assert_eq!(requests.len(), 3);
+        let mut access: Vec<_> = requests
+            .iter()
+            .map(|a| (a.access.target.as_str(), a.access.private))
+            .collect();
+        access.sort();
+        assert_eq!(
+            access,
+            [
+                ("nas.local", false),
+                ("nas.local", true),
+                ("nas.local:8443", false)
+            ]
+        );
+        hub.collect_refusals(&store).unwrap();
+        assert_eq!(store.approvals().unwrap().len(), 3);
+    }
 }
 
 #[test]
@@ -2749,12 +3314,12 @@ fn approval_the_collector_reads_only_a_sandboxs_recent_requests() {
         a.state = "denied".into();
         store.create_approval(&a).unwrap();
     }
-    let ids = |sandbox, from| {
+    let ids = |sandbox: &str, from: i64| {
         let mut ids: Vec<_> = store
-            .approvals_since(sandbox, from)
+            .approval_history_since(sandbox, from * 1000)
             .unwrap()
             .into_iter()
-            .map(|a| a.request)
+            .map(|a| a.approval.request)
             .collect();
         ids.sort();
         ids

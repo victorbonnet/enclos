@@ -17,6 +17,16 @@ pub fn normalized(access: &Access) -> Access {
         AccessKind::Network => {
             if let Ok(entry) = AllowEntry::parse(&access.target) {
                 access.target = entry.to_string();
+            } else if let Ok((host, port)) = crate::net::host::split_port(access.target.trim())
+                && let Ok(ip) = host.parse::<std::net::IpAddr>()
+                && matches!(
+                    crate::net::addr::classify(ip),
+                    crate::net::addr::AddrClass::Blocked(_)
+                )
+            {
+                // Such a destination stays unavailable. Keep the proxy's explicit-port
+                // spelling so its refusal and an explicit request have one identity.
+                access.target = crate::model::net::destination(&ip.to_string(), port);
             }
         }
         AccessKind::Write => {
