@@ -224,6 +224,9 @@ One linked plugin package lives at `~/.enclos-openclaw` in the sandbox; native
 accounts have separate sockets, protected credential paths and durable state.
 The canonical binder preserves unrelated bindings and rejects another agent's
 claim on the exact route. Accounts are enabled only after binding succeeds.
+App configuration grants conversation access to the enclos plugin before
+activation, as required by the native SDK's policy-context hook. The hook adds
+the host's policy context only to enclos-owned turns.
 
 The completed channel stack supplies direct/Home/group conversations, native
 events, files/static HTML, titles, exact cancellation and negotiated native
