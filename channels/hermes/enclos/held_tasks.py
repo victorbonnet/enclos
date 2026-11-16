@@ -1,7 +1,7 @@
 """Held tasks (ADR 0066; docs/protocol.md, Held tasks): this agent's blocked
 tasks on Hermes's kanban board, reported to the bridge whole and resumed with
-Hermes's own unblock; and those its loop breaker moved to `triage`, resumed
-with Hermes's own specify.
+Hermes's own unblock; and those its loop breaker moved to `triage`, reported
+but not resumed from here (`Board.resume`).
 
 Hermes's board is shared by the sandbox's profiles, and an enclos agent is
 the Hermes profile of the same name (its socket's name): a held task is a
@@ -18,7 +18,7 @@ another board as `<board>/<id>`, since two boards can hold the same id. A
 board with no database yet is skipped. Boards are read read-only (a `mode=ro`
 URI, `tasks.read_only`), never through Hermes's `connect()`, which creates and
 migrates the database: only a resume opens Hermes's writer, for its
-`unblock_task` or `specify_triage_task`.
+`unblock_task`.
 
 What a task says comes from the board's rows and its `task_events`, never
 from the text Hermes wakes the agent with: the reason of the latest
@@ -52,13 +52,10 @@ REFRESH_SECONDS = 30
 RETELL_SECONDS = 600
 # What Hermes's unblock does, said on the card.
 RESUME = "Runs it again with a fresh retry budget."
-# What Hermes's specify does for a task its loop breaker moved to triage: its
-# retry count and its count of blocks of one kind stay, so blocked the same
-# way again, it goes straight back to triage.
-RESUME_TRIAGE = "Runs it again without a fresh retry budget; blocked again the same way, it is held again at once."
-# A Hermes with no `specify_triage_task` still lists such a task; its resume
-# answers `unsupported`, without opening Hermes's writer.
-RESUME_UNSUPPORTED = "This Hermes cannot resume it from here; specify it on its kanban board."
+# Said on the card of a task held in triage, whatever this Hermes offers: its
+# resume answers `unsupported` without opening Hermes's writer (`Board.resume`).
+RESUME_UNSUPPORTED = ("The app cannot resume it: Hermes cannot check that it is still held as shown when it "
+                      "resumes it. Specify it on its kanban board.")
 # The bridge's own bounds (`HeldTask::normalized`), kept here too so a list
 # stays far below a message's 1 MiB whatever the board holds.
 MAX_TITLE_CHARS = 200
@@ -350,7 +347,7 @@ class Board:
             "reason": _cut(reason, MAX_REASON_CHARS),
             "since": since,
             "revision": revision,
-            "resume": (RESUME_TRIAGE if self._specifies() else RESUME_UNSUPPORTED) if looped else RESUME,
+            "resume": RESUME_UNSUPPORTED if looped else RESUME,
         }
         assignee = _line(getattr(task, "assignee", None), MAX_ASSIGNEE_CHARS)
         if assignee and assignee != profile:
@@ -360,11 +357,6 @@ class Board:
             entry["last_error"] = _cut(error, MAX_ERROR_CHARS)
         return entry
 
-    def _specifies(self) -> bool:
-        """Whether this Hermes has `specify_triage_task`, which resumes a task
-        held in triage. Optional: without it, blocked tasks resume all the same."""
-        return callable(getattr(self.kb, "specify_triage_task", None))
-
     def _path(self, slug: str) -> Path:
         path = next((p for s, p in self._databases() if s == slug), None)
         if path is None:
@@ -372,20 +364,23 @@ class Board:
         return path
 
     def resume(self, profile: str, ref: str, revision: str) -> None:
-        """Resumes the task `ref` names while `profile` created it and it is
-        still held at `revision`, with Hermes's own operation: `unblock_task`
-        for a `blocked` task, `specify_triage_task` (no field given, so its
-        title, body and assignee stay) for one its loop breaker moved to
-        `triage`. Raises HeldTaskError otherwise, or what Hermes raised when
-        the task was not resumed.
+        """Unblocks the task `ref` names while `profile` created it and it is
+        still held at `revision`; raises HeldTaskError otherwise, or what
+        Hermes raised when the task was not resumed.
 
-        Neither takes a revision: each opens its own write transaction and
-        refuses to run inside another, so the revision is checked just before
-        it, not in the same transaction. A task resumed by someone else in
-        between is not changed (each changes only a task still `blocked`, or
-        still in `triage`, and this answers `conflict`), but one resumed and
-        held again in between is resumed at its newer hold, and one moved out
-        of triage and back by hand in between is specified all the same."""
+        Hermes's `unblock_task` opens its own write transaction and refuses
+        to run inside another, so the revision is checked just before it, not
+        in the same transaction: a task unblocked by someone else in between
+        is not changed (unblock changes only a still-blocked task, and this
+        answers `conflict`), but one unblocked and blocked again in between
+        is resumed at its newer hold.
+
+        A task held in triage, checked the same way, answers `unsupported`
+        before Hermes's writer opens, even where Hermes has
+        `specify_triage_task`: that takes no revision either, and changes any
+        task in triage, so one changed, held again or moved back to triage by
+        hand between the check and the specify would be specified all the
+        same, and could run again on a tap meant for an older hold."""
         slug, task_id = self._split(ref)
         if slug == self.kb.DEFAULT_BOARD and "/" in task_id:
             raise HeldTaskError("not_found", "This agent has no such held task.")
@@ -399,40 +394,36 @@ class Board:
             held = (bound is not None and bound[0] == _LOOP) if looped else task.status == "blocked"
             if not held or f"e:{latest}" != revision:
                 raise HeldTaskError("conflict", "The task changed since; it was not resumed.")
-        if looped and not self._specifies():
-            raise HeldTaskError("unsupported", "This Hermes cannot resume a task it moved to triage.")
+        if looped:
+            raise HeldTaskError("unsupported", "A task Hermes moved to triage cannot be resumed from the app; "
+                                "specify it on its kanban board.")
         try:
             with contextlib.closing(self.connect(db_path=path)) as conn:
-                if looped:
-                    resumed = self.kb.specify_triage_task(conn, task_id)
-                else:
-                    resumed = self.kb.unblock_task(conn, task_id)
+                unblocked = self.kb.unblock_task(conn, task_id)
         except Exception:
-            # Hermes checks its file after committing, and can raise then; a
-            # specify readies the task in a second transaction, after its
-            # own: the task may well have resumed.
-            if self._resumed(path, task_id, revision, looped):
-                logger.warning("Held task %s: Hermes raised after resuming it", ref, exc_info=True)
+            # Hermes checks its file after committing, and can raise then:
+            # the task may well have resumed.
+            if self._resumed(path, task_id, revision):
+                logger.warning("Held task %s: Hermes raised after unblocking it", ref, exc_info=True)
                 return
             raise
-        if not resumed:
+        if not unblocked:
             raise HeldTaskError("conflict", "The task is no longer held; it was not resumed.")
 
-    def _resumed(self, path: Path, task_id: str, revision: str, looped: bool = False) -> bool:
+    def _resumed(self, path: Path, task_id: str, revision: str) -> bool:
         """Whether the task, read again, left its hold at `revision`: no longer
-        blocked (or in triage, `looped`), or unblocked (specified) since."""
+        blocked, or unblocked since."""
         number = _revision_number(revision)
-        status, kind = ("triage", "specified") if looped else ("blocked", "unblocked")
         try:
             with contextlib.closing(self.read_only(path)) as conn:
                 task = self.kb.get_task(conn, task_id)
                 if task is None:
                     return False
-                if task.status != status:
+                if task.status != "blocked":
                     return True
                 return number is not None and conn.execute(
-                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND id > ? LIMIT 1",
-                    (task_id, kind, number)).fetchone() is not None
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' AND id > ? LIMIT 1",
+                    (task_id, number)).fetchone() is not None
         except Exception:
             logger.warning("Cannot read the task again after Hermes failed to unblock it", exc_info=True)
             return False
