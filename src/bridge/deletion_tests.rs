@@ -598,4 +598,21 @@ fn a_removed_sandbox_leaves_nothing_to_delete_unless_its_data_was_kept() {
     )
     .unwrap();
     assert!(store.conversation_info("c-kept").unwrap().is_none());
+    // A second runtime's implicit default is not evidence of data in this
+    // retained Hermes home. Actual OpenClaw folders still prevent deletion,
+    // even after the native roster stopped listing the agent.
+    assert!(hub.deletion_target_absent("kept/main"));
+    let claw = hub.layout.sandbox_home("kept").join(".openclaw");
+    let native = claw.join("agents/main");
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(
+        claw.join("openclaw.json"),
+        "{agents:{ownership:'explicit',entries:{writer:{}}}}",
+    )
+    .unwrap();
+    assert!(!hub.deletion_target_absent("kept/main"));
+    std::fs::remove_dir_all(&native).unwrap();
+    assert!(!hub.deletion_target_absent("kept/main"));
+    std::fs::remove_dir_all(&claw).unwrap();
+    assert!(hub.deletion_target_absent("kept/main"));
 }
