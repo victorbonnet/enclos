@@ -76,6 +76,8 @@ class FakeKanban:
         self.opened: list[Path] = []
         self.unblock_result: Optional[bool] = None
         self.unblock_error: Optional[Exception] = None
+        # The fields each specify_triage_task was given.
+        self.specified: list[dict] = []
         self.raise_after_commit = False
         self.listing_error: Optional[Exception] = None
         self.add_board("default", root / "kanban.db")
@@ -116,6 +118,22 @@ class FakeKanban:
             raise RuntimeError("the database file shrank after commit")
         return changed == 1
 
+    def specify_triage_task(self, conn, task_id, **fields):
+        self.specified.append(fields)
+        if self.unblock_error:
+            raise self.unblock_error
+        if self.unblock_result is not None:
+            return self.unblock_result
+        with conn:
+            changed = conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'triage'",
+                                   (task_id,)).rowcount
+            if changed:
+                self._event(conn, task_id, "specified", None)
+        if self.raise_after_commit:
+            # As Hermes's recompute_ready, in its own transaction after the specify's.
+            raise RuntimeError("database is locked")
+        return changed == 1
+
     def connect(self, db_path):
         self.opened.append(Path(db_path))
         conn = sqlite3.connect(str(db_path))
@@ -153,6 +171,18 @@ class FakeKanban:
         with self.db(board) as conn, conn:
             conn.execute("UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ?", (error, task_id))
             self._event(conn, task_id, kind, payload or {}, at)
+
+    def loop(self, task_id, payload=None, at=2_000, board="default"):
+        """As Hermes's loop breaker: to `triage`, with its event."""
+        self.move(task_id, "triage", "block_loop_detected",
+                  {"reason": "Which client?", "kind": "needs_input", "recurrences": 2, "limit": 2}
+                  if payload is None else payload, at, board)
+
+    def move(self, task_id, status, kind, payload=None, at=None, board="default"):
+        with self.db(board) as conn, conn:
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+            if kind:
+                self._event(conn, task_id, kind, payload, at)
 
     def comment(self, task_id, board="default"):
         with self.db(board) as conn, conn:
@@ -418,6 +448,81 @@ class Reading(FakeBoardCase):
         with self.assertRaises(RuntimeError):
             self.board.read("main")
 
+    def test_a_triage_task_is_held_only_while_the_loop_breaker_s_event_is_its_latest_move(self):
+        self.kb.create("t_loop")
+        self.kb.loop("t_loop", at=5_000)
+        self.kb.comment("t_loop")
+        # Blocked and unblocked once (Hermes keeps its block kind), then put
+        # in triage by hand: a stale block history is no hold.
+        self.kb.create("t_by_hand")
+        self.kb.hold("t_by_hand", payload={"reason": "Old", "kind": "needs_input"})
+        self.kb.move("t_by_hand", "ready", "unblocked")
+        self.kb.move("t_by_hand", "triage", "status", {"status": "triage"})
+        # Held, specified, then put back in triage by hand.
+        self.kb.create("t_again")
+        self.kb.loop("t_again")
+        self.kb.move("t_again", "todo", "specified")
+        self.kb.move("t_again", "triage", "status", {"status": "triage"})
+        # Held, then parked in triage by an import.
+        self.kb.create("t_imported")
+        self.kb.loop("t_imported")
+        self.kb.move("t_imported", "triage", "imported", {"board": "default", "parked": True})
+        # In triage with the event, its later move out of it not followed by one back.
+        self.kb.create("t_odd")
+        self.kb.loop("t_odd")
+        self.kb.move("t_odd", "triage", "specified")
+        # In triage with no event at all.
+        with self.kb.db() as conn, conn:
+            conn.execute("INSERT INTO tasks VALUES ('t_bare', 'Bare', NULL, 'triage', 'main', 1000, NULL)")
+        self.kb.create("t_proposal", status="triage")
+        self.assertEqual(self.board.read("main"), [{
+            "task": "t_loop", "title": "Write the weekly report", "reason": "Which client?", "since": 5_000,
+            "revision": self.revision("t_loop"), "resume": held_tasks.RESUME_TRIAGE}])
+
+    def test_a_hermes_with_no_triage_status_still_reports_its_blocked_tasks(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1")
+        listing = self.kb.list_tasks
+
+        def list_tasks(conn, *, status=None):
+            if status not in self.kb.VALID_STATUSES:
+                raise ValueError(f"status must be one of {sorted(self.kb.VALID_STATUSES)}")
+            return listing(conn, status=status)
+
+        with patch.object(self.kb, "list_tasks", list_tasks), \
+                patch.object(self.kb, "VALID_STATUSES", {"todo", "ready", "running", "blocked", "done"},
+                             create=True), \
+                self.assertNoLogs("enclos.held_tasks", "WARNING"):
+            self.assertEqual([t["task"] for t in self.board.read("main")], ["t_1"])
+
+    def test_a_triage_hold_says_its_kind_with_no_reason_and_nothing_with_an_unreadable_event(self):
+        self.kb.create("t_kind")
+        self.kb.loop("t_kind", {"reason": None, "kind": "needs_input"}, at=3_000)
+        self.kb.create("t_garbled")
+        self.kb.loop("t_garbled", "{not json", at=2_000)
+        self.assertEqual([(t["task"], t["reason"]) for t in self.board.read("main")],
+                         [("t_kind", "Needs input."), ("t_garbled", "")])
+
+    def test_a_triage_hold_is_cut_to_the_bridge_s_bounds_and_named_with_its_board(self):
+        self.kb.add_board("ops")
+        self.kb.create("t_long", title="Line one\nline two " + "x" * 300, assignee="w" * 100, board="ops")
+        self.kb.loop("t_long", {"reason": "r" * 2_000, "kind": "needs_input"}, board="ops")
+        self.kb.create("t_long", created_by="research")
+        self.kb.loop("t_long")
+        [task] = self.board.read("main")
+        self.assertEqual(task["task"], "ops/t_long")
+        self.assertTrue(task["title"].startswith("Line one line two x"))
+        self.assertEqual([len(task[k]) for k in ("title", "reason", "assignee")], [200, 1_000, 64])
+
+    def test_reading_a_triage_hold_changes_no_board(self):
+        self.kb.create("t_1")
+        self.kb.loop("t_1")
+        self.kb.create("t_2", status="triage")
+        before = self.kb.dbs["default"].read_bytes()
+        self.assertEqual(len(self.board.read("main")), 1)
+        self.assertEqual((self.kb.opened, self.kb.specified), ([], []))
+        self.assertEqual(self.kb.dbs["default"].read_bytes(), before)
+
 
 class Resuming(FakeBoardCase):
     def setUp(self):
@@ -473,6 +578,40 @@ class Resuming(FakeBoardCase):
         self.kb.hold("t_1", board="ops")
         self.board.resume("main", "ops/t_1", self.revision("t_1", "ops"))
         self.assertEqual((self.kb.status("t_1", "ops"), self.kb.status("t_1")), ("ready", "blocked"))
+
+    def test_a_triage_hold_is_specified_with_no_field_given(self):
+        self.kb.create("t_loop")
+        self.kb.loop("t_loop")
+        self.board.resume("main", "t_loop", self.revision("t_loop"))
+        self.assertEqual((self.kb.status("t_loop"), self.kb.specified), ("todo", [{}]))
+        self.assertEqual(self.kb.status("t_1"), "blocked")
+
+    def test_a_triage_task_that_is_no_hold_is_a_conflict_and_nothing_is_written(self):
+        self.kb.create("t_proposal", status="triage")
+        self.kb.create("t_by_hand")
+        self.kb.loop("t_by_hand")
+        self.kb.move("t_by_hand", "todo", "specified")
+        self.kb.move("t_by_hand", "triage", "status", {"status": "triage"})
+        for task_id in ("t_proposal", "t_by_hand"):
+            self.assertEqual(self.resume_error(task_id, self.revision(task_id)), "conflict")
+            self.assertEqual(self.kb.status(task_id), "triage")
+        self.assertEqual((self.kb.opened, self.kb.specified), ([], []))
+
+    def test_hermes_s_specify_refusing_raising_before_or_after_it_committed(self):
+        self.kb.create("t_loop")
+        self.kb.loop("t_loop")
+        self.kb.unblock_result = False
+        self.assertEqual(self.resume_error("t_loop", self.revision("t_loop")), "conflict")
+        self.kb.unblock_result = None
+        self.kb.unblock_error = RuntimeError("database is locked")
+        with self.assertRaises(RuntimeError):
+            self.board.resume("main", "t_loop", self.revision("t_loop"))
+        self.assertEqual(self.kb.status("t_loop"), "triage")
+        self.kb.unblock_error = None
+        self.kb.raise_after_commit = True
+        with self.assertLogs("enclos.held_tasks", "WARNING"):
+            self.board.resume("main", "t_loop", self.revision("t_loop"))
+        self.assertEqual(self.kb.status("t_loop"), "todo")
 
 
 class Sent(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
@@ -603,6 +742,33 @@ class Sent(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
         self.kb.hold("t_99", at=20_000)
         with self.assertLogs("enclos.held_tasks", "WARNING"):
             await manager.refresh()
+
+    async def test_past_32_triage_holds_and_blocked_tasks_are_cut_together_newest_first(self):
+        for n in range(34):
+            self.kb.create(f"t_{n:02}")
+            if n % 2:
+                self.kb.loop(f"t_{n:02}", at=10_000 + n)
+            else:
+                self.kb.hold(f"t_{n:02}", at=10_000 + n)
+        manager = self.manager()
+        with self.assertLogs("enclos.held_tasks", "WARNING") as logs:
+            await manager.refresh()
+        self.assertIn("t_00, t_01", logs.output[0])
+        self.assertEqual(self.lists()[0], [f"t_{n:02}" for n in range(33, 1, -1)])
+        self.assertEqual({t["resume"] for t in self.sent[0]["tasks"]}, {held_tasks.RESUME,
+                                                                         held_tasks.RESUME_TRIAGE})
+
+    async def test_a_triage_resume_a_hermes_cannot_make_answers_unsupported(self):
+        self.kb.create("t_loop")
+        self.kb.loop("t_loop")
+        manager = self.manager()
+        with patch.object(self.kb, "specify_triage_task", None):
+            await manager.refresh()
+            self.assertEqual(self.sent[0]["tasks"][0]["resume"], held_tasks.RESUME_UNSUPPORTED)
+            await self.resume(manager, task="t_loop", revision=self.revision("t_loop"))
+        self.assertEqual([(m["type"], m.get("code")) for m in self.sent[1:]],
+                         [("error", "unsupported"), ("held_tasks", None)])
+        self.assertEqual((self.kb.status("t_loop"), self.kb.opened), ("triage", []))
 
     async def resume(self, manager, **fields):
         message = protocol.message("held_task.resume", person="p@example.com", device="d-1", **fields)
@@ -769,6 +935,196 @@ class NativeHermesHeldTasks(unittest.TestCase):
         self.assertEqual({k: tasks[0].get(k) for k in ("title", "assignee", "reason", "since", "revision")}, {
             "title": "Write the weekly report", "assignee": "writer", "reason": reasons[-1],
             "since": loop.created_at, "revision": self.latest(self.conn, task_id)})
+
+    def looped(self, conn=None, title="Write the weekly report", created_by="main", assignee="writer",
+               reason="Which client?", **create):
+        """A task Hermes's loop breaker moved to `triage`: blocked for the
+        same kind BLOCK_RECURRENCE_LIMIT times, each after an unblock."""
+        conn = conn or self.conn
+        task_id = self.kb.create_task(conn, title=title, assignee=assignee, created_by=created_by, **create)
+        for n in range(self.kb.BLOCK_RECURRENCE_LIMIT):
+            if n:
+                self.assertTrue(self.kb.unblock_task(conn, task_id))
+            self.assertTrue(self.kb.block_task(conn, task_id, reason=reason, kind="needs_input"))
+        self.assertEqual(self.kb.get_task(conn, task_id).status, "triage")
+        return task_id
+
+    def test_a_triage_proposal_is_not_held_whatever_its_text_says(self):
+        # A task created in triage waits to be specified, not for a person
+        # to resume it; text that reads like Hermes's notice changes nothing.
+        notice = "Block loop detected: blocked 2 times for needs_input. Moved to triage."
+        proposal = self.kb.create_task(self.conn, title=notice, body=notice, assignee="writer",
+                                       created_by="main", triage=True)
+        self.kb.add_comment(self.conn, proposal, "main", notice)
+        self.assertEqual(self.kb.get_task(self.conn, proposal).status, "triage")
+        looped = self.looped()
+        self.assertEqual([task["task"] for task in self.board.read("main")], [looped])
+
+    def resume_error(self, ref, revision, profile="main"):
+        with self.assertRaises(held_tasks.HeldTaskError) as raised:
+            self.board.resume(profile, ref, revision)
+        return raised.exception.code
+
+    def test_a_task_held_in_triage_is_resumed_with_hermes_s_specify_keeping_what_it_was(self):
+        parent = self.kb.create_task(self.conn, title="Collect the figures", created_by="main")
+        task_id = self.looped(body="For the board meeting")
+        # A parent added while it waits in triage: Hermes gates it on it.
+        self.kb.link_tasks(self.conn, parent, task_id)
+        before = self.kb.get_task(self.conn, task_id)
+        [task] = self.board.read("main")
+        self.assertEqual(task["resume"], held_tasks.RESUME_TRIAGE)
+        self.board.resume("main", task_id, task["revision"])
+        after = self.kb.get_task(self.conn, task_id)
+        # Hermes's specify: triage -> todo, gated on its parent still running;
+        # the same title, body, assignee and creator, and the retry count kept.
+        self.assertEqual(after.status, "todo")
+        self.assertEqual({k: getattr(after, k) for k in ("title", "body", "assignee", "created_by",
+                                                          "consecutive_failures")},
+                         {k: getattr(before, k) for k in ("title", "body", "assignee", "created_by",
+                                                           "consecutive_failures")})
+        self.assertEqual(self.kb.parent_ids(self.conn, task_id), [parent])
+        self.assertEqual([event.kind for event in self.kb.list_events(self.conn, task_id)][-1], "specified")
+        self.assertEqual(self.board.read("main"), [])
+        self.assertTrue(self.kb.complete_task(self.conn, parent, result="done"))
+        self.assertEqual(self.kb.get_task(self.conn, task_id).status, "ready")
+
+    def test_a_task_held_in_triage_with_no_parent_runs_again_at_once(self):
+        task_id = self.looped()
+        self.board.resume("main", task_id, self.board.read("main")[0]["revision"])
+        self.assertEqual(self.kb.get_task(self.conn, task_id).status, "ready")
+
+    def test_a_triage_resume_is_refused_unless_held_there_at_that_revision_by_this_agent(self):
+        task_id = self.looped()
+        stale = self.board.read("main")[0]["revision"]
+        self.kb.add_comment(self.conn, task_id, "research", "Any news?")
+        self.assertEqual(self.resume_error(task_id, stale), "conflict")
+        proposal = self.kb.create_task(self.conn, title="An idea", created_by="main", triage=True)
+        self.assertEqual(self.resume_error(proposal, self.latest(self.conn, proposal)), "conflict")
+        theirs = self.looped(created_by="research")
+        self.assertEqual(self.resume_error(theirs, self.latest(self.conn, theirs)), "not_found")
+        for unchanged in (task_id, proposal, theirs):
+            self.assertEqual(self.kb.get_task(self.conn, unchanged).status, "triage")
+            self.assertNotIn("specified", [e.kind for e in self.kb.list_events(self.conn, unchanged)])
+
+    def test_a_hermes_that_cannot_specify_says_so_and_still_resumes_a_blocked_task(self):
+        class WithoutSpecify:
+            def __init__(self, kb):
+                self._kb = kb
+
+            def __getattr__(self, name):
+                if name == "specify_triage_task":
+                    raise AttributeError(name)
+                return getattr(self._kb, name)
+
+        opened = []
+
+        def connect(**kwargs):
+            opened.append(kwargs)
+            return self.board.connect(**kwargs)
+
+        board = held_tasks.Board(WithoutSpecify(self.kb), connect)
+        looped = self.looped()
+        blocked = self.held()
+        tasks = {task["task"]: task for task in board.read("main")}
+        self.assertEqual(tasks[looped]["resume"], held_tasks.RESUME_UNSUPPORTED)
+        self.assertEqual(tasks[blocked]["resume"], held_tasks.RESUME)
+        with self.assertRaises(held_tasks.HeldTaskError) as raised:
+            board.resume("main", looped, tasks[looped]["revision"])
+        self.assertEqual(raised.exception.code, "unsupported")
+        self.assertEqual(opened, [])
+        self.assertEqual(self.kb.get_task(self.conn, looped).status, "triage")
+        board.resume("main", blocked, tasks[blocked]["revision"])
+        self.assertEqual(self.kb.get_task(self.conn, blocked).status, "ready")
+
+    def test_a_task_looped_again_says_its_latest_reason_and_a_comment_moves_only_the_revision(self):
+        task_id = self.looped(reason="Which client?")
+        self.board.resume("main", task_id, self.board.read("main")[0]["revision"])
+        self.assertEqual(self.kb.get_task(self.conn, task_id).status, "ready")
+        # The same kind again: Hermes kept its count, so straight to triage.
+        self.assertTrue(self.kb.block_task(self.conn, task_id, reason="Which quarter?", kind="needs_input"))
+        self.assertEqual(self.kb.get_task(self.conn, task_id).status, "triage")
+        loops = [event for event in self.kb.list_events(self.conn, task_id) if event.kind == "block_loop_detected"]
+        self.assertEqual(len(loops), 2)
+        [task] = self.board.read("main")
+        self.assertEqual((task["reason"], task["since"], task["revision"]),
+                         ("Which quarter?", loops[-1].created_at, self.latest(self.conn, task_id)))
+        self.kb.add_comment(self.conn, task_id, "research", "Q3, I think")
+        [commented] = self.board.read("main")
+        self.assertEqual((commented["reason"], commented["since"]), (task["reason"], task["since"]))
+        self.assertNotEqual(commented["revision"], task["revision"])
+        self.assertEqual(commented["revision"], self.latest(self.conn, task_id))
+
+    def test_a_triage_hold_cleared_or_finished_on_the_board_or_another_agent_s_is_not_listed(self):
+        theirs = self.looped(created_by="research")
+        specified = self.looped()
+        self.assertTrue(self.kb.specify_triage_task(self.conn, specified))
+        finished = self.looped()
+        self.assertTrue(self.kb.specify_triage_task(self.conn, finished))
+        self.assertTrue(self.kb.complete_task(self.conn, finished, result="done by hand"))
+        archived = self.looped()
+        self.assertTrue(self.kb.archive_task(self.conn, archived))
+        self.assertEqual(self.board.read("main"), [])
+        self.assertEqual([task["task"] for task in self.board.read("research")], [theirs])
+
+    def test_reading_a_triage_hold_never_opens_hermes_s_writer_or_changes_the_board(self):
+        opened = []
+        board = held_tasks.Board(self.kb, lambda **kwargs: opened.append(kwargs))
+        self.looped()
+        self.kb.create_task(self.conn, title="An idea", created_by="main", triage=True)
+        self.held()
+
+        def snapshot():
+            return [self.conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                    for table in ("tasks", "task_events", "task_runs", "task_comments")]
+
+        before = [[tuple(row) for row in rows] for rows in snapshot()]
+        self.assertEqual(len(board.read("main")), 2)
+        self.assertEqual(len(board.read("main")), 2)
+        self.assertEqual([[tuple(row) for row in rows] for rows in snapshot()], before)
+        self.assertEqual(opened, [])
+
+    def test_another_board_s_triage_hold_is_named_with_it_and_resumed_there_alone(self):
+        self.kb.create_board("ops")
+        from hermes_cli.kanban_db_connect import connect
+        with contextlib.closing(connect(board="ops")) as ops:
+            on_ops = self.looped(ops, title="Deploy", board="ops")
+            on_default = self.looped()
+            tasks = {task["task"]: task for task in self.board.read("main")}
+            self.assertEqual(set(tasks), {f"ops/{on_ops}", on_default})
+            self.assertEqual(self.resume_error(f"nowhere/{on_ops}", tasks[f"ops/{on_ops}"]["revision"]),
+                             "not_found")
+            self.board.resume("main", f"ops/{on_ops}", tasks[f"ops/{on_ops}"]["revision"])
+            self.assertEqual(self.kb.get_task(ops, on_ops).status, "ready")
+            self.assertEqual(self.kb.get_task(self.conn, on_default).status, "triage")
+            self.assertEqual([task["task"] for task in self.board.read("main")], [on_default])
+
+    def test_the_manager_lists_a_triage_hold_and_resumes_it(self):
+        task_id = self.looped()
+        proposal = self.kb.create_task(self.conn, title="An idea", created_by="main", triage=True)
+        sent = []
+
+        async def write(message):
+            sent.append(message)
+            return True
+
+        async def run():
+            manager = held_tasks.Manager("main", write, board=self.board, refresh_seconds=3600)
+            manager.bridge_supports = True
+            await manager.refresh()
+            revision = sent[0]["tasks"][0]["revision"]
+            await manager.resume(protocol.message("held_task.resume", task=proposal, revision=revision,
+                                                  person="p@example.com", device="d-1"))
+            await manager.resume(protocol.message("held_task.resume", task=task_id, revision=revision,
+                                                  person="p@example.com", device="d-1"))
+
+        asyncio.run(run())
+        self.assertEqual([(m["type"], m.get("code")) for m in sent], [
+            ("held_tasks", None), ("error", "conflict"), ("held_tasks", None), ("held_task.resumed", None),
+            ("held_tasks", None)])
+        self.assertEqual([[t["task"] for t in m["tasks"]] for m in sent if m["type"] == "held_tasks"],
+                         [[task_id], [task_id], []])
+        self.assertEqual(sent[0]["tasks"][0]["resume"], held_tasks.RESUME_TRIAGE)
+        self.assertEqual(self.kb.get_task(self.conn, proposal).status, "triage")
 
     def test_a_stale_revision_is_a_conflict_and_another_agent_s_task_is_not_found(self):
         task_id = self.held()
