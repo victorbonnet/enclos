@@ -16,15 +16,15 @@ pub struct AppEndpoint {
     pub token: SecretValue,
 }
 
-/// The agents given an app channel, as [`Engine::app_agents`] reads them.
+/// The tracked or built-in agents given an app channel, as [`Engine::app_agents`] reads them.
 #[derive(Default)]
 pub struct AppAgents {
     pub agents: Vec<AppAgent>,
-    /// Each sandbox whose policy or runtime could not be read, and why.
+    /// Each sandbox whose policy, runtime or tracked agents could not be read, and why.
     pub unreadable: Vec<(SandboxName, String)>,
 }
 
-/// An agent whose active policy grants it an app channel token.
+/// A tracked or built-in agent whose active policy grants it an app channel token.
 pub struct AppAgent {
     pub sandbox: SandboxName,
     pub agent: String,
@@ -42,6 +42,12 @@ impl Engine {
     /// grants it (`runtime configure <sandbox>/<agent> --channel app`).
     pub fn app_endpoint(&self, name: &SandboxName, agent: &str) -> Result<AppEndpoint> {
         self.require_sandbox(name)?;
+        if self
+            .builtin_agent(name)?
+            .is_none_or(|builtin| builtin.as_str() != agent)
+        {
+            self.agent_of(name, agent)?;
+        }
         let variable = Channel::App.token_variable();
         let view = self.policy(name)?;
         let grants = view
@@ -113,9 +119,11 @@ impl Engine {
         Ok(true)
     }
 
-    /// Every agent of every sandbox whose active policy grants it an app
-    /// channel token, and each sandbox whose policy or runtime could not be
-    /// read, with why: its agents are not known, not shown to have none.
+    /// Every tracked or built-in agent whose active policy grants it an app
+    /// channel token, and each sandbox whose policy, runtime or tracked
+    /// agents could not be read, with why: its agents are not known, not
+    /// shown to have none. A grant left by `agent rm` does not keep the
+    /// removed agent listed.
     pub fn app_agents(&self) -> Result<AppAgents> {
         let variable = Channel::App.token_variable();
         let mut found = AppAgents::default();
@@ -123,9 +131,10 @@ impl Engine {
             let name = view.record.name.clone();
             let read = self.policy(&name).and_then(|policy| {
                 let runtime = self.runtime(&name)?;
-                Ok((policy, runtime))
+                let tracked = self.state.agents(&name)?;
+                Ok((policy, runtime, tracked))
             });
-            let (policy, runtime) = match read {
+            let (policy, runtime, tracked) = match read {
                 Ok(read) => read,
                 // Removed since it was listed, or never given a policy: it
                 // has no agent to serve.
@@ -135,9 +144,12 @@ impl Engine {
                     continue;
                 }
             };
+            let builtin = runtime.and_then(|kind| crate::runtime::adapter(kind).builtin_agent());
             let runtime = runtime.map(|k| k.to_string()).unwrap_or_default();
             for (agent, grants) in &policy.snapshot.policy.agent_secrets {
-                if grants.contains_key(variable) {
+                let exists = tracked.iter().any(|record| &record.name == agent)
+                    || builtin.is_some_and(|builtin| builtin.as_str() == agent.as_str());
+                if exists && grants.contains_key(variable) {
                     found.agents.push(AppAgent {
                         sandbox: name.clone(),
                         agent: agent.as_str().to_owned(),
