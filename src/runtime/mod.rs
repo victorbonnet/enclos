@@ -350,6 +350,16 @@ pub trait RuntimeAdapter {
     /// read a bounded number of entries, and answer [`Unreadable`], with
     /// the reason, rather than guess (ADR 0023).
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    /// Additional native data whose absence is not established by the roster
+    /// and `agent_facts.folder`. The bridge retains an agent's history while
+    /// this is true, even when those ordinary observations found nothing.
+    fn agent_data_may_remain(
+        &self,
+        _home: &Path,
+        _agent: &RuntimeAgentName,
+    ) -> Result<bool, Unreadable> {
+        Ok(false)
+    }
     /// The native target used when a person omits an agent. Unlike
     /// [`Self::builtin_agent`], this may be an ordinary removable agent
     /// selected by the installed runtime's settings. Read only this home,

@@ -274,6 +274,17 @@ impl RuntimeAdapter for OpenClaw {
         names(&config(home)?)
             .map_err(|why| unreadable("~/.openclaw/openclaw.json", NotRead::Io(why)))
     }
+    fn agent_data_may_remain(
+        &self,
+        home: &Path,
+        _agent: &RuntimeAgentName,
+    ) -> Result<bool, Unreadable> {
+        // The public native delete owns separate agent/session/workspace and
+        // database paths, including custom ones. A missing roster entry is
+        // not proof that all of them were purged. Until native deletion
+        // receipts establish that, retain bridge history while state exists.
+        Ok(super::home::stat(home, &at(".openclaw"))?.is_some())
+    }
     fn default_agent(&self, home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable> {
         let value = config(home)?;
         let agents = names(&value)
