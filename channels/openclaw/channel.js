@@ -181,6 +181,12 @@ export function createChannel(sdk = {}) {
         const typing = on => { if (!transport.closed) transport.write(message('typing', { conversation: incoming.conversation, on })); };
         const finishActivity = activity.begin(incoming);
         let failureReported = false;
+        const reportFailure = () => {
+          if (failureReported || execution.signal.aborted) return;
+          assertAuthority();
+          transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
+          failureReported = true;
+        };
         try { await channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
@@ -188,12 +194,7 @@ export function createChannel(sdk = {}) {
           replyOptions: { abortSignal: execution.signal },
           dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
           delivery: {
-            onError() {
-              if (failureReported || execution.signal.aborted) return;
-              assertAuthority();
-              transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
-              failureReported = true;
-            },
+            onError: reportFailure,
             async deliver(payload) {
             assertAuthority();
             // Preserve the complete native fallback for batches, forms and
@@ -208,7 +209,12 @@ export function createChannel(sdk = {}) {
                 { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
             });
           } },
-        }); } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
+        }); } catch (error) {
+          reportFailure();
+          // Native dispatch may have started work before failing. Preserve the
+          // uncertain receipt so reconnects cannot replay that work.
+          throw error;
+        } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
         } finally { execution.finish(); }
       },
     });

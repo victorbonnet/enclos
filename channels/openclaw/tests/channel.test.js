@@ -59,6 +59,30 @@ test('a native dispatch error becomes one correlated reply without leaking diagn
   assert.equal(channel.running.get(account.accountId).transport.state.outbox.length, 1);
 });
 
+test('a thrown native failure produces a visible reply and ends answering without replaying the turn', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg); let calls = 0;
+  native.api.channel.inbound.dispatch = async () => {
+    calls++;
+    throw new Error('codex app-server request timed out: SENSITIVE_NATIVE_DIAGNOSTIC');
+  };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  await owner.hello({ capabilities: ['activity'] }); await owner.next('agent.activity');
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input);
+  assert.equal((await owner.next('agent.activity')).doing.length, 1);
+  const reply = await owner.next('message.out');
+  assert.equal(reply.reply_to, input.id); assert.equal(reply.kind, 'reply');
+  assert.match(reply.text, /could not respond/); assert.equal(reply.text.includes('SENSITIVE_NATIVE_DIAGNOSTIC'), false);
+  assert.deepEqual((await owner.next('agent.activity')).doing, []);
+  await owner.next('error', input.id);
+  owner.send(input); await owner.next('error', input.id);
+  assert.equal(calls, 1, 'uncertain native work must never be replayed');
+  assert.equal(channel.running.get(account.accountId).transport.state.outbox.length, 1);
+  assert.equal(owner.pending.some(frame => frame.type === 'ack' && frame.of === input.id), false);
+});
+
 test('a native service-backed routine response is live, agent-bound and read-only', async t => {
   const account = accountFixture(t), cfg = configured(account), channel = createChannel();
   const native = nativeHarness(cfg); let service;
