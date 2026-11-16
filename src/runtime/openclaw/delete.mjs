@@ -38,7 +38,7 @@ export async function nativeOwnerSdk() {
   // Resolve its own package exports; cwd/NODE_PATH never select a host SDK.
   const nodeRoot = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
   const packageFile = path.join(nodeRoot, 'lib/node_modules/openclaw/package.json');
-  if (JSON.parse(fs.readFileSync(packageFile)).version !== '2026.11.2') throw new Error('OpenClaw owner helpers need the matching tested runtime version.');
+  if (JSON.parse(fs.readFileSync(packageFile)).version !== '2026.11.3') throw new Error('OpenClaw owner helpers need the matching tested runtime version.');
   const require = createRequire(packageFile);
   const sdk = async subpath => import(pathToFileURL(require.resolve(`openclaw/plugin-sdk/${subpath}`)));
   const [{ readConfigFileSnapshotForWrite }, { resolveConfiguredSecretInputString }, { callGatewayFromCli }] = await Promise.all([

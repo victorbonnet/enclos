@@ -13,7 +13,7 @@ by conversation alone. An `ack` accepts the cancellation request; it is not a
 receipt that native cleanup has drained, tools have exited or a thread was killed.
 No runtime command spelling lives in the bridge.
 
-## OpenClaw 2026.11.2
+## OpenClaw 2026.11.3
 
 The public `GetReplyOptions.abortSignal` is documented as the signal for the
 underlying agent run. `channel.inbound.dispatch` accepts it in `replyOptions`.
