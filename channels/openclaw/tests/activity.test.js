@@ -1,0 +1,30 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createActivity } from '../activity.js';
+
+test('activity retains concurrent ingresses and publishes bounded current state only to negotiated peers', () => {
+  const sent = [];
+  const transport = { bridgeCapabilities: new Set(), write: value => sent.push(value) };
+  let current = true;
+  const activity = createActivity(transport, () => { if (!current) throw new Error('revoked'); });
+  const first = activity.begin({ id: 'one', conversation: 'same' });
+  const second = activity.begin({ id: 'two', conversation: 'same' });
+  assert.deepEqual(sent, []);
+  transport.bridgeCapabilities.add('activity');
+  activity.onHello();
+  assert.deepEqual(sent.at(-1).doing, [{ kind: 'answering', conversation: 'same' }]);
+  const since = sent.at(-1).since;
+  first(); first();
+  assert.equal(sent.length, 1);
+  assert.ok(since > 0);
+  for (let i = 0; i < 20; i++) activity.begin({ id: `many-${i}`, conversation: `c-${i}` });
+  assert.equal(sent.at(-1).doing.length, 16);
+  assert.equal(new Set(sent.at(-1).doing.map(d => d.conversation)).size, 16);
+  const count = sent.length;
+  current = false;
+  second(); activity.onHello();
+  assert.equal(sent.length, count);
+  activity.close();
+  current = true; activity.onHello();
+  assert.equal(sent.length, count, 'a stopped account cannot publish again');
+});

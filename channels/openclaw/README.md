@@ -217,3 +217,18 @@ The channel keeps the latest 10,000 inbound receipts per account and preserves
 in-flight receipts until dispatch finishes. It retains up to 4,096 conversation
 routes, keeping Home and routes with pending delivery. A new inbound message
 reestablishes an evicted route with the same native chat for that person.
+
+## Answering activity
+
+The channel advertises `activity` and publishes `agent.activity` only when the
+bridge also negotiated it. It reports authenticated enclos ingresses while
+awaiting native dispatch and delivery settlement. Concurrent ingresses are
+tracked separately, including ones in the same conversation; a typing idle
+callback or cancellation acknowledgement does not claim native cleanup ended.
+Each message is the current bounded snapshot (at most 16 conversations), sent
+again after every hello. Idle has an empty list and `since: 0`. These transient
+frames never enter the durable outbox, and account shutdown revokes reporting.
+
+This covers answering through this channel. It does not report CLI work,
+scheduled runs or native background tasks, and native deferred ingress is not
+a complete Gateway run inventory. `tasks` and `held_tasks` remain unavailable.
