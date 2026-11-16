@@ -212,3 +212,18 @@ parameters and receipts without starting a gateway client or executing a command
 Live gateway/plugin loading, Seatbelt socket reachability and real model/scheduled
 output are recorded separately in `prototype/m5/`; source/fixture tests alone do
 not establish those behaviors.
+
+## Answering activity
+
+The channel advertises `activity` and publishes `agent.activity` only when the
+bridge also negotiated it. It reports authenticated enclos ingresses while
+awaiting native dispatch and delivery settlement. Concurrent ingresses are
+tracked separately, including ones in the same conversation; a typing idle
+callback or cancellation acknowledgement does not claim native cleanup ended.
+Each message is the current bounded snapshot (at most 16 conversations), sent
+again after every hello. Idle has an empty list and `since: 0`. These transient
+frames never enter the durable outbox, and account shutdown revokes reporting.
+
+This covers answering through this channel. It does not report CLI work,
+scheduled runs or native background tasks, and native deferred ingress is not
+a complete Gateway run inventory. `tasks` and `held_tasks` remain unavailable.

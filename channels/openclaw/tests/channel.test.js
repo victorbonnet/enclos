@@ -193,7 +193,7 @@ test('typing, exact tool events, native commands and policy requests keep their 
   await start(t, channel, cfg, account);
   const owner = await bridge(account.socket); t.after(() => owner.close());
   const hello = await owner.hello();
-  assert.deepEqual(hello.capabilities, ['typing', 'abort', 'commands', 'tools', 'approval']);
+  assert.deepEqual(hello.capabilities, ['typing', 'abort', 'commands', 'tools', 'approval', 'activity']);
   assert.deepEqual((await owner.next('commands')).commands, [{ name: 'help', description: 'Native help on one line' }]);
   const policy = message('policy.context', { text: 'Sandbox access: read the permitted workspace only.' });
   owner.send(policy); await owner.next('ack', policy.id);
@@ -335,4 +335,81 @@ test('typed abort keeps exact native signals apart and cancels preparation befor
   send('successor'); await waitFor(() => signals.has('successor'));
   await abort('first'); assert.equal(signals.get('successor').aborted, false);
   await abort('successor'); await owner.next('ack', 'successor');
+});
+
+test('answering activity follows native dispatch settlement, survives reconnect and counts overlapping ingresses', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg), pending = new Map();
+  native.api.channel.inbound.dispatch = async params => {
+    params.assertAuthority();
+    await new Promise(resolve => pending.set(params.messageId, { resolve, params }));
+  };
+  channel.setRuntime(native.api);
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello({ capabilities: ['activity'] })).capabilities.includes('activity'));
+  assert.deepEqual((await owner.next('agent.activity')).doing, []);
+  owner.send(message('message.in', { id: 'active-first', conversation: 'c', person: 'p', text: 'first' }));
+  owner.send(message('message.in', { id: 'active-second', conversation: 'c', person: 'p', text: 'second' }));
+  await waitFor(() => pending.size === 2);
+  assert.deepEqual((await owner.next('agent.activity')).doing, [{ kind: 'answering', conversation: 'c' }]);
+  pending.get('active-first').params.dispatcherOptions.onIdle();
+  pending.get('active-first').resolve();
+  await owner.next('ack', 'active-first');
+  assert.equal(owner.pending.some(frame => frame.type === 'agent.activity'), false, 'typing idle and one completion do not clear another ingress');
+  await owner.close();
+  await waitFor(() => channel.running.get(account.accountId).transport.peer == null);
+  const replacement = await bridge(account.socket); t.after(() => replacement.close());
+  await replacement.hello({ capabilities: ['activity'] });
+  assert.deepEqual((await replacement.next('agent.activity')).doing, [{ kind: 'answering', conversation: 'c' }]);
+  pending.get('active-second').resolve();
+  const idle = await replacement.next('agent.activity');
+  assert.deepEqual(idle.doing, []); assert.equal(idle.since, 0);
+  assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, [], 'activity is transient');
+});
+
+test('failed admission never reports answering and failed native dispatch clears it', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg);
+  let admitted = false;
+  native.api.channel.inbound.ingress.resolve = async () => admitted
+    ? { ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true } }
+    : { ingress: { admission: 'deny' } };
+  native.api.channel.inbound.dispatch = async () => { throw new Error('native failed'); };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  await owner.hello({ capabilities: ['activity'] }); await owner.next('agent.activity');
+  owner.send(message('message.in', { id: 'denied', conversation: 'c', person: 'p', text: 'denied' }));
+  await owner.next('error', 'denied');
+  assert.equal(owner.pending.some(frame => frame.type === 'agent.activity'), false);
+  admitted = true;
+  owner.send(message('message.in', { id: 'failed', conversation: 'c', person: 'p', text: 'fails' }));
+  assert.equal((await owner.next('agent.activity')).doing.length, 1);
+  assert.deepEqual((await owner.next('agent.activity')).doing, []);
+  await owner.next('error', 'failed');
+});
+
+test('cancellation retains answering until native cleanup finishes and old peers receive no activity', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg); let finish, aborted = false;
+  native.api.channel.inbound.dispatch = async params => {
+    params.replyOptions.abortSignal.addEventListener('abort', () => { aborted = true; }, { once: true });
+    await new Promise(resolve => { finish = resolve; });
+  };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  await owner.hello();
+  owner.send(message('message.in', { id: 'cancelled-ingress', conversation: 'c', person: 'p', text: 'wait' }));
+  await waitFor(() => finish);
+  owner.send(message('turn.abort', { id: 'abort', conversation: 'c', of: 'cancelled-ingress' }));
+  await owner.next('ack', 'abort');
+  assert.equal(aborted, true);
+  assert.equal(owner.pending.some(frame => frame.type === 'agent.activity'), false);
+  await owner.close();
+  await waitFor(() => channel.running.get(account.accountId).transport.peer == null);
+  const replacement = await bridge(account.socket); t.after(() => replacement.close());
+  await replacement.hello({ capabilities: ['activity'] });
+  assert.equal((await replacement.next('agent.activity')).doing.length, 1, 'an abort acknowledgement is not completed cleanup');
+  finish();
+  assert.deepEqual((await replacement.next('agent.activity')).doing, []);
 });
