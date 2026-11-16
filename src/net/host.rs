@@ -139,7 +139,8 @@ impl fmt::Display for AllowEntry {
     }
 }
 
-fn split_port(entry: &str) -> Result<(&str, u16), String> {
+/// Splits a destination's syntax without deciding whether policy may allow it.
+pub(crate) fn split_port(entry: &str) -> Result<(&str, u16), String> {
     let port = |p: &str| {
         p.parse::<u16>()
             .ok()

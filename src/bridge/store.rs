@@ -150,6 +150,14 @@ pub struct StoredAvatar {
     pub image: Option<Vec<u8>>,
 }
 
+/// A policy request with the last instant its lifecycle already handled,
+/// in the network log's millisecond precision. This metadata stays on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalHistory {
+    pub approval: enclos_protocol::approval::Approval,
+    pub through_ms: i64,
+}
+
 /// A conversation named by its runtime.
 pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
@@ -649,6 +657,26 @@ fn add_column(
     Ok(())
 }
 
+/// Appended independently of the released tables, so older bridges still
+/// read and insert their three-column approval rows. Legacy rows retain
+/// only their creation time as a known lower bound; no decision time is invented.
+fn migrate_approval_cutoffs(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS approval_cutoffs (
+            request TEXT PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+            through_ms INTEGER NOT NULL CHECK(typeof(through_ms)='integer')
+        );",
+    )
+}
+
+fn record_approval_cutoff(db: &Connection, request: &str) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT INTO approval_cutoffs VALUES (?1,?2) ON CONFLICT(request) DO UPDATE SET through_ms=MAX(approval_cutoffs.through_ms,excluded.through_ms)",
+        params![request, crate::model::now().as_millisecond()],
+    )?;
+    Ok(())
+}
+
 /// What became of a device's message given to [`Store::add_from_device`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Added {
@@ -981,29 +1009,44 @@ impl Store {
             })
             .collect()
     }
-    /// `sandbox`'s policy requests made at `from` (seconds) or later,
-    /// decided ones too, beyond the inbox's window: what tells a proxy
-    /// refusal last seen at `from` or later whether it was asked already.
-    pub fn approvals_since(
+    /// `sandbox`'s requests that can account for refusals at `from_ms` or
+    /// later, beyond the inbox's history window. Pending and applying
+    /// requests remain relevant however long they have waited. A completed
+    /// request covers retries through its completion, rather than creation.
+    pub fn approval_history_since(
         &self,
         sandbox: &str,
-        from: i64,
-    ) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        from_ms: i64,
+    ) -> rusqlite::Result<Vec<ApprovalHistory>> {
         let mut q = self.db.prepare(
-            "SELECT body, state FROM approvals \
-             WHERE json_extract(body, '$.sandbox') = ?1 AND json_extract(body, '$.time') >= ?2",
+            "WITH history AS (
+                SELECT a.body, a.state,
+                    MAX(COALESCE(c.through_ms, CAST(json_extract(a.body, '$.time') AS INTEGER)*1000),
+                        CAST(json_extract(a.body, '$.time') AS INTEGER)*1000) AS through_ms
+                FROM approvals a LEFT JOIN approval_cutoffs c ON c.request=a.id
+                WHERE json_extract(a.body, '$.sandbox')=?1
+            )
+            SELECT body, state, through_ms FROM history
+            WHERE state IN ('pending','applying') OR through_ms>=?2",
         )?;
         let rows = q
-            .query_map(rusqlite::params![sandbox, from], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            .query_map(rusqlite::params![sandbox, from_ms], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter()
-            .map(|(s, state)| {
+            .map(|(s, state, through_ms)| {
                 let mut a: enclos_protocol::approval::Approval = serde_json::from_str(&s)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 a.state = state;
-                Ok(a)
+                Ok(ApprovalHistory {
+                    approval: a,
+                    through_ms,
+                })
             })
             .collect()
     }
@@ -1021,14 +1064,7 @@ impl Store {
             |r| r.get(0),
         )
     }
-    #[cfg(test)]
-    pub fn set_refusals_since(&self, at: i64) -> rusqlite::Result<()> {
-        self.db.execute(
-            "INSERT INTO approval_marks (name, at) VALUES ('refusals', ?1) ON CONFLICT(name) DO UPDATE SET at=excluded.at",
-            [at],
-        )?;
-        Ok(())
-    }
+
     pub fn approval(
         &self,
         id: &str,
@@ -1053,10 +1089,19 @@ impl Store {
     ) -> rusqlite::Result<bool> {
         let body = serde_json::to_string(a)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        Ok(self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        let created = tx.execute(
             "INSERT OR IGNORE INTO approvals VALUES (?1,?2,?3)",
             params![a.request, body, a.state],
-        )? == 1)
+        )? == 1;
+        if created {
+            tx.execute(
+                "DELETE FROM approval_cutoffs WHERE request=?1",
+                [&a.request],
+            )?;
+        }
+        tx.commit()?;
+        Ok(created)
     }
     /// A failed request asked again: pending, with `a`'s fresh preview.
     pub fn reopen_approval(
@@ -1065,10 +1110,19 @@ impl Store {
     ) -> rusqlite::Result<bool> {
         let body = serde_json::to_string(a)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        Ok(self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE approvals SET body=?2,state='pending' WHERE id=?1 AND state='failed'",
             params![a.request, body],
-        )? == 1)
+        )? == 1;
+        if changed {
+            tx.execute(
+                "DELETE FROM approval_cutoffs WHERE request=?1",
+                [&a.request],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
     /// Reclassify a pending diagnostic notification without granting or denying access.
     pub fn dismiss_probe(
@@ -1084,20 +1138,29 @@ impl Store {
             Some("This attempt comes from the built-in network probe, not agent work.".into());
         let body = serde_json::to_string(&closed)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        Ok((self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE approvals SET body=?2,state='diagnostic' WHERE id=?1 AND state='pending' AND body=?3",
             params![a.request, body, serde_json::to_string(a).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?],
-        )? == 1)
-            .then_some(closed))
+        )? == 1;
+        if changed {
+            record_approval_cutoff(&tx, &a.request)?;
+        }
+        tx.commit()?;
+        Ok(changed.then_some(closed))
     }
     pub fn put_approval(&self, a: &enclos_protocol::approval::Approval) -> rusqlite::Result<()> {
         let body = serde_json::to_string(a)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE approvals SET body=?2,state=?3 WHERE id=?1 AND state='applying'",
             params![a.request, body, a.state],
-        )?;
-        Ok(())
+        )? == 1;
+        if changed && matches!(a.state.as_str(), "approved" | "denied" | "failed") {
+            record_approval_cutoff(&tx, &a.request)?;
+        }
+        tx.commit()
     }
     pub fn refresh_approval(
         &self,
@@ -1144,6 +1207,7 @@ impl Store {
                 params![now(), device, person, id],
             )?;
             tx.execute("INSERT OR IGNORE INTO closed_scopes VALUES (?1)", [scope])?;
+            record_approval_cutoff(&tx, id)?;
         }
         tx.commit()?;
         Ok(changed)
@@ -1180,6 +1244,7 @@ impl Store {
         for (table, column, declaration) in ADDED_COLUMNS {
             add_column(&db, table, column, declaration)?;
         }
+        migrate_approval_cutoffs(&db)?;
         db.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
              CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;
@@ -2408,8 +2473,294 @@ pub fn now() -> i64 {
 }
 
 #[cfg(test)]
+impl Store {
+    pub fn set_refusals_since(&self, at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO approval_marks (name, at) VALUES ('refusals', ?1) ON CONFLICT(name) DO UPDATE SET at=excluded.at",
+            [at],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cutoff_request(id: &str, state: &str) -> enclos_protocol::approval::Approval {
+        enclos_protocol::approval::Approval {
+            request: id.into(),
+            sandbox: "lab".into(),
+            agent: String::new(),
+            conversation: None,
+            access: enclos_protocol::approval::Access {
+                kind: enclos_protocol::approval::AccessKind::Network,
+                target: "example.com".into(),
+                private: false,
+            },
+            action: "Connect to example.com".into(),
+            time: 10,
+            state: state.into(),
+            change: String::new(),
+            scope: "example.com".into(),
+            restart: false,
+            revision: "revision".into(),
+            available: true,
+            reason: None,
+        }
+    }
+
+    fn stored_cutoff(store: &Store, id: &str) -> Option<i64> {
+        store
+            .db
+            .query_row(
+                "SELECT through_ms FROM approval_cutoffs WHERE request=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn approval_cutoffs_persist_completion_precision_without_changing_the_wire_request() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        for state in ["approved", "denied", "failed", "closed", "diagnostic"] {
+            let mut request = cutoff_request(state, "pending");
+            store.create_approval(&request).unwrap();
+            let before = crate::model::now().as_millisecond();
+            match state {
+                "closed" => assert!(
+                    store
+                        .close_approval(state, "pending", "scope", "phone", "owner")
+                        .unwrap()
+                ),
+                "diagnostic" => assert!(store.dismiss_probe(&request).unwrap().is_some()),
+                _ => {
+                    assert!(store.claim_approval(state).unwrap());
+                    request.state = state.into();
+                    store.put_approval(&request).unwrap();
+                }
+            }
+            let after = crate::model::now().as_millisecond();
+            let through_ms = stored_cutoff(&store, state).unwrap();
+            assert!((before..=after).contains(&through_ms));
+            let reopened = Store::open(&path).unwrap();
+            let history = reopened.approval_history_since("lab", through_ms).unwrap();
+            let entry = history
+                .iter()
+                .find(|h| h.approval.request == state)
+                .unwrap();
+            assert_eq!(entry.through_ms, through_ms);
+            assert_eq!(entry.approval.state, state);
+            assert_eq!(entry.approval.time, 10, "display time stays at creation");
+            assert!(
+                reopened
+                    .approval_history_since("lab", through_ms + 1)
+                    .unwrap()
+                    .iter()
+                    .all(|h| h.approval.request != state)
+            );
+            let wire = serde_json::to_value(&entry.approval).unwrap();
+            assert!(wire.get("through_ms").is_none());
+        }
+    }
+
+    #[test]
+    fn approval_cutoff_history_keeps_waiting_requests_and_legacy_creation_boundaries() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        // The released schema has no cutoff table, and older clients use
+        // a positional insert into the unchanged three-column table.
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        let legacy = cutoff_request("legacy", "denied");
+        db.execute(
+            "INSERT INTO approvals VALUES (?1,?2,?3)",
+            params![
+                legacy.request,
+                serde_json::to_string(&legacy).unwrap(),
+                legacy.state
+            ],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(stored_cutoff(&store, "legacy"), None);
+        let history = store.approval_history_since("lab", 10_000).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].through_ms, 10_000);
+        assert!(
+            store
+                .approval_history_since("lab", 10_001)
+                .unwrap()
+                .is_empty()
+        );
+        for id in ["pending", "applying"] {
+            store
+                .create_approval(&cutoff_request(id, "pending"))
+                .unwrap();
+        }
+        assert!(store.claim_approval("applying").unwrap());
+        let reopened = Store::open(&path).unwrap();
+        let mut waiting: Vec<_> = reopened
+            .approval_history_since("lab", 20_000)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.approval.request, h.through_ms))
+            .collect();
+        waiting.sort();
+        assert_eq!(
+            waiting,
+            [
+                ("applying".to_owned(), 10_000),
+                ("pending".to_owned(), 10_000)
+            ]
+        );
+        assert_eq!(stored_cutoff(&reopened, "legacy"), None);
+        let columns: i64 = reopened
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('approvals')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 3);
+        // Repeated opens and a legacy writer neither invent a cutoff nor
+        // require a changed Approval body.
+        reopened
+            .create_approval(&cutoff_request("older-writer", "denied"))
+            .unwrap();
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .approval_history_since("lab", 0)
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn approval_cutoffs_change_only_with_successful_lifecycle_transitions() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let mut request = cutoff_request("r1", "pending");
+        store.create_approval(&request).unwrap();
+        assert!(store.claim_approval("r1").unwrap());
+        request.state = "failed".into();
+        store.put_approval(&request).unwrap();
+        assert!(stored_cutoff(&store, "r1").is_some());
+        store
+            .db
+            .execute(
+                "UPDATE approval_cutoffs SET through_ms=10003 WHERE request='r1'",
+                [],
+            )
+            .unwrap();
+        store.put_approval(&request).unwrap();
+        store.recover_approvals().unwrap();
+        assert!(
+            !store
+                .close_approval("r1", "pending", "scope", "phone", "owner")
+                .unwrap()
+        );
+        assert!(store.dismiss_probe(&request).unwrap().is_none());
+        assert_eq!(stored_cutoff(&store, "r1"), Some(10_003));
+        assert_eq!(
+            store.approval_history_since("lab", 10_003).unwrap()[0].through_ms,
+            10_003
+        );
+        assert!(
+            store
+                .approval_history_since("lab", 10_004)
+                .unwrap()
+                .is_empty()
+        );
+
+        request.state = "pending".into();
+        request.time = 20;
+        assert!(store.reopen_approval(&request).unwrap());
+        assert_eq!(stored_cutoff(&store, "r1"), None);
+        assert!(!store.reopen_approval(&request).unwrap());
+        assert!(store.claim_approval("r1").unwrap());
+        store.recover_approvals().unwrap();
+        assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+        assert!(stored_cutoff(&store, "r1").is_some());
+        assert!(
+            store
+                .close_approval("r1", "failed", "scope", "phone", "owner")
+                .unwrap()
+        );
+        let closed_at = stored_cutoff(&store, "r1");
+        assert!(!store.reopen_approval(&request).unwrap());
+        assert!(
+            !store
+                .close_approval("r1", "failed", "scope", "phone", "owner")
+                .unwrap()
+        );
+        assert_eq!(stored_cutoff(&store, "r1"), closed_at);
+    }
+
+    #[test]
+    fn approval_cutoffs_reset_on_reimport_but_survive_a_duplicate_creation() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let mut request = cutoff_request("r1", "pending");
+        assert!(store.create_approval(&request).unwrap());
+        assert!(store.claim_approval("r1").unwrap());
+        request.state = "failed".into();
+        store.put_approval(&request).unwrap();
+        let cutoff = stored_cutoff(&store, "r1");
+        assert!(cutoff.is_some());
+        request.state = "pending".into();
+        assert!(!store.create_approval(&request).unwrap());
+        assert_eq!(stored_cutoff(&store, "r1"), cutoff);
+        // An older writer may remove a request with foreign-key checks off.
+        store.db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        store
+            .db
+            .execute("DELETE FROM approvals WHERE id='r1'", [])
+            .unwrap();
+        assert_eq!(stored_cutoff(&store, "r1"), cutoff);
+        assert!(store.create_approval(&request).unwrap());
+        assert_eq!(stored_cutoff(&store, "r1"), None);
+    }
+
+    #[test]
+    fn approval_cutoff_storage_failure_rolls_back_the_lifecycle_transition() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let mut request = cutoff_request("decision", "pending");
+        store.create_approval(&request).unwrap();
+        assert!(store.claim_approval("decision").unwrap());
+        store.db.execute_batch("CREATE TRIGGER reject_cutoff BEFORE INSERT ON approval_cutoffs BEGIN SELECT RAISE(ABORT, 'fixture cutoff failure'); END;").unwrap();
+        request.state = "denied".into();
+        assert!(store.put_approval(&request).is_err());
+        assert_eq!(
+            store.approval("decision").unwrap().unwrap().state,
+            "applying"
+        );
+        assert_eq!(stored_cutoff(&store, "decision"), None);
+        store
+            .create_approval(&cutoff_request("close", "pending"))
+            .unwrap();
+        assert!(
+            store
+                .close_approval("close", "pending", "scope", "phone", "owner")
+                .is_err()
+        );
+        assert_eq!(store.approval("close").unwrap().unwrap().state, "pending");
+        assert!(!store.scope_closed("scope").unwrap());
+        assert!(store.log_lines(10).unwrap().is_empty());
+        let probe = cutoff_request("probe", "pending");
+        store.create_approval(&probe).unwrap();
+        assert!(store.dismiss_probe(&probe).is_err());
+        assert_eq!(store.approval("probe").unwrap().unwrap().state, "pending");
+    }
 
     #[test]
     fn a_group_keeps_its_members_their_positions_and_who_said_what() {
