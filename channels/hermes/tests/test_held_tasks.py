@@ -1036,6 +1036,57 @@ class NativeHermesHeldTasks(unittest.TestCase):
         board.resume("main", blocked, tasks[blocked]["revision"])
         self.assertEqual(self.kb.get_task(self.conn, blocked).status, "ready")
 
+    def test_a_task_held_in_triage_is_not_resumed_from_here_even_by_a_hermes_that_can_specify(self):
+        # Hermes's specify takes no revision and checks only the id and
+        # `triage`, in its own transaction after this module's checks: a task
+        # changed, held again or moved back to triage by hand in between would
+        # be specified all the same. So the resume of a task held in triage,
+        # by its creator at its current revision, answers `unsupported` before
+        # Hermes's writer opens, whatever this Hermes offers.
+        task_id = self.looped()
+        self.assertTrue(callable(getattr(self.kb, "specify_triage_task", None)))
+        [task] = self.board.read("main")
+        self.assertEqual((task["task"], task["revision"]), (task_id, self.latest(self.conn, task_id)))
+        opened, called = [], []
+        connect = self.board.connect
+
+        def writer(**kwargs):
+            opened.append(kwargs)
+            return connect(**kwargs)
+
+        def spy(name):
+            native = getattr(self.kb, name)
+
+            def call(*args, **kwargs):
+                called.append(name)
+                return native(*args, **kwargs)
+            return call
+
+        def snapshot():
+            tables = [name for (name,) in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+            return {table: sorted((tuple(row) for row in self.conn.execute(f'SELECT * FROM "{table}"')), key=repr)
+                    for table in tables}
+
+        before = snapshot()
+        natives = ("specify_triage_task", "unblock_task", "recompute_ready", "claim_task")
+        with patch.object(self.board, "connect", writer), \
+                patch.multiple(self.kb, **{name: spy(name) for name in natives}):
+            try:
+                self.board.resume("main", task_id, task["revision"])
+            except held_tasks.HeldTaskError as error:
+                code = error.code
+            else:
+                code = None
+        self.assertEqual({
+            "code": code, "writers": opened, "native calls": called,
+            "status": self.kb.get_task(self.conn, task_id).status, "revision": self.latest(self.conn, task_id),
+            "board unchanged": snapshot() == before, "listed": self.board.read("main"),
+        }, {
+            "code": "unsupported", "writers": [], "native calls": [], "status": "triage",
+            "revision": task["revision"], "board unchanged": True, "listed": [task],
+        })
+
     def test_a_task_looped_again_says_its_latest_reason_and_a_comment_moves_only_the_revision(self):
         task_id = self.looped(reason="Which client?")
         self.board.resume("main", task_id, self.board.read("main")[0]["revision"])
