@@ -7,7 +7,7 @@ route to the host. Text and unsolicited output are baseline. Typing, native
 command discovery, files, exact tool events and sandbox policy requests are negotiated
 only when their native adapters/hooks have been registered.
 
-The package is tested against **OpenClaw 2026.11.2**. `PluginRuntime.version` is
+The package is tested against **OpenClaw 2026.11.3**. `PluginRuntime.version` is
 checked before activation: an untested version gets an actionable failure. The
 SDK is experimental. This does not change enclos's installer-as-served policy.
 There are no runtime dependencies besides Node's standard library and the host's

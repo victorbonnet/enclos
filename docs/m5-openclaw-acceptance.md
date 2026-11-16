@@ -102,7 +102,7 @@ ENCLOS_OPENCLAW_PACKAGE=/path/to/openclaw \
 
 Without this variable, native-package tests explicitly skip. Standard transport,
 protocol, routing, files and authority tests still run. CI installs the tested
-2026.11.2 SDK package in a disposable prefix and runs the native tests too.
+2026.11.3 SDK package in a disposable prefix and runs the native tests too.
 Changing the tested runtime version requires updating and re-running the native
 contract probes; the runtime installer itself remains official/as served.
 

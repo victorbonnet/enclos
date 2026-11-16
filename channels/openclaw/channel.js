@@ -1,4 +1,4 @@
-// OpenClaw 2026.11.2 public channel contract. Native imports live in index.js.
+// OpenClaw 2026.11.3 public channel contract. Native imports live in index.js.
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
@@ -10,7 +10,7 @@ import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
 
-export const TESTED_OPENCLAW = '2026.11.2';
+export const TESTED_OPENCLAW = '2026.11.3';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 
 export function resolveAccount(cfg, accountId) {
