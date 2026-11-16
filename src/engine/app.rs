@@ -112,7 +112,12 @@ impl Engine {
                         what: error.to_string(),
                     }
                 })?;
-            if left != super::agent_rm::Leftover::Nothing {
+            let native_data = runtime
+                .agent_data_may_remain(&home, &crate::runtime::RuntimeAgentName::from(agent))
+                .map_err(|error| Error::Session {
+                    what: error.to_string(),
+                })?;
+            if left != super::agent_rm::Leftover::Nothing || native_data {
                 return Ok(false);
             }
         }
