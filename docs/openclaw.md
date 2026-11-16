@@ -183,6 +183,11 @@ Gateway, install a native host service or send Hermes's restart signal. Native
 hot reload handles supported settings changes. A pending sandbox policy requires
 `policy apply`; restarting alone does not apply it.
 
+On Linux the managed Gateway uses `setsid` from util-linux to establish a
+process session visible inside its PID namespace. Native Codex requires those
+process identities for supervision. Interactive clients keep their terminal
+session.
+
 The `assistant` template permits the public web through the proxy. For an
 allowlist sandbox, use `--template minimal`; the adapter adds observed install
 and OpenAI login destinations. Other providers and tools can need additional

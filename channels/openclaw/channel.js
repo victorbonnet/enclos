@@ -180,13 +180,21 @@ export function createChannel(sdk = {}) {
         });
         const typing = on => { if (!transport.closed) transport.write(message('typing', { conversation: incoming.conversation, on })); };
         const finishActivity = activity.begin(incoming);
+        let failureReported = false;
         try { await channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
           replyOptions: { abortSignal: execution.signal },
           dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
-          delivery: { async deliver(payload) {
+          delivery: {
+            onError() {
+              if (failureReported || execution.signal.aborted) return;
+              assertAuthority();
+              transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
+              failureReported = true;
+            },
+            async deliver(payload) {
             assertAuthority();
             // Preserve the complete native fallback for batches, forms and
             // presentations that this channel cannot faithfully control.

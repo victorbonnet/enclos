@@ -39,5 +39,11 @@ fi
 if [ "${1:-}" = gateway ] && [ "${2:-}" = run ]; then
     shift 2
     set -- gateway run --bind loopback --port "$OPENCLAW_GATEWAY_PORT" "$@"
+    # The enclosing PID namespace can inherit a group from outside it, which
+    # procfs reports as 0. Native Codex supervision requires a visible group.
+    # This service has no controlling terminal; interactive clients keep theirs.
+    if [ "$(uname -s)" = Linux ]; then
+        exec setsid --wait "$HOME/.local/share/openclaw/bin/openclaw" "$@"
+    fi
 fi
 exec "$HOME/.local/share/openclaw/bin/openclaw" "$@"
