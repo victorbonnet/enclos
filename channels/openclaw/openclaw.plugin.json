@@ -26,6 +26,7 @@
                 "socket": { "type": "string" },
                 "tokenFile": { "type": "string" },
                 "stateDir": { "type": "string" },
+                "bridgeKey": { "type": "string" },
                 "home": { "type": "string", "minLength": 1, "maxLength": 128 }
               }
             }
