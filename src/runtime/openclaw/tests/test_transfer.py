@@ -3,6 +3,8 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import os
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -141,6 +143,14 @@ class TransferTests(unittest.TestCase):
         with self.assertRaises(ValueError): transfer.assert_local_codex({}, {'runtime': {'type': 'acp'}})
         own, shared = transfer.projected_config({'agents': {'entries': {'main': {}}}, 'cron': {'enabled': True}, 'hooks': {'enabled': True}}, 'main')
         self.assertNotIn('cron', shared); self.assertNotIn('hooks', shared)
+        projected = {'plugins': {'entries': {'codex': {'config': {'appServer': {'homeScope': 'user'}}}}}}
+        transfer.merge_shared(projected, shared)
+        with self.assertRaises(ValueError): transfer.assert_local_codex(projected, own)
+
+    def test_plugin_provenance_consent_uses_a_terminal_without_overwrite_mode(self):
+        result = transfer.terminal_command([sys.executable, '-I', '-c', 'import sys; print(sys.stdin.isatty(), sys.stdout.isatty()); print("no overwrite mode")'], os.environ)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b'True True', result.stdout)
 
 
 if __name__ == '__main__': unittest.main()
