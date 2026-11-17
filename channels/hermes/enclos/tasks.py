@@ -87,10 +87,23 @@ OUTCOMES = {"completed": "completed", "blocked": "blocked", "crashed": "crashed"
 # heartbeat, worker bound...) are the board's own workings, and an attempt's
 # start and end come from its run.
 EVENTS = {"created": "created", "blocked": "blocked", "dependency_wait": "blocked",
-          "block_loop_detected": "blocked", "unblocked": "unblocked", "review_requested": "review",
-          "completed": "done"}
+          "block_loop_detected": "blocked", "gave_up": "blocked", "unblocked": "unblocked",
+          "review_requested": "review", "completed": "done"}
 # What a block that waits for other tasks says, when Hermes gives no reason.
 WAITS_FOR_TASKS = "Waits for the tasks it depends on"
+# What the block says when Hermes stopped retrying: its `gave_up` event is the
+# only trace, as the failed run keeps its own outcome (a timeout, a crash).
+GAVE_UP = "Stopped retrying"
+
+
+def _gave_up(payload: dict[str, Any]) -> str:
+    """Why Hermes stopped retrying, from its `gave_up` event's payload."""
+    failures = payload.get("failures")
+    text = GAVE_UP
+    if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+        text += f" after {failures} failed attempt" + ("s" if failures > 1 else "")
+    error = _line(payload.get("error"), MAX_HISTORY_TEXT_CHARS)
+    return f"{text}: {error}" if error else text
 
 # One task of this profile's, on one board: where its detail is read.
 _ONE = "SELECT id, body, created_by, created_at FROM tasks WHERE id = ? AND assignee = ? AND status != 'archived'"
@@ -275,6 +288,8 @@ def detail_of(conn: sqlite3.Connection, row: Any) -> dict[str, Any]:
                      MAX_HISTORY_TEXT_CHARS)
         if not text and event["kind"] == "dependency_wait":
             text = WAITS_FOR_TASKS
+        if event["kind"] == "gave_up":
+            text = _line(_gave_up(payload), MAX_HISTORY_TEXT_CHARS)
         if text:
             entry["text"] = text
         history.append(entry)

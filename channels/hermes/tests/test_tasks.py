@@ -242,6 +242,29 @@ class DetailTest(unittest.TestCase):
         self.assertEqual([(e["kind"], e.get("outcome")) for e in self.board.detail("t-1")["history"]], [
             ("created", None), ("attempt", "blocked"), ("blocked", None), ("unblocked", None), ("attempt", None)])
 
+    def test_retries_running_out_show_as_a_block_saying_why(self):
+        # As Hermes's dispatcher does: the timed-out run keeps its outcome,
+        # then `_record_task_failure` blocks the task and writes only
+        # `gave_up`, with the error and not a reason.
+        self.scratch.run("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
+        self.scratch.task("t-1", "blocked", created_at=NOW - 100)
+        self.scratch.attempt("t-1", "engineer", NOW - 90, NOW - 30, "timed_out", error="no heartbeat for 60s")
+        self.scratch.run("INSERT INTO task_events (task_id, kind, created_at, run_id) VALUES (?, ?, ?, ?)",
+                         "t-1", "claimed", NOW - 90, 1)
+        self.scratch.run("INSERT INTO task_events (task_id, kind, created_at, run_id) VALUES (?, ?, ?, ?)",
+                         "t-1", "timed_out", NOW - 30, 1)
+        self.scratch.event("t-1", "gave_up", NOW - 30, {"failures": 2, "error": "no heartbeat\nfor 60s",
+                                                         "trigger_outcome": "timed_out"})
+        self.scratch.event("t-1", "gave_up", NOW - 20, {"failures": 1})
+        self.scratch.event("t-1", "gave_up", NOW - 10, {})
+        history = self.board.detail("t-1")["history"]
+        self.assertEqual([(e["kind"], e.get("outcome"), e.get("text")) for e in history], [
+            ("created", None, None),
+            ("attempt", "timed_out", "no heartbeat for 60s"),
+            ("blocked", None, "Stopped retrying after 2 failed attempts: no heartbeat for 60s"),
+            ("blocked", None, "Stopped retrying after 1 failed attempt"),
+            ("blocked", None, "Stopped retrying")])
+
     def test_only_the_profiles_own_task_is_read(self):
         self.scratch.task("t-1", assignee="reviewer")
         self.scratch.task("t-2", "archived")
