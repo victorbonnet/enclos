@@ -822,6 +822,8 @@ mod tests {
     fn native_roster_and_default_do_not_invent_an_immortal_main() {
         let home = tempfile::tempdir().unwrap();
         assert!(OpenClaw.builtin_agent().is_none());
+        assert!(OpenClaw.agents_in(home.path()).unwrap().is_empty());
+        save(home.path(), "{}");
         assert_eq!(OpenClaw.agents_in(home.path()).unwrap(), [agent("main")]);
         assert_eq!(
             OpenClaw.default_agent(home.path()).unwrap(),
