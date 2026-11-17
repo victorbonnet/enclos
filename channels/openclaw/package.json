@@ -5,12 +5,12 @@
   "type": "module",
   "files": ["index.js", "channel.js", "transport.js", "protocol.js", "features.js", "activity.js", "media.js", "routines.js", "native-titles.js", "native-approvals.js", "native-turns.js", "openclaw.plugin.json"],
   "scripts": { "build": "node scripts/build.mjs", "test": "node --test tests/*.test.js" },
-  "peerDependencies": { "openclaw": "2026.11.3" },
+  "peerDependencies": { "openclaw": ">=2026.11.5" },
   "peerDependenciesMeta": { "openclaw": { "optional": true } },
   "openclaw": {
     "extensions": ["./index.js"],
     "channel": { "id": "enclos", "label": "enclos app", "blurb": "Conversations through the enclos host bridge." },
-    "compat": { "minGatewayVersion": "2026.11.3" },
-    "build": { "openclawVersion": "2026.11.3", "pluginSdkVersion": "2026.11.3" }
+    "compat": { "minGatewayVersion": "2026.11.5" },
+    "build": { "openclawVersion": "2026.11.5", "pluginSdkVersion": "2026.11.5" }
   }
 }

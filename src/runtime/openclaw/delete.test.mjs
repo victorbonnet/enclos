@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deleteAgent } from './delete.mjs';
+import { deleteAgent, ownerSdk } from './delete.mjs';
 
 function fixture() {
   const ref = { source: 'file', provider: 'enclos-sandbox', id: '/OPENCLAW_GATEWAY_TOKEN' };
@@ -39,4 +39,17 @@ test('an ambiguous native deletion failure is never retried or sent through anot
   f.params.callGateway = async method => { f.calls.push({ method }); if (method === 'agents.delete') throw new Error('connection lost'); return {}; };
   await assert.rejects(deleteAgent(f.params));
   assert.deepEqual(f.calls.map(c => c.method), ['health', 'agents.delete']);
+});
+
+test('the owner helper checks the minimum and names a missing native capability', async () => {
+  const sdk = {
+    'config-mutation': { readConfigFileSnapshotForWrite() {} },
+    'secret-input-runtime': { resolveConfiguredSecretInputString() {} },
+    'gateway-runtime': { callGatewayFromCli() {} },
+  };
+  const load = async name => sdk[name];
+  await assert.rejects(ownerSdk('2026.11.3', load), /Update OpenClaw to 2026.11.5 or newer/);
+  assert.equal((await ownerSdk('2026.11.10', load)).callGateway, sdk['gateway-runtime'].callGatewayFromCli);
+  sdk['gateway-runtime'] = {};
+  await assert.rejects(ownerSdk('2026.11.10', load), /missing callGatewayFromCli/);
 });

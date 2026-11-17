@@ -1,5 +1,5 @@
 //! OpenClaw's native CLI, configuration and protected-file consumers.
-//! Source contracts were checked against the installed 2026.11.3 package;
+//! Source contracts were checked against the installed 2026.11.5 package;
 //! all native mutations remain SandboxCommands executed by the engine.
 
 use std::path::Path;
