@@ -662,15 +662,27 @@ pub(super) fn write_secrets_file(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => return Err(io(&new)(source)),
     }
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&new)
-        .map_err(io(&new))?;
-    out.write_all(text.as_bytes()).map_err(io(&new))?;
-    out.sync_all().map_err(io(&new))?;
-    std::fs::rename(&new, &file).map_err(io(&file))
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&new)
+            .map_err(io(&new))?;
+        out.write_all(text.as_bytes()).map_err(io(&new))?;
+        out.sync_all().map_err(io(&new))?;
+        std::fs::rename(&new, &file).map_err(io(&file))
+    })();
+    if result.is_err()
+        && let Err(cleanup) = std::fs::remove_file(&new)
+        && cleanup.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(refused(format!(
+            "credential write failed and temporary file {} could not be removed: {cleanup}",
+            new.display()
+        )));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -683,6 +695,25 @@ mod tests {
 
     fn home() -> SandboxName {
         "home".parse().unwrap()
+    }
+
+    #[test]
+    fn a_failed_credential_publish_removes_its_plaintext_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("credentials")).unwrap();
+        let values = vec![("API_KEY".to_owned(), value("private-fixture"))];
+        assert!(
+            write_secrets_file(
+                &home(),
+                dir.path(),
+                "credentials",
+                &values,
+                SecretFileFormat::Json
+            )
+            .is_err()
+        );
+        assert!(dir.path().join("credentials").is_dir());
+        assert!(!dir.path().join("credentials.new").exists());
     }
 
     /// Each value double-quoted, `\` and `"` escaped, as both of Hermes's
