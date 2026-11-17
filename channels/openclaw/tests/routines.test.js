@@ -103,9 +103,12 @@ test('native intervals, one-time instants and disabled scheduler status stay fai
   assert.equal(response.routines[1].state, undefined);
 });
 
-test('unsupported native schedules and per-job time zones fail explicitly', async () => {
-  for (const schedule of [{ kind: 'cron', expr: '0 9 * * *', tz: 'America/New_York' }, { kind: 'every', everyMs: 1500 }, { kind: 'event', source: 'native-plugin' }]) {
-    await assert.rejects(harness([job('one', { schedule })]).request(), code('unsupported'));
+test('the list omits unsupported native schedules and ids while get refuses unsupported details', async () => {
+  const schedules = [{ kind: 'cron', expr: '0 9 * * *', tz: 'America/New_York' }, { kind: 'every', everyMs: 1500 }, { kind: 'event', source: 'native-plugin' }];
+  for (const schedule of schedules) {
+    const h = harness([job('valid'), job('unsupported', { schedule }), job('invalid\u0000id')]);
+    assert.deepEqual((await h.request()).routines.map(routine => routine.id), ['valid']);
+    await assert.rejects(h.request({ action: 'get', routine: 'unsupported' }), code('unsupported'));
   }
 });
 
