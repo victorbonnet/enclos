@@ -583,7 +583,7 @@ A task (`tasks`) is work an agent does outside a conversation's answer, which it
 
 **Held tasks.** A task that waits for a person is reported as `blocked`, like any other. Resuming it is not part of this capability: that is the `held_tasks` card of [ADR 0066](adr/0066-held-tasks-stay-with-the-runtime.md), proposed.
 
-**OpenClaw** announces neither yet: its 2026.11.2 release has no task board (its Tasks and TaskFlow registry was removed), and whether its background subagents fit a task is to verify. Nothing in these messages names a Hermes concept.
+**OpenClaw** announces `activity` for authenticated enclos ingresses while its public native dispatch and delivery settle. It reports each active conversation once, retains overlapping ingresses independently, and sends its current snapshot after every hello to a bridge that negotiated `activity`. Typing idle and abort acknowledgement do not clear another active ingress. This is a transient view of this channel's dispatches, not a complete inventory of Gateway runs, CLI work or scheduled activity; native dispatch can defer ingress to existing work. It announces no `tasks` or `held_tasks`: its 2026.11.2 release has no task board (its Tasks and TaskFlow registry was removed), and whether its background subagents fit a task is to verify. Nothing in these messages names a Hermes concept.
 
 ### Task details
 
