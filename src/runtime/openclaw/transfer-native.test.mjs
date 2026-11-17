@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assertIdleBinding, bindingForAgent, mergeAuth } from './transfer-native.mjs';
+import { assertIdleBinding, bindingForAgent, legacyThreadOwner, mergeAuth } from './transfer-native.mjs';
 
 test('inherited logins become local without replacing own profile priority', () => {
   const target = { version: 1, profiles: { own: { key: 'own' } }, order: { openai: ['own'] } };
@@ -27,4 +27,14 @@ test('an active lease or unresolved native subagent work cannot be migrated', ()
     { nativeSubagentSubmissions: { receipts: [{}] } }, { nativeSubagentTaskImport: {} }]) {
     assert.throws(() => assertIdleBinding(value, 2));
   }
+});
+
+test('unrouted legacy references require unique physical thread provenance and no obligations', () => {
+  const value = { version: 1, state: 'active', binding: { threadId: 'historic', cwd: '/old/workspace' } };
+  const owner = { agent: 'main', rollout: 'codex-home/sessions/historic.jsonl' };
+  assert.equal(legacyThreadOwner('conversation:old', value, new Map([['historic', [owner]]])), owner);
+  assert.throws(() => legacyThreadOwner('conversation:old', value, new Map()));
+  assert.throws(() => legacyThreadOwner('conversation:old', value, new Map([['historic', [owner, owner]]])));
+  assert.throws(() => legacyThreadOwner('conversation:old', { ...value, lease: { expiresAt: 1 } }, new Map([['historic', [owner]]])));
+  assert.throws(() => legacyThreadOwner('conversation:old', { ...value, nativeSubagentTaskImport: {} }, new Map([['historic', [owner]]])));
 });

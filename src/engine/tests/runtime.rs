@@ -4755,6 +4755,73 @@ fn portable_photo() -> Vec<u8> {
 }
 
 #[test]
+fn portable_export_materializes_file_credentials_while_stopped_and_cleans_them_on_failure() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::with_secrets(Box::new(crate::secrets::InMemory::default()));
+    done(lab.install(&portable_installer(), Confirm::Yes).unwrap());
+    let agent: AgentName = "source".parse().unwrap();
+    std::fs::create_dir_all(lab.home.join(".hermes/profiles/source")).unwrap();
+    std::fs::write(
+        lab.home.join(".hermes/profiles/source/config.yaml"),
+        "model: source",
+    )
+    .unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"home/source-api".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("private-fixture".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.source]\nenv = {{ API_KEY = \"secret:home/source-api\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+        .unwrap();
+    let python = lab.home.join(".hermes/hermes-agent/.hermes/bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    crate::test_scripts::write_script(
+        &python,
+        "test -f \"$HOME/../secrets/source.env\" || exit 91\nprintf observed > \"$HOME/export-credentials-observed\"\nexec python3 \"$@\"\n",
+    );
+    let secrets = lab.engine.layout.sandbox_secrets_dir("home");
+    assert!(!secrets.exists());
+    let archive = lab._dir.path().join("file-credentials.enclos");
+    done(
+        lab.engine
+            .export_agent(&alice(), &lab.name, &agent, &archive, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(lab.home.join("export-credentials-observed").is_file());
+    assert!(
+        !secrets.exists(),
+        "temporary delivery must not outlive export"
+    );
+    crate::test_scripts::write_script(
+        &python,
+        "test -f \"$HOME/../secrets/source.env\" || exit 91\nexit 92\n",
+    );
+    assert!(
+        lab.engine
+            .export_agent(
+                &alice(),
+                &lab.name,
+                &agent,
+                &lab._dir.path().join("failed-export.enclos"),
+                Confirm::Yes
+            )
+            .is_err()
+    );
+    assert!(
+        !secrets.exists(),
+        "failed export must clean temporary delivery"
+    );
+}
+
+#[test]
 fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let root = super::Root {

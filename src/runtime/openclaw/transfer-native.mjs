@@ -26,6 +26,52 @@ export function assertIdleBinding(value, now = Date.now()) {
   }
 }
 
+export function legacyThreadOwner(key, value, catalog) {
+  if (!key.startsWith('conversation:') || value?.version !== 1 || value.state !== 'active' ||
+      Object.keys(value).some(k => !['version', 'state', 'binding'].includes(k))) throw new Error('unsupported orphan native binding');
+  assertIdleBinding(value);
+  const owners = catalog.get(value.binding?.threadId) ?? [];
+  if (owners.length !== 1) throw new Error('orphan Codex thread has ambiguous or missing physical provenance');
+  return owners[0];
+}
+
+async function legacyThreadCatalog(config, resolveAgentDir) {
+  const { DatabaseSync } = await import('node:sqlite');
+  const home = fs.realpathSync(process.env.HOME);
+  const inside = (root, file) => file.startsWith(root + path.sep);
+  const global = new DatabaseSync(path.join(home, '.openclaw/state/openclaw.sqlite'), { readOnly: true });
+  try {
+    if (global.prepare('select count(*) as n from current_conversation_bindings').get().n !== 0) {
+      throw new Error('registered native conversation bindings need a supported ownership export');
+    }
+  } finally { global.close(); }
+  const result = new Map();
+  for (const agent of Object.keys(config.agents?.entries ?? {})) {
+    const agentDir = fs.realpathSync(resolveAgentDir(config, agent));
+    if (!inside(home, agentDir)) throw new Error('native thread home is outside its sandbox');
+    const codexHome = path.join(agentDir, 'codex-home');
+    const file = path.join(codexHome, 'state_5.sqlite');
+    if (!fs.existsSync(file)) continue;
+    if (!inside(agentDir, fs.realpathSync(file))) throw new Error('linked native thread catalog leaves its agent');
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      for (const row of db.prepare('select id,rollout_path from threads').all()) {
+        // Older copied catalogs can retain pre-Enclos absolute paths. Keep
+        // those records as reference data, never as active native bindings.
+        const marker = '/codex-home/';
+        const index = row.rollout_path.lastIndexOf(marker);
+        if (index < 0) throw new Error('native rollout has no captured agent-home provenance');
+        const relative = row.rollout_path.slice(index + marker.length);
+        const captured = fs.realpathSync(path.join(codexHome, relative));
+        if (!inside(fs.realpathSync(codexHome), captured) || !fs.statSync(captured).isFile()) throw new Error('native rollout bytes are not captured in its agent');
+        const owners = result.get(row.id) ?? [];
+        owners.push({ agent, rollout: path.relative(agentDir, captured) }); result.set(row.id, owners);
+      }
+    } finally { db.close(); }
+  }
+  return result;
+}
+
 async function main() {
   const [operation, agent, file, agentDir] = process.argv.slice(1);
   if (!/^[a-z][a-z0-9-]{1,40}$/.test(agent ?? '')) throw new Error('invalid agent');
@@ -40,7 +86,7 @@ async function main() {
   const initial = signature(); let live = true;
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => { live = false; });
   const assertCurrent = () => { if (!live || signature() !== initial) throw new Error('native transfer authority changed'); };
-  const [{ loadAuthProfileStoreWithoutExternalProfilesAsync }, auth, config, state, secrets] = await Promise.all([
+  const [{ loadAuthProfileStoreWithoutExternalProfilesAsync, resolveAgentDir }, auth, config, state, secrets] = await Promise.all([
     sdk('agent-runtime'), sdk('provider-auth'), sdk('config-mutation'), sdk('plugin-state-store-runtime'), sdk('secret-input-runtime'),
   ]);
   const store = state.createPluginStateKeyedStoreV2('codex', {
@@ -58,15 +104,20 @@ async function main() {
     if (!snapshot?.valid || !snapshot.sourceConfig) throw new Error('native config is invalid');
     const shared = await loadAuthProfileStoreWithoutExternalProfilesAsync(undefined);
     const own = await loadAuthProfileStoreWithoutExternalProfilesAsync(agentDir, { inheritedAuthDir: agentDir });
-    const bindings = [];
-    for (const entry of await store.entries()) {
+    const bindings = [], legacyBindings = [];
+    const entries = await store.entries();
+    const catalog = entries.some(e => e.key.startsWith('conversation:')) ? await legacyThreadCatalog(snapshot.sourceConfig, resolveAgentDir) : null;
+    for (const entry of entries) {
       if (bindingForAgent(entry.key, agent)) { assertIdleBinding(entry.value); bindings.push([entry.key, entry.value]); }
-      else if (entry.key.startsWith('conversation:')) throw new Error('native conversation-bound Codex state needs a supported ownership export');
+      else if (entry.key.startsWith('conversation:')) {
+        const owner = legacyThreadOwner(entry.key, entry.value, catalog);
+        if (owner.agent === agent) legacyBindings.push({ key: entry.key, value: entry.value, rollout: owner.rollout });
+      }
     }
     const resolve = async (value, location) => {
       if (value && typeof value === 'object' && ['env', 'file', 'exec'].includes(value.source) && typeof value.provider === 'string' && typeof value.id === 'string') {
         const resolved = await secrets.resolveConfiguredSecretInputString({ config: snapshot.sourceConfig, env: process.env, value, path: location });
-        if (typeof resolved.value !== 'string' || resolved.unresolvedRefReason) throw new Error('source credential could not be resolved');
+        if (typeof resolved.value !== 'string' || resolved.unresolvedRefReason) throw new Error(`source credential could not be resolved at ${location}`);
         return resolved.value;
       }
       if (Array.isArray(value)) return Promise.all(value.map((v, i) => resolve(v, `${location}.${i}`)));
@@ -91,7 +142,7 @@ async function main() {
       if (sourceConfig[key] != null) sourceConfig[key] = await resolve(sourceConfig[key], key);
     }
     assertCurrent();
-    fs.writeFileSync(file, JSON.stringify({ config: sourceConfig, agentNames, sharedAuth: await materializeAuth(shared), localAuth: await materializeAuth(own), bindings }), { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(file, JSON.stringify({ config: sourceConfig, agentNames, sharedAuth: await materializeAuth(shared), localAuth: await materializeAuth(own), bindings, legacyBindings }), { mode: 0o600, flag: 'wx' });
   } else if (operation === 'import') {
     const input = JSON.parse(fs.readFileSync(file));
     for (const [key, value] of input.bindings) {

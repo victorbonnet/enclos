@@ -109,8 +109,18 @@ impl Engine {
                 .confirm(&format!("exporting {name}/{agent}"))?;
         }
         let paused = self.pause_runtime(by, name, "agent export")?;
+        let temporary_secrets = !self.layout.sandbox_secrets_dir(name.as_str()).exists();
         let result = (|| {
             let state = self.export_host_state(name, agent)?;
+            // A stopped runtime has no protected credential files. Its
+            // exporter still needs the adapter's normal file delivery to
+            // resolve configured references through the native API.
+            self.service_secrets(
+                name,
+                kind,
+                "agent export",
+                &self.policy(name)?.snapshot.policy,
+            )?;
             let _runtime_cleanup = Temporary::runtime_output(runtime_path.clone())?;
             let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
             if ended.exit != 0 {
@@ -174,6 +184,23 @@ impl Engine {
             )?;
             Ok(Planned::Done(exported))
         })();
+        let cleanup = if temporary_secrets {
+            self.remove_secrets_file(name)
+        } else {
+            Ok(())
+        };
+        let result = match (result, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(error)) => Err(Error::FailedAfter {
+                error: Box::new(error),
+                done:
+                    "writing the complete export; its temporary credential delivery needs cleanup"
+                        .into(),
+            }),
+            (Err(error), Err(cleanup)) => Err(failed(format!(
+                "{error}; also could not clean temporary credential delivery: {cleanup}"
+            ))),
+        };
         let resumed = self.resume_runtime(by, name, paused);
         match (result, resumed) {
             (Ok(exported), Ok(())) => Ok(exported),

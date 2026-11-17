@@ -101,7 +101,7 @@ class TransferTests(unittest.TestCase):
         meta = {'format': transfer.FORMAT, 'version': transfer.VERSION, 'home': '/sandbox', 'agent': 'main',
                 'snapshot': 'native-id', 'workspace': '.openclaw/workspace', 'agent_config': {}, 'shared_config': {},
                 'plugins': [], 'routes': {}, 'sharedAuth': {'profiles': {}}, 'localAuth': {'profiles': {}},
-                'bindings': [], 'host_reference': {}}
+                'bindings': [], 'legacy_bindings': [], 'host_reference': {}}
         transfer.validate_manifest(meta, Path('/sandbox'), 'main')
         for patch in [{'agent': 'kilian'}, {'home': '/other'}, {'snapshot': '../escape'}, {'unexpected': True},
                       {'bindings': [['session:kilian:id', {}]]}, {'shared_config': {'gateway': {}}},
