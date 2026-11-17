@@ -8,6 +8,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('transfer', Path(__file__).parents[1] / 'transfer.py')
 transfer = importlib.util.module_from_spec(spec); spec.loader.exec_module(transfer)
@@ -121,16 +122,95 @@ class TransferTests(unittest.TestCase):
             with self.assertRaises(ValueError): list(transfer.regular_tree(link, home))
 
     def test_manifest_rejects_rekeying_relocation_and_foreign_authority_before_native_writes(self):
-        meta = {'format': transfer.FORMAT, 'version': transfer.VERSION, 'home': '/sandbox', 'agent': 'main',
+        meta = {'format': transfer.FORMAT, 'version': transfer.MINIMUM_OPENCLAW, 'home': '/sandbox', 'agent': 'main',
                 'snapshot': 'native-id', 'workspace': '.openclaw/workspace', 'agent_config': {}, 'shared_config': {},
                 'plugins': [], 'routes': {}, 'sharedAuth': {'profiles': {}}, 'localAuth': {'profiles': {}},
                 'bindings': [], 'legacy_bindings': [], 'host_reference': {}}
-        transfer.validate_manifest(meta, Path('/sandbox'), 'main')
+        transfer.validate_manifest(meta, Path('/sandbox'), 'main', transfer.MINIMUM_OPENCLAW)
         for patch in [{'agent': 'kilian'}, {'home': '/other'}, {'snapshot': '../escape'}, {'unexpected': True},
                       {'bindings': [['session:kilian:id', {}]]}, {'shared_config': {'gateway': {}}},
                       {'shared_config': {'agents': {'entries': {'foreign': {}}}}}]:
             with self.subTest(patch=patch), self.assertRaises(ValueError):
-                transfer.validate_manifest({**meta, **patch}, Path('/sandbox'), 'main')
+                transfer.validate_manifest({**meta, **patch}, Path('/sandbox'), 'main', transfer.MINIMUM_OPENCLAW)
+
+    def test_agent_settings_secret_survives_export_and_rebinds_as_a_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            home = root / 'home'; home.mkdir()
+            agent = 'main'
+            cfg = home / '.openclaw/openclaw.json'
+            workspace = home / '.openclaw/workspace'
+            workspace.mkdir(parents=True)
+            (home / ".openclaw/agents/main/agent").mkdir(parents=True)
+            provider = 'enclos-' + transfer.hashlib.sha256(agent.encode()).hexdigest()[:16]
+            ref = {'source': 'file', 'provider': provider, 'id': '/MODEL_TOKEN'}
+            config = {'agents': {'entries': {agent: {'workspace': str(workspace)}}, 'ownership': 'explicit'},
+                      'models': {'providers': {'example': {'apiKey': ref}}}}
+            cfg.write_text(json.dumps(config))
+            archive = root / 'runtime.tar.gz'
+            secret_file = root / 'protected/main.env'
+            secret_file.parent.mkdir()
+            secret_file.write_text('{"MODEL_TOKEN":"fixture-value-stays-in-enclos"}')
+            native_calls = []
+
+            def native_data(_home, operation, _agent, output, _directory, _credential_files=None):
+                if operation == 'export':
+                    output.write_text(json.dumps({'version': transfer.MINIMUM_OPENCLAW, 'config': config,
+                        'agentNames': [agent], 'sharedAuth': {'profiles': {}}, 'localAuth': {'profiles': {}},
+                        'bindings': [], 'legacyBindings': []}))
+                if operation == 'check':
+                    output.write_text(json.dumps('2026.11.10'))
+
+            def native(_home, *args, **kwargs):
+                native_calls.append(args)
+                if args[:3] == ('backup', 'sqlite', 'create'):
+                    snapshot = Path(args[args.index('--repository')+1]) / 'snapshot-one'
+                    snapshot.mkdir(parents=True)
+                    with sqlite3.connect(snapshot / 'database.sqlite') as db:
+                        db.execute('create table session_nodes(entry_json text)')
+                elif args[:2] == ('config', 'patch'):
+                    output = json.loads(Path(args[args.index('--file')+1]).read_text())
+                    cfg.write_text(json.dumps(output))
+                return b'[]'
+
+            with mock.patch.object(transfer, 'native_data', native_data), mock.patch.object(transfer, 'native', native), mock.patch.object(transfer, 'assert_snapshot_identity'):
+                transfer.export(home, agent, archive, settings_grants={'agent': ['MODEL_TOKEN']}, write_package_plan=True)
+                self.assertEqual(json.loads(archive.with_suffix('.plugins.json').read_text()), [])
+                with tarfile.open(archive) as data:
+                    manifest = json.load(data.extractfile('manifest.json'))
+                self.assertEqual(manifest['shared_config']['models']['providers']['example']['apiKey'], ref)
+                self.assertNotIn('fixture-value-stays-in-enclos', json.dumps(manifest))
+                # Destination already names the same secret reference.
+                home.rename(root / 'saved-home')
+                cfg.parent.mkdir(parents=True)
+                cfg.write_text(json.dumps({'models': config['models']}))
+                transfer.restore(home, agent, archive, {'secret_variables': ['MODEL_TOKEN'], 'agent_secrets_file': str(secret_file)})
+            restored = json.loads(cfg.read_text())
+            self.assertEqual(restored['models']['providers']['example']['apiKey'], ref)
+            self.assertEqual(restored['secrets']['providers'][provider]['path'], str(secret_file))
+            self.assertNotIn('fixture-value-stays-in-enclos', cfg.read_text())
+            self.assertEqual(secret_file.read_text(), '{"MODEL_TOKEN":"fixture-value-stays-in-enclos"}')
+
+    def test_package_confirmation_precedes_native_import_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            meta = {'format': transfer.FORMAT, 'version': transfer.MINIMUM_OPENCLAW, 'home': str(home), 'agent': 'main',
+                    'snapshot': 'native-id', 'workspace': '.openclaw/workspace', 'agent_config': {}, 'shared_config': {},
+                    'plugins': [{'id': 'plugin', 'spec': 'fixture-plugin@1.0.0'}], 'routes': {},
+                    'sharedAuth': {'profiles': {}}, 'localAuth': {'profiles': {}}, 'bindings': [],
+                    'legacy_bindings': [], 'host_reference': {}}
+            def check(_home, operation, _agent, version_file, _directory):
+                self.assertEqual(operation, 'check')
+                version_file.write_text(json.dumps(transfer.MINIMUM_OPENCLAW))
+            with mock.patch.object(transfer, 'extract', return_value=meta), mock.patch.object(transfer, 'native_data', check), mock.patch.object(transfer, 'native') as native:
+                for approval in ([], ['fixture-plugin@2.0.0']):
+                    with self.assertRaisesRegex(ValueError, 'consent does not match'):
+                        transfer.restore(home, 'main', home / 'export.tgz', {'approved_plugins': approval})
+                native.assert_not_called()
+                self.assertFalse((home / '.openclaw').exists())
+            with self.assertRaisesRegex(ValueError, 'update destination OpenClaw'):
+                transfer.validate_manifest({**meta, 'version': '2026.11.10'}, home, 'main', transfer.MINIMUM_OPENCLAW)
+            transfer.validate_manifest(meta, home, 'main', '2026.11.10')
 
     def test_empty_workspace_and_dependency_lockfiles_survive_the_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

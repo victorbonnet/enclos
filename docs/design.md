@@ -583,7 +583,12 @@ pub trait RuntimeAdapter {
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
     fn agent_delete_mode(&self) -> AgentDeleteMode;
     fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
-    fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport>;
+    fn export_agent(
+        &self,
+        _name: &AgentName,
+        _prefix: &Path,
+        _context: &str,
+    ) -> Option<RuntimeExport>;
     fn import_export(
         &self,
         name: &AgentName,

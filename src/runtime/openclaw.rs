@@ -274,6 +274,7 @@ impl RuntimeAdapter for OpenClaw {
         Some(super::RuntimeExport {
             format: "openclaw-data-v1",
             command: transfer("export", name, &archive, context),
+            package_plan: Some(archive.with_extension("plugins.json")),
             archive,
         })
     }

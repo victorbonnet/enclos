@@ -1,4 +1,4 @@
-"""Manual native probe, inside a sandbox with the pinned private install.
+"""Manual native probe, inside a sandbox with a supported private install.
 
     python3 -I /path/to/native-roundtrip.py
 
@@ -44,7 +44,7 @@ const result=await auth.updateAuthProfileStoreWithLock({stateDir:path.join(proce
 if (!result) throw new Error('fixture shared-auth preparation failed');
 '''
 
-for agent in ['main', 'kilian']:
+for agent in ['main', 'helper']:
     with tempfile.TemporaryDirectory(prefix='native-transfer-probe-', dir=outer / '.cache') as tmp:
         root = Path(tmp)
         home = root / 'home'
@@ -71,7 +71,7 @@ for agent in ['main', 'kilian']:
         t.export(home, agent, archive)
         home.rename(root / 'saved-source')
         fixture_home(home)
-        if agent == 'kilian':
+        if agent == 'helper':
             t.initialize_config(home, 'anchor', {'workspace': str(home / '.openclaw/workspace-anchor')})
             t.native(home, 'config', 'set', 'cron.enabled', 'true', '--json')
         t.restore(home, agent, archive, {'conversations': {}, 'destination_person': 'fixture-owner'})

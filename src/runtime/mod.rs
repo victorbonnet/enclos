@@ -87,6 +87,8 @@ pub struct RuntimeExport {
     pub format: &'static str,
     pub command: SandboxCommand,
     pub archive: PathBuf,
+    /// The optional export sidecar containing exact package specs, never secrets.
+    pub package_plan: Option<PathBuf>,
 }
 
 /// A command that runs inside a sandbox, under its policy. Anyone can make
