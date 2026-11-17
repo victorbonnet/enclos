@@ -16,6 +16,7 @@ whatever was lost. A task it refuses is sent again at the next reading.
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 import os
 import sqlite3
@@ -62,10 +63,52 @@ SELECT t.id, t.title, t.status, t.created_by, t.created_at, t.started_at, t.comp
        (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id) AS changed_at,
        (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind = 'claimed') AS claimed_at,
        (SELECT s.chat_id FROM kanban_notify_subs s WHERE s.task_id = t.id AND s.platform = ?
-         ORDER BY s.created_at LIMIT 1) AS conversation
+         ORDER BY s.created_at LIMIT 1) AS conversation,
+       (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments
   FROM tasks t
  WHERE t.assignee = ? AND t.status != 'archived'
 """
+
+# What a `task.detail` carries at most (`enclos_protocol::task_detail`): the
+# bridge cuts it again itself, and fits it into one frame for a phone.
+MAX_BODY_CHARS = 4000
+MAX_COMMENTS = 20
+MAX_COMMENT_CHARS = 1000
+MAX_AUTHOR_CHARS = 64
+MAX_RELATED = 20
+MAX_HISTORY = 30
+MAX_HISTORY_TEXT_CHARS = 300
+
+# How an attempt ended (`task_runs.outcome`), as the protocol's outcome. One
+# Hermes adds later is left without an outcome: the app reads it as ended.
+OUTCOMES = {"completed": "completed", "blocked": "blocked", "crashed": "crashed", "timed_out": "timed_out",
+            "gave_up": "gave_up", "spawn_failed": "failed", "reclaimed": "stopped"}
+# The events of a task's log its history shows; the others (claimed, spawned,
+# heartbeat, worker bound...) are the board's own workings, and an attempt's
+# start and end come from its run.
+EVENTS = {"created": "created", "blocked": "blocked", "dependency_wait": "blocked",
+          "block_loop_detected": "blocked", "unblocked": "unblocked", "review_requested": "review",
+          "completed": "done"}
+# What a block that waits for other tasks says, when Hermes gives no reason.
+WAITS_FOR_TASKS = "Waits for the tasks it depends on"
+
+# One task of this profile's, on one board: where its detail is read.
+_ONE = "SELECT id, body, created_by, created_at FROM tasks WHERE id = ? AND assignee = ? AND status != 'archived'"
+_RELATED = """
+SELECT t.id, t.title, t.status, t.assignee, 'parent' AS relation
+  FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?1
+UNION ALL
+SELECT t.id, t.title, t.status, t.assignee, 'child' AS relation
+  FROM task_links l JOIN tasks t ON t.id = l.child_id WHERE l.parent_id = ?1
+"""
+_COMMENTS = "SELECT author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?"
+_COMMENT_COUNT = "SELECT COUNT(*) FROM task_comments WHERE task_id = ?"
+_RUNS = "SELECT id, profile, started_at, ended_at, outcome, summary, error FROM task_runs WHERE task_id = ? ORDER BY id"
+# Every event, in the order the board wrote them: an attempt takes its place
+# at its run's first event, so things of one second keep their order.
+_EVENTS = "SELECT kind, payload, created_at, run_id FROM task_events WHERE task_id = ? ORDER BY id"
+# A board whose events name no run.
+_EVENTS_WITHOUT_RUNS = "SELECT kind, payload, created_at, NULL AS run_id FROM task_events WHERE task_id = ? ORDER BY id"
 
 
 def _epoch(value: Any) -> Optional[int]:
@@ -129,7 +172,125 @@ def task_of(row: Any, agent: str) -> Optional[dict[str, Any]]:
     summary = _line(row["result"], MAX_SUMMARY_CHARS) if state == "done" else ""
     if summary:
         task["summary"] = summary
+    comments = row["comments"]
+    if isinstance(comments, int) and not isinstance(comments, bool):
+        task["comments"] = comments
     return task
+
+
+def _text(value: Any, chars: int) -> str:
+    """A longer text from the board, its lines kept (the bridge cleans it again)."""
+    if isinstance(value, bytes):
+        value = _lossy(value)
+    lines = [line.rstrip() for line in str(value or "").replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).strip()[:chars].rstrip()
+
+
+def _payload(value: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes)) else None
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional(conn: sqlite3.Connection, sql: str, args: tuple) -> list:
+    """Rows of a table an older board may not have: none then."""
+    try:
+        return conn.execute(sql, args).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def detail_of(conn: sqlite3.Connection, row: Any) -> dict[str, Any]:
+    """The `task.detail` of the task `row` of the board `conn`: its body, the
+    tasks linked to it, its newest comments, and its history from its runs
+    and the few events a person reads, oldest first."""
+    task_id = row["id"]
+    detail: dict[str, Any] = {}
+    body = _text(row["body"], MAX_BODY_CHARS)
+    if body:
+        detail["body"] = body
+    related = []
+    for linked in _optional(conn, _RELATED, (task_id,)):
+        title = _line(linked["title"], MAX_TITLE_CHARS)
+        linked_id = linked["id"]
+        if not title or not isinstance(linked_id, str) or visible.has_hidden(linked_id):
+            continue
+        entry: dict[str, Any] = {"id": linked_id, "title": title, "relation": linked["relation"]}
+        state = STATES.get(linked["status"])
+        if state:
+            entry["state"] = state
+        assignee = _line(linked["assignee"], protocol.MAX_ID_BYTES)
+        if assignee:
+            entry["assignee"] = assignee
+        related.append(entry)
+    if related:
+        detail["related"] = related[:MAX_RELATED]
+    comments = []
+    for comment in reversed(_optional(conn, _COMMENTS, (task_id, MAX_COMMENTS))):
+        text = _text(comment["body"], MAX_COMMENT_CHARS)
+        author = _line(comment["author"], MAX_AUTHOR_CHARS)
+        if text and author:
+            comments.append({"author": author, "time": _epoch(comment["created_at"]) or 0, "text": text})
+    if comments:
+        detail["comments"] = comments
+    counted = _optional(conn, _COMMENT_COUNT, (task_id,))
+    detail["comments_total"] = max(int(counted[0][0]) if counted else 0, len(comments))
+    attempts: dict[Any, dict[str, Any]] = {}
+    for run in _optional(conn, _RUNS, (task_id,)):
+        entry = {"kind": "attempt", "time": _epoch(run["started_at"]) or 0}
+        ended = _epoch(run["ended_at"])
+        if ended is not None:
+            entry["until"] = ended
+            outcome = OUTCOMES.get(run["outcome"])
+            if outcome:
+                entry["outcome"] = outcome
+        by = _line(run["profile"], protocol.MAX_ID_BYTES)
+        if by:
+            entry["by"] = by
+        text = _line(run["error"] or run["summary"], MAX_HISTORY_TEXT_CHARS)
+        if text:
+            entry["text"] = text
+        attempts[run["id"]] = entry
+    try:
+        events = conn.execute(_EVENTS, (task_id,)).fetchall()
+    except sqlite3.OperationalError:
+        events = _optional(conn, _EVENTS_WITHOUT_RUNS, (task_id,))
+    history = []
+    for event in events:
+        attempt = attempts.pop(event["run_id"], None)
+        if attempt:
+            history.append(attempt)
+        if event["kind"] not in EVENTS:
+            continue
+        kind = EVENTS[event["kind"]]
+        payload = _payload(event["payload"])
+        entry = {"kind": kind, "time": _epoch(event["created_at"]) or 0}
+        by = _line(row["created_by"] if kind == "created" else payload.get("actor"), protocol.MAX_ID_BYTES)
+        if by:
+            entry["by"] = by
+        reason = payload.get("reason")
+        text = _line(reason if isinstance(reason, str) and reason != "initial_status" else "",
+                     MAX_HISTORY_TEXT_CHARS)
+        if not text and event["kind"] == "dependency_wait":
+            text = WAITS_FOR_TASKS
+        if text:
+            entry["text"] = text
+        history.append(entry)
+    # Attempts no event names (an older board's) go by their time.
+    history.extend(attempts.values())
+    if not any(e["kind"] == "created" for e in history) and _epoch(row["created_at"]) is not None:
+        created = {"kind": "created", "time": _epoch(row["created_at"])}
+        by = _line(row["created_by"], protocol.MAX_ID_BYTES)
+        if by:
+            created["by"] = by
+        history.insert(0, created)
+    # Oldest first; a stable sort keeps the board's order within one second.
+    history.sort(key=lambda e: e["time"])
+    if history:
+        detail["history"] = history[-MAX_HISTORY:]
+    return detail
 
 
 def listed(tasks: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
@@ -178,6 +339,21 @@ class Board:
                 seen.add(task["id"])
                 tasks.append(task)
         return cursor, tasks
+
+    def detail(self, task_id: str) -> Optional[dict[str, Any]]:
+        """The detail of task `task_id` of the profile's, from the newest board
+        that has it; None when no board has it as this profile's (another
+        profile's task, or archived). Raises on a board it cannot read."""
+        newest: Optional[tuple[int, dict[str, Any]]] = None
+        for path in self.files():
+            with contextlib.closing(self._open(path)) as conn:
+                row = conn.execute(_ONE, (task_id, self.profile)).fetchone()
+                if row is None:
+                    continue
+                created = _epoch(row["created_at"]) or 0
+                if newest is None or created > newest[0]:
+                    newest = (created, detail_of(conn, row))
+        return newest[1] if newest else None
 
 
 def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
@@ -240,7 +416,27 @@ class Reporter:
 
     @property
     def capabilities(self) -> tuple[str, ...]:
-        return ("activity", "tasks") if self.board else ("activity",)
+        return ("activity", "tasks", "task_details") if self.board else ("activity",)
+
+    async def detail(self, message: dict[str, Any]) -> None:
+        """Answers the bridge's `task.get`: the task's detail, read from the
+        board read-only, or an `error` (`not_found` for a task that is not this
+        agent's). Nothing is kept: the next request reads the board again."""
+        of = message["id"]
+        if not self.board:
+            await self._write(protocol.error("unsupported", "This agent's runtime has no task board.", of))
+            return
+        try:
+            detail = await asyncio.to_thread(self.board.detail, message["task"])
+        except Exception as error:
+            logger.warning("Cannot read task %s's detail from the kanban board: %s: %s",
+                           message["task"], type(error).__name__, error)
+            await self._write(protocol.error("internal", "The runtime's task board could not be read.", of))
+            return
+        if detail is None:
+            await self._write(protocol.error("not_found", "This agent has no such task on its board.", of))
+        else:
+            await self._write(protocol.message("task.detail", of=of, detail=detail))
 
     def start(self) -> None:
         if self.board and self._watching is None:

@@ -27,6 +27,16 @@ pub enum FromDevice {
         task: HeldTaskId,
         revision: u64,
     },
+    /// The detail of a task the bridge keeps (`task.detail`): the host's
+    /// person, on a still-paired device, from an agent whose channel
+    /// announces `task_details`.
+    #[serde(rename = "task.get")]
+    TaskGet {
+        /// The assignee, `<sandbox>/<agent>`.
+        agent: String,
+        /// The task's id.
+        task: String,
+    },
     #[serde(rename = "agent.name.get")]
     AgentNameGet { agent: String },
     #[serde(rename = "agent.name.set")]
@@ -206,6 +216,7 @@ pub const AGENT_FORGET: &str = "agent.forget";
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.answer",
     "held_task.resume",
+    "task.get",
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -407,6 +418,17 @@ pub enum ToDevice {
         /// Its id.
         task: String,
     },
+    /// The answer to the device's `task.get` `of`: the task's detail as
+    /// its runtime holds it now, kept by no one.
+    #[serde(rename = "task.detail")]
+    TaskDetail {
+        of: MessageId,
+        /// The assignee, `<sandbox>/<agent>`.
+        agent: String,
+        /// Its id.
+        task: String,
+        detail: crate::task_detail::TaskDetail,
+    },
     /// Bytes of an attachment, from `offset`, at most [`ATTACHMENT_CHUNK`]:
     /// a Noise message holds 64 KiB, base64 included.
     #[serde(rename = "attachment.data")]
@@ -463,6 +485,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "agent.activity",
     "task",
     "task.removed",
+    "task.detail",
     "group.state",
     "attachment.data",
     "synced",

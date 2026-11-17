@@ -54,6 +54,11 @@ pub enum FromBridge {
         person: Person,
         device: String,
     },
+    /// The detail of one of the agent's tasks, by the runtime's id
+    /// (`task_details`): a read, which the plugin answers `task.detail` or
+    /// an `error` (`not_found` for a task that is not the agent's).
+    #[serde(rename = "task.get")]
+    TaskGet { task: String },
     #[serde(rename = "routine.request")]
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
@@ -115,6 +120,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "question.answer",
     "question.sync",
     "held_task.resume",
+    "task.get",
     "routine.request",
     "policy.context",
     "hello",
@@ -225,6 +231,12 @@ pub enum FromPlugin {
     /// Every task of the agent's the runtime still has (`tasks`).
     #[serde(rename = "tasks")]
     Tasks { tasks: Vec<crate::task::Task> },
+    /// The answer to the bridge's `task.get` `of` (`task_details`).
+    #[serde(rename = "task.detail")]
+    TaskDetail {
+        of: MessageId,
+        detail: crate::task_detail::TaskDetail,
+    },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -250,6 +262,7 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "agent.activity",
     "task.update",
     "tasks",
+    "task.detail",
     "ack",
     "error",
 ];
@@ -353,6 +366,9 @@ pub enum Capability {
     Activity,
     /// It reports the agent's tasks (`task.update`, `tasks`).
     Tasks,
+    /// It answers `task.get` with one of the agent's tasks' detail
+    /// (`task.detail`); requires the bridge's matching hello capability.
+    TaskDetails,
     /// It reports what each model call of the agent consumed (`usage`); a
     /// bridge that takes them names it in its own `hello`.
     Usage,

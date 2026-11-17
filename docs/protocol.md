@@ -532,6 +532,7 @@ A task (`tasks`) is work an agent does outside a conversation's answer, which it
 | `state` | `queued`, `running`, `blocked`, `done`, `failed` or `cancelled`; the last three have ended |
 | `since` | When it entered its current state, in seconds since the Unix epoch |
 | `summary`? | A short result, once it has ended |
+| `comments`? | How many comments it has, from a runtime that keeps them: a change tells a device that shows the task's [detail](#task-details) to ask for it again |
 
 **Only the assignee's own plugin reports a task.** The plugin's connection proves which agent it is, so a task whose `assignee` is another agent is refused: agents sharing one board do not report a task several times, and no plugin posts another agent's work. **Every field is untrusted text from the sandbox**, cleaned by the bridge itself: `title`, `summary` and `asked_by` on one line (line breaks made spaces) without hidden characters (`enclos_protocol::visible`), the title cut to 120 characters, the summary to 500; `asked_by` is dropped when, written `sandbox/agent`, it would break the id rule or hold another `/`; the `id` follows the routine id rule. A task whose title is blank once cleaned, or whose id the bridge does not take, is refused (`bad_message`), and in a `tasks` list the others are kept. A `state` outside the six fails the whole message, as any field a receiver cannot read does: it is answered `bad_message` and not acknowledged, and for a `tasks` list nothing is replaced. Its `conversation` is kept only when it is a conversation of the same sandbox (one of its agents' or one of its groups) owned by the host's person; otherwise the task is kept without it. `since` is kept no later than the bridge's clock.
 
@@ -544,6 +545,33 @@ A task (`tasks`) is work an agent does outside a conversation's answer, which it
 **Held tasks.** A task that waits for a person is reported as `blocked`, like any other. Resuming it is not part of this capability: that is the `held_tasks` card of [ADR 0066](adr/0066-held-tasks-stay-with-the-runtime.md), proposed.
 
 **OpenClaw** announces neither yet: its 2026.11.2 release has no task board (its Tasks and TaskFlow registry was removed), and whether its background subagents fit a task is to verify. Nothing in these messages names a Hermes concept.
+
+### Task details
+
+Issue #318. When the person opens a task, the app asks for its detail: what the runtime holds of it beyond the fields above. An optional `task_details` capability, announced in both the bridge's and the plugin's `hello` and listed among the agent's capabilities in `agents.list`, says the agent's runtime answers. It is a read, like the rest of this section: nothing here changes a task, and commenting from the app is not part of it (commenting on a Hermes task steers its running worker, so it would need its own decision).
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `task.get` | device | `agent` (`sandbox/agent`), `task` | The detail of a task the bridge keeps |
+| `task.get` | bridge (plugin leg) | `task` | The same, to the assignee's plugin, under the bridge's own id |
+| `task.detail` | plugin | `of`, `detail` | The plugin's answer, or an `error` naming `of` |
+| `task.detail` | bridge (device leg) | `of`, `agent`, `task`, `detail` | The answer, to the device that asked |
+
+`detail` holds, each part left out when empty:
+
+- `body`: what the task asks, its lines kept, at most 4,000 characters;
+- `related`: the tasks it waits for (`relation: "parent"`) and that wait for it (`"child"`), at most 20, each `{id, title, relation, state?, assignee?}`; `state` is left out when the runtime's says nothing the protocol knows (Hermes: archived);
+- `comments`: the newest 20, oldest first, each `{author, agent?, time, text}`, the text's lines kept, at most 1,000 characters; `author` is the runtime's name for who wrote it, and on the device leg `agent` is `sandbox/agent` when that name is an agent the host serves, so the app shows its name and photo; a person's name or any other stays text;
+- `comments_total`: how many comments the task has;
+- `history`: what happened to it, oldest first, the newest 30 entries, each `{kind, time, until?, outcome?, by?, text?}`. `kind` is `created`, `attempt` (from `time` to `until` once it ended, with its `outcome`: `completed`, `blocked`, `crashed`, `timed_out`, `gave_up`, `failed` or `stopped`), `blocked`, `unblocked`, `review` or `done`; `by` names the agent as `asked_by` does; `text` is one line of at most 300 characters (an attempt's summary or error, why it blocked). A device leaves out an entry of a kind it does not know and reads an outcome it does not know as ended.
+
+**Only the host's person asks**, on a still-paired device, for a task the bridge keeps for that agent: a task's detail can hold what its title does and more. Anyone else is refused `not_allowed`, a task the bridge does not keep `not_found`, an agent it does not serve `unknown_agent`, and an agent whose channel does not announce `task_details` `unsupported`; nothing reaches the plugin then. The plugin answers `not_found` for a task that is not its agent's.
+
+**It is live and kept by no one.** The bridge sends the plugin the request at once, on the agent's current connection, opening it if it can (`agent_unavailable` otherwise), and passes the answer to the device that asked only, once it checked the device is still paired to the same person. A request the runtime leaves unanswered for 15 seconds, or whose connection closes first, is answered `agent_unavailable`; one that comes later is dropped. At most 64 are in flight (`busy` beyond). Nothing is stored, queued or logged: a device asks again, when the person opens the task again or when a `task` for it arrives with another state or comment count.
+
+**Every field is untrusted text from the sandbox**, cleaned by the bridge itself: the body and comments keep their lines but lose hidden characters (`enclos_protocol::visible`), their carriage returns and line and paragraph separators made newlines, tabs spaces, line ends trimmed and blank lines in a row made one; every other text is on one line, as a task's title is; ids follow the routine id rule (a related task with another id is left out), times are kept no later than the bridge's clock, and an attempt's `until` no earlier than its `time`. The bridge cuts every part to its bounds itself, then gives up the oldest history entries, then the oldest comments, related tasks and finally the body's end until the detail encodes within 56 KiB, so that a `task.detail` stays within one Noise message. An app shows all of it as plain text, never as markdown or links.
+
+**Hermes.** The adapter reads the task on every board, read-only, as it reads its tasks: `body`; `task_links` for parents and children, their statuses mapped as above; `task_comments` for the newest comments and their count; and `task_runs` for the attempts, their `outcome` mapped (`spawn_failed` is `failed`, `reclaimed` is `stopped`) and their error or summary as text. Of the event log it shows only `created`, `blocked`, `dependency_wait` and `block_loop_detected` (each `blocked`, with its reason), `unblocked`, `review_requested` (`review`) and `completed` (`done`); claims, spawns, heartbeats and the rest are the board's own workings. Each attempt takes its place in the history at its run's first event, so that things that happened within one second keep their order.
 
 ## Agent display names
 

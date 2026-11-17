@@ -31,6 +31,7 @@ pub mod preview;
 pub mod question;
 pub mod routine;
 pub mod task;
+pub mod task_detail;
 pub mod usage;
 pub mod visible;
 

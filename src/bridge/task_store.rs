@@ -95,6 +95,16 @@ impl Store {
         )
     }
 
+    /// Whether the bridge keeps task `id` of `agent` (`<sandbox>/<agent>`):
+    /// the only tasks a device may ask the detail of.
+    pub fn keeps_task(&self, agent: &str, id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE agent = ?1 AND id = ?2)",
+            params![agent, id],
+            |r| r.get(0),
+        )
+    }
+
     /// Every kept task, the ones still going first, then the most recent.
     /// Drops the ended ones past their 3 days first, returned as in
     /// [`TaskChanges::removed`].
@@ -316,6 +326,7 @@ mod tests {
             state,
             since,
             summary: None,
+            comments: None,
         }
     }
 

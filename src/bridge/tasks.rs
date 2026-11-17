@@ -340,6 +340,7 @@ mod tests {
             state: TaskState::Running,
             since: i64::MAX,
             summary: None,
+            comments: None,
         }
     }
 
