@@ -306,6 +306,10 @@ test('the native message target resolver accepts owned bridge conversations with
   assert.equal(delivered.kind, 'reply');
   assert.equal((await resolve('home.other.scout')).ok, false);
   assert.equal((await resolve('alice@example.com')).ok, false);
+  cfg.channels.enclos.accounts.main = { ...account, agentId: 'scout',
+    socket: `${account.socket}.new`, tokenFile: `${account.tokenFile}.new`, stateDir: `${account.stateDir}.new` };
+  await assert.rejects(resolve(account.home), /stopped or reconfigured/);
+  await assert.rejects(channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: account.home, text: 'must not send' }), /stopped or reconfigured/);
   abort.abort(); await lifetime;
   assert.equal((await resolve(account.home)).ok, false, 'a stopped account cannot resolve a target');
 });
