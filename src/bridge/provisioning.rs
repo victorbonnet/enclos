@@ -29,7 +29,7 @@ pub enum Operation {
     },
 }
 
-const MOBILE_RUNTIMES: [RuntimeKind; 1] = [RuntimeKind::Hermes];
+const MOBILE_RUNTIMES: [RuntimeKind; 2] = [RuntimeKind::Hermes, RuntimeKind::OpenClaw];
 
 impl Operation {
     pub fn create(sandbox: &str, template: &str) -> Result<Self, String> {
@@ -653,14 +653,14 @@ mod mobile_runtime_tests {
     use super::*;
 
     #[test]
-    fn openclaw_is_unavailable_for_phone_provisioning_until_its_app_channel_exists() {
+    fn openclaw_is_available_for_phone_provisioning_with_its_app_channel() {
         let host = Host::new(Layout::at(std::path::Path::new("/unused")), PathBuf::new());
         assert!(
             host.runtimes()
                 .iter()
-                .all(|info| info.runtime != "openclaw")
+                .any(|info| info.runtime == "openclaw")
         );
-        assert!(Operation::install("lab", "openclaw").is_err());
+        assert!(Operation::install("lab", "openclaw").is_ok());
         assert!(Operation::install("lab", "hermes").is_ok());
     }
 }

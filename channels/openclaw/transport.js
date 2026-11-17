@@ -93,6 +93,12 @@ export class ChannelTransport {
       encode(pending);
     }
     this.home = account.home;
+    this.sequence = 0;
+    for (const registry of [this.state.receipts, this.state.routes]) {
+      for (const entry of Object.values(registry)) {
+        if (Number.isSafeInteger(entry.order)) this.sequence = Math.max(this.sequence, entry.order);
+      }
+    }
   }
 
   save() {
@@ -107,6 +113,36 @@ export class ChannelTransport {
     try { fs.fsyncSync(folder); } finally { fs.closeSync(folder); }
   }
 
+  // Older state records have no order. They precede all newly recorded entries.
+  oldest(registry, eligible) {
+    let oldest;
+    for (const [key, entry] of Object.entries(registry)) {
+      if (eligible(key) && (!oldest || (entry.order ?? 0) < (oldest[1].order ?? 0))) {
+        oldest = [key, entry];
+      }
+    }
+    return oldest;
+  }
+
+  saveRoute(conversation, route) {
+    const routes = this.state.routes;
+    let evicted;
+    if (Object.keys(routes).length >= MAX_ROUTES) {
+      const busy = new Set(this.state.outbox.map(outgoing => outgoing.conversation));
+      for (const id of this.inflight.keys()) busy.add(this.state.receipts[id].conversation);
+      evicted = this.oldest(routes, key => key !== this.home && !busy.has(key));
+      if (!evicted) throw new ProtocolError('agent_unavailable', 'the agent has too many conversations with pending delivery');
+      delete routes[evicted[0]];
+    }
+    routes[conversation] = { ...route, order: ++this.sequence };
+    try { this.save(); } catch (error) {
+      delete routes[conversation];
+      if (evicted) routes[evicted[0]] = evicted[1];
+      throw error;
+    }
+    return routes[conversation];
+  }
+
   route(conversation, person) {
     checkedId(conversation, 'conversation'); checkedId(person, 'person');
     const current = this.state.routes[conversation] ?? (conversation === this.home ? this.homeRoute() : undefined);
@@ -119,11 +155,7 @@ export class ChannelTransport {
     }
     if (current && current.person !== person) throw new ProtocolError('not_allowed', 'conversation belongs to another person');
     if (current) return current;
-    if (Object.keys(this.state.routes).length >= MAX_ROUTES) throw new Error('channel conversation registry is full');
-    const route = { person, peer: digest([conversation, person]) };
-    this.state.routes[conversation] = route;
-    try { this.save(); } catch (error) { delete this.state.routes[conversation]; throw error; }
-    return route;
+    return this.saveRoute(conversation, { person, peer: digest([conversation, person]) });
   }
 
   homePeer(conversation) {
@@ -133,11 +165,7 @@ export class ChannelTransport {
   homeRoute() {
     const conversation = checkedId(this.home, 'home');
     if (this.state.routes[conversation]) return this.state.routes[conversation];
-    if (Object.keys(this.state.routes).length >= MAX_ROUTES) throw new Error('channel conversation registry is full');
-    const route = { kind: 'home', person: null, peer: this.homePeer(conversation) };
-    this.state.routes[conversation] = route;
-    try { this.save(); } catch (error) { delete this.state.routes[conversation]; throw error; }
-    return route;
+    return this.saveRoute(conversation, { kind: 'home', person: null, peer: this.homePeer(conversation) });
   }
 
   send(conversation, text, { replyTo, kind } = {}) {
@@ -255,10 +283,23 @@ export class ChannelTransport {
       if (old.status === 'received') return;
       throw new ProtocolError('agent_unavailable', 'earlier native delivery is uncertain and will not be replayed');
     }
-    if (this.inflight.size >= MAX_INFLIGHT || Object.keys(this.state.receipts).length >= MAX_RECEIPTS) throw new Error('channel receipt registry is full');
+    if (this.inflight.size >= MAX_INFLIGHT) throw new ProtocolError('agent_unavailable', 'the agent is busy; try again after a message finishes');
     const route = this.route(incoming.conversation, incoming.person);
-    this.state.receipts[incoming.id] = { hash, status: 'dispatching' };
-    try { this.save(); } catch (error) { delete this.state.receipts[incoming.id]; throw error; }
+    const receipts = this.state.receipts;
+    const previousOrder = route.order;
+    let evicted;
+    if (Object.keys(receipts).length >= MAX_RECEIPTS) {
+      evicted = this.oldest(receipts, id => !this.inflight.has(id));
+      delete receipts[evicted[0]];
+    }
+    route.order = ++this.sequence;
+    receipts[incoming.id] = { hash, status: 'dispatching', order: this.sequence, conversation: incoming.conversation };
+    try { this.save(); } catch (error) {
+      delete receipts[incoming.id];
+      route.order = previousOrder;
+      if (evicted) receipts[evicted[0]] = evicted[1];
+      throw error;
+    }
     const pending = Promise.resolve().then(() => this.onMessage(incoming, route, this)).then(() => {
       this.state.receipts[incoming.id].status = 'received';
       this.save();

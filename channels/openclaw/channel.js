@@ -22,7 +22,7 @@ export function resolveAccount(cfg, accountId) {
   return {
     accountId: id, agentId: value.agentId, socket: value.socket,
     tokenFile: value.tokenFile, home: value.home,
-    stateDir: value.stateDir ?? path.join(path.dirname(value.socket), 'openclaw-state'),
+    stateDir: value.stateDir ?? path.join(path.dirname(value.socket), 'openclaw-state', id),
     enabled: section?.enabled !== false && value.enabled !== false,
   };
 }

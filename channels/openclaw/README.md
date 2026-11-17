@@ -106,3 +106,8 @@ session-key checks are optional when the exact installed package is unavailable.
 Live gateway/plugin loading, Seatbelt socket reachability and real model/scheduled
 output are recorded separately in `prototype/m5/`; source/fixture tests alone do
 not establish those behaviors.
+
+The channel keeps the latest 10,000 inbound receipts per account and preserves
+in-flight receipts until dispatch finishes. It retains up to 4,096 conversation
+routes, keeping Home and routes with pending delivery. A new inbound message
+reestablishes an evicted route with the same native chat for that person.
