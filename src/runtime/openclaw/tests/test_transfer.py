@@ -156,5 +156,15 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(b'True True', result.stdout)
 
+    def test_repeat_exports_keep_previous_and_new_inactive_session_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve(); agent = home / 'native/main/agent'; agent.mkdir(parents=True)
+            session = agent.parent / 'sessions/history.json'; session.parent.mkdir(); session.write_text('new-one')
+            target = home / 'data/agent'; previous = target / 'enclos-source-agent-files/sessions/history.json'
+            previous.parent.mkdir(parents=True); previous.write_text('previous-import')
+            transfer.preserve_adjacent_files(agent, home, target)
+            session.write_text('new-two'); transfer.preserve_adjacent_files(agent, home, target)
+            self.assertEqual(sorted(p.read_text() for p in target.rglob('history.json')), ['new-one', 'new-two', 'previous-import'])
+
 
 if __name__ == '__main__': unittest.main()

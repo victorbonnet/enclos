@@ -84,7 +84,7 @@ impl Engine {
             ".enclos-export-{}.archive",
             new_id().map_err(failed)?
         ));
-        let export = runtime.export_agent(agent, &prefix).ok_or_else(|| {
+        let export = runtime.export_agent(agent, &prefix, "{}").ok_or_else(|| {
             failed(format!(
                 "{} has no agent export command",
                 kind.display_name()
@@ -92,7 +92,6 @@ impl Engine {
         })?;
         let runtime_path = export.archive;
         let format = export.format;
-        let command = export.command;
         if runtime_path.parent() != Some(home.as_path()) {
             return Err(failed(
                 "the runtime export must be a file in the sandbox home",
@@ -109,18 +108,24 @@ impl Engine {
                 .confirm(&format!("exporting {name}/{agent}"))?;
         }
         let paused = self.pause_runtime(by, name, "agent export")?;
-        let temporary_secrets = !self.layout.sandbox_secrets_dir(name.as_str()).exists();
         let result = (|| {
             let state = self.export_host_state(name, agent)?;
-            // A stopped runtime has no protected credential files. Its
-            // exporter still needs the adapter's normal file delivery to
-            // resolve configured references through the native API.
-            self.service_secrets(
-                name,
-                kind,
-                "agent export",
-                &self.policy(name)?.snapshot.policy,
-            )?;
+            let (credential_files, _credential_cleanup) =
+                self.export_credential_files(name, agent, runtime.as_ref())?;
+            let context = serde_json::json!({"max_bytes":agent_export::MAX_PAYLOAD_BYTES,
+                "credential_files":credential_files})
+            .to_string();
+            let mut command = runtime
+                .export_agent(agent, &prefix, &context)
+                .ok_or_else(|| failed("runtime export became unavailable"))?
+                .command;
+            let reads = command
+                .reads()
+                .iter()
+                .cloned()
+                .chain(credential_files.values().cloned())
+                .collect();
+            command = command.reading(reads);
             let _runtime_cleanup = Temporary::runtime_output(runtime_path.clone())?;
             let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
             if ended.exit != 0 {
@@ -184,23 +189,6 @@ impl Engine {
             )?;
             Ok(Planned::Done(exported))
         })();
-        let cleanup = if temporary_secrets {
-            self.remove_secrets_file(name)
-        } else {
-            Ok(())
-        };
-        let result = match (result, cleanup) {
-            (result, Ok(())) => result,
-            (Ok(_), Err(error)) => Err(Error::FailedAfter {
-                error: Box::new(error),
-                done:
-                    "writing the complete export; its temporary credential delivery needs cleanup"
-                        .into(),
-            }),
-            (Err(error), Err(cleanup)) => Err(failed(format!(
-                "{error}; also could not clean temporary credential delivery: {cleanup}"
-            ))),
-        };
         let resumed = self.resume_runtime(by, name, paused);
         match (result, resumed) {
             (Ok(exported), Ok(())) => Ok(exported),
@@ -213,6 +201,54 @@ impl Engine {
                 "{error}; also could not resume runtime: {resume}"
             ))),
         }
+    }
+
+    /// Give only this export private copies of declared runtime credential
+    /// files. Service paths are references, never written or removed.
+    fn export_credential_files(
+        &self,
+        name: &SandboxName,
+        agent: &AgentName,
+        runtime: &dyn crate::runtime::RuntimeAdapter,
+    ) -> Result<(std::collections::BTreeMap<PathBuf, PathBuf>, Vec<Temporary>)> {
+        let mut sources = std::collections::BTreeMap::new();
+        let mut cleanup = Vec::new();
+        let Some(delivery) = runtime.secret_files() else {
+            return Ok((sources, cleanup));
+        };
+        let policy = self.policy(name)?.snapshot.policy;
+        let directory = self.layout.sandbox_installers(name.as_str());
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .map_err(failed)?;
+        let mut stage = |source: PathBuf,
+                         values: Vec<(String, crate::model::secret::SecretValue)>,
+                         format|
+         -> Result<()> {
+            let file = format!("export-{}.credentials", new_id().map_err(failed)?);
+            let target = directory.join(&file);
+            let guard = Temporary::runtime_output(target.clone())?;
+            super::secrets::write_secrets_file(name, &directory, &file, &values, format)?;
+            sources.insert(source, target);
+            cleanup.push(guard);
+            Ok(())
+        };
+        stage(
+            self.layout.sandbox_secrets_dir(name.as_str()).join(".env"),
+            self.granted_values(&policy.secrets)?,
+            delivery.sandbox,
+        )?;
+        if let Some(grants) = policy.agent_secrets.get(agent.as_str()) {
+            stage(
+                self.layout
+                    .agent_secrets_file(name.as_str(), agent.as_str()),
+                self.granted_values(grants)?,
+                delivery.agent,
+            )?;
+        }
+        Ok((sources, cleanup))
     }
 
     /// Imports an Enclos export; the runtime still extracts its own payload inside the sandbox.

@@ -403,17 +403,16 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
-    fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
+    fn export_agent(
+        &self,
+        name: &AgentName,
+        prefix: &Path,
+        context: &str,
+    ) -> Option<super::RuntimeExport> {
         let archive = prefix.with_extension("tar.gz");
         Some(super::RuntimeExport {
             format: "hermes-data-v1",
-            command: transfer(
-                "export",
-                name,
-                &archive,
-                &serde_json::json!({"max_bytes": crate::agent_export::MAX_PAYLOAD_BYTES})
-                    .to_string(),
-            ),
+            command: transfer("export", name, &archive, context),
             archive,
         })
     }
