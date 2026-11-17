@@ -3,7 +3,8 @@
 //! for a person before it runs again (a blocked task on Hermes's kanban
 //! board). The runtime keeps the task; the bridge keeps a card for it in
 //! the Home of the agent that started it; the host's person may resume it
-//! with the runtime's own operation.
+//! with the runtime's own operation, unless the runtime reports it not
+//! `resumable`, when the card says what to do outside the app instead.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +20,9 @@ pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_REASON_CHARS: usize = 1_000;
 /// Its last error, in characters; lines allowed.
 pub const MAX_ERROR_CHARS: usize = 2_000;
-/// What resuming does for this runtime, in characters; one line.
+/// What resuming does for this runtime, or for a task that is not
+/// `resumable` the optional instruction for outside the app, in
+/// characters; one line.
 pub const MAX_RESUME_CHARS: usize = 200;
 
 /// What a card says when the runtime gave no reason.
@@ -47,8 +50,20 @@ pub struct HeldTask {
     /// it checks. Not the bridge's card revision, a number.
     pub revision: HeldTaskRevision,
     /// What resuming does for this runtime, one line ("Runs it again with
-    /// a fresh retry budget.").
+    /// a fresh retry budget."); for a task that cannot be resumed from the
+    /// app, what a person does instead.
     pub resume: String,
+    /// Whether the app may offer to resume it: false for a task the runtime
+    /// holds but does not resume this way, which the bridge refuses
+    /// (`unsupported`) before asking the plugin. A JSON boolean; absent,
+    /// as from an older plugin, it reads as true.
+    #[serde(default = "resumable")]
+    pub resumable: bool,
+}
+
+/// `resumable` where a plugin, bridge or card did not say.
+fn resumable() -> bool {
+    true
 }
 
 impl HeldTask {
@@ -148,7 +163,8 @@ pub fn accept(tasks: Vec<HeldTask>) -> Result<Vec<HeldTask>, String> {
     Ok(tasks.into_iter().map(HeldTask::normalized).collect())
 }
 
-/// Where a card is. `held` is the only one with a Resume.
+/// Where a card is. `held` is the only state eligible for a Resume, and
+/// a held card offers one only when it is also `resumable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeldTaskState {
@@ -184,6 +200,10 @@ pub struct HeldTaskInfo {
     pub last_error: Option<String>,
     pub since: i64,
     pub resume: String,
+    /// The task's own `resumable`: a card that is false shows how to go on
+    /// instead of a Resume. Absent, as from an older bridge, it reads as true.
+    #[serde(default = "resumable")]
+    pub resumable: bool,
     pub state: HeldTaskState,
     /// The bridge's revision of the card, advanced on every change: a
     /// device keeps the highest it saw, and a resume names it.
@@ -207,6 +227,7 @@ mod tests {
             since: 1_763_000_000,
             revision: HeldTaskRevision::new("e:42").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
+            resumable: true,
         }
     }
 
@@ -269,6 +290,7 @@ mod tests {
             last_error: None,
             since: 1_763_000_000,
             resume: String::new(),
+            resumable: true,
             state: HeldTaskState::Held,
             revision: 3,
         };
@@ -302,6 +324,91 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `resumable` as each leg carries it after a decode and an encode:
+    /// what an older plugin, bridge or card omits reads as true, and a
+    /// false survives.
+    #[test]
+    fn whether_a_held_task_can_be_resumed_survives_each_leg() {
+        let task = |resumable: Option<serde_json::Value>| {
+            let mut task = serde_json::json!({"task":"t_1","title":"t","reason":"r","since":1,
+                "revision":"e:42","resume":""});
+            if let Some(value) = resumable {
+                task["resumable"] = value;
+            }
+            task
+        };
+        let card = |resumable: Option<serde_json::Value>| {
+            let mut card = serde_json::json!({"agent":"lab/main","conversation":"home.lab.main",
+                "task":"t_1","title":"t","reason":"r","since":1,"resume":"","state":"held",
+                "revision":3});
+            if let Some(value) = resumable {
+                card["resumable"] = value;
+            }
+            card
+        };
+        for (given, read) in [
+            (None, true),
+            (Some(true.into()), true),
+            (Some(false.into()), false),
+        ] {
+            let line = serde_json::json!({"v":1,"id":"h","type":"held_tasks",
+                "tasks":[task(given.clone())]});
+            let decoded = decode_from_plugin(line.to_string().as_bytes()).unwrap();
+            let again: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(
+                again["tasks"][0]["resumable"], read,
+                "plugin leg, given {given:?}"
+            );
+
+            for line in [
+                serde_json::json!({"v":1,"id":"b","type":"held_task","held_task":card(given.clone())}),
+                serde_json::json!({"v":1,"id":"b","type":"held_task.result","of":"r1",
+                    "held_task":card(given.clone())}),
+            ] {
+                let decoded = decode_to_device(line.to_string().as_bytes()).unwrap();
+                let again: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+                assert_eq!(again["held_task"]["resumable"], read, "{line}");
+            }
+        }
+    }
+
+    /// Present, `resumable` is a JSON boolean: nothing else reads as one,
+    /// and none reads as the default.
+    #[test]
+    fn a_resumable_that_is_not_a_boolean_is_refused_on_each_leg() {
+        for bad in [
+            serde_json::Value::Null,
+            "false".into(),
+            "true".into(),
+            0.into(),
+            1.into(),
+            0.5.into(),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let line = serde_json::json!({"v":1,"id":"h","type":"held_tasks","tasks":[{
+                "task":"t_1","title":"t","reason":"r","since":1,"revision":"e:42","resume":"",
+                "resumable":bad}]});
+            assert!(
+                decode_from_plugin(line.to_string().as_bytes()).is_err(),
+                "{line}"
+            );
+            let card = serde_json::json!({"agent":"lab/main","conversation":"home.lab.main",
+                "task":"t_1","title":"t","reason":"r","since":1,"resume":"","state":"held",
+                "revision":3,"resumable":bad});
+            for line in [
+                serde_json::json!({"v":1,"id":"b","type":"held_task","held_task":card.clone()}),
+                serde_json::json!({"v":1,"id":"b","type":"held_task.result","of":"r1",
+                    "held_task":card.clone()}),
+            ] {
+                assert!(
+                    decode_to_device(line.to_string().as_bytes()).is_err(),
+                    "{line}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -416,26 +523,37 @@ mod tests {
         // widest as quotes, 256 once escaped.
         let wide = |n: usize| "\u{1F600}".repeat(n);
         let quotes = || "\"".repeat(crate::ids::MAX_ID_BYTES);
-        let info = HeldTaskInfo {
-            agent: format!("{}/{}", "\"".repeat(63), "\"".repeat(64)),
-            conversation: ConversationId::new(quotes()).unwrap(),
-            task: HeldTaskId::new(quotes()).unwrap(),
-            title: wide(MAX_TITLE_CHARS),
-            assignee: Some(wide(MAX_ASSIGNEE_CHARS)),
-            reason: wide(MAX_REASON_CHARS),
-            last_error: Some(wide(MAX_ERROR_CHARS)),
-            since: i64::MIN,
-            resume: wide(MAX_RESUME_CHARS),
-            state: HeldTaskState::Released,
-            revision: u64::MAX,
-        };
-        let frame = Envelope::new(
-            MessageId::new(quotes()).unwrap(),
-            ToDevice::HeldTaskResult {
-                of: MessageId::new(quotes()).unwrap(),
-                held_task: info,
-            },
-        );
-        assert!(crate::encode_line(&frame).len() <= crate::device::MAX_DEVICE_MESSAGE);
+        // Both values of `resumable`: `false` is the wider by one byte.
+        let lengths = [true, false].map(|resumable| {
+            let info = HeldTaskInfo {
+                agent: format!("{}/{}", "\"".repeat(63), "\"".repeat(64)),
+                conversation: ConversationId::new(quotes()).unwrap(),
+                task: HeldTaskId::new(quotes()).unwrap(),
+                title: wide(MAX_TITLE_CHARS),
+                assignee: Some(wide(MAX_ASSIGNEE_CHARS)),
+                reason: wide(MAX_REASON_CHARS),
+                last_error: Some(wide(MAX_ERROR_CHARS)),
+                since: i64::MIN,
+                resume: wide(MAX_RESUME_CHARS),
+                resumable,
+                state: HeldTaskState::Released,
+                revision: u64::MAX,
+            };
+            let frame = Envelope::new(
+                MessageId::new(quotes()).unwrap(),
+                ToDevice::HeldTaskResult {
+                    of: MessageId::new(quotes()).unwrap(),
+                    held_task: info,
+                },
+            );
+            let line = crate::encode_line(&frame);
+            assert!(
+                line.len() <= crate::device::MAX_DEVICE_MESSAGE,
+                "resumable {resumable}: {} bytes",
+                line.len()
+            );
+            line.len()
+        });
+        assert_eq!(lengths[1], lengths[0] + 1);
     }
 }

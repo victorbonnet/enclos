@@ -15,6 +15,8 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Pending {
     device: String,
+    device_key: Vec<u8>,
+    noise_key: Vec<u8>,
     person: String,
     agent: String,
     task: String,
@@ -37,6 +39,12 @@ fn failure(of: MessageId, code: ErrorCode, message: impl Into<String>) -> ErrorB
     }
 }
 
+struct TaskRead {
+    agent: String,
+    task: String,
+    held: bool,
+}
+
 impl Hub {
     /// A device's `task.get` for `task` of `agent` (`<sandbox>/<agent>`).
     /// `Err` is the answer to send now, with nothing sent to the plugin;
@@ -50,6 +58,48 @@ impl Hub {
         agent: String,
         task: String,
     ) -> Result<(), ErrorBody> {
+        self.read_task_details(
+            store,
+            device,
+            person,
+            original,
+            TaskRead {
+                agent,
+                task,
+                held: false,
+            },
+        )
+    }
+    pub(super) fn held_task_get(
+        self: &Arc<Self>,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        original: MessageId,
+        agent: String,
+        task: String,
+    ) -> Result<(), ErrorBody> {
+        self.read_task_details(
+            store,
+            device,
+            person,
+            original,
+            TaskRead {
+                agent,
+                task,
+                held: true,
+            },
+        )
+    }
+    fn read_task_details(
+        self: &Arc<Self>,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        original: MessageId,
+        target: TaskRead,
+    ) -> Result<(), ErrorBody> {
+        let TaskRead { agent, task, held } = target;
         // Only the host's person sees tasks: a task can name repository
         // paths and internal plans, and so can its detail.
         self.host_authority(store, device, person)
@@ -59,7 +109,14 @@ impl Hub {
         }
         // Only a task the bridge keeps, so only one the assignee's own
         // plugin reported as its own.
-        match store.keeps_task(&agent, &task) {
+        let known = if held {
+            store
+                .held_task(&agent, &task)
+                .map(|card| card.is_some_and(|card| card.owner == person))
+        } else {
+            store.keeps_task(&agent, &task)
+        };
+        match known {
             Ok(true) => {}
             Ok(false) => return Err(failure(original, ErrorCode::NotFound, "No such task.")),
             Err(e) => {
@@ -79,7 +136,11 @@ impl Hub {
             plugins.get(&agent).map(|plugin| {
                 (
                     Arc::clone(&plugin.out),
-                    plugin.capabilities.contains(&Capability::TaskDetails),
+                    plugin.capabilities.contains(if held {
+                        &Capability::HeldTaskDetails
+                    } else {
+                        &Capability::TaskDetails
+                    }),
                 )
             })
         };
@@ -131,6 +192,8 @@ impl Hub {
                 rpc.to_string(),
                 Pending {
                     device: device.id.clone(),
+                    device_key: device.device_key.clone(),
+                    noise_key: device.noise_key.clone(),
                     person: person.into(),
                     agent: agent.clone(),
                     task: task.clone(),
@@ -144,7 +207,7 @@ impl Hub {
             .lock()
             .expect("not poisoned")
             .writer
-            .send_with_id(rpc.clone(), FromBridge::TaskGet { task });
+            .send_with_id(rpc.clone(), FromBridge::TaskGet { task, held });
         if let Err(e) = sent {
             self.task_details
                 .lock()
@@ -271,11 +334,26 @@ impl Hub {
     /// Sends `answer` to the device that asked, if it is still connected
     /// and still paired to the same person.
     fn deliver_task_device(&self, store: &Store, pending: &Pending, answer: ToDevice) {
+        let answer = match store.host_person() {
+            Ok(person) if person.as_deref() == Some(pending.person.as_str()) => answer,
+            Ok(_) => return,
+            Err(error) => {
+                eprintln!("enclos app: cannot recheck task-detail host ownership: {error}");
+                ToDevice::Error(failure(
+                    pending.original.clone(),
+                    ErrorCode::Internal,
+                    "The bridge could not check host ownership. Try again.",
+                ))
+            }
+        };
         let answer = match store.devices() {
             Ok(devices)
-                if devices
-                    .iter()
-                    .any(|d| d.id == pending.device && d.person == pending.person) =>
+                if devices.iter().any(|d| {
+                    d.id == pending.device
+                        && d.person == pending.person
+                        && d.device_key == pending.device_key
+                        && d.noise_key == pending.noise_key
+                }) =>
             {
                 answer
             }
@@ -467,7 +545,7 @@ mod tests {
 
     fn asked(from_bridge: &Receiver<Envelope<FromBridge>>) -> MessageId {
         let sent = plugin_frame(from_bridge);
-        let FromBridge::TaskGet { task } = sent.body else {
+        let FromBridge::TaskGet { task, .. } = sent.body else {
             panic!("a task.get for the plugin");
         };
         assert_eq!(task, "t1");
@@ -652,5 +730,135 @@ mod tests {
             ("open-3", ErrorCode::AgentUnavailable)
         );
         assert!(hub.task_details.lock().unwrap().pending.is_empty());
+    }
+    #[test]
+    fn held_detail_reads_the_exact_creator_reference_without_resuming() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = fake_plugin(&hub, vec![Capability::HeldTaskDetails]);
+        store.ensure_home(AGENT, OWNER, true).unwrap();
+        let home = crate::bridge::store::home_id(AGENT);
+        let task: enclos_protocol::held_task::HeldTask =
+            serde_json::from_value(serde_json::json!({
+                "task":"app/t1", "title":"Review", "reason":"Needs a decision", "since":1,
+                "revision":"v1", "resume":"Review on board", "resumable":false
+            }))
+            .unwrap();
+        store
+            .report_held_tasks(AGENT, home.as_str(), &[task])
+            .unwrap();
+        let before = store.held_task(AGENT, "app/t1").unwrap().unwrap();
+        let read = |phone: &Device, reference: &str| {
+            hub.held_task_get(
+                &store,
+                phone,
+                &phone.person,
+                MessageId::new("read-held").unwrap(),
+                AGENT.into(),
+                reference.into(),
+            )
+        };
+        let guest = device("guest", "guest@example.com");
+        store.add_device(&guest).unwrap();
+        assert_eq!(
+            read(&guest, "app/t1").unwrap_err().code,
+            ErrorCode::NotAllowed
+        );
+        assert_eq!(read(&phone, "t1").unwrap_err().code, ErrorCode::NotFound);
+        read(&phone, "app/t1").unwrap();
+        let frame = plugin_frame(&from_bridge);
+        assert!(matches!(frame.body, FromBridge::TaskGet {task,held:true} if task == "app/t1"));
+        say(
+            &mut plugin,
+            "held-detail",
+            FromPlugin::TaskDetail {
+                of: frame.id,
+                detail: TaskDetail {
+                    body: Some("Description".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(
+            matches!(next(&rx),ToDevice::TaskDetail{task,detail,..} if task == "app/t1" && detail.body.as_deref()==Some("Description"))
+        );
+        assert_eq!(store.held_task(AGENT, "app/t1").unwrap().unwrap(), before);
+    }
+    #[test]
+    fn review_task_details_recheck_owner_and_both_pairing_keys_before_delivery() {
+        for changed in ["owner", "noise", "signing", "database"] {
+            let (_dir, hub, store, phone, rx) = fixture();
+            let (_plugin, frames) =
+                reported(&hub, &rx, vec![Capability::Tasks, Capability::TaskDetails]);
+            get(&hub, &store, &phone, "review-private-detail").unwrap();
+            let rpc = asked(&frames);
+            let pending = hub
+                .task_details
+                .lock()
+                .unwrap()
+                .pending
+                .remove(rpc.as_str())
+                .unwrap();
+            match changed {
+                "owner" => {
+                    store.set_host("other@example.com").unwrap();
+                }
+                "database" => {
+                    store.db.execute("DROP TABLE settings", []).unwrap();
+                }
+                key => {
+                    let mut swapped = phone.clone();
+                    if key == "noise" {
+                        swapped.noise_key = vec![77; 32];
+                    } else {
+                        swapped.device_key = vec![88; 32];
+                    }
+                    store.remove_device(&phone.id).unwrap();
+                    store.add_device(&swapped).unwrap();
+                }
+            }
+            hub.deliver_task_device(
+                &store,
+                &pending,
+                ToDevice::TaskDetail {
+                    of: pending.original.clone(),
+                    agent: AGENT.into(),
+                    task: "t1".into(),
+                    detail: TaskDetail {
+                        body: Some("Private".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+            if changed == "database" {
+                assert!(matches!(next(&rx),ToDevice::Error(e) if e.code==ErrorCode::Internal));
+            } else {
+                assert!(
+                    rx.recv_timeout(Duration::from_millis(30)).is_err(),
+                    "{changed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_generic_task_detail_capability_does_not_allow_held_reads() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        let (_plugin, frames) = fake_plugin(&hub, vec![Capability::TaskDetails]);
+        let task=serde_json::from_value(serde_json::json!({"task":"app/t1","title":"Review","reason":"Decision","since":1,"revision":"v1","resume":"Review","resumable":false})).unwrap();
+        store
+            .report_held_tasks(AGENT, &crate::bridge::store::home_id(AGENT), &[task])
+            .unwrap();
+        let error = hub
+            .held_task_get(
+                &store,
+                &phone,
+                &phone.person,
+                MessageId::new("review-cap").unwrap(),
+                AGENT.into(),
+                "app/t1".into(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(frames.try_recv().is_err());
     }
 }

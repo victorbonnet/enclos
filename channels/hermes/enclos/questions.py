@@ -641,4 +641,4 @@ def register_skill(ctx):
     register = getattr(ctx, "register_skill", None)
     if callable(register):
         register("app-questions", Path(__file__).parent / "skills" / "app-questions" / "SKILL.md",
-                 "Use when asking a person for a choice or missing information through the enclos mobile app.")
+                 "Use when asking a person for a choice or missing information, or sending a digest of blocked work with reply buttons, through the enclos mobile app.")

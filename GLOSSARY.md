@@ -214,6 +214,12 @@ _Avoid_: busy state, presence, status (enclos's own)
 An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
 _Avoid_: runtime approval, policy request (different authority)
 
+**Open item**:
+A question, runtime approval, held task or policy request still waiting for a person on a host. An unanswered ordinary question can remain an open item after its native waiting call expires.
+
+**Suggested reply**:
+An agent's proposed literal response to an ordinary message, which a person can choose to send as their own message.
+
 **Held task**:
 Background work an agent's runtime started that has stopped and waits for a person before it runs again. The runtime keeps it; the app shows it and may resume it.
 _Avoid_: blocked task, stuck task, job, ticket (except when naming a runtime's own feature, such as a blocked task on Hermes's kanban board)

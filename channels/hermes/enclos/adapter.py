@@ -38,6 +38,7 @@ from . import decisions
 from . import held_tasks
 from . import routines
 from . import questions
+from . import suggested_replies
 from . import runtime_approvals
 from . import tasks
 
@@ -89,6 +90,7 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        self._suggested_replies: dict[str, suggested_replies.Pending] = {}
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
@@ -514,8 +516,13 @@ class EnclosAdapter(BasePlatformAdapter):
             if asyncio.get_running_loop().time() - at < self.FILES_ANSWER_SECONDS:
                 reply_to = last
         message = protocol.message_out(chat_id, text, reply_to, files)
+        pending_replies = suggested_replies.peek(self, chat_id, reply_to)
+        replies = pending_replies.replies if pending_replies else []
+        if replies:
+            message["suggested_replies"] = replies
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
+        suggested_replies.consume(self, chat_id, pending_replies)
         await self._write(message)
         self._check_title_soon(chat_id)
         return SendResult(success=True, message_id=message["id"])
@@ -581,6 +588,11 @@ class EnclosAdapter(BasePlatformAdapter):
         # Hermes about itself (gateway online, shutting down): a quiet line.
         notice = False if literal_approval else protocol.is_notice(content)
         message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
+        pending_replies = None
+        if not notice and not literal_approval:
+            pending_replies = suggested_replies.peek(self, chat_id, reply_to)
+            if pending_replies:
+                message["suggested_replies"] = pending_replies.replies
         reason = protocol.unsendable(message)
         if reason:
             # The bridge would refuse it, and kept, it would come first in
@@ -589,6 +601,7 @@ class EnclosAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"the enclos app cannot carry this message: {reason}")
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
+        suggested_replies.consume(self, chat_id, pending_replies)
         await self._write(message)  # if it is not connected, it gets the message on its next hello
         if not notice:
             self._check_title_soon(chat_id)
@@ -927,6 +940,7 @@ def _env_enablement() -> dict | None:
 
 def register(ctx) -> None:
     questions.register_skill(ctx)
+    suggested_replies.register(ctx, _ADAPTERS, PLATFORM)
     approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"), PLATFORM)
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),

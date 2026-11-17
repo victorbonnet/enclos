@@ -366,6 +366,7 @@ impl Hub {
         // Refuse before persistence if a future fallback renderer exceeds the device frame.
         let introduction = || {
             ToDevice::Message(ConversationMessage {
+                suggested_replies: Vec::new(),
                 conversation: conversation.clone(),
                 agent: origin.agent.into(),
                 from: "agent".into(),
@@ -539,6 +540,40 @@ impl Hub {
                         || self.known_host().as_deref() == Some(person))
             })
             .ok_or(ErrorCode::NotFound)
+    }
+
+    pub(super) fn question_close(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        original: MessageId,
+        question: QuestionId,
+        revision: u64,
+    ) -> Result<ToDevice, ErrorBody> {
+        self.question_authority(store, device, person, &question)
+            .map_err(|code| failure(original.clone(), code, "No such question."))?;
+        store
+            .close_expired_question(&question, revision, person, original.as_str())
+            .map_err(|error| match error {
+                QuestionStoreError::Sql(error) => {
+                    eprintln!("enclos app: could not close a question reminder: {error}");
+                    failure(
+                        original.clone(),
+                        ErrorCode::Internal,
+                        "The request could not be closed. Reconnect and try again.",
+                    )
+                }
+                QuestionStoreError::Unknown => {
+                    failure(original.clone(), ErrorCode::NotFound, "No such question.")
+                }
+                error => failure(original.clone(), ErrorCode::Conflict, error.to_string()),
+            })?;
+        self.publish_open_items(store, person);
+        Ok(ToDevice::QuestionClosed {
+            of: original,
+            question,
+        })
     }
 
     pub(super) fn question_answer(
@@ -792,6 +827,7 @@ impl Hub {
         }
         let message = change.message.map(|message| {
             ToDevice::Message(ConversationMessage {
+                suggested_replies: Vec::new(),
                 question: message.question,
                 held_task: None,
                 conversation: current.info.conversation.clone(),
@@ -818,7 +854,7 @@ impl Hub {
                 &m.agent,
                 m.conversation.as_str(),
                 m.seq,
-                &m.text,
+                &format!("Needs you: {}", current.info.definition.text),
             );
         }
         let paired = store.devices().unwrap_or_default();
@@ -840,6 +876,7 @@ impl Hub {
                 }
             }
         }
+        self.publish_open_items(store, &current.owner);
     }
 
     pub(super) fn question_error(&self, store: &Store, origin: Origin, mut error: ErrorBody) {
