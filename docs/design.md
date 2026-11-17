@@ -568,6 +568,11 @@ pub trait RuntimeAdapter {
     fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath>;
     fn reads_agent_secrets(&self, _text: &str, _secrets_file: &Path) -> bool;
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    fn agent_data_may_remain(
+        &self,
+        _home: &Path,
+        _agent: &RuntimeAgentName,
+    ) -> Result<bool, Unreadable>;
     fn default_agent(&self, _home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable>;
     fn builtin_agent(&self) -> Option<BuiltinAgent>;
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
