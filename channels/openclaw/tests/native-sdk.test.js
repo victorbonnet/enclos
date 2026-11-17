@@ -1,3 +1,4 @@
+import { bridgeApprovalFixtureKey } from './helpers.js';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -49,7 +50,13 @@ test('the installed public SDK registers the package and builds isolated session
 test('the combined channel registers the native approval context with its actual persisted route', { skip: !installed }, async t => {
   const load = name => import(pathToFileURL(path.join(installed, `dist/plugin-sdk/${name}.js`)));
   const [delivery, handler, contexts, routing] = await Promise.all(['approval-delivery-runtime', 'approval-handler-runtime', 'channel-runtime-context', 'routing'].map(load));
-  const account = accountFixture(t), cfg = { channels: { enclos: { accounts: { main: account } } },
+  const sandbox = process.env.ENCLOS_SANDBOX;
+  process.env.ENCLOS_SANDBOX = 'lab';
+  t.after(() => {
+    if (sandbox === undefined) delete process.env.ENCLOS_SANDBOX;
+    else process.env.ENCLOS_SANDBOX = sandbox;
+  });
+  const account = { ...accountFixture(t), bridgeKey: bridgeApprovalFixtureKey }, cfg = { channels: { enclos: { accounts: { main: account } } },
     agents: { ownership: 'explicit', entries: { main: {} } }, bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] };
   let registration, disposed = false;
   const nativeApprovals = createNativeApprovals({ ...delivery, ...handler, ...contexts,

@@ -356,7 +356,7 @@ test('installed public SDK delivers authoritative views and canonical resolver p
   assert.ok(ask); assert.equal(ask.question.approval.command, request.request.command);
   assert.deepEqual(ask.question.approval.actions, ['once', 'always', 'deny']);
   const control = message('question.answer', { question: ask.question.id, conversation: 'one', answer: { kind: 'approval', action: 'once' } });
-  await controller.handleControl(control);
+  await controller.handleControl(signedAnswer({ definition: ask.question }, control));
   assert.equal(calls, 1); assert.equal(last(wire).state, 'answered'); assert.equal(last(wire).of, control.id);
   await runtime.handleResolved({ id: request.id, decision: 'allow-once', ts: Date.now(), request: request.request });
   const oneShot = nativeRequest({ ask: 'always' }); oneShot.id = 'native-one-shot';
