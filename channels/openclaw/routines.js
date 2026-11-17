@@ -78,7 +78,8 @@ function delivery(job, account, allowed) {
 }
 
 function summary(job, account, allowed, timezone, automatic) {
-  identifier(job.id, 'routine');
+  try { checkedId(job.id, 'routine'); }
+  catch { fail('unsupported', 'OpenClaw returned a routine id this app cannot represent.'); }
   const output = delivery(job, account, allowed);
   const text = job.payload?.kind === 'agentTurn' ? job.payload.message : job.payload?.text;
   return {
@@ -154,7 +155,15 @@ export class RoutineInventory {
         ...(model ? { model } : {}) };
       response = message('routine.response', { of: control.id, result: 'routine', routine: { ...found, definition } });
     } else {
-      const routines = own.map(job => summary(job, account, allowed, timezone, automatic));
+      const routines = [];
+      for (const job of own) {
+        try { routines.push(summary(job, account, allowed, timezone, automatic)); }
+        catch (error) {
+          if (!(error instanceof ProtocolError) || error.code !== 'unsupported') throw error;
+        }
+      }
+      const omitted = own.length - routines.length;
+      if (omitted && control.cursor == null) context.logger?.warn?.(`enclos omitted ${omitted} OpenClaw routines it cannot represent`);
       const fingerprint = hash(routines.map(job => [job.id, job.revision])).slice(0, 32);
       let offset = 0;
       if (control.cursor != null) {
