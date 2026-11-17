@@ -271,7 +271,7 @@ def merge_shared(target, source):
 
 def validate_manifest(meta, home, agent):
     fields = {'format', 'version', 'home', 'agent', 'snapshot', 'workspace', 'agent_config', 'shared_config',
-              'plugins', 'routes', 'sharedAuth', 'localAuth', 'bindings', 'host_reference'}
+              'plugins', 'routes', 'sharedAuth', 'localAuth', 'bindings', 'legacy_bindings', 'host_reference'}
     if not isinstance(meta, dict) or set(meta) != fields: fail('invalid OpenClaw export manifest')
     if meta['format'] != FORMAT or meta['version'] != VERSION: fail('unsupported OpenClaw data format or version')
     if meta['agent'] != agent: fail('OpenClaw native data currently retains its original agent id')
@@ -288,6 +288,11 @@ def validate_manifest(meta, home, agent):
     for key in ['sharedAuth', 'localAuth']:
         if not isinstance(meta[key].get('profiles'), dict): fail('invalid native credential data')
     if not isinstance(meta['bindings'], list) or len(meta['bindings']) > 50000: fail('invalid native bindings')
+    if not isinstance(meta['legacy_bindings'], list) or len(meta['legacy_bindings']) > 50000: fail('invalid legacy native binding references')
+    for record in meta['legacy_bindings']:
+        if not isinstance(record, dict) or set(record) != {'key', 'value', 'rollout'} or not isinstance(record['key'], str) or not record['key'].startswith('conversation:') or not isinstance(record['value'], dict): fail('invalid legacy native binding reference')
+        rollout = PurePosixPath(record['rollout'])
+        if rollout.is_absolute() or any(x in {'.', '..'} for x in rollout.parts) or rollout.parts[:2] not in {('codex-home', 'sessions'), ('codex-home', 'archived_sessions')}: fail('invalid captured legacy rollout')
     keys = set()
     for binding in meta['bindings']:
         if not isinstance(binding, list) or len(binding) != 2 or not isinstance(binding[0], str) or not isinstance(binding[1], dict) or binding[0] in keys:
@@ -371,6 +376,15 @@ def export(home, agent, output, limit=MAX_BYTES):
                 if label == 'agent' and str(rel) == 'openclaw-agent.sqlite': continue
                 if file is None: (data / label / rel).mkdir(parents=True, exist_ok=True)
                 else: copy_consistent(file, data / label / rel)
+        # Native snapshots carry current session history. Adjacent old
+        # sessions/import archives are retained as data outside native
+        # discovery paths so a destination cannot re-ingest old work.
+        for item in sorted(agent_dir.parent.iterdir()):
+            if item == agent_dir: continue
+            for rel, file in regular_tree(item, home, Path(item.name), directories=True):
+                target = data / 'agent/enclos-source-agent-files' / rel
+                if file is None: target.mkdir(parents=True, exist_ok=True)
+                else: copy_consistent(file, target)
         commands = HELPERS | set(meta['agentNames'])
         for item in sorted(home.iterdir()):
             if item == output: continue
@@ -382,7 +396,7 @@ def export(home, agent, output, limit=MAX_BYTES):
         manifest = {'format': FORMAT, 'version': VERSION, 'home': str(home), 'agent': agent, 'snapshot': snapshot.name,
                     'workspace': workspace_rel, 'agent_config': own, 'shared_config': shared,
                     'plugins': plugins, 'routes': routes, 'sharedAuth': meta['sharedAuth'], 'localAuth': meta['localAuth'],
-                    'bindings': meta['bindings'], 'host_reference': {'channels': sorted(cfg.get('channels', {})), 'bindings': [b for b in cfg.get('bindings', []) if b.get('agentId') == agent], 'cron_enabled': cfg.get('cron', {}).get('enabled'), 'hooks_enabled': cfg.get('hooks', {}).get('enabled')}}
+                    'bindings': meta['bindings'], 'legacy_bindings': meta['legacyBindings'], 'host_reference': {'channels': sorted(cfg.get('channels', {})), 'bindings': [b for b in cfg.get('bindings', []) if b.get('agentId') == agent], 'cron_enabled': cfg.get('cron', {}).get('enabled'), 'hooks_enabled': cfg.get('hooks', {}).get('enabled')}}
         text = json.dumps(manifest)
         if len(text.encode()) > 4 * 1024**2: fail('runtime manifest is too large')
         (data / 'manifest.json').write_text(text); (data / 'manifest.json').chmod(0o600)
@@ -416,6 +430,8 @@ def restore(home, agent, source, context):
     with tempfile.TemporaryDirectory(prefix='.enclos-openclaw-import-', dir=home) as tmp:
         stage = Path(tmp); meta = extract(source, stage)
         validate_manifest(meta, home, agent)
+        for record in meta['legacy_bindings']:
+            if not (stage / 'agent' / record['rollout']).is_file(): fail('legacy native rollout bytes are missing')
         workspace_rel = PurePosixPath(meta['workspace'])
         if workspace_rel.is_absolute() or any(p in {'.', '..'} for p in workspace_rel.parts): fail('invalid native workspace path')
         workspace = home.joinpath(*workspace_rel.parts); relative(str(workspace), home)
@@ -497,6 +513,10 @@ def restore(home, agent, source, context):
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as out: json.dump(routes, out)
         (agent_dir / 'enclos-source-host-reference.json').write_text(json.dumps(meta['host_reference']))
+        if meta['legacy_bindings']:
+            # Preserve unrouted historical data without publishing native
+            # conversation ownership, rewriting paths or reactivating work.
+            (agent_dir / 'enclos-legacy-codex-bindings.json').write_text(json.dumps(meta['legacy_bindings']))
         native(home, 'skills', 'list', '--agent', agent, '--json')
 
 
