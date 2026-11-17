@@ -267,6 +267,11 @@ impl RuntimeAdapter for OpenClaw {
         format!("openclaw tui --session agent:{agent}:main")
     }
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable> {
+        // An absent native state is no agent data, even when the CLI would
+        // create an implicit main on its first invocation.
+        if super::home::stat(home, &at(".openclaw"))?.is_none() {
+            return Ok(Vec::new());
+        }
         names(&config(home)?)
             .map_err(|why| unreadable("~/.openclaw/openclaw.json", NotRead::Io(why)))
     }
@@ -728,6 +733,8 @@ mod tests {
     fn native_roster_and_default_do_not_invent_an_immortal_main() {
         let home = tempfile::tempdir().unwrap();
         assert!(OpenClaw.builtin_agent().is_none());
+        assert!(OpenClaw.agents_in(home.path()).unwrap().is_empty());
+        save(home.path(), "{}");
         assert_eq!(OpenClaw.agents_in(home.path()).unwrap(), [agent("main")]);
         assert_eq!(
             OpenClaw.default_agent(home.path()).unwrap(),
