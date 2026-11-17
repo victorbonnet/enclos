@@ -522,6 +522,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+          check-latest: true
       - name: Check generated channel JavaScript
         run: node channels/openclaw/scripts/build.mjs --check
       - name: Install the supported public SDK without running package scripts
