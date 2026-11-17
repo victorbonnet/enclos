@@ -166,5 +166,18 @@ class TransferTests(unittest.TestCase):
             session.write_text('new-two'); transfer.preserve_adjacent_files(agent, home, target)
             self.assertEqual(sorted(p.read_text() for p in target.rglob('history.json')), ['new-one', 'new-two', 'previous-import'])
 
+    def test_codex_background_queues_refuse_and_temporary_launch_binaries_are_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); agent = root / 'agent'; home = agent / 'codex-home'; home.mkdir(parents=True)
+            with sqlite3.connect(home / 'queue_1.sqlite') as db: db.execute('create table queued_items(id text)')
+            transfer.assert_idle_codex(agent)
+            with sqlite3.connect(home / 'queue_1.sqlite') as db: db.execute("insert into queued_items values ('pending')")
+            with self.assertRaises(ValueError): transfer.assert_idle_codex(agent)
+            (home / 'tmp/arg0-linux').mkdir(parents=True); (home / 'tmp/arg0-linux/codex-linux-sandbox').write_text('rebuildable')
+            (home / 'sessions').mkdir(); (home / 'sessions/history.jsonl').write_text('retained')
+            paths = [str(p) for p, _ in transfer.regular_tree(agent, root)]
+            self.assertIn('codex-home/sessions/history.jsonl', paths)
+            self.assertFalse(any('/tmp/' in p for p in paths))
+
 
 if __name__ == '__main__': unittest.main()
