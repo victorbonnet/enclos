@@ -2,13 +2,13 @@
 
 Milestone 5 adds OpenClaw as a second runtime through the same CLI and mobile app. [Issue #218](https://github.com/victorbonnet/enclos/issues/218) holds the PR checklist. This document records the intended interfaces and acceptance gates; it does not claim that installation, confinement or native capabilities have been demonstrated. [The source findings](research/m5-openclaw-runtime.md) distinguish upstream evidence from required probes.
 
-The stack is rebased onto the requested mobile PR heads: [enclos #227](https://github.com/victorbonnet/enclos/pull/227), `753fc70084b1233c44632979d616148f1b8eda68`, and [enclos-app #44](https://github.com/victorbonnet/enclos-app/pull/44), `4e53b966253e5e3e0348ceed28cb0858c28b0659`, These bases include policy-request closure and the newer core; existing Linux behavior is retained while live OpenClaw Linux acceptance stays deferred. Each M5 PR builds on its predecessor.
+Each M5 PR builds on its predecessor. [Issue #218](https://github.com/victorbonnet/enclos/issues/218) records the current base and stack heads.
 
 macOS implementation and a disposable Seatbelt prototype come first on this host. Linux-specific implementation and live acceptance wait until the new Linux host is ready, as the final PR. Existing cross-platform CI continues, but cannot establish live OpenClaw acceptance. No Pi run is required. Host-service forwards, other runtimes/backends, a general web UI, sharing, iOS and general mobile administration ([#166](https://github.com/victorbonnet/enclos/issues/166)) remain separate work.
 
 ## Runtime contracts
 
-These are proposed changes at existing seams, driven by the two runtimes. The implemented trait remains in [`src/runtime/mod.rs`](../src/runtime/mod.rs). Do not describe a proposed method or capability as available before its implementation and tests land.
+These are planned changes to support both runtimes through the existing interfaces. The implemented trait remains in [`src/runtime/mod.rs`](../src/runtime/mod.rs). Do not describe a planned method or capability as available before its implementation and tests land.
 
 | Seam | Interface and ownership | Required invariants |
 | --- | --- | --- |

@@ -277,7 +277,7 @@ The proxy connects only to addresses that passed, by address. Falling back from 
 
 **What the proxy can and cannot promise.** enclos constrains the connections the sandbox makes, not what the services it reaches do. A remote browser, a search service, an MCP server, or the model provider's own tools (a hosted web search, for example) can fetch other sites on the agent's behalf. Allowing such a service grants that capability: the policy and `enclos policy show` describe it as "remote fetching through <service>", not as network isolation. The same applies to any allowed destination that relays data.
 
-**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: no host-service forward before milestone 5.1, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15). A runtime's own gateway is its sandbox's service under ADR 0028, not a host-service forward.
+**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: host-service forwards are deferred until after milestone 5, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15). A runtime's own gateway is its sandbox's service under ADR 0028, not a host-service forward.
 
 **The runtime's own service** ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), issue #64; the listening, the service's port, `connect` starting the service, and `status` naming the dashboard command and listeners are in this build). Hermes 0.22.3's chat reaches its gateway only over a WebSocket on a loopback port the gateway picks at start: each client finds the gateway, gets a ticket for its own agent over the gateway's Unix socket in the home, and dials the port the gateway gives. So a runtime adapter can declare its listening service (Hermes: `gateway`). Such a sandbox may listen (§5), and a session started while that service listens is given its port: `wrap` passes `-D ENCLOS_SERVICE=localhost:<port>`, and the compiled policy, the same for every session, allows outbound TCP to that port on 127.0.0.1 alone. enclos takes the port from its records of the service's session, never from a file the sandbox writes: the one TCP port at 127.0.0.1 (not every address, where another program of the user could hold 127.0.0.1 at that port) in the system's ephemeral range that the program it started for the service holds, and no other process holds 127.0.0.1 at that port (a socket sharing it with `SO_REUSEPORT` would get the session's connections) (a bind on port 0 lands there; a port the runtime binds by number, such as Hermes's API server or webhooks, does not), checked to be the same process before and after reading its ports, so a reused PID is not taken for it, and none when there is none or several. Hermes then works as it does outside enclos, each agent and client as itself. `connect` makes sure the service listens first, since a session reaches it only on the port it held when the session started. When the service itself is not installed (nothing of the sandbox is, or only its proxy, as when it was started before its runtime was installed), it installs the sandbox's services as `sandbox start` does, so they start again at each login until `sandbox stop`, and says so on stderr, along with the open sessions' connections being cut when its proxy runs (one an earlier `connect` started, or the proxy service), since the new proxy service replaces it; `--dry-run` says both. A start that fails after removing the services it replaces leaves none; when the proxy service was among them, the session is told so, with `enclos sandbox start` to get them back. When the service is installed, or a session of it is open but not listening yet (one still starting), it only waits: installing the sandbox's services again would stop that service and the proxy. It waits up to 60 seconds for the service to listen, gives up after 15 seconds while no session of it is open, as when it exits at once, and at once for what waiting does not fix (several ports, a port another process shares); a start that fails ends the wait too, and in each case it says why and connects anyway. One `connect` of a sandbox at a time decides and waits, under a lock file in enclos's `run` folder. It starts nothing when the runtime's files are gone from the home (the path its adapter names for `status`), since the service could not run, nor when whether they are there cannot be told, which it says. `policy show` and `policy test` say that such a sandbox's listening is open, and `status` names what in it listens beyond loopback. This is not a loopback exception: a session reaches its own proxy and the port its own sandbox's service held when it started, and nothing else on the host's loopback, until the service restarts, when whatever then holds that port at 127.0.0.1 is reachable from it ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), Consequences).
 
@@ -546,37 +546,85 @@ pub trait AuditLog {
 
 **Runtime adapter**
 
-The sketch below names the implemented interface in [`src/runtime/mod.rs`](../src/runtime/mod.rs); optional methods are shown without their default bodies. Milestone 5's proposed changes are separate in [the OpenClaw plan](m5-openclaw.md#runtime-contracts), so a planned method is not mistaken for an available one.
+This sketch lists the implemented signatures in [`src/runtime/mod.rs`](../src/runtime/mod.rs). The [OpenClaw plan](m5-openclaw.md#runtime-contracts) describes planned changes.
 
 ```rust
 pub trait RuntimeAdapter {
     fn kind(&self) -> RuntimeKind;
-    fn endpoints(&self) -> &'static str;  fn version(&self) -> &'static str;  // destinations and adapter version recorded in snapshot inputs
-    fn installer(&self) -> Installer;                                           // downloaded on the host over HTTPS only, as the runtime serves it, its SHA-256 in the audit entry, run inside the sandbox (milestone 1, ADR 0020, ADR 0029)
-    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;               // files enclos stages beside the home for that backend; copied in from inside the sandbox
-    fn login(&self) -> String;                                                  // the runtime's own login and setup, shown as `connect <sandbox> -- <this>`, never run by enclos
+    fn version(&self) -> &'static str;
+    fn endpoints(&self) -> &'static str;
+    fn installer(&self) -> Installer;
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;
+    fn login(&self) -> String;
+    fn create_agent(&self, name: &AgentName) -> SandboxCommand;
+    fn after_create_agent(&self, _name: &AgentName) -> Vec<SandboxCommand>;
+    fn agent_files(&self, name: &AgentName) -> String;
+    fn talk(&self, agent: &AgentName) -> String;
+    fn services(&self) -> Vec<RuntimeService>;
+    fn listener(&self) -> Option<RuntimeListener>;
+    fn dashboard(&self) -> Option<RuntimeDashboard>;
+    fn secrets_folder_var(&self) -> Option<&'static str>;
+    fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath>;
+    fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath>;
+    fn reads_agent_secrets(&self, _text: &str, _secrets_file: &Path) -> bool;
+    fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    fn builtin_agent(&self) -> Option<BuiltinAgent>;
+    fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
+    fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
+    fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport>;
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        _context: &str,
+    ) -> Option<SandboxCommand>;
+    fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand>;
+    fn channel_token_file(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+    ) -> Option<(HomePath, &'static str)>;
+    fn agent_secrets_source(
+        &self,
+        _agent: &RuntimeAgentName,
+        _secrets_file: &Path,
+    ) -> Option<Vec<SandboxCommand>>;
+    fn set_setting(
+        &self,
+        _agent: &RuntimeAgentName,
+        _key: &str,
+        _value: &str,
+    ) -> Option<SandboxCommand>;
+    fn channel_settings(
+        &self,
+        _channel: Channel,
+        _token: &str,
+        _answers: &[ChannelUser],
+    ) -> Option<Vec<(String, String)>>;
+    fn app_channel(
+        &self,
+        _agent: &RuntimeAgentName,
+        _socket: &Path,
+        _home: &str,
+        _bridge_key: &str,
+    ) -> Option<AppChannel>;
+    fn usage(
+        &self,
+        _agents: &[RuntimeAgentName],
+        _since: i64,
+        _report: &Path,
+    ) -> Option<SandboxCommand>;
+    fn disk_parts(&self) -> Vec<(DiskPart, HomePath)>;
+    fn runtime_facts(&self) -> RuntimeFacts;
+    fn agent_facts(&self, _agent: &RuntimeAgentName) -> AgentFacts;
+}
 
-    fn create_agent(&self, agent: &AgentName) -> SandboxCommand;                // run inside the sandbox; a `SandboxCommand` can be started nowhere else
-    fn after_create_agent(&self, agent: &AgentName) -> Vec<SandboxCommand>;      // runtime cleanup after creation; empty by default
-    fn agent_files(&self, agent: &AgentName) -> String;                         // where the runtime keeps the agent's files, for messages
-    fn talk(&self, agent: &AgentName) -> String;                               // shown, never run by enclos
-    fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
-    fn listener(&self) -> Option<RuntimeListener> { None }                     // ADR 0028: the service that listens, whose port the sandbox's sessions reach
-    fn dashboard(&self) -> Option<RuntimeDashboard> { None }                   // ADR 0040: namespace relay; ADR 0063 (proposed): inherited Unix listener on macOS
-    fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> { /* those of the built-in agent and of `agents` */ }  // ADR 0031: read only as its services start; a change restarts each service with a `restart` signal
-    fn agent_settings_files(&self, agent: &RuntimeAgentName) -> Vec<HomePath> { Vec::new() }  // those of one agent, which `doctor` looks at against what the policy grants it
-    fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool { false }  // whether a settings file has the agent read its secrets file
-    fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;   // read on the host; Err: cannot tell, and why
-    fn builtin_agent(&self) -> Option<BuiltinAgent>;                            // permanent identity, if any; not the runtime's selected default
-    fn delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand>;
-    fn finish_delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // finishes a delete that failed after the agent and its folder went: Hermes 0.23.0's `profile purge-identity`
-    fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand> { None }   // the runtime's own import of its export, run in the sandbox
-    fn usage(&self, agents: &[RuntimeAgentName], since: i64, report: &Path) -> Option<SandboxCommand> { None }  // reads the runtime's own usage records in the sandbox and writes a usage report (§11, Usage); None: not provided
-
-    // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.
-    fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> { Vec::new() }             // Runtime | Cache
-    fn runtime_facts(&self) -> RuntimeFacts { RuntimeFacts::default() }          // version, login file, install path
-    fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts { AgentFacts::default() }   // folder, model, activity files
+pub struct AgentFacts {
+    pub folder: Option<HomePath>,
+    pub model: Option<ValueAt>,
+    pub provider: Option<ProviderAt>,
+    pub activity: Vec<HomePath>,
 }
 ```
 
@@ -1187,5 +1235,5 @@ Proposed for milestone 4, not decided: a bridge on each host for the mobile app 
 | A missing deny entry inside a writable grant (bubblewrap) | Decided: `wrap` always masks an entry inside a workspace or the sandbox's home, making an empty folder as the mount point when the path is missing, then a tmpfs sealed with `--remount-ro`. A mask made only for what exists would leave a missing entry uncovered for the whole session: `~/proj/.env`, denied and made by the user during a long session, would be readable, and with `write = ["~/.cargo"]` the sandbox could write the `credentials.toml` the host's `cargo` then trusts. The cost is an empty folder on the host, and a later `cargo login` fails visibly, which is better than a silent hole. What compile does: it lists the entry as `in_sandbox_home` or `in_workspace`, whether or not it exists. `wrap` makes these masks; no run has shown this for a compiled policy. |
 | A deny entry that is a link or is reached through a symlinked folder (§5) | Decided: `wrap` masks the resolved path too, wherever it is, as Seatbelt does. With `~/.config -> ../data` and the deny entry `~/.config/google-chrome`, or `~/.ssh -> dotfiles/ssh` and the deny entry `~/.ssh` (as GNU stow sets a home up), hiding the path as named leaves its target readable through the broad read, and in a workspace `proj/token -> ../secrets/token` resolves outside the grant. Seatbelt compiles the resolved path, so the same `policy.toml` would hide the target on a Mac and not on Linux. The other options were to refuse the session when an entry resolves outside the home, or to leave it and have `policy test` report the entry as not hidden. So `wrap` resolves each entry at every launch with `real_path` and masks where it leads as well as the entry as written (§5, Links, resolved at launch), which relaxes the rule that deny entries are under the home for resolved paths; an entry that leads to the home or above it refuses the session. What compile does: it never resolves a path, so the entry stays listed by its name through the link, and `wrap` resolves it. Not shown by a run: the wrap tests check the arguments `wrap` builds on a folder tree with links; no bubblewrap run has read through either path yet. |
 | `listen = false` on bubblewrap (§5, §7) | Decided in [ADR 0041](adr/0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md), which amends [ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md) for this field: declared unenforced, and said at each start, with no acceptance asked. Nothing in a bubblewrap session refuses `bind` or `listen`: the network namespace holds what leaves the sandbox, not what listens in it. Compile lists it in the compiled output's `unenforced`, and does not refuse it there: every template leaves `listen` false. Now that `wrap` runs sessions, such a policy runs with it unheld, every template included; `doctor`'s capabilities say "`listen = false` is not held", and every session's start in such a sandbox prints one line that says it is not held on bubblewrap, as ADR 0038 has a start do for a field not enforced (§5, What compiling for bubblewrap gives); the line is in this build, and no acceptance is asked, as ADR 0041 decides. The other options were to make it need `--accept-unenforced` as `[exec]` and `memory` do, which every bubblewrap sandbox would then need, or to enforce it now. Enforcing it, with Landlock's TCP bind right (ABI 4, `LANDLOCK_ACCESS_NET_BIND_TCP`) where the kernel has it and declared unenforced below ABI 4 or without Landlock, since seccomp cannot read `bind`'s address and refusing `listen()` outright stops Unix sockets too, was to come with the sandbox's shared namespace ([ADR 0039](adr/0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md)), when a listener first becomes reachable from another session of the sandbox. Milestone 3 shipped that namespace without the rule ([ADR 0057](adr/0057-landlocks-tcp-bind-right-is-not-built.md)), so a listener in one session is reached by the sandbox's other sessions, and `listen = false` stays declared not held on every host and kernel. The rule is later work, planned for no milestone yet: it needs ADR 0040, which says bind and listen stay open, amended, and no run has shown Landlock's TCP rule under bubblewrap yet. macOS is unchanged: Seatbelt holds `listen = false` and prints nothing. |
-| Host-service forward mechanism | Decided: milestone 5.1, one named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |
-| OpenClaw native contracts (milestone 5) | Proposed in [the M5 plan](m5-openclaw.md): retain the existing runtime-adapter/channel-plugin/bridge seams, with runtime-aware identities, observations, secret consumers and verified listener selection. Prototype native supervision/reload and the experimental SDK before production depends on them. Native approval scopes and routine mutation revisions require compatible generic contracts or explicit unavailable controls; no invented Session scope or unsafe read-compare-mutate fallback. Existing ADR statuses remain unchanged. |
+| Host-service forward mechanism | Deferred until after milestone 5. One named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |
+| OpenClaw native contracts (milestone 5) | Planned in [the M5 plan](m5-openclaw.md): retain the existing runtime-adapter/channel-plugin/bridge seams, with runtime-aware identities, observations, secret consumers and verified listener selection. Prototype native supervision/reload and the experimental SDK before production depends on them. Native approval scopes and routine mutation revisions require compatible generic contracts or explicit unavailable controls; no invented Session scope or unsafe read-compare-mutate fallback. Existing ADR statuses remain unchanged. |
