@@ -4,6 +4,7 @@ Native snapshots and public native APIs own database/auth/binding writes. The
 archive retains native IDs and paths: upstream offers no lossless rekey/relocate.
 """
 import hashlib
+from contextlib import closing
 import io
 import json
 import os
@@ -71,7 +72,7 @@ def regular_tree(root, home, prefix=Path(), skip=None, ancestors=frozenset(), di
             if p.name in REBUILDABLE | {'plugin-skills'} or p.name.endswith(('-wal', '-shm', '.sock', '.pid', '.pyc')):
                 continue
             # Native Codex rebuilds these installation caches for the target CPU.
-            if tuple((prefix / p.name).parts[-2:]) in {('plugins', 'cache'), ('plugins', 'marketplaces'), ('skills', '.system')}:
+            if tuple((prefix / p.name).parts[-2:]) in {('plugins', 'cache'), ('plugins', 'marketplaces'), ('skills', '.system'), ('codex-home', 'tmp')}:
                 continue
             yield from regular_tree(p, home, prefix / p.name, skip, ancestors | {identity}, directories)
     elif root.is_file():
@@ -111,7 +112,7 @@ def copy_consistent(source, destination):
     with source.open('rb') as stream:
         sqlite = stream.read(16) == b'SQLite format 3\0'
     if sqlite:
-        with sqlite3.connect(source.as_uri() + '?mode=ro', uri=True) as src, sqlite3.connect(destination) as dst:
+        with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src, closing(sqlite3.connect(destination)) as dst:
             src.backup(dst)
     else:
         before = source.stat()
@@ -214,6 +215,19 @@ def assert_idle_database(file):
                 fail('OpenClaw has unresolved execution or delivery state; finish or stop its turns before exporting')
         if 'session_pending_inputs' in tables and db.execute("select 1 from session_pending_inputs where consumed_event_id is null and state in ('queued','interrupted') limit 1").fetchone():
             fail('OpenClaw has pending input; finish or cancel it before exporting')
+
+
+def assert_idle_codex(agent_dir):
+    # These native background queues are separate from OpenClaw's session
+    # recovery. This format refuses their work rather than editing it away.
+    for name, tables in [('queue_1.sqlite', ['queued_items']),
+                         ('goals_1.sqlite', ['thread_goals', 'thread_goal_continuation_deferrals'])]:
+        file = agent_dir / 'codex-home' / name
+        if not file.exists(): continue
+        with closing(sqlite3.connect(file.as_uri() + '?mode=ro', uri=True)) as db:
+            for table in tables:
+                if db.execute('select 1 from ' + table + ' limit 1').fetchone():
+                    fail('Codex has persisted queue or goal state requiring a supported native export')
 
 
 def projected_config(config, agent):
@@ -366,6 +380,7 @@ def export(home, agent, output, limit=MAX_BYTES, credential_files=None):
         agent_dir = Path(own.get('agentDir', str(agent_dir)))
         if relative(str(agent_dir), home) != f'.openclaw/agents/{agent}/agent':
             fail('custom native agent directories are not supported for portable data')
+        assert_idle_codex(agent_dir)
         workspace = Path(own.get('workspace', cfg.get('agents', {}).get('defaults', {}).get('workspace', '')))
         workspace_rel = relative(str(workspace), home)
         if not workspace.is_dir(): fail('agent workspace is missing')
@@ -439,6 +454,7 @@ def restore(home, agent, source, context):
         validate_manifest(meta, home, agent)
         for record in meta['legacy_bindings']:
             if not (stage / 'agent' / record['rollout']).is_file(): fail('legacy native rollout bytes are missing')
+        assert_idle_codex(stage / 'agent')
         workspace_rel = PurePosixPath(meta['workspace'])
         if workspace_rel.is_absolute() or any(p in {'.', '..'} for p in workspace_rel.parts): fail('invalid native workspace path')
         workspace = home.joinpath(*workspace_rel.parts); relative(str(workspace), home)
