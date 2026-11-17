@@ -34,7 +34,7 @@ For a free-text question, omit `choices`:
 clarify({"questions":[{"question":"What name should the report use?"}]})
 ```
 
-Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer. An unanswered live question times out after an hour; continue from the result Hermes returns. Updated apps keep expired information questions in Needs you. The person can open a reply draft in a separate conversation, review it, and send it as a new contextual message; the expired native waiter stays closed. Read that message as their current answer and keep its original scope.
+Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer. An unanswered live question times out after an hour; continue from the result Hermes returns. Updated apps keep expired information questions read-only in Needs you, with View conversation and Dismiss reminder. Treat expiry as unanswered; when the decision is still needed, ask a fresh question with current context and wait for its actual result.
 
 Use policy request tools for sandbox access; answering a question does not change policy. Request a concrete scope through `enclos_request_access` and wait for the person's decision in the policy inbox.
 
