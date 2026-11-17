@@ -44,6 +44,12 @@ class TransferTests(unittest.TestCase):
             with sqlite3.connect(p) as db:
                 db.execute('delete from session_pending_inputs'); db.execute('update session_nodes set entry_json=?', (json.dumps({'mainRestartRecovery': {'cycleId': 'pending'}}),))
             with self.assertRaises(ValueError): transfer.assert_idle_database(p)
+            for entry in [{'status': 'interrupted', 'abortedLastRun': True, 'restartRecoveryRuns': [{'runId': 'unresolved'}]},
+                          {'status': 'done', 'restartRecoveryDeliveryRunId': 'delivery'}]:
+                with sqlite3.connect(p) as db: db.execute('update session_nodes set entry_json=?', (json.dumps(entry),))
+                with self.assertRaises(ValueError): transfer.assert_idle_database(p)
+            with sqlite3.connect(p) as db: db.execute('update session_nodes set entry_json=?', (json.dumps({'restartRecoveryRuns': [{'runId': 'historic'}], 'restartRecoveryTerminalRunIds': ['historic']}),))
+            transfer.assert_idle_database(p)
 
     def test_archive_rejects_links_traversal_duplicates_and_runtime_control_files(self):
         cases = [('home/.openclaw/state/openclaw.sqlite', tarfile.REGTYPE), ('../escape', tarfile.REGTYPE),
@@ -100,6 +106,41 @@ class TransferTests(unittest.TestCase):
                       {'shared_config': {'agents': {'entries': {'foreign': {}}}}}]:
             with self.subTest(patch=patch), self.assertRaises(ValueError):
                 transfer.validate_manifest({**meta, **patch}, Path('/sandbox'), 'main')
+
+    def test_empty_workspace_and_dependency_lockfiles_survive_the_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); data = root / 'data'; data.mkdir()
+            (data / 'manifest.json').write_text('{}')
+            (data / 'workspace/empty').mkdir(parents=True)
+            for name in ['uv.lock', 'Cargo.lock', 'yarn.lock']:
+                (data / 'workspace' / name).write_text(name)
+            files = list(transfer.regular_tree(data / 'workspace', root))
+            self.assertEqual({str(p) for p, _ in files}, {'uv.lock', 'Cargo.lock', 'yarn.lock'})
+            archive = root / 'export.tgz'; transfer.write_archive(data, archive, 4096)
+            restored = root / 'restored'; restored.mkdir(); transfer.extract(archive, restored, 4096)
+            self.assertTrue((restored / 'workspace/empty').is_dir())
+            self.assertEqual((restored / 'workspace/uv.lock').read_text(), 'uv.lock')
+            (data / 'workspace/compressible').write_bytes(b'0' * 8192)
+            too_large = root / 'too-large.tgz'
+            with self.assertRaises(ValueError): transfer.write_archive(data, too_large, 4096)
+            self.assertFalse(too_large.exists())
+
+    def test_plugins_are_reused_or_refused_without_replacing_shared_installations(self):
+        installed = {'plugin': {'id': 'example', 'packageName': '@scope/example', 'packageVersion': '1.2.3'},
+                     'install': {'source': 'npm', 'resolvedName': '@scope/example', 'resolvedVersion': '1.2.3'}}
+        wanted = [{'id': 'example', 'spec': '@scope/example@1.2.3'}]
+        self.assertEqual(transfer.missing_plugins([installed], wanted), [])
+        self.assertEqual(transfer.missing_plugins([], wanted), ['@scope/example@1.2.3'])
+        with self.assertRaises(ValueError): transfer.missing_plugins([installed], [{'id': 'example', 'spec': '@scope/example@1.2.4'}])
+
+    def test_external_codex_owners_refuse_instead_of_publishing_incomplete_data(self):
+        for config in [{'homeScope': 'user'}, {'transport': 'websocket'}, {'transport': 'unix'},
+                       {'command': '/external/codex'}, {'remoteWorkspaceRoot': '/remote'}, {'nativeHookRelay': {'url': 'https://example.invalid'}}]:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                transfer.assert_local_codex({'plugins': {'entries': {'codex': {'config': {'appServer': config}}}}}, {})
+        with self.assertRaises(ValueError): transfer.assert_local_codex({}, {'runtime': {'type': 'acp'}})
+        own, shared = transfer.projected_config({'agents': {'entries': {'main': {}}}, 'cron': {'enabled': True}, 'hooks': {'enabled': True}}, 'main')
+        self.assertNotIn('cron', shared); self.assertNotIn('hooks', shared)
 
 
 if __name__ == '__main__': unittest.main()

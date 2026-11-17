@@ -54,7 +54,7 @@ def relative(value, home):
     return str(path.relative_to(home))
 
 
-def regular_tree(root, home, prefix=Path(), skip=None, ancestors=frozenset()):
+def regular_tree(root, home, prefix=Path(), skip=None, ancestors=frozenset(), directories=False):
     if skip and skip(prefix): return
     if root.is_symlink():
         root = root.resolve(strict=True)
@@ -62,13 +62,14 @@ def regular_tree(root, home, prefix=Path(), skip=None, ancestors=frozenset()):
     if root.is_dir():
         identity = (root.stat().st_dev, root.stat().st_ino)
         if identity in ancestors: fail('linked agent data contains a directory cycle')
+        if directories: yield prefix, None
         for p in sorted(root.iterdir()):
-            if p.name in REBUILDABLE | {'plugin-skills'} or p.name.endswith(('-wal', '-shm', '.sock', '.pid', '.lock', '.pyc')):
+            if p.name in REBUILDABLE | {'plugin-skills'} or p.name.endswith(('-wal', '-shm', '.sock', '.pid', '.pyc')):
                 continue
             # Native Codex rebuilds these installation caches for the target CPU.
             if tuple((prefix / p.name).parts[-2:]) in {('plugins', 'cache'), ('plugins', 'marketplaces'), ('skills', '.system')}:
                 continue
-            yield from regular_tree(p, home, prefix / p.name, skip, ancestors | {identity})
+            yield from regular_tree(p, home, prefix / p.name, skip, ancestors | {identity}, directories)
     elif root.is_file():
         yield prefix, root
     elif not stat.S_ISSOCK(root.stat().st_mode):
@@ -115,6 +116,14 @@ def copy_consistent(source, destination):
         if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
             fail('agent data changed during export; stop interactive writers and retry')
     destination.chmod(0o700 if source.stat().st_mode & 0o111 else 0o600)
+
+
+def equal_files(first, second):
+    if first.stat().st_size != second.stat().st_size: return False
+    with first.open('rb') as a, second.open('rb') as b:
+        while chunk := a.read(1024**2):
+            if chunk != b.read(len(chunk)): return False
+    return True
 
 
 def native(home, *args):
@@ -165,7 +174,9 @@ def assert_idle_database(file):
             fail('native agent snapshot has no session catalog')
         for row in db.execute('select entry_json from session_nodes'):
             entry = json.loads(row[0])
-            if entry.get('status') in {'running', 'queued'} or any(entry.get(k) for k in (
+            terminal = entry.get('restartRecoveryTerminalRunIds', [])
+            recovery_runs = any(run.get('runId') not in terminal for run in entry.get('restartRecoveryRuns', []))
+            if recovery_runs or entry.get('restartRecoveryDeliveryRunId') or entry.get('status') in {'running', 'queued'} or any(entry.get(k) for k in (
                     'mainRestartRecovery', 'pendingFinalDelivery', 'initializationPending',
                     'restartRecoveryBeforeAgentReplyState', 'restartRecoveryDeliveryReceiptState',
                     'restartRecoveryHarnessCompletion', 'subagentRecovery')):
@@ -180,6 +191,7 @@ def projected_config(config, agent):
     if config.get('session', {}).get('store'):
         fail('custom shared native session stores need a supported ownership export')
     own = dict(config['agents']['entries'][agent])
+    assert_local_codex(config, own)
     shared = {k: config[k] for k in ['tools', 'skills', 'models', 'messages', 'commands', 'session'] if k in config}
     shared['plugins'] = {'entries': {k: v for k, v in config.get('plugins', {}).get('entries', {}).items() if k != 'enclos'}}
     if defaults: shared['agents'] = {'defaults': defaults}
@@ -187,6 +199,35 @@ def projected_config(config, agent):
     # Shared schedulers, external messaging bindings and hooks are host-owned.
     # Restore their source configuration as reference only, never executable work.
     return own, shared
+
+
+def assert_local_codex(config, own):
+    codex = config.get('plugins', {}).get('entries', {}).get('codex', {}).get('config', {}).get('appServer', {})
+    if codex.get('homeScope', 'agent') != 'agent' or codex.get('transport', 'stdio') != 'stdio' or any(
+            codex.get(k) for k in ['url', 'command', 'args', 'remoteWorkspaceRoot', 'nativeHookRelay']):
+        fail('external or user-scoped Codex state needs a supported native export')
+    if own.get('runtime', {}).get('type', 'native') != 'native':
+        fail('external agent harness state needs a supported native export')
+
+
+def plugin_spec(inspection):
+    plugin, install = inspection['plugin'], inspection.get('install') or {}
+    name, version = plugin.get('packageName'), plugin.get('packageVersion') or plugin.get('version')
+    spec = f'{name}@{version}'
+    if not valid_plugin_spec(spec): fail('native plugin has no exact package identity')
+    if plugin.get('origin') != 'bundled' and (install.get('source') != 'npm' or install.get('resolvedName') != name or install.get('resolvedVersion') != version):
+        fail('native plugin does not have verified exact npm provenance')
+    return spec
+
+
+def missing_plugins(inspections, wanted):
+    installed = {x['plugin']['id']: x for x in inspections}
+    missing = []
+    for plugin in wanted:
+        current = installed.get(plugin['id'])
+        if current is None: missing.append(plugin['spec'])
+        elif plugin_spec(current) != plugin['spec']: fail('conflicting destination native plugin version')
+    return missing
 
 
 def merge_shared(target, source):
@@ -254,6 +295,17 @@ class LimitedOutput:
     def tell(self): return self.size
 
 
+def write_archive(data, output, limit):
+    entries = sorted(data.rglob('*'))
+    if sum(p.stat().st_size for p in entries if p.is_file()) > limit: fail('unpacked agent data exceeds its limit')
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream, tarfile.open(fileobj=LimitedOutput(stream, limit), mode='w:gz') as archive:
+            for p in entries: archive.add(p, arcname=str(p.relative_to(data)), recursive=False)
+    except BaseException:
+        output.unlink(missing_ok=True); raise
+
+
 def export(home, agent, output, limit=MAX_BYTES):
     checked_name(agent)
     with tempfile.TemporaryDirectory(prefix='.enclos-openclaw-export-', dir=home) as tmp:
@@ -268,19 +320,14 @@ def export(home, agent, output, limit=MAX_BYTES):
             fail('custom native agent directories are not supported for portable data')
         workspace = Path(own.get('workspace', cfg.get('agents', {}).get('defaults', {}).get('workspace', '')))
         workspace_rel = relative(str(workspace), home)
+        if not workspace.is_dir(): fail('agent workspace is missing')
         own, shared = projected_config(cfg, agent)
         inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
         plugins = []
         for inspection in inspections:
-            plugin, install = inspection['plugin'], inspection.get('install', {})
+            plugin = inspection['plugin']
             if not plugin.get('enabled') or plugin['id'] == 'enclos' or plugin.get('origin') == 'bundled': continue
-            if install.get('source') != 'npm': fail('enabled local or non-npm plugins need a supported source export')
-            name, version = install.get('resolvedName'), install.get('resolvedVersion')
-            if not name or not version or name != plugin.get('packageName') or version != (plugin.get('packageVersion') or plugin.get('version')):
-                fail('native plugin does not have verified exact npm provenance')
-            spec = name + '@' + version
-            if not valid_plugin_spec(spec): fail('native plugin has an unsupported exact version')
-            plugins.append({'id': plugin['id'], 'spec': spec})
+            plugins.append({'id': plugin['id'], 'spec': plugin_spec(inspection)})
         repository = stage / 'repository'
         native(home, 'backup', 'sqlite', 'create', '--agent', agent, '--repository', str(repository), '--json')
         snapshots = [p for p in repository.iterdir() if p.is_dir()]
@@ -289,28 +336,26 @@ def export(home, agent, output, limit=MAX_BYTES):
         shutil.copytree(snapshot, data / 'snapshot' / snapshot.name)
         for label, root in [('agent', agent_dir), ('workspace', workspace), ('shared-skills', home / '.openclaw/skills')]:
             if not root.exists(): continue
-            for rel, file in regular_tree(root, home):
+            for rel, file in regular_tree(root, home, directories=True):
                 if label == 'agent' and str(rel) == 'openclaw-agent.sqlite': continue
-                copy_consistent(file, data / label / rel)
+                if file is None: (data / label / rel).mkdir(parents=True, exist_ok=True)
+                else: copy_consistent(file, data / label / rel)
         commands = HELPERS | set(meta['agentNames'])
         for item in sorted(home.iterdir()):
             if item == output: continue
-            for rel, file in regular_tree(item, home, Path(item.name), lambda rel: home_skip(rel, commands)):
-                copy_consistent(file, data / 'home' / rel)
+            for rel, file in regular_tree(item, home, Path(item.name), lambda rel: home_skip(rel, commands), directories=True):
+                if file is None: (data / 'home' / rel).mkdir(parents=True, exist_ok=True)
+                else: copy_consistent(file, data / 'home' / rel)
         state = home / '.enclos-app/openclaw-state' / agent / 'state.json'
         routes = json.loads(state.read_text()).get('routes', {}) if state.exists() else {}
         manifest = {'format': FORMAT, 'version': VERSION, 'home': str(home), 'agent': agent, 'snapshot': snapshot.name,
                     'workspace': workspace_rel, 'agent_config': own, 'shared_config': shared,
                     'plugins': plugins, 'routes': routes, 'sharedAuth': meta['sharedAuth'], 'localAuth': meta['localAuth'],
                     'bindings': meta['bindings'], 'host_reference': {'channels': sorted(cfg.get('channels', {})), 'bindings': [b for b in cfg.get('bindings', []) if b.get('agentId') == agent], 'cron_enabled': cfg.get('cron', {}).get('enabled'), 'hooks_enabled': cfg.get('hooks', {}).get('enabled')}}
-        (data / 'manifest.json').write_text(json.dumps(manifest)); (data / 'manifest.json').chmod(0o600)
-        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, 'wb') as stream, tarfile.open(fileobj=LimitedOutput(stream, limit), mode='w:gz') as archive:
-                for p in sorted(data.rglob('*')):
-                    if p.is_file(): archive.add(p, arcname=str(p.relative_to(data)), recursive=False)
-        except BaseException:
-            output.unlink(missing_ok=True); raise
+        text = json.dumps(manifest)
+        if len(text.encode()) > 4 * 1024**2: fail('runtime manifest is too large')
+        (data / 'manifest.json').write_text(text); (data / 'manifest.json').chmod(0o600)
+        write_archive(data, output, limit)
 
 
 def extract(source, destination, limit=MAX_BYTES):
@@ -318,15 +363,18 @@ def extract(source, destination, limit=MAX_BYTES):
     with tarfile.open(source) as archive:
         for entry in archive:
             p = PurePosixPath(entry.name)
-            if not entry.isfile() or p.is_absolute() or str(p) != entry.name or '\\' in entry.name or any(x in {'.', '..'} for x in p.parts) or entry.name in seen:
+            if not (entry.isfile() or entry.isdir() and entry.size == 0) or not p.parts or p.is_absolute() or str(p) != entry.name or '\\' in entry.name or any(x in {'.', '..'} for x in p.parts) or entry.name in seen:
                 fail('unsafe or duplicate OpenClaw export entry')
             seen.add(entry.name); total += entry.size
             if total > limit or entry.size < 0: fail('unpacked agent data exceeds its limit')
-            if p.parts[0] == 'home' and (len(p.parts) < 2 or home_skip(Path(*p.parts[1:]), HELPERS)): fail('runtime or control data in shared home archive')
-            if p.parts[0] == 'agent' and (len(p.parts) < 2 or p.parts[1] == 'openclaw-agent.sqlite' or p.parts[-1].endswith(('-wal', '-shm', '.sock', '.pid', '.lock'))): fail('live native state in agent archive')
+            if p.parts[0] == 'home' and (len(p.parts) < 2 and not entry.isdir() or home_skip(Path(*p.parts[1:]), HELPERS)): fail('runtime or control data in shared home archive')
+            if p.parts[0] == 'agent' and (len(p.parts) < 2 and not entry.isdir() or len(p.parts) >= 2 and p.parts[1] == 'openclaw-agent.sqlite' or p.parts[-1].endswith(('-wal', '-shm', '.sock', '.pid'))): fail('live native state in agent archive')
             if p.parts[0] not in {'manifest.json', 'snapshot', 'agent', 'workspace', 'shared-skills', 'home'}: fail('unknown runtime export entry')
             if entry.name == 'manifest.json' and entry.size > 4 * 1024**2: fail('runtime manifest is too large')
             target = destination.joinpath(*p.parts); target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.isdir():
+                if p.parts[0] == 'manifest.json': fail('runtime manifest is not a regular file')
+                target.mkdir(exist_ok=True, mode=0o700); continue
             with target.open('xb') as out: shutil.copyfileobj(archive.extractfile(entry), out)
             target.chmod(0o700 if entry.mode & 0o111 else 0o600)
     return json.loads((destination / 'manifest.json').read_text())
@@ -353,21 +401,23 @@ def restore(home, agent, source, context):
         # The destination's system agent selection is not imported authority.
         if 'agents' in projected: projected['agents'] = {'defaults': {k: v for k, v in projected['agents'].get('defaults', {}).items() if k not in {'workspace', 'systemAgent'}}}
         merge_shared(projected, meta['shared_config'])
+        assert_local_codex(meta['shared_config'], meta['agent_config'])
         routes = imported_routes(meta['routes'], context.get('conversations', {}), context.get('destination_person'), agent)
         extras = stage / 'home'
         shared = stage / 'shared-skills'
         if shared.exists():
             for file in shared.rglob('*'):
-                if file.is_file(): copy_consistent(file, extras / '.openclaw/skills' / file.relative_to(shared))
+                destination = extras / '.openclaw/skills' / file.relative_to(shared)
+                if file.is_dir(): destination.mkdir(parents=True, exist_ok=True)
+                else: copy_consistent(file, destination)
         if extras.exists():
             commands = HELPERS | set(cfg.get('agents', {}).get('entries', {})) | {agent}
             for file in extras.rglob('*'):
-                if not file.is_file(): continue
                 rel = file.relative_to(extras)
                 if home_skip(rel, commands) and rel.parts[:2] != ('.openclaw', 'skills'): fail('runtime command in shared user data')
                 destination = home / rel
                 no_link_ancestors(destination, home)
-                if destination.exists() and (not destination.is_file() or destination.read_bytes() != file.read_bytes()): fail('conflicting shared user data at destination')
+                if destination.exists() and (file.is_dir() != destination.is_dir() or file.is_file() and not equal_files(destination, file)): fail('conflicting shared user data at destination')
         snapshot = stage / 'snapshot' / meta['snapshot']
         assert_snapshot_identity(snapshot, agent)
         assert_idle_database(snapshot / 'database.sqlite')
@@ -375,9 +425,9 @@ def restore(home, agent, source, context):
         initialize_config(home, agent, entry)
         native(home, 'backup', 'sqlite', 'verify', str(snapshot), '--json')
         native_data(home, 'prepare', agent, stage / 'native-prepare.json', agent_dir)
-        for plugin in meta['plugins']:
-            if not valid_plugin_spec(plugin.get('spec')): fail('invalid plugin reference')
-            native(home, 'plugins', 'install', plugin['spec'], '--force', '--pin', '--no-enable')
+        inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
+        for spec in missing_plugins(inspections, meta['plugins']):
+            native(home, 'plugins', 'install', spec, '--pin', '--no-enable')
         # Foreign user executables are data, not runnable target installations.
         expected = {'x86_64': 62, 'aarch64': 183, 'arm64': 183}.get(platform.machine())
         for tree in ['agent', 'workspace', 'home', 'shared-skills']:
@@ -398,11 +448,13 @@ def restore(home, agent, source, context):
         workspace.parent.mkdir(parents=True, exist_ok=True); shutil.copytree(stage / 'workspace', workspace)
         if extras.exists():
             for file in extras.rglob('*'):
-                if file.is_file() and not (home / file.relative_to(extras)).exists(): copy_consistent(file, home / file.relative_to(extras))
+                destination = home / file.relative_to(extras)
+                if file.is_dir(): destination.mkdir(parents=True, exist_ok=True)
+                elif not destination.exists(): copy_consistent(file, destination)
         patch = {**projected, 'agents': {**projected.get('agents', {}), 'ownership': 'explicit',
             'entries': {agent: entry}}}
-        # Host messaging and schedules are regenerated, never copied active.
-        patch['cron'] = {'enabled': False}; patch['hooks'] = {'enabled': False}
+        # Source host messaging/schedules are omitted. Existing destination
+        # switches stay unchanged; only a newly authored config disables them.
         file = stage / 'config-patch.json'; file.write_text(json.dumps(patch)); file.chmod(0o600)
         native(home, 'config', 'patch', '--file', str(file))
         data_file = stage / 'native-import.json'; data_file.write_text(json.dumps(meta)); data_file.chmod(0o600)
