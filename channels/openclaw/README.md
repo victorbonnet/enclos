@@ -232,3 +232,7 @@ frames never enter the durable outbox, and account shutdown revokes reporting.
 This covers answering through this channel. It does not report CLI work,
 scheduled runs or native background tasks, and native deferred ingress is not
 a complete Gateway run inventory. `tasks` and `held_tasks` remain unavailable.
+
+Native message targets require the calling agent's identity. OpenClaw's target
+resolver can inherit that identity during an enclos dispatch. A target lookup
+with no authenticated dispatch or caller identity returns no enclos route.
