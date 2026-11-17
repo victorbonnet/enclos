@@ -4783,10 +4783,23 @@ fn portable_export_materializes_file_credentials_while_stopped_and_cleans_them_o
         .unwrap();
     let python = lab.home.join(".hermes/hermes-agent/.hermes/bin/python");
     std::fs::create_dir_all(python.parent().unwrap()).unwrap();
-    crate::test_scripts::write_script(
-        &python,
-        "test -f \"$HOME/../secrets/source.env\" || exit 91\nprintf observed > \"$HOME/export-credentials-observed\"\nexec python3 \"$@\"\n",
-    );
+    let wrapper = r#"python3 - "$6" <<'PY'
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+source = home.parent / 'secrets/source.env'
+files = json.loads(sys.argv[1])['credential_files']
+staged = pathlib.Path(files[str(source)])
+assert staged.is_file() and 'API_KEY' in staged.read_text()
+(home / 'export-credentials-observed').write_text(str(staged))
+PY
+if [ -f "$HOME/retain-service-delivery" ]; then
+  mkdir -p "$HOME/../secrets"
+  printf 'live-service-delivery' > "$HOME/../secrets/source.env"
+fi
+if [ -f "$HOME/fail-export" ]; then exit 92; fi
+exec python3 "$@"
+"#;
+    crate::test_scripts::write_script(&python, wrapper);
     let secrets = lab.engine.layout.sandbox_secrets_dir("home");
     assert!(!secrets.exists());
     let archive = lab._dir.path().join("file-credentials.enclos");
@@ -4800,10 +4813,10 @@ fn portable_export_materializes_file_credentials_while_stopped_and_cleans_them_o
         !secrets.exists(),
         "temporary delivery must not outlive export"
     );
-    crate::test_scripts::write_script(
-        &python,
-        "test -f \"$HOME/../secrets/source.env\" || exit 91\nexit 92\n",
-    );
+    let staged = std::fs::read_to_string(lab.home.join("export-credentials-observed")).unwrap();
+    assert!(!Path::new(&staged).exists());
+    std::fs::write(lab.home.join("fail-export"), "").unwrap();
+    std::fs::write(lab.home.join("retain-service-delivery"), "").unwrap();
     assert!(
         lab.engine
             .export_agent(
@@ -4815,9 +4828,14 @@ fn portable_export_materializes_file_credentials_while_stopped_and_cleans_them_o
             )
             .is_err()
     );
+    let staged = std::fs::read_to_string(lab.home.join("export-credentials-observed")).unwrap();
     assert!(
-        !secrets.exists(),
-        "failed export must clean temporary delivery"
+        !Path::new(&staged).exists(),
+        "failed export must clean its own delivery"
+    );
+    assert_eq!(
+        std::fs::read_to_string(secrets.join("source.env")).unwrap(),
+        "live-service-delivery"
     );
 }
 

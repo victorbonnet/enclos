@@ -264,16 +264,16 @@ impl RuntimeAdapter for OpenClaw {
             name.as_str(),
         ]))
     }
-    fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
+    fn export_agent(
+        &self,
+        name: &AgentName,
+        prefix: &Path,
+        context: &str,
+    ) -> Option<super::RuntimeExport> {
         let archive = prefix.with_extension("tar.gz");
         Some(super::RuntimeExport {
             format: "openclaw-data-v1",
-            command: transfer(
-                "export",
-                name,
-                &archive,
-                &json!({"max_bytes": crate::agent_export::MAX_PAYLOAD_BYTES}).to_string(),
-            ),
+            command: transfer("export", name, &archive, context),
             archive,
         })
     }
@@ -886,7 +886,7 @@ mod tests {
     fn complete_exports_use_the_adapter_owned_format_and_reject_other_runtime_data() {
         let name: AgentName = "kilian".parse().unwrap();
         let export = OpenClaw
-            .export_agent(&name, Path::new("/sandbox/export"))
+            .export_agent(&name, Path::new("/sandbox/export"), "{}")
             .unwrap();
         assert_eq!(export.format, "openclaw-data-v1");
         assert_eq!(export.archive, Path::new("/sandbox/export.tar.gz"));
