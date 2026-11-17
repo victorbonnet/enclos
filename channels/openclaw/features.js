@@ -62,7 +62,7 @@ export function registerFeatures(api, { findTurn, assertTurn, running }) {
       return {
         name: 'enclos_request_access',
         label: 'Request sandbox access',
-        description: 'Ask the host\'s person for a sandbox policy scope. This requests access; it grants nothing. Wait for the person and updated policy context before trying again.',
+        description: 'Send a policy request to the host\'s person for one destination or path. This requests access; it grants nothing. Wait for the person and updated policy context before trying again.',
         parameters: { type: 'object', additionalProperties: false, required: ['kind', 'target', 'action'], properties: {
           kind: { type: 'string', enum: ['network', 'read', 'write'] },
           target: { type: 'string', minLength: 1, maxLength: 4096 },
@@ -75,7 +75,7 @@ export function registerFeatures(api, { findTurn, assertTurn, running }) {
               Buffer.byteLength(params.target) > 4096 || /[\x00-\x1f\x7f-\x9f]/u.test(params.target) ||
               (params.kind !== 'network' && !path.isAbsolute(params.target)) || typeof params.action !== 'string' ||
               !params.action.trim() || Buffer.byteLength(params.action) > 200 || /[\x00-\x1f\x7f-\x9f]/u.test(params.action) ||
-              (params.private != null && typeof params.private !== 'boolean')) throw new Error('request one explicit valid sandbox scope');
+              (params.private != null && typeof params.private !== 'boolean')) throw new Error('request one valid destination or path');
           const request = message('approval.request', { conversation: turn.conversation,
             access: { kind: params.kind, target: params.target, private: params.private === true }, action: params.action });
           turn.active.transport.enqueue(request);

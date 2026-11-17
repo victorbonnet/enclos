@@ -4,7 +4,7 @@ import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
-import { inboundMedia, mediaFolder, stageMedia } from './media.js';
+import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -148,10 +148,11 @@ export function createChannel(sdk = {}) {
             assertAuthority();
             const urls = [...new Set([...(payload.mediaUrl ? [payload.mediaUrl] : []), ...(payload.mediaUrls ?? [])])];
             if (urls.length && !hasMedia) throw new Error('enclos OpenClaw channel media is not enabled');
-            const attachments = urls.length ? await stageMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }) : [];
-            assertAuthority();
-            if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
-              { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            return withStagedMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }, attachments => {
+              assertAuthority();
+              if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
+                { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            });
           } },
         }); } finally { typing(false); }
       },
@@ -191,11 +192,13 @@ export function createChannel(sdk = {}) {
     if (!active) throw new Error('enclos account is not running');
     const assertAuthority = () => { ctx.signal?.throwIfAborted(); ctx.assertDirectAdapterHandoff?.(); assertCurrent(ctx.cfg, account, active.transport); };
     assertAuthority();
-    const attachments = await stageMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority });
-    await ctx.onPlatformSendDispatch?.(); assertAuthority();
-    const to = target(ctx.to, { ...account, home: active.transport.home });
-    const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
-    return { channel: 'enclos', to, messageId: id };
+    return withStagedMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority }, async attachments => {
+      await ctx.onPlatformSendDispatch?.();
+      assertAuthority();
+      const to = target(ctx.to, { ...account, home: active.transport.home });
+      const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
+      return { channel: 'enclos', to, messageId: id };
+    });
   }
 
   const plugin = {
@@ -243,7 +246,7 @@ export function createChannel(sdk = {}) {
         'The person is using the enclos mobile app. Use CommonMark, fenced code and narrow tables.',
         hasMedia ? 'For a file, write it to a permitted local path and send MEDIA:/absolute/path/file. Images and files travel through the app channel, never a host URL.' : 'This channel currently sends text. Do not claim a file was delivered.',
         'For a static HTML artefact, use a self-contained UTF-8 .html file with inline CSS and data images/fonts. Scripts, remote assets, forms and automatic navigation are unavailable; deliberate HTTP(S) links open the browser.',
-        'If sandbox policy refuses access, request the exact scope with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
+        'If sandbox policy refuses access, request the exact access with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
         'Remote markdown images are links; HTML in text is literal. Home is the bridge-owned permanent destination for output without another conversation.',
       ] }),
     },
