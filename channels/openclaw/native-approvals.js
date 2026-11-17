@@ -322,12 +322,15 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
         if (!owner.isCurrent() || !negotiated(transport.bridgeHello)) throw new ProtocolError('unsupported', 'native approval scopes are not negotiated', control.id);
         if (!record) throw new ProtocolError('conflict', 'this exact native approval is no longer pending', control.id);
         const answer = control.answer, requested = answer?.action;
-        if (answer?.kind !== 'approval' || Object.keys(answer).sort().join(',') !== 'action,kind' || !record.definition.approval.actions.includes(requested)) throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
+        if (answer?.kind !== 'approval' || Object.keys(answer).sort().join(',') !== 'action,kind' || typeof requested !== 'string') throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
         const signatureFailure = checkDecision(key, agent, record, control, Math.floor(now() / 1000));
         const refused = () => new ProtocolError('not_allowed', 'The bridge signature for this runtime approval is missing or invalid.', control.id);
         if (signatureFailure) {
-          warn(`enclos refused a signed runtime approval for ${record.id}: ${signatureFailure}`);
+          warn(`enclos refused a runtime approval decision for ${record.id}: ${signatureFailure}`);
           if (!binding || record.state !== 'pending' || record.attempted || !owner.target(binding.native)) throw refused();
+        }
+        if (!signatureFailure && !record.definition.approval.actions.includes(requested)) {
+          throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
         }
         const action = signatureFailure ? 'deny' : requested;
         const hash = digest([control.question, control.conversation, control.answer]);
