@@ -1,3 +1,4 @@
+import { createECDH } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -49,3 +50,6 @@ export async function bridge(socket) {
     async close() { if (!peer.destroyed) { peer.destroy(); await once(peer, 'close'); } },
   };
 }
+
+// A public P-256 fixture key for tests that only negotiate approval capabilities.
+export const bridgeApprovalFixtureKey = createECDH('prime256v1').generateKeys('base64url');
