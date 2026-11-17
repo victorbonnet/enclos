@@ -1013,13 +1013,13 @@ mod tests {
             )
         });
         checkpoint.0.wait();
-        // Same opaque runtime revision and same bridge revision: the false-only
-        // capability update must still revoke admission after channel-open delay.
+        // The same opaque runtime hold gets a new bridge revision when capability
+        // is revoked. An in-flight request must recheck it after opening.
         hub.held_tasks_report(&store, AGENT, vec![not_resumable("t1")])
             .unwrap();
         checkpoint.1.wait();
         let error = worker.join().unwrap().unwrap_err();
-        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert_eq!(error.code, ErrorCode::Conflict);
         assert!(resume_lines(&store).is_empty());
         assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
         assert!(

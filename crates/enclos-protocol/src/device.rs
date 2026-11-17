@@ -1272,6 +1272,22 @@ mod tests {
         assert_eq!(decode_to_device(&wire).unwrap().body, list);
         assert_eq!(AGENT_FORGET, "agent.forget");
     }
+    #[test]
+    fn invalid_optional_reply_metadata_never_hides_the_message() {
+        let message = agent_text("Still readable");
+        for replies in [
+            serde_json::json!(["Same", "Same"]),
+            serde_json::json!([1]),
+            serde_json::json!(["two\nlines"]),
+            serde_json::json!("not an array"),
+        ] {
+            let mut json = serde_json::to_value(&message).unwrap();
+            json["suggested_replies"] = replies;
+            let decoded: ConversationMessage = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.text, "Still readable");
+            assert!(decoded.suggested_replies.is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1457,21 +1473,5 @@ mod usage_tests {
         };
         let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
         assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
-    }
-    #[test]
-    fn invalid_optional_reply_metadata_never_hides_the_message() {
-        let message = agent_text("Still readable");
-        for replies in [
-            serde_json::json!(["Same", "Same"]),
-            serde_json::json!([1]),
-            serde_json::json!(["two\nlines"]),
-            serde_json::json!("not an array"),
-        ] {
-            let mut json = serde_json::to_value(&message).unwrap();
-            json["suggested_replies"] = replies;
-            let decoded: ConversationMessage = serde_json::from_value(json).unwrap();
-            assert_eq!(decoded.text, "Still readable");
-            assert!(decoded.suggested_replies.is_empty());
-        }
     }
 }

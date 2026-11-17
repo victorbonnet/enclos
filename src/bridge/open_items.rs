@@ -134,7 +134,19 @@ impl Hub {
                     kind: OpenItemKind::PolicyRequest,
                     agent: (!a.agent.is_empty()).then_some(a.agent),
                     conversation: a.conversation.and_then(|id| ConversationId::new(id).ok()),
-                    summary: summary(&a.action),
+                    summary: summary(&format!(
+                        "{} {}",
+                        match a.access.kind {
+                            enclos_protocol::approval::AccessKind::Network => "Connect to",
+                            enclos_protocol::approval::AccessKind::Write => "Write to",
+                            enclos_protocol::approval::AccessKind::Read => "Read",
+                        },
+                        enclos_protocol::visible::revealed(if a.scope.trim().is_empty() {
+                            &a.access.target
+                        } else {
+                            &a.scope
+                        })
+                    )),
                     since: a.time,
                     expired: false,
                 });

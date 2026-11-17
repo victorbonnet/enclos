@@ -2522,6 +2522,14 @@ fn open_item_snapshots_are_person_scoped_bounded_and_fail_visibly() {
                 Some(OWNER),
             )
             .unwrap();
+        store
+            .settle_question(
+                AGENT,
+                &q.id,
+                Settlement::reported(QuestionState::Expired, None),
+                &format!("expire-{i}"),
+            )
+            .unwrap();
     }
     let frames = hub.open_item_frames(&store, OWNER).unwrap();
     assert_eq!(frames.len(), 3);
@@ -2589,8 +2597,10 @@ fn the_index_combines_canonical_requests_without_sharing_host_person_authority()
     }
     let task = serde_json::from_value(serde_json::json!({"task":"held", "title":"Review", "reason":"Choose the next step", "since":1, "revision":"hold-1", "resume":"Review with Director", "resumable":false})).unwrap();
     store.report_held_tasks(AGENT, "owned", &[task]).unwrap();
-    let policy = serde_json::from_value(serde_json::json!({"request":"policy", "sandbox":"lab", "agent":AGENT, "access":{"kind":"network", "target":"example.com:443"}, "action":"Allow the download?", "time":2, "state":"pending", "change":"", "restart":false, "revision":"r1", "available":false})).unwrap();
-    store.put_approval(&policy).unwrap();
+    let policy = serde_json::from_value(serde_json::json!({"request":"policy", "sandbox":"lab", "agent":AGENT, "access":{"kind":"network", "target":"example.com:443"}, "scope":"resolved.example.com:443", "action":"Allow the download?", "time":2, "state":"pending", "change":"", "restart":false, "revision":"r1", "available":false})).unwrap();
+    store.create_approval(&policy).unwrap();
+    let frames = hub.open_item_frames(&store, OWNER).unwrap();
+    assert!(frames.iter().any(|frame| matches!(frame, ToDevice::OpenItems { items, .. } if items.iter().any(|item| item.kind == OpenItemKind::PolicyRequest && item.summary == "Connect to resolved.example.com:443"))));
     let kinds = |person| {
         hub.open_item_frames(&store, person)
             .unwrap()
@@ -2616,4 +2626,49 @@ fn the_index_combines_canonical_requests_without_sharing_host_person_authority()
     // Changing the host's person removes host-wide controls, while owned ordinary questions remain.
     set_host(&hub, Some("guest@example.com"));
     assert_eq!(kinds(OWNER), [OpenItemKind::Question]);
+}
+
+#[test]
+fn live_open_item_snapshots_require_opt_in_and_current_person_pairing() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let (_guest, guest_rx) = phone(&hub, &store, "guest", "guest@example.com");
+    let q = definition("snapshot-live");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &q,
+            "ask-live",
+            Some(OWNER),
+        )
+        .unwrap();
+    hub.publish_open_items(&store, OWNER);
+    assert!(rx.try_recv().is_err());
+    hub.open_item_devices
+        .lock()
+        .unwrap()
+        .extend([device.id.clone(), "guest".to_owned()]);
+    hub.publish_open_items(&store, OWNER);
+    assert!(
+        matches!(next(&rx), ToDevice::OpenItems { complete: true, items, .. } if items.len() == 1)
+    );
+    assert!(guest_rx.try_recv().is_err());
+    store
+        .settle_question(
+            AGENT,
+            &q.id,
+            Settlement::reported(
+                QuestionState::Answered,
+                Some(QuestionAnswer::Choices { indices: vec![0] }),
+            ),
+            "answer-live",
+        )
+        .unwrap();
+    hub.publish_open_items(&store, OWNER);
+    assert!(
+        matches!(next(&rx), ToDevice::OpenItems { complete: true, items, .. } if items.is_empty())
+    );
+    store.remove_device(&device.id).unwrap();
+    hub.publish_open_items(&store, OWNER);
+    assert!(rx.try_recv().is_err());
 }

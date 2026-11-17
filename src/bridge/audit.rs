@@ -202,9 +202,18 @@ mod tests {
         ] {
             assert!(host.iter().any(|c| c == capability), "{host:?}");
         }
-        assert_eq!(host.len(), 5, "{host:?}");
+        assert_eq!(host.len(), 8, "{host:?}");
         // Every person reads the usage of their own conversations.
-        assert_eq!(hub.capabilities("guest"), ["usage", "usage.series"]);
+        assert_eq!(
+            hub.capabilities("guest"),
+            [
+                "open_items",
+                "question.close",
+                "suggested_replies",
+                "usage",
+                "usage.series"
+            ]
+        );
         let id = || MessageId::new("audit-request").unwrap();
         let reply = hub
             .host_audit(&store, &device, "alice", id(), None)
@@ -241,7 +250,16 @@ mod tests {
                 .code,
             ErrorCode::NotAllowed
         );
-        assert_eq!(hub.capabilities("alice"), ["usage", "usage.series"]);
+        assert_eq!(
+            hub.capabilities("alice"),
+            [
+                "open_items",
+                "question.close",
+                "suggested_replies",
+                "usage",
+                "usage.series"
+            ]
+        );
         store.set_host("alice").unwrap();
         store.remove_device(&device.id).unwrap();
         assert_eq!(

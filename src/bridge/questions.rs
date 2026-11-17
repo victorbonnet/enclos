@@ -555,7 +555,20 @@ impl Hub {
             .map_err(|code| failure(original.clone(), code, "No such question."))?;
         store
             .close_expired_question(&question, revision, person, original.as_str())
-            .map_err(|e| failure(original.clone(), ErrorCode::Conflict, e.to_string()))?;
+            .map_err(|error| match error {
+                QuestionStoreError::Sql(error) => {
+                    eprintln!("enclos app: could not close a question reminder: {error}");
+                    failure(
+                        original.clone(),
+                        ErrorCode::Internal,
+                        "The request could not be closed. Reconnect and try again.",
+                    )
+                }
+                QuestionStoreError::Unknown => {
+                    failure(original.clone(), ErrorCode::NotFound, "No such question.")
+                }
+                error => failure(original.clone(), ErrorCode::Conflict, error.to_string()),
+            })?;
         self.publish_open_items(store, person);
         Ok(ToDevice::QuestionClosed {
             of: original,

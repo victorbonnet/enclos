@@ -1839,16 +1839,17 @@ impl Store {
                 self.add_attachment(file, first)?;
             }
         }
-        if let Some((last, _)) = pieces.last() {
-            if !replies.is_empty() && enclos_protocol::suggested_replies::validate(replies) {
-                self.db.execute(
-                    "UPDATE messages SET suggested_replies=?2 WHERE id=?1",
-                    params![
-                        last,
-                        serde_json::to_string(replies).expect("strings serialize")
-                    ],
-                )?;
-            }
+        if let Some((last, _)) = pieces.last()
+            && !replies.is_empty()
+            && enclos_protocol::suggested_replies::validate(replies)
+        {
+            self.db.execute(
+                "UPDATE messages SET suggested_replies=?2 WHERE id=?1",
+                params![
+                    last,
+                    serde_json::to_string(replies).expect("strings serialize")
+                ],
+            )?;
         }
         transaction.commit()?;
         Ok(Some(seqs))
