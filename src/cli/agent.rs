@@ -116,7 +116,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             metadata_only,
             approved_plugins,
         } => {
-            match engine.import_agent_export(
+            match engine.import_agent_export_with_options(
                 by,
                 &sandbox,
                 agent.clone(),
