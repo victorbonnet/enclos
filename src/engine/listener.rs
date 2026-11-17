@@ -70,8 +70,10 @@ impl HostServices {
             .filter(|(pid, _)| *pid == root.pid)
             .map(|(_, addr)| *addr)
             .collect();
-        let port =
-            chosen(service, root.pid, &held, &snapshot.ephemeral).map_err(|e| e.to_string())?;
+        let port = chosen(service, root.pid, &held, listener.ports, || {
+            Ok(snapshot.ephemeral.clone())
+        })
+        .map_err(|e| e.to_string())?;
         let address = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
         alone_at(
             service,
