@@ -108,14 +108,17 @@ protocol, routing, files and authority tests still run. CI installs the tested
 Changing the tested runtime version requires updating and re-running the native
 contract probes; the runtime installer itself remains official/as served.
 
-## Final stack checks
+## Historical combined-stack checks (superseded)
 
-The combined source passed **1,564 Rust tests**: 1,331 library, 67 CLI-unit,
+These counts record an earlier version of the combined stack. The current
+PR heads and their GitHub Actions results are recorded in issue #218.
+
+That version passed **1,564 Rust tests**: 1,331 library, 67 CLI-unit,
 100 CLI-integration, 24 documentation, 36 protocol and six shared fixtures.
 Workspace Clippy, formatting and `cargo deny` passed. Destructive runner-only
 host-service/member probes were not enabled on this Mac.
 
-The final OpenClaw suite passed **67 tests with zero skips** against the installed
+The OpenClaw suite at that point passed **67 tests with zero skips** against the installed
 SDK; six launcher/owner-helper tests also passed. Hermes Python 3.13 verification
 ran 103 cases: **102 passed, one optional legacy-source skip**. This includes
 18 native routine, 14 native question and eight native approval checks, plus all
