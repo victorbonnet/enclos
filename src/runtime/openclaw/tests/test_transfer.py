@@ -14,6 +14,14 @@ transfer = importlib.util.module_from_spec(spec); spec.loader.exec_module(transf
 
 
 class TransferTests(unittest.TestCase):
+    def test_native_install_provenance_prompt_is_answered_without_overwrite_flags(self):
+        command = [sys.executable, '-c', "import sys; assert sys.stdin.isatty() and sys.stdout.isatty(); print('Install this non-ClawHub plugin source? [y/N] ',end='',flush=True); answer=input(); assert answer=='y'; print('native-install-consented')"]
+        result = transfer.terminal_command(command, os.environ, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b'native-install-consented', result.stdout)
+        other = [sys.executable, '-c', "import select,sys; print('Different authorization? [y/N] ',end='',flush=True); assert not select.select([sys.stdin],[],[],0.1)[0]"]
+        self.assertEqual(transfer.terminal_command(other, os.environ, timeout=5).returncode, 0)
+
     def test_bridge_routes_rebase_ownership_without_rekeying_native_history_or_replaying(self):
         peer = transfer.digest(['old', 'alice'])
         result = transfer.imported_routes({'old': {'person': 'alice', 'peer': peer}}, {'old': 'new'}, 'bob', 'kilian')

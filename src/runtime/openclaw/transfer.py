@@ -132,11 +132,11 @@ def equal_files(first, second):
 
 
 def terminal_command(command, env, timeout=600):
-    # The pinned CLI requires a terminal before honoring global --yes for
-    # npm provenance consent. Keep install mode (no --force/update), so its
-    # native installer still refuses a concurrently created target plugin.
+    # The pinned CLI exposes provenance consent only through a terminal
+    # or --force, which also enables overwrites. Answer that exact prompt
+    # once, preserving native install mode and its concurrent-target refusal.
     master, slave = pty.openpty()
-    output = bytearray(); deadline = time.monotonic() + timeout
+    output = bytearray(); prompt = bytearray(); consented = False; deadline = time.monotonic() + timeout
     try:
         with subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env) as child:
             os.close(slave); slave = None
@@ -148,6 +148,9 @@ def terminal_command(command, env, timeout=600):
                     except OSError: break  # The terminal slave closed.
                     if not chunk: break
                     output.extend(chunk[:max(0, 65536 - len(output))])
+                    prompt.extend(chunk); del prompt[:-4096]
+                    if not consented and b'Install this non-ClawHub plugin source? [y/N] ' in prompt:
+                        os.write(master, b'y\r'); consented = True
                 child.wait(timeout=max(0.1, deadline - time.monotonic()))
             except BaseException:
                 child.kill(); child.wait(); raise
@@ -497,7 +500,7 @@ def restore(home, agent, source, context):
         native_data(home, 'prepare', agent, stage / 'native-prepare.json', agent_dir)
         inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
         for spec in missing_plugins(inspections, meta['plugins']):
-            native(home, '--yes', 'plugins', 'install', spec, '--pin', '--no-enable', terminal=True)
+            native(home, 'plugins', 'install', spec, '--pin', '--no-enable', '--accept-capabilities', terminal=True)
         # Foreign user executables are data, not runnable target installations.
         expected = {'x86_64': 62, 'aarch64': 183, 'arm64': 183}.get(platform.machine())
         for tree in ['agent', 'workspace', 'home', 'shared-skills']:
