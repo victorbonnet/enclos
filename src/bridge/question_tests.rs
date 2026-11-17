@@ -163,6 +163,140 @@ fn definition(id: &str) -> QuestionDefinition {
 fn next(rx: &Receiver<ToDevice>) -> ToDevice {
     rx.recv_timeout(Duration::from_secs(2)).unwrap()
 }
+
+#[test]
+fn an_expired_information_question_stays_open_without_reentering_native_answer_delivery() {
+    let (_dir, hub, store, phone, rx) = fixture();
+    let q = definition("late-reply");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &q,
+            "ask-late",
+            Some(OWNER),
+        )
+        .unwrap();
+    store
+        .settle_question(
+            AGENT,
+            &q.id,
+            Settlement::reported(QuestionState::Expired, None),
+            "expire-late",
+        )
+        .unwrap();
+    let foreign = definition("foreign-late");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("foreign").unwrap(),
+            &foreign,
+            "ask-foreign",
+            Some(OWNER),
+        )
+        .unwrap();
+    let frames = hub.open_item_frames(&store, OWNER).unwrap();
+    let ToDevice::OpenItems {
+        items,
+        reset,
+        complete,
+        ..
+    } = &frames[0]
+    else {
+        panic!("snapshot")
+    };
+    assert!(*reset && *complete);
+    assert_eq!(items.len(), 1);
+    assert!(items[0].expired);
+    assert_eq!(items[0].id, "late-reply");
+    assert_eq!(items[0].summary, q.text);
+    assert_eq!(store.pending_questions_for(OWNER).unwrap().len(), 0);
+    assert!(
+        hub.question_answer(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("late-answer").unwrap(),
+            AnswerRequest {
+                question: q.id.clone(),
+                revision: 1,
+                answer: QuestionAnswer::Choices { indices: vec![0] }
+            }
+        )
+        .is_err()
+    );
+    assert!(store.pending("lab", "coder").unwrap().is_empty());
+    assert_eq!(
+        store.question(&q.id).unwrap().unwrap().info.state,
+        QuestionState::Expired
+    );
+    assert!(
+        rx.try_iter()
+            .all(|f| !matches!(f, ToDevice::QuestionResult { .. }))
+    );
+}
+
+#[test]
+fn a_late_answer_never_revives_an_expired_runtime_approval() {
+    let (_dir, hub, store, phone, _rx) = fixture();
+    let mut q = definition("expired-command");
+    q.choices.clear();
+    q.multiple = false;
+    q.approval = Some(enclos_protocol::question::RuntimeApprovalDefinition {
+        command: "touch approved".into(),
+        reason: "Test gate".into(),
+        actions: vec![
+            enclos_protocol::question::RuntimeApprovalAction::Once,
+            enclos_protocol::question::RuntimeApprovalAction::Deny,
+        ],
+        smart_denied: false,
+        patterns: vec![],
+    });
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &q,
+            "ask-command",
+            Some(OWNER),
+        )
+        .unwrap();
+    store
+        .settle_question(
+            AGENT,
+            &q.id,
+            Settlement::reported(QuestionState::Expired, None),
+            "expire-command",
+        )
+        .unwrap();
+    assert!(
+        hub.open_item_frames(&store, OWNER)
+            .unwrap()
+            .iter()
+            .all(|f| matches!(f, ToDevice::OpenItems { items, .. } if items.is_empty()))
+    );
+    assert!(
+        hub.question_answer(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("expired-allow").unwrap(),
+            AnswerRequest {
+                question: q.id.clone(),
+                revision: 1,
+                answer: QuestionAnswer::Approval {
+                    action: enclos_protocol::question::RuntimeApprovalAction::Once
+                },
+            }
+        )
+        .is_err()
+    );
+    assert!(store.pending("lab", "coder").unwrap().is_empty());
+    assert_eq!(
+        store.question(&q.id).unwrap().unwrap().info.state,
+        QuestionState::Expired
+    );
+}
 fn ask(native: &mut Native, rx: &Receiver<ToDevice>, definition: &QuestionDefinition) {
     ask_with(native, rx, definition, "ask");
 }
@@ -1255,7 +1389,10 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
     let mut sync = |since| {
         let message = encode_line(&Envelope::new(
             MessageId::new(format!("sync-{since}")).unwrap(),
-            FromDevice::Sync { since },
+            FromDevice::Sync {
+                since,
+                open_items: false,
+            },
         ));
         socket
             .send(Message::Binary(
@@ -2294,4 +2431,189 @@ fn an_answer_the_bridge_cannot_check_answers_internal_not_not_found() {
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[test]
+fn closing_an_expired_reminder_preserves_native_state_and_survives_reopen() {
+    let (_dir, hub, store, device, _rx) = fixture();
+    let q = definition("close-q");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &q,
+            "ask-close",
+            Some(OWNER),
+        )
+        .unwrap();
+    assert!(
+        store
+            .close_expired_question(&q.id, 0, OWNER, "early-close")
+            .is_err()
+    );
+    store
+        .settle_question(
+            AGENT,
+            &q.id,
+            Settlement::reported(QuestionState::Expired, None),
+            "expire-close",
+        )
+        .unwrap();
+    let before = store.question(&q.id).unwrap().unwrap();
+    assert!(
+        store
+            .close_expired_question(&q.id, 0, OWNER, "stale-close")
+            .is_err()
+    );
+    assert!(
+        store
+            .close_expired_question(&q.id, 1, "guest@example.com", "foreign-close")
+            .is_err()
+    );
+    assert!(matches!(
+        hub.question_close(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("close").unwrap(),
+            q.id.clone(),
+            1
+        )
+        .unwrap(),
+        ToDevice::QuestionClosed { .. }
+    ));
+    // A lost receipt can be retried; neither native state nor history changes.
+    assert!(
+        store
+            .close_expired_question(&q.id, 1, OWNER, "close-again")
+            .is_ok()
+    );
+    assert_eq!(
+        before,
+        hub.store().unwrap().question(&q.id).unwrap().unwrap()
+    );
+    assert!(
+        hub.store()
+            .unwrap()
+            .open_questions_for(OWNER)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.pending("lab", "coder").unwrap().is_empty());
+}
+
+#[test]
+fn open_item_snapshots_are_person_scoped_bounded_and_fail_visibly() {
+    let (_dir, hub, store, _device, _rx) = fixture();
+    for i in 0..49 {
+        let id = format!("many-{i}");
+        let conversation = format!("conversation-{i}");
+        store
+            .conversation(&conversation, "lab", "coder", OWNER)
+            .unwrap();
+        let mut q = definition(&id);
+        q.text = "\"".repeat(300);
+        store
+            .ask_question(
+                AGENT,
+                &ConversationId::new(conversation).unwrap(),
+                &q,
+                &format!("ask-{i}"),
+                Some(OWNER),
+            )
+            .unwrap();
+    }
+    let frames = hub.open_item_frames(&store, OWNER).unwrap();
+    assert_eq!(frames.len(), 3);
+    let mut total = 0;
+    for (i, frame) in frames.iter().enumerate() {
+        let ToDevice::OpenItems {
+            revision,
+            reset,
+            complete,
+            unavailable,
+            items,
+        } = frame
+        else {
+            panic!("snapshot")
+        };
+        assert_eq!(*revision, 1);
+        assert_eq!(*reset, i == 0);
+        assert_eq!(*complete, i == 2);
+        assert!(!unavailable);
+        assert!(items.len() <= 24);
+        total += items.len();
+        assert!(
+            encode_line(&Envelope::new(
+                MessageId::new("00000000-0000-0000-0000-000000000000").unwrap(),
+                frame.clone()
+            ))
+            .len()
+                <= enclos_protocol::device::MAX_DEVICE_MESSAGE
+        );
+    }
+    assert_eq!(total, 49);
+    assert!(
+        matches!(&hub.open_item_frames(&store, "guest@example.com").unwrap()[0], ToDevice::OpenItems { revision: 1, items, .. } if items.is_empty())
+    );
+    store
+        .db
+        .execute(
+            "UPDATE questions SET definition='not json' WHERE id='many-0'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        matches!(&hub.open_item_frames(&store, OWNER).unwrap()[0], ToDevice::OpenItems { revision: 2, unavailable: true, items, .. } if items.is_empty())
+    );
+}
+
+#[test]
+fn the_index_combines_canonical_requests_without_sharing_host_person_authority() {
+    use enclos_protocol::open_items::OpenItemKind;
+    let (_dir, hub, store, _device, _rx) = fixture();
+    set_host(&hub, Some(OWNER));
+    for (id, definition) in [
+        ("ordinary", definition("ordinary")),
+        ("command", approval_definition("command", false)),
+    ] {
+        store
+            .ask_question(
+                AGENT,
+                &ConversationId::new("owned").unwrap(),
+                &definition,
+                &format!("ask-{id}"),
+                Some(OWNER),
+            )
+            .unwrap();
+    }
+    let task = serde_json::from_value(serde_json::json!({"task":"held", "title":"Review", "reason":"Choose the next step", "since":1, "revision":"hold-1", "resume":"Review with Director", "resumable":false})).unwrap();
+    store.report_held_tasks(AGENT, "owned", &[task]).unwrap();
+    let policy = serde_json::from_value(serde_json::json!({"request":"policy", "sandbox":"lab", "agent":AGENT, "access":{"kind":"network", "target":"example.com:443"}, "action":"Allow the download?", "time":2, "state":"pending", "change":"", "restart":false, "revision":"r1", "available":false})).unwrap();
+    store.put_approval(&policy).unwrap();
+    let kinds = |person| {
+        hub.open_item_frames(&store, person)
+            .unwrap()
+            .into_iter()
+            .flat_map(|frame| match frame {
+                ToDevice::OpenItems { items, .. } => items,
+                _ => panic!("snapshot"),
+            })
+            .map(|item| item.kind)
+            .collect::<Vec<_>>()
+    };
+    let all = kinds(OWNER);
+    assert_eq!(all.len(), 4);
+    for kind in [
+        OpenItemKind::Question,
+        OpenItemKind::RuntimeApproval,
+        OpenItemKind::HeldTask,
+        OpenItemKind::PolicyRequest,
+    ] {
+        assert!(all.contains(&kind));
+    }
+    assert!(kinds("guest@example.com").is_empty());
+    // Changing the host's person removes host-wide controls, while owned ordinary questions remain.
+    set_host(&hub, Some("guest@example.com"));
+    assert_eq!(kinds(OWNER), [OpenItemKind::Question]);
 }

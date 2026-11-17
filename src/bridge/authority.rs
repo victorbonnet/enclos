@@ -18,6 +18,9 @@ impl Hub {
     /// Append each supported feature here so authentication has one capability list.
     pub(super) fn capabilities(&self, person: &str) -> Vec<String> {
         let mut capabilities = vec![
+            "open_items".to_owned(),
+            "question.close".to_owned(),
+            "suggested_replies".to_owned(),
             enclos_protocol::device::USAGE.to_owned(),
             enclos_protocol::device::USAGE_SERIES.to_owned(),
         ];

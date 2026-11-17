@@ -259,6 +259,21 @@ impl Store {
         cards(&self.db, "c.owner = ?1 AND h.state = 'held'", person)
     }
 
+    /// The attention index must not turn an unreadable held card into an empty list.
+    pub fn indexed_held_tasks_for(&self, person: &str) -> rusqlite::Result<Vec<StoredHeldTask>> {
+        self.db
+            .prepare(&format!(
+                "{HELD_COLUMNS} WHERE c.owner=?1 AND h.state='held' ORDER BY h.rowid"
+            ))?
+            .query_map([person], read_card)?
+            .map(|row| {
+                row?.map_err(|why| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(why)))
+                })
+            })
+            .collect()
+    }
+
     /// Takes `tasks`, every task `agent`'s runtime holds now, already
     /// accepted ([`enclos_protocol::held_task::accept`]), into the cards of
     /// `home`, its Home, in one transaction: a task newly held (or held

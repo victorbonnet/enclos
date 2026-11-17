@@ -343,6 +343,7 @@ impl Hub {
             }
         }
         store.finish_deletion(id, person, device).map_err(storage)?;
+        self.publish_open_items(store, person);
         self.groups.lock().expect("not poisoned").remove(id);
         self.deliver(
             person,

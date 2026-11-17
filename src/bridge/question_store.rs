@@ -135,7 +135,7 @@ fn history_message(
     question: &str,
     kind: &str,
 ) -> rusqlite::Result<Option<Message>> {
-    db.query_row("SELECT seq,id,conversation,person,text,kind,at,speaker,question,held_task FROM messages WHERE question=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1", params![question,kind], message_row).optional()
+    db.query_row("SELECT seq,id,conversation,person,text,kind,at,speaker,question,held_task,suggested_replies FROM messages WHERE question=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1", params![question,kind], message_row).optional()
 }
 
 fn origin_conversation(
@@ -246,19 +246,94 @@ fn settlement_text(info: &QuestionInfo, confirmed: bool) -> String {
 }
 
 impl Store {
+    pub fn close_expired_question(
+        &self,
+        id: &QuestionId,
+        revision: u64,
+        person: &str,
+        request: &str,
+    ) -> Result<(), QuestionStoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current = question_in(&tx, id.as_str())?
+            .filter(|q| q.owner == person && q.info.definition.approval.is_none())
+            .ok_or(QuestionStoreError::Unknown)?;
+        if current.info.state != QuestionState::Expired || current.info.revision != revision {
+            return Err(QuestionStoreError::Conflict);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO question_closures(question,person,request) VALUES (?1,?2,?3)",
+            params![id.as_str(), person, request],
+        )?;
+        let closed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM question_closures WHERE question=?1 AND person=?2)",
+            params![id.as_str(), person],
+            |r| r.get(0),
+        )?;
+        if !closed {
+            return Err(QuestionStoreError::Conflict);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn question_time(&self, id: &QuestionId) -> rusqlite::Result<i64> {
+        self.db.query_row(
+            "SELECT m.at FROM questions q JOIN messages m ON m.id=q.ask_message WHERE q.id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+    }
+
     pub fn question(&self, id: &QuestionId) -> rusqlite::Result<Option<StoredQuestion>> {
         question_in(&self.db, id.as_str())
     }
 
     pub fn pending_questions_for(&self, person: &str) -> rusqlite::Result<Vec<StoredQuestion>> {
-        let sql =
-            format!("{QUESTION_COLUMNS} WHERE c.owner=?1 AND q.state='pending' ORDER BY q.rowid");
-        let rows = self
-            .db
+        Ok(self
+            .open_questions_for(person)?
+            .into_iter()
+            .filter(|q| q.info.state == QuestionState::Pending)
+            .collect())
+    }
+
+    fn open_question_rows(&self, person: &str) -> rusqlite::Result<Vec<QuestionRow>> {
+        let sql = format!(
+            "{QUESTION_COLUMNS} WHERE c.owner=?1 AND q.state IN ('pending','expired') AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=q.id AND x.person=c.owner) ORDER BY q.rowid"
+        );
+        self.db
             .prepare(&sql)?
             .query_map([person], read_question)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.into_iter().filter_map(usable).collect())
+            .collect()
+    }
+
+    pub fn open_questions_for(&self, person: &str) -> rusqlite::Result<Vec<StoredQuestion>> {
+        let rows = self.open_question_rows(person)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(usable)
+            .filter(|q| {
+                q.info.state == QuestionState::Pending || q.info.definition.approval.is_none()
+            })
+            .collect())
+    }
+
+    pub fn indexed_questions_for(&self, person: &str) -> rusqlite::Result<Vec<StoredQuestion>> {
+        let rows = self.open_question_rows(person)?;
+        rows.into_iter()
+            .map(|(_, parsed)| {
+                parsed.map_err(|why| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(why)))
+                })
+            })
+            .filter(|q| {
+                q.as_ref().map_or(true, |q| {
+                    q.info.state == QuestionState::Pending || q.info.definition.approval.is_none()
+                })
+            })
+            .collect()
     }
 
     /// Every pending question: its agent, id, and when it was asked

@@ -4,6 +4,7 @@ use crate::bridge::store::MAX_MIME_BYTES;
 /// An agent's text in its own conversation, as the bridge stores it.
 fn agent_text(text: &str) -> ConversationMessage {
     ConversationMessage {
+        suggested_replies: Vec::new(),
         conversation: ConversationId::new("c-1").unwrap(),
         agent: "lab/main".to_owned(),
         from: "agent".to_owned(),
@@ -3715,6 +3716,7 @@ fn a_forgotten_device_is_unpaired_and_logged() {
 /// An agent's message in `c-1` of `lab/main`, as the plugin leg gives it.
 fn agent_says(text: &str) -> ConversationMessage {
     ConversationMessage {
+        suggested_replies: Vec::new(),
         question: None,
         held_task: None,
         conversation: ConversationId::new("c-1").unwrap(),

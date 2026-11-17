@@ -1,11 +1,15 @@
 ---
 name: app-questions
-description: Use when asking a person for a choice or missing information through the enclos mobile app.
+description: Use when asking a person for a choice or missing information, or sending a digest of blocked work with reply buttons, through the enclos mobile app.
 ---
 
 # App questions
 
 Use this skill when a decision or missing detail needs the person's answer in the enclos app. Choose routine, low-stakes details yourself.
+
+Explain what is blocked, why, and what the person can decide in one or two plain sentences. Offer two or three short actionable choices, recommendation first. Keep internal run IDs, paths, logs and handoff rules in task reports. Example: “Inbox filters reset when you return from an agent. Allow a fix and independent testing?” Choices: “Fix Inbox filters”, “Keep paused”.
+
+For a digest that should end your turn rather than wait, call `suggest_replies` with up to four literal replies, then send the short explanation as your next message in this conversation. Each button sends its exact text as the person's ordinary message on their next turn. The buttons remain until that person sends another message. Use distinct replies that name the decision, such as “Fix Inbox filters”, so an answer cannot be confused with another blocked task.
 
 1. Ask through the native `clarify` tool. Put the question in `question` and short option labels only in `choices`. The app shows tappable rows, an Other text field and Skip. In a one-to-one conversation the person can also reply in the composer with an option's number or text, or "skip"; any other message cancels the question and reaches you as a message. In a group, a message waits for your turn to end, so the person answers on the card.
 2. Put your recommendation first. Hermes adds the recommendation label; the person selects their own answer.
@@ -30,7 +34,7 @@ For a free-text question, omit `choices`:
 clarify({"questions":[{"question":"What name should the report use?"}]})
 ```
 
-Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer. An unanswered question times out after an hour; continue from the result Hermes returns.
+Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer. An unanswered live question times out after an hour; continue from the result Hermes returns. Updated apps keep expired information questions in Needs you. The person can open a reply draft in a separate conversation, review it, and send it as a new contextual message; the expired native waiter stays closed. Read that message as their current answer and keep its original scope.
 
 Use policy request tools for sandbox access; answering a question does not change policy. Request a concrete scope through `enclos_request_access` and wait for the person's decision in the policy inbox.
 

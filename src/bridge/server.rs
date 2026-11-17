@@ -38,6 +38,8 @@ mod forget;
 mod group_turns;
 #[path = "held_tasks.rs"]
 mod held_tasks;
+#[path = "open_items.rs"]
+mod open_items;
 #[path = "policy.rs"]
 mod policy;
 #[path = "questions.rs"]
@@ -200,6 +202,8 @@ struct Hub {
     deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     deletion_jobs: Mutex<HashSet<(String, String)>>,
     questions: Mutex<questions::QuestionRequests>,
+    open_items: Mutex<HashMap<String, u64>>,
+    open_item_devices: Mutex<HashSet<String>>,
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     /// Task details asked of plugins for devices.
@@ -466,6 +470,8 @@ impl Hub {
             opening: Mutex::new(HashMap::new()),
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
+            open_items: Mutex::new(HashMap::new()),
+            open_item_devices: Mutex::new(HashSet::new()),
             held_tasks: Mutex::new(Default::default()),
             task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
@@ -977,6 +983,7 @@ impl Hub {
                         questions::acknowledge_question(&mut acks, &message.id, result);
                     }
                     FromPlugin::MessageOut {
+                        suggested_replies,
                         conversation,
                         text,
                         kind,
@@ -1069,6 +1076,11 @@ impl Hub {
                             From::Agent
                         };
                         let whole = ConversationMessage {
+                            suggested_replies: if kind == "status" {
+                                vec![]
+                            } else {
+                                suggested_replies
+                            },
                             question: None,
                             held_task: None,
                             conversation: conversation.clone(),
@@ -1348,7 +1360,14 @@ impl Hub {
         let media = self.media();
         let taken = take_attachments(home, &media, &whole.agent, conversation, attachments)?;
         let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
-        let seqs = match store.add_pieces(&pieces, conversation, from, &whole.kind, &stored) {
+        let seqs = match store.add_pieces_with_replies(
+            &pieces,
+            conversation,
+            from,
+            &whole.kind,
+            &stored,
+            &whole.suggested_replies,
+        ) {
             Ok(Some(seqs)) => seqs,
             // Stored meanwhile, with copies of its own: the plugin's are
             // no longer needed either.
@@ -1393,6 +1412,11 @@ impl Hub {
                     ToDevice::Message(ConversationMessage {
                         text,
                         seq,
+                        suggested_replies: if Some(seq) == last {
+                            whole.suggested_replies.clone()
+                        } else {
+                            vec![]
+                        },
                         attachments: std::mem::take(&mut files),
                         ..whole.clone()
                     }),
@@ -1530,6 +1554,7 @@ pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<T
         .map(attachment_info)
         .collect();
     Ok(ToDevice::Message(ConversationMessage {
+        suggested_replies: m.suggested_replies,
         question: m.question,
         held_task: m.held_task,
         conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
@@ -2347,6 +2372,10 @@ fn connection(
             ));
         }
     };
+    hub.open_item_devices
+        .lock()
+        .expect("not poisoned")
+        .remove(&device.id);
     link.send(ToDevice::Authenticated {
         person: person.clone(),
         capabilities: hub.capabilities(&person),
@@ -2703,6 +2732,17 @@ fn run_session(
                     }
                 }
             }
+            FromDevice::QuestionClose { question, revision } => {
+                let result = hub.question_close(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    question,
+                    revision,
+                );
+                link.send(result.unwrap_or_else(ToDevice::Error))?;
+            }
             FromDevice::QuestionAnswer {
                 question,
                 revision,
@@ -3023,7 +3063,13 @@ fn run_session(
                 }
                 Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
             },
-            FromDevice::Sync { since } => {
+            FromDevice::Sync { since, open_items } => {
+                if open_items {
+                    hub.open_item_devices
+                        .lock()
+                        .expect("not poisoned")
+                        .insert(device.id.clone());
+                }
                 for id in store.deletions(person).map_err(|e| e.to_string())? {
                     if let Ok(conversation) = ConversationId::new(id) {
                         link.send(ToDevice::ConversationDeleted { conversation })?;
@@ -3069,7 +3115,7 @@ fn run_session(
                 }
                 // Pending cards must refresh even when their introduction predates `since`.
                 for question in store
-                    .pending_questions_for(person)
+                    .open_questions_for(person)
                     .map_err(|e| e.to_string())?
                 {
                     if hub.shows_question(person, &question.info.definition) {
@@ -3098,6 +3144,11 @@ fn run_session(
                 // higher `seq`
                 let newest = store.newest_seq().map_err(|e| e.to_string())?;
                 let last = send_history(hub, store, link, &device.id, person, since)?;
+                if open_items {
+                    for frame in hub.open_item_frames(store, person)? {
+                        link.send(frame)?;
+                    }
+                }
                 link.send(ToDevice::Synced { seq: last })?;
                 // What was stored meanwhile is in the history above, or
                 // comes after it. A `since` past every stored message (an
@@ -4002,6 +4053,7 @@ fn send(
         .is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
+        suggested_replies: Vec::new(),
         question: None,
         held_task: None,
         conversation: conversation.clone(),
@@ -4040,7 +4092,11 @@ fn send(
             let text = echo.text.clone();
             hub.deliver(
                 person,
-                ToDevice::Message(ConversationMessage { seq, ..echo }),
+                ToDevice::Message(ConversationMessage {
+                    suggested_replies: Vec::new(),
+                    seq,
+                    ..echo
+                }),
             );
             hub.group_said(store, conversation.as_str(), seq, &text);
         }
@@ -4060,7 +4116,11 @@ fn send(
     {
         hub.deliver(
             person,
-            ToDevice::Message(ConversationMessage { seq, ..echo }),
+            ToDevice::Message(ConversationMessage {
+                suggested_replies: Vec::new(),
+                seq,
+                ..echo
+            }),
         );
     }
     Ok(hub.forward(store, &name).err().map(|e| {
@@ -4371,6 +4431,7 @@ mod connection_end_tests {
                             answer(FromPlugin::Ack { of: message.id });
                             if long {
                                 answer(FromPlugin::MessageOut {
+                                    suggested_replies: Vec::new(),
                                     conversation,
                                     text: "é".repeat(150_000),
                                     kind: OutKind::Reply,
@@ -4829,7 +4890,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             .add("after", "c-1", &From::Agent, "and then", "reply")
             .unwrap()
             .unwrap();
-        device.send("s-1", FromDevice::Sync { since: 0 });
+        device.send(
+            "s-1",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut texts = Vec::new();
         let synced = loop {
             match device.receive() {
@@ -4897,7 +4964,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
 
     /// The tasks a sync from 0 sends `device`, up to `synced`.
     fn synced_tasks(device: &mut PhoneLink) -> Vec<enclos_protocol::task::Task> {
-        device.send("sync-tasks", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-tasks",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut tasks = Vec::new();
         loop {
             match device.receive() {
@@ -4962,7 +5035,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
     /// Syncs `device` from `since`, as the app does once authenticated: the
     /// messages it is sent, up to `synced`, whose `seq` comes last.
     fn synced(device: &mut PhoneLink, since: i64) -> (Vec<ConversationMessage>, i64) {
-        device.send(&format!("sync-{since}"), FromDevice::Sync { since });
+        device.send(
+            &format!("sync-{since}"),
+            FromDevice::Sync {
+                since,
+                open_items: false,
+            },
+        );
         let mut messages = Vec::new();
         loop {
             match device.receive() {
@@ -5613,6 +5692,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         plugin_that(&bridge.socket, move |mut lines, mut out| {
             // What its outbox holds, sent after each hello.
             let said = FromPlugin::MessageOut {
+                suggested_replies: Vec::new(),
                 conversation: ConversationId::new("c-1").unwrap(),
                 text: "the answer".into(),
                 kind: OutKind::Reply,
@@ -6938,7 +7018,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         // keeps sending pings and receiving ordinary sync responses.
         for _ in 0..5 {
             device.socket.send(Message::Ping(vec![1].into())).unwrap();
-            device.send("sync-pending", FromDevice::Sync { since: 0 });
+            device.send(
+                "sync-pending",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: false,
+                },
+            );
             loop {
                 match device.receive() {
                     Some(ToDevice::Synced { .. }) => break,
@@ -6964,7 +7050,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             }
         }
         assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
-        device.send("sync-after-delete", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-after-delete",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         loop {
             match device.receive() {
                 Some(ToDevice::Synced { .. }) => break,
@@ -7047,7 +7139,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         }
         assert_eq!(deleted, ["c-gone", "home.gone.coder"]);
         // A device that was away hears of them at sync.
-        device.send("sync-after-forget", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-after-forget",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut synced = Vec::new();
         loop {
             match device.receive() {

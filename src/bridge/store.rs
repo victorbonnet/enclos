@@ -41,6 +41,7 @@ pub enum From {
 /// One stored message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    pub suggested_replies: Vec<String>,
     pub question: Option<enclos_protocol::QuestionId>,
     /// The held task this message is about: a card of its conversation's agent.
     pub held_task: Option<enclos_protocol::HeldTaskId>,
@@ -56,12 +57,17 @@ pub struct Message {
 }
 
 /// The columns [`message_row`] reads, in its order.
-const MESSAGE_COLUMNS: &str = "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task FROM messages";
+const MESSAGE_COLUMNS: &str = "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages";
 
 fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let person: Option<String> = row.get(3)?;
     let speaker: Option<String> = row.get(7)?;
     Ok(Message {
+        suggested_replies: row
+            .get::<_, Option<String>>(10)?
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .filter(|r| enclos_protocol::suggested_replies::validate(r))
+            .unwrap_or_default(),
         held_task: row
             .get::<_, Option<String>>(9)?
             .map(|id| {
@@ -368,6 +374,7 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     add_column(db, "messages", "question", "TEXT")?;
     // A history line about a held task names it (ADR 0066, proposed).
     add_column(db, "messages", "held_task", "TEXT")?;
+    add_column(db, "messages", "suggested_replies", "TEXT")?;
     // A question's owner is its conversation's, read from there: the copy
     // an earlier build kept went stale when a Home was claimed.
     let mut query = db.prepare("SELECT name FROM pragma_table_info('questions')")?;
@@ -493,8 +500,10 @@ CREATE TABLE IF NOT EXISTS messages (
     kind TEXT NOT NULL,
     at INTEGER NOT NULL,
     question TEXT,
-    held_task TEXT
+    held_task TEXT,
+    suggested_replies TEXT
 );
+CREATE TABLE IF NOT EXISTS question_closures (question TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE, person TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(question,person), UNIQUE(person,request));
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
     message TEXT NOT NULL,
@@ -1804,6 +1813,18 @@ impl Store {
         kind: &str,
         files: &[StoredAttachment],
     ) -> rusqlite::Result<Option<Vec<i64>>> {
+        self.add_pieces_with_replies(pieces, conversation, from, kind, files, &[])
+    }
+
+    pub fn add_pieces_with_replies(
+        &self,
+        pieces: &[(String, String)],
+        conversation: &str,
+        from: &From,
+        kind: &str,
+        files: &[StoredAttachment],
+        replies: &[String],
+    ) -> rusqlite::Result<Option<Vec<i64>>> {
         let transaction = self.db.unchecked_transaction()?;
         let mut seqs = Vec::new();
         for (id, text) in pieces {
@@ -1816,6 +1837,17 @@ impl Store {
         if let Some((first, _)) = pieces.first() {
             for file in files {
                 self.add_attachment(file, first)?;
+            }
+        }
+        if let Some((last, _)) = pieces.last() {
+            if !replies.is_empty() && enclos_protocol::suggested_replies::validate(replies) {
+                self.db.execute(
+                    "UPDATE messages SET suggested_replies=?2 WHERE id=?1",
+                    params![
+                        last,
+                        serde_json::to_string(replies).expect("strings serialize")
+                    ],
+                )?;
             }
         }
         transaction.commit()?;
@@ -1947,7 +1979,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question, m.held_task FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question, m.held_task, m.suggested_replies FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -1966,7 +1998,7 @@ impl Store {
     /// The messages of conversation `id` after `since`, in order.
     pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = query.query_map(params![id, since], message_row)?;
@@ -1983,7 +2015,7 @@ impl Store {
         at_most: usize,
     ) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
         )?;
         let rows = query.query_map(params![id, since, at_most as i64], message_row)?;
@@ -3477,6 +3509,43 @@ mod tests {
             None
         );
         assert_eq!(store.since("victor@example.com", 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn suggested_replies_are_atomic_with_the_last_piece_and_survive_reopen() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        store.conversation("c", "lab", "main", "owner").unwrap();
+        let pieces = [
+            ("first".into(), "A short explanation".into()),
+            ("last".into(), "Choose a next step".into()),
+        ];
+        let replies = vec!["Fix Inbox filters".into(), "Keep paused".into()];
+        assert!(
+            store
+                .add_pieces_with_replies(&pieces, "c", &From::Agent, "reply", &[], &replies)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .add_pieces_with_replies(
+                    &pieces,
+                    "c",
+                    &From::Agent,
+                    "reply",
+                    &[],
+                    &["Changed".into()]
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let restored = Store::open(&path).unwrap();
+        let messages = restored.messages_after("c", 0).unwrap();
+        assert!(messages[0].suggested_replies.is_empty());
+        assert_eq!(messages[1].suggested_replies, replies);
     }
 
     #[test]

@@ -465,6 +465,7 @@ mod tests {
                     send(
                         &mut out,
                         FromPlugin::MessageOut {
+                            suggested_replies: Vec::new(),
                             conversation,
                             text: format!("echo: {text}"),
                             kind: OutKind::Reply,
@@ -620,6 +621,7 @@ mod tests {
 
     fn out_line(id: &str, text: &str) -> Vec<u8> {
         let body = FromPlugin::MessageOut {
+            suggested_replies: Vec::new(),
             conversation: ConversationId::new("c-1").unwrap(),
             text: text.into(),
             kind: OutKind::Reply,

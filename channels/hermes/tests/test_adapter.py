@@ -139,6 +139,25 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual(answer["type"], "hello")
 
+    async def test_suggested_replies_survive_outbox_replay_and_do_not_attach_to_notices(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        now = asyncio.get_running_loop().time()
+        self.adapter._last_in["c-1"] = ("m1", now)
+        replies = ["Fix Inbox filters", "Keep paused"]
+        self.adapter._suggested_replies["c-1"] = (("m1", now), now, replies)
+        await self.adapter.send("c-1", "♻️ Gateway online", None)
+        notice = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertNotIn("suggested_replies", notice)
+        await self.adapter.send("c-1", "Inbox filters reset. Allow a fix?", "m1")
+        sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(sent["suggested_replies"], replies)
+        self.assertEqual(self.adapter._outbox.pending()[-1]["suggested_replies"], replies)
+        await self.adapter.send("c-1", "Another message", "m1")
+        following = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertNotIn("suggested_replies", following)
+        writer.close()
+
     async def test_a_message_longer_than_64_kib_reaches_the_runtime(self):
         reader, writer = await self.bridge()
         await self.hello(reader, writer)

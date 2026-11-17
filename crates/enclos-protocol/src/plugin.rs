@@ -183,6 +183,12 @@ pub enum FromPlugin {
     /// What the agent says.
     #[serde(rename = "message.out")]
     MessageOut {
+        #[serde(
+            default,
+            deserialize_with = "crate::suggested_replies::deserialize",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        suggested_replies: Vec<String>,
         conversation: ConversationId,
         text: String,
         kind: OutKind,

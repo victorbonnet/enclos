@@ -791,6 +791,7 @@ fn chat(
             .and_then(|id| MessageId::new(id).ok())
             .ok_or_else(|| failed("cannot make a message id".to_owned()))?;
         let whole = ConversationMessage {
+            suggested_replies: Vec::new(),
             question: None,
             held_task: None,
             conversation: conversation.clone(),
@@ -915,6 +916,7 @@ fn read_agent(
                 &server::pieces(
                     &message.id,
                     &ConversationMessage {
+                        suggested_replies: Vec::new(),
                         question: None,
                         held_task: None,
                         conversation: conversation.clone(),
@@ -1024,6 +1026,7 @@ mod tests {
                 send(
                     id,
                     FromPlugin::MessageOut {
+                        suggested_replies: Vec::new(),
                         conversation: ConversationId::new(*conversation).unwrap(),
                         text: (*text).into(),
                         kind: *kind,

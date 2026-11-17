@@ -43,6 +43,8 @@ struct Pending {
 
 #[derive(Default)]
 pub(super) struct HeldTaskRequests {
+    #[cfg(test)]
+    before_open: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     /// Each agent's current plugin connection, as `held_task_connected` saw it.
     connections: HashMap<String, String>,
     pending: HashMap<String, Pending>,
@@ -209,9 +211,12 @@ impl Hub {
             .ensure_home(agent, host.as_deref().unwrap_or(""), host.is_some())
             .map_err(internal)?;
         self.record_unrecorded(store, Some(agent));
+        // The same lock linearizes capability updates with resume admission and dispatch.
+        let admission = self.held_tasks.lock().expect("not poisoned");
         let changes = store
             .report_held_tasks(agent, &home, &tasks)
             .map_err(internal)?;
+        drop(admission);
         self.publish_held(store, changes);
         Ok(())
     }
@@ -262,8 +267,23 @@ impl Hub {
                 return;
             }
         };
+        let owners: std::collections::HashSet<_> =
+            changes.iter().map(|c| c.card.owner.clone()).collect();
         for change in changes {
             let owner = change.card.owner.clone();
+            if let Some(message) = &change.message
+                && message.kind == "notify"
+                && change.card.info.state == HeldTaskState::Held
+            {
+                self.push_if_away(
+                    store,
+                    &owner,
+                    &change.card.info.agent,
+                    change.card.info.conversation.as_str(),
+                    message.seq,
+                    &format!("Needs you: {}", change.card.info.title),
+                );
+            }
             let mut frames = vec![ToDevice::HeldTask {
                 held_task: change.card.info,
             }];
@@ -290,6 +310,9 @@ impl Hub {
                     }
                 }
             }
+        }
+        for owner in owners {
+            self.publish_open_items(store, &owner);
         }
     }
 
@@ -359,6 +382,19 @@ impl Hub {
                 "This task cannot be resumed from the app. Nothing was sent.",
             ));
         }
+        #[cfg(test)]
+        {
+            let checkpoint = self
+                .held_tasks
+                .lock()
+                .expect("not poisoned")
+                .before_open
+                .take();
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.0.wait();
+                checkpoint.1.wait();
+            }
+        }
         let requester = Person::new(person)
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e.to_string()))?;
         // Opened if it is not: a resume is live, but the connection may
@@ -419,6 +455,19 @@ impl Hub {
                     "The agent's channel is disconnected. Nothing was sent.",
                 )
             })?;
+        // Opening a channel may have taken time. Read authority again under the
+        // lock that reports hold through their store write, and retain it through
+        // admission/audit and the actual send: no accepted revocation can slip in.
+        let card = self
+            .resume_authority(store, device, person, &request)
+            .map_err(|(code, why)| failure(original.clone(), code, why))?;
+        if !card.info.resumable {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This task cannot be resumed from the app. Nothing was sent.",
+            ));
+        }
         let pending = Pending {
             device: device.id.clone(),
             person: person.into(),
@@ -434,7 +483,6 @@ impl Hub {
             return Err(failure(original, ErrorCode::Internal, NOT_READ));
         }
         requests.pending.insert(rpc.to_string(), pending);
-        drop(requests);
         let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::HeldTaskResume {
@@ -444,6 +492,7 @@ impl Hub {
                 device: device.id.clone(),
             },
         );
+        drop(requests);
         if let Err(e) = sent {
             let taken = self.take_pending(&request.agent, None, &rpc);
             if let Some((key, pending)) = taken {
@@ -944,6 +993,40 @@ mod tests {
         next(rx);
         next(rx);
         (plugin, from_bridge)
+    }
+
+    #[test]
+    fn a_resume_revoked_while_opening_the_channel_has_no_admission_side_effects() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        let checkpoint = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        hub.held_tasks.lock().unwrap().before_open = Some(Arc::clone(&checkpoint));
+        let worker_hub = Arc::clone(&hub);
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("revoked-before-admission").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        checkpoint.0.wait();
+        // Same opaque runtime revision and same bridge revision: the false-only
+        // capability update must still revoke admission after channel-open delay.
+        hub.held_tasks_report(&store, AGENT, vec![not_resumable("t1")])
+            .unwrap();
+        checkpoint.1.wait();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(resume_lines(&store).is_empty());
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(
+            from_bridge
+                .try_iter()
+                .all(|f| !matches!(f.body, FromBridge::HeldTaskResume { .. }))
+        );
     }
 
     #[test]
@@ -1817,7 +1900,10 @@ mod tests {
         let mut sync = |since| {
             let message = encode_line(&Envelope::new(
                 MessageId::new(format!("sync-{since}")).unwrap(),
-                FromDevice::Sync { since },
+                FromDevice::Sync {
+                    since,
+                    open_items: false,
+                },
             ));
             socket
                 .send(Message::Binary(
