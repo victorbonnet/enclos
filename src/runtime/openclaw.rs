@@ -578,12 +578,15 @@ impl RuntimeAdapter for OpenClaw {
         }
         let mut result = Vec::new();
         let mut plain = std::collections::BTreeSet::new();
+        let mut dotenv = std::collections::BTreeSet::new();
         for file in files {
             if file.path.as_path() == Path::new(".openclaw/.env") {
                 for (n, line) in file.text.lines().enumerate() {
                     if let Some((name, value)) = dotenv_line(line) {
                         let granted = file.granted.contains(name);
-                        if (granted || names_a_secret(name)) && !matches!(value, "" | "\"\"" | "''")
+                        if (granted || names_a_secret(name))
+                            && !matches!(value, "" | "\"\"" | "''")
+                            && dotenv.insert(n)
                         {
                             result.push(SettingsFinding::Plain {
                                 agent: file.agent.clone(),
