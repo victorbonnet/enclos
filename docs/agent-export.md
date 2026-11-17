@@ -33,6 +33,14 @@ An agent export is not a whole-host backup. Device pairings, private bridge/sign
 
 Hermes exports preserve raw profile files, memories, skills, plugin source, runtime sessions and databases, including committed SQLite WAL data. Shared runtime logins, plugins and skills are made available in the imported profile without replacing the destination's global runtime login. Shared user files from the sandbox home are included; conflicting destination files are refused rather than overwritten. Rebuilt installations, caches, virtual environments, dependency downloads, shell startup files, older runtime backup folders and live process/socket state are omitted. Foreign executable bytes are retained outside the imported agent's executable paths and may need a native replacement. Expired or revoked provider logins still require signing in again.
 
+## OpenClaw transfers
+
+OpenClaw 2026.11.3 exports use `openclaw-data-v1`. They preserve the native agent ID and require the same absolute sandbox home path on the destination: native database ownership and opaque Codex continuation records cannot currently be renamed or relocated through a supported native API. Use matching sandbox names and host user/home paths. The destination native agent and workspace must be fresh.
+
+The adapter creates, verifies and restores native SQLite snapshots, retains per-agent Codex files and agent-scoped global Codex bindings, and materializes persisted shared provider logins into the destination agent’s local store through native APIs. Destination global accounts are retained. Workspaces, authored shared skills and shared home files are preserved; conflicting shared settings or files refuse the import. Enabled npm plugins with verified exact versions are installed for the destination CPU. Enabled local plugins and custom shared native session stores currently refuse export.
+
+Bridge routes retain their original native peer and rebind the imported conversation to the destination host person. Outboxes and receipts are empty. Native snapshots containing runnable input, active turns or unresolved recovery/delivery state refuse transfer; the adapter does not edit protected native tables to clear them. Export an idle source and stop it before activating the destination. Shared messaging accounts, bindings, cron and hooks remain source-host configuration, saved as reference rather than enabled at the destination. Runtime installations and generated caches are rebuilt; expired provider credentials still require login.
+
 ## Format, version 2
 
 The framing remains the ASCII prefix `ENCLOS_AGENT_EXPORT_V1\n`, a four-byte big-endian header length and UTF-8 JSON of that length. The header is at most 64 KiB. Its `schema_version` is `2`, and it contains:

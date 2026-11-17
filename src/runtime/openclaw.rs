@@ -264,6 +264,28 @@ impl RuntimeAdapter for OpenClaw {
             name.as_str(),
         ]))
     }
+    fn export_agent(&self, name: &AgentName, prefix: &Path) -> Option<super::RuntimeExport> {
+        let archive = prefix.with_extension("tar.gz");
+        Some(super::RuntimeExport {
+            format: "openclaw-data-v1",
+            command: transfer(
+                "export",
+                name,
+                &archive,
+                &json!({"max_bytes": crate::agent_export::MAX_PAYLOAD_BYTES}).to_string(),
+            ),
+            archive,
+        })
+    }
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        context: &str,
+    ) -> Option<SandboxCommand> {
+        (format == "openclaw-data-v1").then(|| transfer("import", name, archive, context))
+    }
     fn agent_files(&self, name: &AgentName) -> String {
         format!("~/.openclaw/agents/{name}")
     }
@@ -834,6 +856,20 @@ impl RuntimeAdapter for OpenClaw {
     }
 }
 
+fn transfer(operation: &str, name: &AgentName, archive: &Path, context: &str) -> SandboxCommand {
+    SandboxCommand::new(vec![
+        "python3".into(),
+        "-I".into(),
+        "-c".into(),
+        include_str!("openclaw/transfer.py").into(),
+        include_str!("openclaw/transfer-native.mjs").into(),
+        operation.into(),
+        name.as_str().into(),
+        archive.as_os_str().to_owned(),
+        context.into(),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +880,30 @@ mod tests {
     fn save(home: &Path, text: &str) {
         std::fs::create_dir_all(home.join(".openclaw")).unwrap();
         std::fs::write(home.join(CONFIG), text).unwrap();
+    }
+
+    #[test]
+    fn complete_exports_use_the_adapter_owned_format_and_reject_other_runtime_data() {
+        let name: AgentName = "kilian".parse().unwrap();
+        let export = OpenClaw
+            .export_agent(&name, Path::new("/sandbox/export"))
+            .unwrap();
+        assert_eq!(export.format, "openclaw-data-v1");
+        assert_eq!(export.archive, Path::new("/sandbox/export.tar.gz"));
+        assert_eq!(export.command.words[0], "python3");
+        assert_eq!(export.command.words[1], "-I");
+        assert_eq!(export.command.words[5], "export");
+        assert!(
+            OpenClaw
+                .import_export(&name, &export.archive, export.format, "{}")
+                .is_some()
+        );
+        assert!(
+            OpenClaw
+                .import_export(&name, &export.archive, "hermes-data-v1", "{}")
+                .is_none()
+        );
+        assert!(OpenClaw.import_agent(&name, &export.archive).is_none());
     }
 
     #[test]
