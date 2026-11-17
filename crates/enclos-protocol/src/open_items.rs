@@ -13,6 +13,9 @@ pub enum OpenItemKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenItem {
+    /// Opaque source generation, used only to dismiss this exact reminder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     /// The existing question, held-task or policy-request id. Kind and agent scope it.
     pub id: String,
     pub kind: OpenItemKind,
@@ -23,4 +26,15 @@ pub struct OpenItem {
     pub summary: String,
     pub since: i64,
     pub expired: bool,
+}
+
+impl OpenItemKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::RuntimeApproval => "runtime_approval",
+            Self::HeldTask => "held_task",
+            Self::PolicyRequest => "policy_request",
+        }
+    }
 }

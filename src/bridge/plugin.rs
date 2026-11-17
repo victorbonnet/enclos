@@ -112,6 +112,7 @@ fn connect_within(
             Capability::RuntimeApprovals,
             Capability::Activity,
             Capability::Tasks,
+            Capability::HeldTaskDetails,
             Capability::TaskDetails,
             Capability::Usage,
             Capability::HeldTasks,

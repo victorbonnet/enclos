@@ -319,10 +319,12 @@ class Board:
     """Hermes's kanban boards, read for the tasks of one profile. `files` gives
     each board's database, `platform` is this channel's, for the conversation."""
 
-    def __init__(self, profile: str, files: Callable[[], list[str]], platform: str):
+    def __init__(self, profile: str, files: Callable[[], list[str]], platform: str, held_boards=None, default_board=None):
         self.profile = profile
         self.files = files
         self.platform = platform
+        self.held_boards = held_boards
+        self.default_board = default_board
 
     @staticmethod
     def _open(path: str) -> sqlite3.Connection:
@@ -370,6 +372,19 @@ class Board:
                     newest = (created, detail_of(conn, row))
         return newest[1] if newest else None
 
+    def held_detail(self, reference: str) -> Optional[dict[str, Any]]:
+        """Read exactly the board/id the creator reported as held; never search another board."""
+        if not self.held_boards or not self.default_board:
+            return None
+        board, task_id = reference.split("/", 1) if "/" in reference else (self.default_board, reference)
+        for slug, path in self.held_boards():
+            if slug != board:
+                continue
+            with contextlib.closing(self._open(path)) as conn:
+                row = conn.execute(_ONE.replace("assignee = ?", "created_by = ?"), (task_id, self.profile)).fetchone()
+                return detail_of(conn, row) if row is not None else None
+        return None
+
 
 def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
     """The board of the Hermes this plugin runs in, for the profile whose home
@@ -397,7 +412,12 @@ def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
                 found.append(path)
         return found
 
-    return Board(profile, files, platform)
+    default_board = getattr(kanban_db, "DEFAULT_BOARD", None)
+    def held_boards():
+        return [(str(board.get("slug") or default_board), str(board.get("db_path")))
+                for board in kanban_db.list_boards(include_archived=False)
+                if board.get("db_path") and os.path.isfile(str(board["db_path"]))]
+    return Board(profile, files, platform, held_boards=held_boards, default_board=default_board)
 
 
 class Reporter:
@@ -431,7 +451,10 @@ class Reporter:
 
     @property
     def capabilities(self) -> tuple[str, ...]:
-        return ("activity", "tasks", "task_details") if self.board else ("activity",)
+        if not self.board:
+            return ("activity",)
+        extra = ("held_task_details",) if getattr(self.board, "held_boards", None) and getattr(self.board, "default_board", None) else ()
+        return ("activity", "tasks", "task_details") + extra
 
     async def detail(self, message: dict[str, Any]) -> None:
         """Answers the bridge's `task.get`: the task's detail, read from the
@@ -442,7 +465,8 @@ class Reporter:
             await self._write(protocol.error("unsupported", "This agent's runtime has no task board.", of))
             return
         try:
-            detail = await asyncio.to_thread(self.board.detail, message["task"])
+            reader = self.board.held_detail if message.get("held") is True else self.board.detail
+            detail = await asyncio.to_thread(reader, message["task"])
         except Exception as error:
             logger.warning("Cannot read task %s's detail from the kanban board: %s: %s",
                            message["task"], type(error).__name__, error)

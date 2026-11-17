@@ -202,12 +202,14 @@ mod tests {
         ] {
             assert!(host.iter().any(|c| c == capability), "{host:?}");
         }
-        assert_eq!(host.len(), 8, "{host:?}");
+        assert_eq!(host.len(), 10, "{host:?}");
         // Every person reads the usage of their own conversations.
         assert_eq!(
             hub.capabilities("guest"),
             [
                 "open_items",
+                "held_task.get",
+                "open_item.dismiss",
                 "question.close",
                 "suggested_replies",
                 "usage",
@@ -254,6 +256,8 @@ mod tests {
             hub.capabilities("alice"),
             [
                 "open_items",
+                "held_task.get",
+                "open_item.dismiss",
                 "question.close",
                 "suggested_replies",
                 "usage",

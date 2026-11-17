@@ -58,7 +58,11 @@ pub enum FromBridge {
     /// (`task_details`): a read, which the plugin answers `task.detail` or
     /// an `error` (`not_found` for a task that is not the agent's).
     #[serde(rename = "task.get")]
-    TaskGet { task: String },
+    TaskGet {
+        task: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        held: bool,
+    },
     #[serde(rename = "routine.request")]
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
@@ -375,6 +379,8 @@ pub enum Capability {
     /// It answers `task.get` with one of the agent's tasks' detail
     /// (`task.detail`); requires the bridge's matching hello capability.
     TaskDetails,
+    /// It reads details of a held task created by this agent, using its exact board reference.
+    HeldTaskDetails,
     /// It reports what each model call of the agent consumed (`usage`); a
     /// bridge that takes them names it in its own `hello`.
     Usage,

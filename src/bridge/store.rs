@@ -503,6 +503,7 @@ CREATE TABLE IF NOT EXISTS messages (
     held_task TEXT,
     suggested_replies TEXT
 );
+CREATE TABLE IF NOT EXISTS open_item_dismissals (person TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT NOT NULL, item TEXT NOT NULL, version TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(person,kind,agent,item), UNIQUE(person,request));
 CREATE TABLE IF NOT EXISTS question_closures (question TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE, person TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(question,person), UNIQUE(person,request));
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,

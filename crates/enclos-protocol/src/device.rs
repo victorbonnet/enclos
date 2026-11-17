@@ -13,6 +13,17 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "held_task.get")]
+    HeldTaskGet { agent: String, task: HeldTaskId },
+    /// Hide only this reminder; no native request is resolved or resumed.
+    #[serde(rename = "open_item.dismiss")]
+    OpenItemDismiss {
+        kind: crate::open_items::OpenItemKind,
+        item: String,
+        #[serde(default)]
+        agent: Option<String>,
+        version: String,
+    },
     /// Close discovery of an expired information question; native state stays expired.
     #[serde(rename = "question.close")]
     QuestionClose { question: QuestionId, revision: u64 },
@@ -222,9 +233,11 @@ pub const AGENT_FORGET: &str = "agent.forget";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
+    "open_item.dismiss",
     "question.answer",
     "held_task.resume",
     "task.get",
+    "held_task.get",
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -266,6 +279,15 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "open_item.dismissed")]
+    OpenItemDismissed {
+        of: MessageId,
+        kind: crate::open_items::OpenItemKind,
+        item: String,
+        #[serde(default)]
+        agent: Option<String>,
+        version: String,
+    },
     #[serde(rename = "question.closed")]
     QuestionClosed { of: MessageId, question: QuestionId },
     #[serde(rename = "open_items")]
@@ -473,6 +495,7 @@ pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
     "question.closed",
+    "open_item.dismissed",
     "open_items",
     "question",
     "question.result",

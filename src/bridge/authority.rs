@@ -19,6 +19,8 @@ impl Hub {
     pub(super) fn capabilities(&self, person: &str) -> Vec<String> {
         let mut capabilities = vec![
             "open_items".to_owned(),
+            "held_task.get".to_owned(),
+            "open_item.dismiss".to_owned(),
             "question.close".to_owned(),
             "suggested_replies".to_owned(),
             enclos_protocol::device::USAGE.to_owned(),

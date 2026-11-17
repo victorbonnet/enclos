@@ -2,6 +2,14 @@
 use super::*;
 use enclos_protocol::open_items::{OpenItem, OpenItemKind};
 
+/// The exact discovery generation the device reviewed; not a native decision.
+pub(super) struct ReminderRef<'a> {
+    pub kind: OpenItemKind,
+    pub id: &'a str,
+    pub agent: Option<&'a str>,
+    pub version: &'a str,
+}
+
 fn summary(text: &str) -> String {
     let line = enclos_protocol::visible::stripped(text, true);
     line.split_whitespace()
@@ -79,6 +87,24 @@ impl Hub {
             .db
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
+        let mut items = self.read_open_items(store, person)?;
+        let dismissed = store
+            .dismissed_open_items(person)
+            .map_err(|e| e.to_string())?;
+        items.retain(|item| {
+            !dismissed.contains(&(
+                item.kind.as_str().to_owned(),
+                item.agent.clone().unwrap_or_default(),
+                item.id.clone(),
+                item.version.clone(),
+            ))
+        });
+        snapshot.commit().map_err(|e| e.to_string())?;
+        Ok(items)
+    }
+
+    /// Canonical sources, also read under the immediate dismissal transaction.
+    fn read_open_items(&self, store: &Store, person: &str) -> Result<Vec<OpenItem>, String> {
         let host = store.host_person().map_err(|e| e.to_string())?;
         let mut items = vec![];
         for question in store
@@ -93,6 +119,7 @@ impl Hub {
                 .question_time(&q.definition.id)
                 .map_err(|e| e.to_string())?;
             items.push(OpenItem {
+                version: format!("question:{}", q.definition.id),
                 id: q.definition.id.to_string(),
                 kind: if q.definition.approval.is_some() {
                     OpenItemKind::RuntimeApproval
@@ -114,6 +141,7 @@ impl Hub {
             {
                 let h = held.info;
                 items.push(OpenItem {
+                    version: format!("held:{}", h.revision),
                     id: h.task.to_string(),
                     kind: OpenItemKind::HeldTask,
                     agent: Some(h.agent),
@@ -130,6 +158,7 @@ impl Hub {
                 .filter(|a| matches!(a.state.as_str(), "pending" | "applying" | "failed"))
             {
                 items.push(OpenItem {
+                    version: format!("policy:{}:{}", a.revision, a.state),
                     id: a.request,
                     kind: OpenItemKind::PolicyRequest,
                     agent: (!a.agent.is_empty()).then_some(a.agent),
@@ -152,8 +181,76 @@ impl Hub {
                 });
             }
         }
-        snapshot.commit().map_err(|e| e.to_string())?;
         Ok(items)
+    }
+
+    pub(super) fn dismiss_open_item(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        request: MessageId,
+        reminder: ReminderRef<'_>,
+    ) -> Result<ToDevice, ErrorBody> {
+        let ReminderRef {
+            kind,
+            id,
+            agent,
+            version,
+        } = reminder;
+        let error = |code, message: &str| ErrorBody {
+            of: Some(request.clone()),
+            code,
+            message: message.into(),
+        };
+        let internal = |detail: String| {
+            eprintln!("enclos app: reminder dismissal failed: {detail}");
+            error(
+                ErrorCode::Internal,
+                "The reminder could not be dismissed. Refresh and try again.",
+            )
+        };
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &store.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| internal(e.to_string()))?;
+        if device.person != person
+            || store
+                .device(&device.id)
+                .map_err(|e| internal(e.to_string()))?
+                .is_none_or(|current| {
+                    current.person != person
+                        || current.noise_key != device.noise_key
+                        || current.device_key != device.device_key
+                })
+        {
+            return Err(error(ErrorCode::NotFound, "No such request."));
+        }
+        let item = self
+            .read_open_items(store, person)
+            .map_err(internal)?
+            .into_iter()
+            .find(|item| item.kind == kind && item.id == id && item.agent.as_deref() == agent)
+            .ok_or_else(|| error(ErrorCode::NotFound, "No such request."))?;
+        if item.version != version || version.is_empty() {
+            return Err(error(
+                ErrorCode::Conflict,
+                "This request changed. Refresh before dismissing it.",
+            ));
+        }
+        store
+            .dismiss_open_item(person, &item, request.as_str())
+            .map_err(|e| internal(e.to_string()))?;
+        transaction.commit().map_err(|e| internal(e.to_string()))?;
+        self.publish_open_items(store, person);
+        Ok(ToDevice::OpenItemDismissed {
+            of: request,
+            kind,
+            item: id.to_owned(),
+            agent: item.agent,
+            version: item.version,
+        })
     }
 
     pub(super) fn publish_open_items(&self, store: &Store, person: &str) {
@@ -178,5 +275,28 @@ impl Hub {
             }
             Err(error) => eprintln!("enclos app: open requests could not be read: {error}"),
         }
+    }
+}
+
+impl Store {
+    fn dismissed_open_items(
+        &self,
+        person: &str,
+    ) -> rusqlite::Result<HashSet<(String, String, String, String)>> {
+        self.db
+            .prepare("SELECT kind,agent,item,version FROM open_item_dismissals WHERE person=?1")?
+            .query_map([person], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect()
+    }
+    fn dismiss_open_item(
+        &self,
+        person: &str,
+        item: &OpenItem,
+        request: &str,
+    ) -> rusqlite::Result<()> {
+        self.db.execute("INSERT INTO open_item_dismissals(person,kind,agent,item,version,request) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(person,kind,agent,item) DO UPDATE SET version=excluded.version,request=excluded.request",
+            rusqlite::params![person,item.kind.as_str(),item.agent.as_deref().unwrap_or(""),item.id,item.version,request]).map(drop)
     }
 }

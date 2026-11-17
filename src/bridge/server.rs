@@ -2732,6 +2732,26 @@ fn run_session(
                     }
                 }
             }
+            FromDevice::OpenItemDismiss {
+                kind,
+                item,
+                agent,
+                version,
+            } => {
+                let result = hub.dismiss_open_item(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    open_items::ReminderRef {
+                        kind,
+                        id: &item,
+                        agent: agent.as_deref(),
+                        version: &version,
+                    },
+                );
+                link.send(result.unwrap_or_else(ToDevice::Error))?;
+            }
             FromDevice::QuestionClose { question, revision } => {
                 let result = hub.question_close(
                     store,
@@ -2770,6 +2790,18 @@ fn run_session(
                 };
                 if let Err(error) = hub.held_task_resume(store, device, person, message.id, request)
                 {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::HeldTaskGet { agent, task } => {
+                if let Err(error) = hub.held_task_get(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    agent,
+                    task.to_string(),
+                ) {
                     link.send(ToDevice::Error(error))?;
                 }
             }
