@@ -43,7 +43,7 @@ sh prototype/m5/probe.sh stop
 sh prototype/m5/probe.sh remove
 ```
 
-Removal retains the evidence directory. `setup-gateway.py` and `enable-listener.sh` are prototype helpers, not production setup paths.
+`sandbox stop` deletes the prototype token file. Run the setup helper again before starting another foreground gateway. Removal retains the evidence directory. `setup-gateway.py` and `enable-listener.sh` are prototype helpers, not production setup paths.
 
 ## Observed on 2026-11-09
 
@@ -52,8 +52,8 @@ On macOS 27.2, build 26B123, arm64:
 - The official installer completed inside Seatbelt through the enclos proxy: private Node 24.22.1 and OpenClaw 2026.11.2 (`b556fdf`). It reported native service refresh skipped because of runtime-only mode. The observed installer SHA-256 was `2218bac9796a5da99f6be8e7cc838420e282aca7897bea80a8f40dab0f6bfc3d`.
 - Installation reached `nodejs.org` and `registry.npmjs.org` in the proxy log. This is an observed install endpoint set, not proof that every provider, optional tool or later release needs only those destinations.
 - A fresh native roster selected implicit `main`. Native noninteractive creation of `scout` succeeded. The writer produced `agents.entries` with `main` and `scout`, explicit ownership and `agents.defaults.systemAgent.agentId = main`; this differs from older `agents.list` examples.
-- The foreground gateway reached its native `ready` log in about 9.5 seconds with a file-backed auth reference outside its home. Its recorded session root held both `127.0.0.1:43002` and `[::1]:43002`; test-owned worker processes remained session members. No ownership broadening is needed for that listener.
-- The generated token was absent from the gateway root's startup environment and ordinary runtime configuration. The protected file had mode `0600`. These checks reported booleans only, without publishing the token.
+- Manual observations: the foreground gateway reached its native `ready` log in about 9.5 seconds with a file-backed auth reference outside its home. Its recorded session root held both `127.0.0.1:43002` and `[::1]:43002`; test-owned worker processes remained session members. No ownership broadening is needed for that listener.
+- Manual observations: the generated token was absent from the gateway root's startup environment and ordinary runtime configuration. The protected file had mode `0600`. The recorded results give booleans only. The scripts do not check listener ownership, readiness time, or the token’s absence.
 - `audit verify` reported 28 entries, an intact chain, no torn tail and no unfinished entries after these probes.
 
 The checked-in results are a small sanitized record. Raw logs and test-only auth remain in the disposable experiment, not the repository.
