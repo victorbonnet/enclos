@@ -21,6 +21,7 @@ test('binding selection respects complete native agent id boundaries', () => {
 test('an active lease or unresolved native subagent work cannot be migrated', () => {
   assert.doesNotThrow(() => assertIdleBinding({ binding: { threadId: 'completed' }, lease: { expiresAt: 1 } }, 2));
   for (const value of [null, { lease: {} }, { lease: { expiresAt: 3 } },
+    { binding: { connectionScope: 'supervision' } },
     { binding: { pendingSupervisionBranch: {} } },
     { nativeSubagentAssignments: { assignments: [{}] } },
     { nativeSubagentSubmissions: { receipts: [{}] } }, { nativeSubagentTaskImport: {} }]) {

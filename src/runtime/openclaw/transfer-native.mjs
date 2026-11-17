@@ -18,6 +18,7 @@ export function bindingForAgent(key, agent) {
 
 export function assertIdleBinding(value, now = Date.now()) {
   if (!value || typeof value !== 'object') throw new Error('invalid native binding');
+  if (value.binding?.connectionScope === 'supervision' || value.binding?.supervisionSourceThreadId) throw new Error('supervised Codex state needs a supported native export');
   if (value.lease && (!Number.isFinite(value.lease.expiresAt) || value.lease.expiresAt > now)) throw new Error('native Codex binding is leased; finish its turn before exporting');
   if (value.binding?.pendingSupervisionBranch || value.nativeSubagentAssignments?.assignments?.length ||
       value.nativeSubagentSubmissions?.receipts?.length || value.nativeSubagentTaskImport) {
