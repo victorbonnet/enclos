@@ -75,6 +75,11 @@ pub struct Task {
     /// A short result, once it has ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// How many comments it has, from a runtime that keeps comments: a
+    /// change tells a device showing its detail to ask for it again
+    /// (`task_details`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<u32>,
 }
 
 /// Why the bridge refuses a task.
@@ -265,6 +270,7 @@ mod tests {
             state: TaskState::Running,
             since: 100,
             summary: None,
+            comments: None,
         }
     }
 

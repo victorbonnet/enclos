@@ -24,10 +24,16 @@ NOW = 1_800_000_000
 DAY = 24 * 3600
 
 SCHEMA = """
-CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT, created_by TEXT,
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT, created_by TEXT,
                     created_at INTEGER, started_at INTEGER, completed_at INTEGER, result TEXT);
-CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, created_at INTEGER);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT,
+                          created_at INTEGER);
 CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, created_at INTEGER);
+CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, author TEXT, body TEXT,
+                            created_at INTEGER);
+CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, profile TEXT, started_at INTEGER,
+                        ended_at INTEGER, outcome TEXT, summary TEXT, error TEXT);
 """
 
 
@@ -50,8 +56,20 @@ class Scratch:
         self.run(f"INSERT INTO tasks ({','.join(row)}) VALUES ({','.join('?' * len(row))})", *row.values())
         self.event(task_id, "created", created_at)
 
-    def event(self, task_id, kind, at):
-        self.run("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)", task_id, kind, at)
+    def event(self, task_id, kind, at, payload=None):
+        self.run("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)", task_id, kind,
+                 json.dumps(payload) if payload is not None else None, at)
+
+    def comment(self, task_id, author, body, at):
+        self.run("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                 task_id, author, body, at)
+
+    def link(self, parent, child):
+        self.run("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", parent, child)
+
+    def attempt(self, task_id, profile, started, ended=None, outcome=None, summary=None, error=None):
+        self.run("INSERT INTO task_runs (task_id, profile, started_at, ended_at, outcome, summary, error)"
+                 " VALUES (?, ?, ?, ?, ?, ?, ?)", task_id, profile, started, ended, outcome, summary, error)
 
     def set(self, task_id, **fields):
         for key, value in fields.items():
@@ -79,7 +97,14 @@ class BoardTest(unittest.TestCase):
         self.scratch.task("t-1", "done", created_by="main", completed_at=NOW - 10, result="All\nfine")
         self.assertEqual(self.read()["t-1"], {
             "id": "t-1", "title": "Write the report", "assignee": "engineer", "asked_by": "main",
-            "state": "done", "since": NOW - 10, "summary": "All fine"})
+            "state": "done", "since": NOW - 10, "summary": "All fine", "comments": 0})
+
+    def test_a_task_counts_its_comments(self):
+        self.scratch.task("t-1")
+        self.scratch.comment("t-1", "lead", "Go", NOW - 5)
+        self.scratch.comment("t-1", "engineer", "On it", NOW - 4)
+        self.scratch.comment("t-2", "lead", "Another task's", NOW - 3)
+        self.assertEqual(self.read()["t-1"]["comments"], 2)
 
     def test_another_profiles_task_is_not_its(self):
         self.scratch.task("t-1", assignee="reviewer")
@@ -152,6 +177,118 @@ class BoardTest(unittest.TestCase):
                 conn.execute("DELETE FROM tasks")
 
 
+class DetailTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.scratch = Scratch(self.folder)
+        self.board = tasks.Board("engineer", lambda: [self.scratch.path], "enclos")
+
+    def test_the_body_keeps_its_lines_and_the_related_tasks_their_state(self):
+        self.scratch.task("t-1", "running", body="Fix the threads.\r\n\nThen reply.  \n", created_by="lead")
+        self.scratch.task("t-0", "done", assignee="pm", title="Shared\ncontract")
+        self.scratch.task("t-2", "todo", assignee="reviewer", title="Review it")
+        self.scratch.task("t-3", "archived", assignee="", title="Old")
+        self.scratch.link("t-0", "t-1")
+        self.scratch.link("t-1", "t-2")
+        self.scratch.link("t-1", "t-3")
+        detail = self.board.detail("t-1")
+        self.assertEqual(detail["body"], "Fix the threads.\n\nThen reply.")
+        self.assertEqual(detail["related"], [
+            {"id": "t-0", "title": "Shared contract", "relation": "parent", "state": "done", "assignee": "pm"},
+            {"id": "t-2", "title": "Review it", "relation": "child", "state": "queued", "assignee": "reviewer"},
+            {"id": "t-3", "title": "Old", "relation": "child"}])
+
+    def test_the_newest_comments_come_oldest_first_with_their_total(self):
+        self.scratch.task("t-1")
+        for n in range(25):
+            self.scratch.comment("t-1", "lead" if n % 2 else "default", f"note {n}\nsecond line", NOW - 100 + n)
+        self.scratch.comment("t-1", "lead", "  \n ", NOW)
+        detail = self.board.detail("t-1")
+        self.assertEqual(len(detail["comments"]), tasks.MAX_COMMENTS - 1)
+        self.assertEqual(detail["comments"][0], {"author": "default", "time": NOW - 94, "text": "note 6\nsecond line"})
+        self.assertEqual(detail["comments_total"], 26)
+
+    def test_the_history_is_its_attempts_and_the_events_a_person_reads(self):
+        self.scratch.task("t-1", "running", created_by="lead", created_at=NOW - 100)
+        self.scratch.event("t-1", "dependency_wait", NOW - 90, {"reason": None, "kind": "dependency"})
+        self.scratch.event("t-1", "promoted", NOW - 80)
+        self.scratch.event("t-1", "claimed", NOW - 70)
+        self.scratch.event("t-1", "heartbeat", NOW - 65)
+        self.scratch.attempt("t-1", "engineer", NOW - 70, NOW - 60, "crashed", error="worker exited 1")
+        self.scratch.event("t-1", "blocked", NOW - 50, {"reason": "Needs the API key", "actor": "engineer"})
+        self.scratch.event("t-1", "unblocked", NOW - 40)
+        self.scratch.attempt("t-1", "engineer", NOW - 30, NOW - 20, "a-later-end", summary="Half done")
+        self.scratch.attempt("t-1", "engineer", NOW - 10)
+        self.assertEqual(self.board.detail("t-1")["history"], [
+            {"kind": "created", "time": NOW - 100, "by": "lead"},
+            {"kind": "blocked", "time": NOW - 90, "text": tasks.WAITS_FOR_TASKS},
+            {"kind": "attempt", "time": NOW - 70, "until": NOW - 60, "outcome": "crashed", "by": "engineer",
+             "text": "worker exited 1"},
+            {"kind": "blocked", "time": NOW - 50, "by": "engineer", "text": "Needs the API key"},
+            {"kind": "unblocked", "time": NOW - 40},
+            {"kind": "attempt", "time": NOW - 30, "until": NOW - 20, "by": "engineer", "text": "Half done"},
+            {"kind": "attempt", "time": NOW - 10, "by": "engineer"}])
+
+    def test_within_one_second_the_history_keeps_the_boards_order(self):
+        # Hermes names each attempt's run on its events: an attempt takes its
+        # place at its run's first one.
+        self.scratch.run("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
+        self.scratch.task("t-1", "running", created_at=NOW)
+        self.scratch.attempt("t-1", "engineer", NOW, NOW, "blocked", summary="Needs the key")
+        self.scratch.attempt("t-1", "engineer", NOW)
+        for kind, run in (("claimed", 1), ("blocked", 1), ("unblocked", None), ("claimed", 2)):
+            self.scratch.run("INSERT INTO task_events (task_id, kind, created_at, run_id) VALUES (?, ?, ?, ?)",
+                             "t-1", kind, NOW, run)
+        self.assertEqual([(e["kind"], e.get("outcome")) for e in self.board.detail("t-1")["history"]], [
+            ("created", None), ("attempt", "blocked"), ("blocked", None), ("unblocked", None), ("attempt", None)])
+
+    def test_retries_running_out_show_as_a_block_saying_why(self):
+        # As Hermes's dispatcher does: the timed-out run keeps its outcome,
+        # then `_record_task_failure` blocks the task and writes only
+        # `gave_up`, with the error and not a reason.
+        self.scratch.run("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
+        self.scratch.task("t-1", "blocked", created_at=NOW - 100)
+        self.scratch.attempt("t-1", "engineer", NOW - 90, NOW - 30, "timed_out", error="no heartbeat for 60s")
+        self.scratch.run("INSERT INTO task_events (task_id, kind, created_at, run_id) VALUES (?, ?, ?, ?)",
+                         "t-1", "claimed", NOW - 90, 1)
+        self.scratch.run("INSERT INTO task_events (task_id, kind, created_at, run_id) VALUES (?, ?, ?, ?)",
+                         "t-1", "timed_out", NOW - 30, 1)
+        self.scratch.event("t-1", "gave_up", NOW - 30, {"failures": 2, "error": "no heartbeat\nfor 60s",
+                                                         "trigger_outcome": "timed_out"})
+        self.scratch.event("t-1", "gave_up", NOW - 20, {"failures": 1})
+        self.scratch.event("t-1", "gave_up", NOW - 10, {})
+        history = self.board.detail("t-1")["history"]
+        self.assertEqual([(e["kind"], e.get("outcome"), e.get("text")) for e in history], [
+            ("created", None, None),
+            ("attempt", "timed_out", "no heartbeat for 60s"),
+            ("blocked", None, "Stopped retrying after 2 failed attempts: no heartbeat for 60s"),
+            ("blocked", None, "Stopped retrying after 1 failed attempt"),
+            ("blocked", None, "Stopped retrying")])
+
+    def test_only_the_profiles_own_task_is_read(self):
+        self.scratch.task("t-1", assignee="reviewer")
+        self.scratch.task("t-2", "archived")
+        self.assertIsNone(self.board.detail("t-1"))
+        self.assertIsNone(self.board.detail("t-2"))
+        self.assertIsNone(self.board.detail("t-9"))
+
+    def test_the_detail_is_read_read_only(self):
+        self.scratch.task("t-1")
+        opened = []
+        real = tasks.Board._open
+
+        def watched(path):
+            conn = real(path)
+            opened.append(conn)
+            return conn
+        with patch.object(tasks.Board, "_open", staticmethod(watched)):
+            self.board.detail("t-1")
+        self.assertTrue(opened)
+        with contextlib.closing(tasks.read_only(self.scratch.path)) as conn:
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("DELETE FROM tasks")
+
+
 class ListTest(unittest.TestCase):
     def task(self, n, state="queued", since=NOW):
         return {"id": f"t-{n}", "title": "x", "assignee": "engineer", "state": state, "since": since}
@@ -196,8 +333,25 @@ class ReporterTest(unittest.IsolatedAsyncioTestCase):
             await self.reporter._send_activity()
 
     def test_tasks_is_announced_only_with_a_board(self):
-        self.assertEqual(self.reporter.capabilities, ("activity", "tasks"))
+        self.assertEqual(self.reporter.capabilities, ("activity", "tasks", "task_details"))
         self.assertEqual(tasks.Reporter("engineer", self.sent).capabilities, ("activity",))
+
+    async def test_a_task_get_is_answered_with_its_detail_or_an_error(self):
+        self.scratch.task("t-1", "running", body="Fix it")
+        self.scratch.task("t-2", assignee="reviewer")
+        await self.reporter.detail({"id": "b-1", "type": "task.get", "task": "t-1"})
+        answer = self.sent.messages[-1]
+        self.assertEqual((answer["type"], answer["of"], answer["detail"]["body"]), ("task.detail", "b-1", "Fix it"))
+        # Another profile's task, and one no board has.
+        for task_id in ("t-2", "t-9"):
+            await self.reporter.detail({"id": "b-2", "type": "task.get", "task": task_id})
+            self.assertEqual((self.sent.messages[-1]["type"], self.sent.messages[-1]["code"]), ("error", "not_found"))
+        os.remove(self.scratch.path)
+        with self.assertLogs("enclos.tasks", "WARNING"):
+            await self.reporter.detail({"id": "b-3", "type": "task.get", "task": "t-1"})
+        self.assertEqual((self.sent.messages[-1]["code"], self.sent.messages[-1]["of"]), ("internal", "b-3"))
+        await tasks.Reporter("engineer", self.sent).detail({"id": "b-4", "type": "task.get", "task": "t-1"})
+        self.assertEqual(self.sent.messages[-1]["code"], "unsupported")
 
     async def test_an_idle_agent_says_so_after_the_hello(self):
         await self.reporter.connected()
@@ -408,6 +562,39 @@ class RealHermesBoardTest(unittest.TestCase):
         self.assertEqual((by_id[done]["conversation"], by_id[done]["asked_by"], by_id[done]["summary"]),
                          ("c-1", "main", "All done"))
         self.assertTrue(all(t["since"] > 0 and t["assignee"] == "engineer" for t in found))
+
+    def test_the_plugin_reads_the_detail_hermes_writes(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect
+        with contextlib.closing(connect()) as conn:
+            parent = kb.create_task(conn, title="Shared contract", assignee="pm", created_by="lead")
+            task = kb.create_task(conn, title="Fix the threads", body="Fix them.\n\nThen reply.",
+                                  assignee="engineer", created_by="lead", parents=[parent])
+            child = kb.create_task(conn, title="Review the fix", assignee="reviewer", parents=[task])
+            kb.add_comment(conn, task, "lead", "Implement with the engineer.\nReview after.")
+            kb.claim_task(conn, parent)
+            kb.complete_task(conn, parent, result="Agreed")
+            kb.claim_task(conn, task)
+            kb.block_task(conn, task, reason="Needs the API key")
+            kb.unblock_task(conn, task)
+            kb.claim_task(conn, task)
+        board = tasks.hermes_board(self.home, "enclos")
+        _, found = board.read("engineer")
+        self.assertEqual(found[0]["comments"], 1)
+        detail = board.detail(task)
+        self.assertEqual(detail["body"], "Fix them.\n\nThen reply.")
+        self.assertEqual({(r["id"], r["relation"], r.get("state")) for r in detail["related"]},
+                         {(parent, "parent", "done"), (child, "child", "queued")})
+        self.assertEqual([(c["author"], c["text"]) for c in detail["comments"]],
+                         [("lead", "Implement with the engineer.\nReview after.")])
+        self.assertEqual(detail["comments_total"], 1)
+        kinds = [(e["kind"], e.get("outcome")) for e in detail["history"]]
+        self.assertEqual(kinds[0], ("created", None))
+        self.assertIn(("attempt", "blocked"), kinds)
+        self.assertIn(("blocked", None), kinds)
+        self.assertIn(("unblocked", None), kinds)
+        self.assertEqual(kinds[-1], ("attempt", None))
+        self.assertIsNone(board.detail(child))
 
     def test_every_board_hook_is_one_hermes_has(self):
         from hermes_cli.plugins import VALID_HOOKS

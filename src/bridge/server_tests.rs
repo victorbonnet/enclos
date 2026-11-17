@@ -4258,6 +4258,7 @@ fn reported(
         state,
         since: 1,
         summary: None,
+        comments: None,
     }
 }
 

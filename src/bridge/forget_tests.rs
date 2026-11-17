@@ -284,6 +284,7 @@ fn forgetting_an_agent_drops_the_tasks_kept_for_it() {
         state: enclos_protocol::task::TaskState::Running,
         since: 1,
         summary: None,
+        comments: None,
     };
     store
         .put_task("gone", &task("t1", "gone/coder"), 1)

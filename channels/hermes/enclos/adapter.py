@@ -348,6 +348,11 @@ class EnclosAdapter(BasePlatformAdapter):
             # Hermes's unblock waits on the board's write lock: it runs
             # beside the connection, as a routine control does.
             self._held.track(asyncio.create_task(self._held.resume(message)))
+        elif kind == "task.get":
+            # A read of every board: beside the connection too.
+            task = asyncio.create_task(self._reporter.detail(message))
+            self._routine_tasks.add(task)
+            task.add_done_callback(self._routine_tasks.discard)
         elif kind == "error":
             approvals.answered(self._answers, message)
             # A task it refused is sent again at the board's next reading.

@@ -198,6 +198,14 @@ _Avoid_: automation, scheduled session, cron job (except when naming a runtime's
 Work an agent does outside a conversation's answer, which its runtime tracks from the moment it is asked for until it ends. Another agent, or a person, asks for it.
 _Avoid_: job, ticket, card, kanban item (except when naming a runtime's own feature, such as a task on Hermes's kanban board)
 
+**Task detail**:
+What a task's runtime holds of it beyond where it stands: what it asks, the tasks it waits for and that wait for it, the comments on it, and its history.
+_Avoid_: task page, ticket
+
+**Task history**:
+What happened to a task, oldest first: when it was asked for, each attempt at it and how that ended, when it blocked and went on, and when it was done.
+_Avoid_: activity, timeline, log (activity is what an agent is doing now)
+
 **Agent activity**:
 What an agent is doing right now: answering in a conversation, running a routine or working on a task, several at once, or nothing (idle).
 _Avoid_: busy state, presence, status (enclos's own)

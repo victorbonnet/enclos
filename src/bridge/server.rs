@@ -46,6 +46,8 @@ mod questions;
 mod routines;
 #[path = "served.rs"]
 mod served;
+#[path = "task_details.rs"]
+mod task_details;
 #[path = "tasks.rs"]
 mod tasks;
 
@@ -200,6 +202,8 @@ struct Hub {
     questions: Mutex<questions::QuestionRequests>,
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
+    /// Task details asked of plugins for devices.
+    task_details: Mutex<task_details::TaskDetailRequests>,
     /// One lock per agent, held while its plugin connection opens, never
     /// with `plugins`: a plugin slow to answer its `hello` holds up the
     /// callers that need that agent, not the bridge. Made for an agent the
@@ -463,6 +467,7 @@ impl Hub {
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
             held_tasks: Mutex::new(Default::default()),
+            task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
             _live: live,
@@ -918,6 +923,9 @@ impl Hub {
                         if hub.held_task_error(&store, &agent, &routine_connection, &error) {
                             continue;
                         }
+                        if hub.task_detail_error(&store, &agent, &routine_connection, &error) {
+                            continue;
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -1254,6 +1262,10 @@ impl Hub {
                             break;
                         }
                     }
+                    // A task's detail, which a device asked for: to it alone.
+                    FromPlugin::TaskDetail { of, detail } => {
+                        hub.task_detail_answered(&store, &agent, &routine_connection, &of, detail);
+                    }
                     FromPlugin::AgentUsage(call) => {
                         hub.pace_usage(&agent);
                         let at = crate::bridge::store::now();
@@ -1284,6 +1296,7 @@ impl Hub {
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
             hub.held_task_disconnected(&store, &agent, &routine_connection);
+            hub.task_details_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
             // turn it was running gets no reply on this connection.
             let mut plugins = hub.plugins.lock().expect("not poisoned");
@@ -2717,6 +2730,11 @@ fn run_session(
                 };
                 if let Err(error) = hub.held_task_resume(store, device, person, message.id, request)
                 {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::TaskGet { agent, task } => {
+                if let Err(error) = hub.task_get(store, device, person, message.id, agent, task) {
                     link.send(ToDevice::Error(error))?;
                 }
             }
@@ -4912,6 +4930,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                     state: enclos_protocol::task::TaskState::Running,
                     since: 1,
                     summary: None,
+                    comments: None,
                 },
                 now(),
             )

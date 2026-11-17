@@ -378,6 +378,17 @@ impl Hub {
         Ok(())
     }
 
+    /// `agent`'s current plugin connection, as [`Hub::routine_connected`]
+    /// named it: what a live request to the plugin is bound to.
+    pub(super) fn agent_connection(&self, agent: &str) -> Option<String> {
+        self.routines
+            .lock()
+            .expect("not poisoned")
+            .connections
+            .get(agent)
+            .cloned()
+    }
+
     pub(super) fn routine_connected(&self, agent: &str) -> String {
         let connection = new_id().expect("system randomness available");
         self.routines
@@ -574,6 +585,7 @@ impl Hub {
                     self.expire_routines(&store);
                     self.expire_questions(&store);
                     self.expire_held_resumes(&store);
+                    self.expire_task_gets(&store);
                 },
                 Err(e) => {
                     eprintln!(

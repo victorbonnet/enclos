@@ -17,12 +17,22 @@ const TO_DEVICE: &[(&str, &str)] = &[
         "message_held_task",
         include_str!("fixtures/device/to_device_message_held_task.json"),
     ),
+    (
+        "task_detail",
+        include_str!("fixtures/device/to_device_task_detail.json"),
+    ),
 ];
 
-const FROM_DEVICE: &[(&str, &str)] = &[(
-    "held_task_resume",
-    include_str!("fixtures/device/from_device_held_task_resume.json"),
-)];
+const FROM_DEVICE: &[(&str, &str)] = &[
+    (
+        "held_task_resume",
+        include_str!("fixtures/device/from_device_held_task_resume.json"),
+    ),
+    (
+        "task_get",
+        include_str!("fixtures/device/from_device_task_get.json"),
+    ),
+];
 
 fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("valid JSON")

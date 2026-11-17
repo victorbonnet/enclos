@@ -37,6 +37,8 @@ class FromTheBridge(unittest.TestCase):
              "bad_message"),
             (b'{"v":1,"id":"m1","type":"held_task.resume","task":"","revision":"e:1","person":"p","device":"d"}',
              "bad_message"),
+            (b'{"v":1,"id":"m1","type":"task.get","task":""}', "bad_message"),
+            (b'{"v":1,"id":"m1","type":"task.get"}', "bad_message"),
             (b'{"v":2,"id":"m1","type":"ack","of":"m0"}', "version"),
             (b'{"id":"m1","type":"ack","of":"m0"}', "bad_message"),
             (b'{"v":1,"id":"","type":"ack","of":"m0"}', "bad_message"),
