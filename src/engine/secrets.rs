@@ -602,7 +602,7 @@ fn check_writable(
 /// over it, each value as `format` takes it back. Refused, before anything
 /// is written: a value [`check_writable`] refuses, and a folder that is a
 /// link, never followed.
-fn write_secrets_file(
+pub(super) fn write_secrets_file(
     name: &SandboxName,
     folder: &Path,
     file: &str,

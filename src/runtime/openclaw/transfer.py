@@ -20,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 
 FORMAT = 'openclaw-data-v1'
 VERSION = '2026.11.3'
@@ -185,9 +186,9 @@ def initialize_config(home, agent, entry):
                        'cron': {'enabled': False}, 'hooks': {'enabled': False}}, out)
 
 
-def native_data(home, operation, agent, file, agent_dir):
+def native_data(home, operation, agent, file, agent_dir, credential_files=None):
     result = subprocess.run([str(home / '.local/share/openclaw/tools/node/bin/node'), '--input-type=module', '-e', NATIVE_SOURCE,
-                             operation, agent, str(file), str(agent_dir)], env=native_env(home), capture_output=True, timeout=240)
+                             operation, agent, str(file), str(agent_dir), json.dumps(credential_files or {})], env=native_env(home), capture_output=True, timeout=240)
     if result.returncode:
         error = file.with_name(file.name + '.error')
         if error.is_file():
@@ -342,12 +343,23 @@ def write_archive(data, output, limit):
         output.unlink(missing_ok=True); raise
 
 
-def export(home, agent, output, limit=MAX_BYTES):
+def preserve_adjacent_files(agent_dir, home, destination):
+    # A fresh generation keeps references from an earlier import intact.
+    generation = uuid.uuid4().hex
+    for item in sorted(agent_dir.parent.iterdir()):
+        if item == agent_dir: continue
+        for rel, file in regular_tree(item, home, Path(item.name), directories=True):
+            target = destination / 'enclos-source-agent-files' / generation / rel
+            if file is None: target.mkdir(parents=True, exist_ok=True)
+            else: copy_consistent(file, target)
+
+
+def export(home, agent, output, limit=MAX_BYTES, credential_files=None):
     checked_name(agent)
     with tempfile.TemporaryDirectory(prefix='.enclos-openclaw-export-', dir=home) as tmp:
         stage = Path(tmp); data = stage / 'data'; data.mkdir()
         agent_dir = home / '.openclaw/agents' / agent / 'agent'
-        bundle = stage / 'native.json'; native_data(home, 'export', agent, bundle, agent_dir)
+        bundle = stage / 'native.json'; native_data(home, 'export', agent, bundle, agent_dir, credential_files)
         meta = json.loads(bundle.read_text()); cfg = meta['config']
         own = cfg.get('agents', {}).get('entries', {}).get(agent)
         if not isinstance(own, dict): fail('native agent is missing from the explicit roster')
@@ -379,12 +391,7 @@ def export(home, agent, output, limit=MAX_BYTES):
         # Native snapshots carry current session history. Adjacent old
         # sessions/import archives are retained as data outside native
         # discovery paths so a destination cannot re-ingest old work.
-        for item in sorted(agent_dir.parent.iterdir()):
-            if item == agent_dir: continue
-            for rel, file in regular_tree(item, home, Path(item.name), directories=True):
-                target = data / 'agent/enclos-source-agent-files' / rel
-                if file is None: target.mkdir(parents=True, exist_ok=True)
-                else: copy_consistent(file, target)
+        preserve_adjacent_files(agent_dir, home, data / 'agent')
         commands = HELPERS | set(meta['agentNames'])
         for item in sorted(home.iterdir()):
             if item == output: continue
@@ -516,7 +523,8 @@ def restore(home, agent, source, context):
         if meta['legacy_bindings']:
             # Preserve unrouted historical data without publishing native
             # conversation ownership, rewriting paths or reactivating work.
-            (agent_dir / 'enclos-legacy-codex-bindings.json').write_text(json.dumps(meta['legacy_bindings']))
+            with (agent_dir / f'enclos-legacy-codex-bindings-{uuid.uuid4().hex}.json').open('x') as reference:
+                json.dump(meta['legacy_bindings'], reference)
         native(home, 'skills', 'list', '--agent', agent, '--json')
 
 
@@ -525,7 +533,7 @@ if __name__ == '__main__':
         NATIVE_SOURCE, operation, name, file, context = sys.argv[1:]
         os.umask(0o077)
         home = Path.home().resolve(); context = json.loads(context)
-        if operation == 'export': export(home, name, Path(file), context.get('max_bytes', MAX_BYTES))
+        if operation == 'export': export(home, name, Path(file), context.get('max_bytes', MAX_BYTES), context.get('credential_files'))
         elif operation == 'import': restore(home, name, Path(file), context)
         else: fail('unknown transfer operation')
     except Exception as error:

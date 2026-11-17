@@ -73,7 +73,7 @@ async function legacyThreadCatalog(config, resolveAgentDir) {
 }
 
 async function main() {
-  const [operation, agent, file, agentDir] = process.argv.slice(1);
+  const [operation, agent, file, agentDir, credentialFiles = '{}'] = process.argv.slice(1);
   if (!/^[a-z][a-z0-9-]{1,40}$/.test(agent ?? '')) throw new Error('invalid agent');
   const nodeRoot = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
   const packageFile = path.join(nodeRoot, 'lib/node_modules/openclaw/package.json');
@@ -102,6 +102,11 @@ async function main() {
   } else if (operation === 'export') {
     const { snapshot } = await config.readConfigFileSnapshotForWrite();
     if (!snapshot?.valid || !snapshot.sourceConfig) throw new Error('native config is invalid');
+    const resolutionConfig = structuredClone(snapshot.sourceConfig);
+    const aliases = JSON.parse(credentialFiles);
+    for (const provider of Object.values(resolutionConfig.secrets?.providers ?? {})) {
+      if (provider.source === 'file' && Object.hasOwn(aliases, provider.path)) provider.path = aliases[provider.path];
+    }
     const shared = await loadAuthProfileStoreWithoutExternalProfilesAsync(undefined);
     const own = await loadAuthProfileStoreWithoutExternalProfilesAsync(agentDir, { inheritedAuthDir: agentDir });
     const bindings = [], legacyBindings = [];
@@ -115,8 +120,8 @@ async function main() {
       }
     }
     const resolve = async (value, location) => {
-      if (value && typeof value === 'object' && ['env', 'file', 'exec'].includes(value.source) && typeof value.provider === 'string' && typeof value.id === 'string') {
-        const resolved = await secrets.resolveConfiguredSecretInputString({ config: snapshot.sourceConfig, env: process.env, value, path: location });
+      if (value && typeof value === 'object' && ['env', 'file', 'exec', 'store'].includes(value.source) && typeof value.provider === 'string' && typeof value.id === 'string') {
+        const resolved = await secrets.resolveConfiguredSecretInputString({ config: resolutionConfig, env: process.env, value, path: location });
         if (typeof resolved.value !== 'string' || resolved.unresolvedRefReason) throw new Error(`source credential could not be resolved at ${location}`);
         return resolved.value;
       }
