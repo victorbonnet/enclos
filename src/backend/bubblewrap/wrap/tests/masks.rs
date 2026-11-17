@@ -42,6 +42,30 @@ fn a_denied_path_in_the_home_is_left_out_of_its_folders_and_the_rest_bound_back(
 }
 
 #[test]
+fn a_home_reached_by_symlink_is_rebuilt_at_its_target_with_its_deny_masks() {
+    let home = Home::new();
+    let actual = home.user();
+    let alias = actual.with_file_name("via-link");
+    symlink(&actual, &alias).unwrap();
+    let denied = home.folder(".private");
+    let visible = home.file("visible");
+    let mut c = compiled(&home, Lists::default());
+    c.bubblewrap.root_masks.home = text(&alias);
+    c.bubblewrap.root_masks.denied =
+        vec![text(&alias.join(".private")), text(&alias.join(".enclos"))];
+
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host, &[]));
+    assert!(host.hidden.contains(&denied));
+    let tmpfs = ["--tmpfs", actual.to_str().unwrap()];
+    assert_eq!(args.windows(2).filter(|words| *words == tmpfs).count(), 1);
+    position(&args, &["--remount-ro", &text(&actual)]);
+    position(&args, &["--symlink", &text(&actual), &text(&alias)]);
+    position(&args, &["--ro-bind-try", &text(&visible), &text(&visible)]);
+    assert!(!args.contains(&text(&denied)), "{args:?}");
+}
+
+#[test]
 fn the_root_view_builds_and_seals_each_home_ancestor_once() {
     use crate::backend::bubblewrap::wrap::host::Entry;
 
