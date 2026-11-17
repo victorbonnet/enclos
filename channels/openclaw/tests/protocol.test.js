@@ -44,3 +44,11 @@ test('JSON token files require private single-link regular files', t => {
   linkSync(account.tokenFile, `${alias}-hard`);
   assert.throws(() => readToken(account.tokenFile));
 });
+
+
+test('current bridge controls decode without advertising native authority', () => {
+  assert.throws(() => decode(encode(message('conversation.delete', {}))), e => e.code === 'bad_message');
+  assert.throws(() => decode(encode(message('held_task.resume', { task: 't', revision: 'e:1', person: 'p' }))), e => e.code === 'bad_message');
+  assert.throws(() => decode(encode(message('task.get', {}))), e => e.code === 'bad_message');
+  assert.equal(decode(encode(message('task.get', { task: 't' }))).task, 't');
+});
