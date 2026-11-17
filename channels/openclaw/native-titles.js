@@ -1,4 +1,4 @@
-// Public native session metadata; no native store paths or schemas are copied.
+// Public native chat metadata; no native store paths or schemas are copied.
 import { message, ProtocolError } from './protocol.js';
 
 function displayTitle(entry) {
@@ -16,7 +16,7 @@ export function createNativeTitles(runtime, account, transport, { currentConfig,
   let closed = false;
   const assertOwner = () => {
     assertCurrent();
-    if (closed || session.resolveStorePath(currentConfig().session?.store, { agentId: account.agentId }) !== storePath) throw new Error('native session owner was stopped or reconfigured');
+    if (closed || session.resolveStorePath(currentConfig().session?.store, { agentId: account.agentId }) !== storePath) throw new Error('native chat owner was stopped or reconfigured');
   };
   function target(conversation) {
     assertOwner();
@@ -78,7 +78,7 @@ export function createNativeTitles(runtime, account, transport, { currentConfig,
           authority: { kind: 'host', assertCurrent: assertTarget },
           prepare(entry, context) {
             assertTarget();
-            // Renaming an unused conversation does not create a native session.
+            // Renaming an unused conversation does not create a native chat.
             // Display titles may repeat. Addressable native labels keep their
             // own validation/uniqueness contract and are never rewritten here.
             return context.existingEntry && entry.sessionId ? { displayName: title || undefined } : null;
@@ -88,7 +88,7 @@ export function createNativeTitles(runtime, account, transport, { currentConfig,
         if (updated) { last.delete(control.conversation); await refresh(control.conversation); }
       } catch (error) {
         assertTarget();
-        throw new ProtocolError('conflict', 'the native session kept its current title; refresh before renaming it again');
+        throw new ProtocolError('conflict', 'the native chat kept its current title; refresh before renaming it again');
       }
       return true;
     },
