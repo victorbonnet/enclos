@@ -641,7 +641,7 @@ fn secret_source_commands(
 }
 
 #[cfg(test)]
-mod tests {
+mod secret_source_tests {
     use super::*;
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
         let mut policy = Policy::default();
         policy
             .agent_secrets
-            .entry(agent.to_string())
+            .entry(agent.as_str().parse().unwrap())
             .or_default()
             .insert(
                 "EXAMPLE_TOKEN".to_owned(),
