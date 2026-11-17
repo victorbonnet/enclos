@@ -52,10 +52,11 @@ REFRESH_SECONDS = 30
 RETELL_SECONDS = 600
 # What Hermes's unblock does, said on the card.
 RESUME = "Runs it again with a fresh retry budget."
-# Said on the card of a task held in triage, whatever this Hermes offers: its
-# resume answers `unsupported` without opening Hermes's writer (`Board.resume`).
-RESUME_UNSUPPORTED = ("The app cannot resume it: Hermes cannot check that it is still held as shown when it "
-                      "resumes it. Specify it on its kanban board.")
+# What a person does instead for a task held in triage, which is reported
+# `resumable: false` whatever this Hermes offers: the bridge refuses its
+# resume, and this plugin answers one that reaches it `unsupported` without
+# opening Hermes's writer (`Board.resume`).
+NOT_RESUMABLE = "Decide on the agent's task board."
 # The bridge's own bounds (`HeldTask::normalized`), kept here too so a list
 # stays far below a message's 1 MiB whatever the board holds.
 MAX_TITLE_CHARS = 200
@@ -309,11 +310,17 @@ class Board:
 
     def _read_board(self, slug: str, path: Path, profile: str) -> list[dict[str, Any]]:
         entries = []
-        # A Hermes whose board has no `triage` refuses to list it.
-        statuses = ["blocked", "triage"] if "triage" in getattr(self.kb, "VALID_STATUSES", ("triage",)) else ["blocked"]
+        # `blocked` is always read; `triage` only where this Hermes says it
+        # has it (`VALID_STATUSES`): one that does not say may refuse to list
+        # it, which would leave its blocked tasks standing as last read.
+        statuses = ["blocked"]
+        if "triage" in getattr(self.kb, "VALID_STATUSES", ()):
+            statuses.append("triage")
         with contextlib.closing(self.read_only(path)) as conn:
-            for task in [task for status in statuses for task in self.kb.list_tasks(conn, status=status)]:
-                if _creator(task) == profile:
+            for status in statuses:
+                for task in self.kb.list_tasks(conn, status=status):
+                    if _creator(task) != profile:
+                        continue
                     entry = self._describe(conn, slug, task, profile)
                     if entry is not None:
                         entries.append(entry)
@@ -347,7 +354,8 @@ class Board:
             "reason": _cut(reason, MAX_REASON_CHARS),
             "since": since,
             "revision": revision,
-            "resume": RESUME_UNSUPPORTED if looped else RESUME,
+            "resume": NOT_RESUMABLE if looped else RESUME,
+            "resumable": not looped,
         }
         assignee = _line(getattr(task, "assignee", None), MAX_ASSIGNEE_CHARS)
         if assignee and assignee != profile:

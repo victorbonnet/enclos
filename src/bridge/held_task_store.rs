@@ -82,6 +82,7 @@ fn read_card(row: &rusqlite::Row) -> rusqlite::Result<Row> {
             last_error: task.last_error,
             since: task.since,
             resume: task.resume,
+            resumable: task.resumable,
             state,
             revision,
         },
@@ -140,11 +141,23 @@ pub fn held_text(task: &HeldTask) -> String {
     if let Some(error) = &task.last_error {
         text.push_str(&format!("\nLast error: {error}"));
     }
-    if !task.resume.is_empty() {
+    if !task.resumable {
+        // What to do instead, never as a Resume.
+        let instead = if task.resume.is_empty() {
+            NOT_RESUMABLE
+        } else {
+            &task.resume
+        };
+        text.push_str(&format!("\n{instead}"));
+    } else if !task.resume.is_empty() {
         text.push_str(&format!("\nResume: {}", task.resume));
     }
     text
 }
+
+/// What a card's first message says of a task that cannot be resumed from
+/// the app when its runtime says nothing more.
+const NOT_RESUMABLE: &str = "This task cannot be resumed from the app.";
 
 /// What the quiet line says when a card leaves `held`.
 fn left_text(state: HeldTaskState, title: &str) -> String {
@@ -272,14 +285,17 @@ impl Store {
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             let current = card_in(&tx, agent, task.task.as_str())?;
             let message = match &current {
-                // Still held: new details, no new message.
+                // Still held: new details, no new message. Compared as read,
+                // so a body an earlier build wrote without a field that now
+                // reads as its default is no change.
                 Some(card) if card.info.state == HeldTaskState::Held => {
                     let stored: String = tx.query_row(
                         "SELECT body FROM held_tasks WHERE agent = ?1 AND task = ?2",
                         params![agent, task.task.as_str()],
                         |row| row.get(0),
                     )?;
-                    if stored == body {
+                    if serde_json::from_str::<HeldTask>(&stored).is_ok_and(|stored| stored == *task)
+                    {
                         continue;
                     }
                     tx.execute(
@@ -400,6 +416,7 @@ mod tests {
             since: 1_763_000_000,
             revision: HeldTaskRevision::new("e:1").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
+            resumable: true,
         }
     }
 
@@ -466,6 +483,148 @@ mod tests {
         assert_eq!(changes[0].card.info.revision, 1);
         assert!(changes[0].message.is_none());
         assert_eq!(store.newest_seq().unwrap(), before);
+    }
+
+    /// Only whether it can be resumed changes: the card is updated once
+    /// each way, with no new history, and stays as it was through a reopen.
+    #[test]
+    fn a_change_of_resumable_alone_updates_the_card_once_each_way() {
+        let (dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        let before = store.newest_seq().unwrap();
+        let not_here = HeldTask {
+            resumable: false,
+            ..task("t1", "r")
+        };
+        let changes = store
+            .report_held_tasks(AGENT, &home, std::slice::from_ref(&not_here))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].card.info.resumable);
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].card.info.revision, 1);
+        assert_eq!(changes[0].card.runtime_revision.as_str(), "e:1");
+        assert!(changes[0].message.is_none());
+        // The same report again changes nothing.
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, std::slice::from_ref(&not_here))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.newest_seq().unwrap(), before);
+        // As stored.
+        drop(store);
+        let store = Store::open(&dir.path().join("app.db")).unwrap();
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert!(!card.info.resumable);
+        assert_eq!(card.info.revision, 1);
+        assert!(!store.held_tasks_for(OWNER).unwrap()[0].info.resumable);
+        // And back.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].card.info.resumable);
+        assert_eq!(changes[0].card.info.revision, 2);
+        assert!(changes[0].message.is_none());
+        assert_eq!(store.newest_seq().unwrap(), before);
+    }
+
+    /// A card an earlier bridge stored has no `resumable`: it reads as
+    /// true, and the same task reported again is no change.
+    #[test]
+    fn a_card_stored_without_resumable_reads_as_resumable_and_does_not_change() {
+        let (dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        let body: String = store
+            .db
+            .query_row("SELECT body FROM held_tasks WHERE task = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut older: serde_json::Value = serde_json::from_str(&body).unwrap();
+        older.as_object_mut().unwrap().remove("resumable");
+        store
+            .db
+            .execute(
+                "UPDATE held_tasks SET body = ?1 WHERE task = 't1'",
+                params![older.to_string()],
+            )
+            .unwrap();
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert!(card.info.resumable);
+        assert_eq!(card.info.revision, 0);
+        // Read again by a bridge that opens the database afresh, as after
+        // an upgrade: the body on disk still has no `resumable`.
+        drop(store);
+        let store = Store::open(&dir.path().join("app.db")).unwrap();
+        let body: String = store
+            .db
+            .query_row("SELECT body FROM held_tasks WHERE task = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!body.contains("resumable"), "{body}");
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert_eq!(
+            (card.info.resumable, card.info.revision, card.info.state),
+            (true, 0, HeldTaskState::Held)
+        );
+        assert!(store.held_tasks_for(OWNER).unwrap()[0].info.resumable);
+        let seq = store.newest_seq().unwrap();
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.newest_seq().unwrap(), seq);
+        assert_eq!(
+            store.held_task(AGENT, "t1").unwrap().unwrap().info.revision,
+            0
+        );
+    }
+
+    /// A task that cannot be resumed from the app says what to do instead,
+    /// not as a Resume.
+    #[test]
+    fn a_task_not_resumable_here_is_introduced_without_a_resume() {
+        let (_dir, store, home) = store();
+        let changes = store
+            .report_held_tasks(
+                AGENT,
+                &home,
+                &[
+                    HeldTask {
+                        resumable: false,
+                        resume: "Decide on the agent's task board.".into(),
+                        ..task("t1", "Blocked again")
+                    },
+                    HeldTask {
+                        resumable: false,
+                        resume: String::new(),
+                        ..task("t2", "Blocked again")
+                    },
+                ],
+            )
+            .unwrap();
+        let texts: Vec<_> = changes
+            .iter()
+            .map(|change| change.message.as_ref().unwrap().text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Held task: Task t1\nBlocked again\nLast error: boom\nDecide on the agent's task board.",
+                "Held task: Task t2\nBlocked again\nLast error: boom\nThis task cannot be resumed from the app.",
+            ]
+        );
+        assert!(changes.iter().all(|change| !change.card.info.resumable));
     }
 
     #[test]
