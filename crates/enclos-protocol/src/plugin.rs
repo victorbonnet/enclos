@@ -99,14 +99,6 @@ pub enum FromBridge {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<bool>,
     },
-    /// Requests cancellation of this exact ingress, when the plugin advertises
-    /// `abort`. Unknown or settled targets have no effect on later turns. An ack
-    /// accepts the request; it does not certify native cleanup has drained.
-    #[serde(rename = "turn.abort")]
-    TurnAbort {
-        conversation: ConversationId,
-        of: MessageId,
-    },
     /// The person named the conversation, or, with an empty `title`,
     /// cleared its name.
     #[serde(rename = "conversation.rename")]
@@ -133,7 +125,6 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "policy.context",
     "hello",
     "message.in",
-    "turn.abort",
     "conversation.rename",
     "conversation.delete",
     "ack",
