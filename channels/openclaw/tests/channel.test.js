@@ -175,6 +175,8 @@ test('typing, exact tool events, native commands and policy requests keep their 
   let live = true;
   const tool = toolFactory.create({ ...ctx, messageChannel: 'enclos', assertInvocationCurrent() { if (!live) throw new Error('retired invocation'); } });
   assert.equal(toolFactory.create({ sessionKey: 'unrelated', assertInvocationCurrent() {} }), null);
+  assert.match(tool.description, /policy request/);
+  assert.doesNotMatch(tool.description, /scope/);
   const result = await tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read the requested file' });
   const request = await owner.next('approval.request');
   assert.equal(request.id, result.details.request); assert.equal(result.details.status, 'requested');
