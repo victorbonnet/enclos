@@ -111,7 +111,7 @@ fn connect_stops_waiting_at_once_for_a_gateway_refused() {
     let (_dir, engine, name) = with_sandbox();
     let home = engine.layout.sandbox_home(name.as_str());
     std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
-    let (child, ports) = gateway(&engine, &name, 2);
+    let (child, _) = gateway(&engine, &name, 2);
     let begun = std::time::Instant::now();
     let got = engine.start_listener_service(&alice(), &name, &mut |_| {});
     end(child);
@@ -188,7 +188,7 @@ fn a_configured_service_port_does_not_have_to_be_ephemeral() {
 #[test]
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
-    let (child, _) = gateway(&engine, &name, 2);
+    let (child, port) = gateway(&engine, &name, 2);
     let got = service_listener(
         engine.state.as_ref(),
         &name,
@@ -201,14 +201,14 @@ fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::Loopback(ports[0]),
+        ListenerPorts::Loopback(port),
     );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
         "{got:?}"
     );
-    assert_eq!(configured, Ok(ports[0]));
+    assert_eq!(configured, Ok(port));
 }
 
 #[test]
