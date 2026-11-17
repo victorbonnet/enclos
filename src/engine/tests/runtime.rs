@@ -4965,7 +4965,7 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             &other,
             "comptoir-dev".parse().unwrap(),
             &archive,
-            crate::engine::AgentImportOptions::default(),
+            false,
             Confirm::Yes,
         )
         .unwrap_err();
@@ -4998,7 +4998,7 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
                 &other,
                 "comptoir-dev".parse().unwrap(),
                 &archive,
-                crate::engine::AgentImportOptions::default(),
+                false,
                 Confirm::Yes,
             )
             .unwrap(),
@@ -5117,10 +5117,7 @@ fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
                 &lab.name,
                 "main".parse().unwrap(),
                 &path,
-                crate::engine::AgentImportOptions {
-                    metadata_only: true,
-                    ..Default::default()
-                },
+                true,
                 Confirm::DryRun
             )
             .unwrap(),
@@ -5135,10 +5132,7 @@ fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
                 &lab.name,
                 "main".parse().unwrap(),
                 &path,
-                crate::engine::AgentImportOptions {
-                    metadata_only: true,
-                    ..Default::default()
-                },
+                true,
                 Confirm::Yes,
             )
             .unwrap(),
@@ -5171,10 +5165,7 @@ fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
                 &lab.name,
                 "main".parse().unwrap(),
                 &path,
-                crate::engine::AgentImportOptions {
-                    metadata_only: true,
-                    ..Default::default()
-                },
+                true,
                 Confirm::Yes
             )
             .is_err()
@@ -5222,7 +5213,7 @@ fn review_dry_run_refuses_conflicts_and_describes_service_pause_and_resume() {
                     &lab.name,
                     agent(name),
                     &path,
-                    crate::engine::AgentImportOptions::default(),
+                    false,
                     Confirm::DryRun
                 )
                 .is_err(),
@@ -5244,7 +5235,7 @@ fn review_dry_run_refuses_conflicts_and_describes_service_pause_and_resume() {
             &lab.name,
             agent("fresh"),
             &path,
-            crate::engine::AgentImportOptions::default(),
+            false,
             Confirm::DryRun,
         )
         .unwrap()
@@ -5275,7 +5266,7 @@ fn review_partial_runtime_import_keeps_the_presentation_recovery_hint() {
             &lab.name,
             agent("fresh"),
             &path,
-            crate::engine::AgentImportOptions::default(),
+            false,
             Confirm::Yes,
         )
         .unwrap_err();
@@ -5304,7 +5295,7 @@ fn review_portable_import_preserves_a_staged_copy_cleanup_warning_in_its_report(
                 &lab.name,
                 agent("fresh"),
                 &path,
-                crate::engine::AgentImportOptions::default(),
+                false,
                 Confirm::Yes,
             )
             .unwrap(),
@@ -5356,7 +5347,7 @@ fn review_resume_failure_reports_that_presentation_was_already_restored() {
             &lab.name,
             agent("fresh"),
             &path,
-            crate::engine::AgentImportOptions::default(),
+            false,
             Confirm::Yes,
         )
         .unwrap_err();

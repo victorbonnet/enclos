@@ -1,4 +1,4 @@
-// Private native transfer bridge. Only public APIs of the pinned runtime are
+// Private native transfer bridge. Only public APIs of a supported runtime are
 // imported; credentials and opaque bindings stay in private data files.
 import fs from 'node:fs';
 import path from 'node:path';

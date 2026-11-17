@@ -312,8 +312,31 @@ impl Engine {
         Ok((sources, cleanup))
     }
 
-    /// Imports an Enclos export; the runtime still extracts its own payload inside the sandbox.
+    /// Imports an Enclos export without package authorizations.
     pub fn import_agent_export(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        from: &Path,
+        metadata_only: bool,
+        confirm: Confirm,
+    ) -> Result<Planned<ImportedAgentExport>> {
+        self.import_agent_export_with_options(
+            by,
+            name,
+            agent,
+            from,
+            AgentImportOptions {
+                metadata_only,
+                ..AgentImportOptions::default()
+            },
+            confirm,
+        )
+    }
+
+    /// Imports an Enclos export; the runtime extracts its own payload inside the sandbox.
+    pub fn import_agent_export_with_options(
         &self,
         by: &Actor,
         name: &SandboxName,

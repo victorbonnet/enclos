@@ -4,6 +4,7 @@
 
 Uses only public fixture credentials. No real configuration or agents change.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -51,6 +52,13 @@ for agent in ['main', 'helper']:
         fixture_home(home)
         workspace = home / '.openclaw' / ('workspace' if agent == 'main' else f'workspace-{agent}')
         t.initialize_config(home, agent, {'workspace': str(workspace)})
+        provider = 'enclos-' + hashlib.sha256(agent.encode()).hexdigest()[:16]
+        source_secret_file = root / 'source-protected.json'
+        source_secret_file.write_text(json.dumps({'FIXTURE_API_KEY': 'public-settings-fixture'}))
+        t.native(home, 'config', 'set', f'secrets.providers.{provider}',
+                 json.dumps({'source': 'file', 'mode': 'json', 'path': str(source_secret_file)}), '--strict-json')
+        t.native(home, 'config', 'set', 'skills.entries.fixture.apiKey',
+                 '--ref-source', 'file', '--ref-provider', provider, '--ref-id', '/FIXTURE_API_KEY')
         workspace.mkdir()
         if agent == 'main':
             (workspace / 'MEMORY.md').write_text('native migration fixture memory\n')
@@ -68,13 +76,21 @@ for agent in ['main', 'helper']:
         t.native_data(home, 'import', agent, data, agent_dir)
         data.unlink()
         archive = root / 'agent.tar.gz'
-        t.export(home, agent, archive)
+        t.export(home, agent, archive, settings_grants={'agent': ['FIXTURE_API_KEY']})
         home.rename(root / 'saved-source')
         fixture_home(home)
         if agent == 'helper':
             t.initialize_config(home, 'anchor', {'workspace': str(home / '.openclaw/workspace-anchor')})
             t.native(home, 'config', 'set', 'cron.enabled', 'true', '--json')
-        t.restore(home, agent, archive, {'conversations': {}, 'destination_person': 'fixture-owner'})
+        destination_secret_file = root / 'destination-protected.json'
+        destination_secret_file.write_text(source_secret_file.read_text())
+        t.restore(home, agent, archive, {'conversations': {}, 'destination_person': 'fixture-owner',
+                  'secret_variables': ['FIXTURE_API_KEY'], 'agent_secrets_file': str(destination_secret_file)})
+        restored_config = (home / '.openclaw/openclaw.json').read_text()
+        settings = json.loads(restored_config)
+        assert settings['skills']['entries']['fixture']['apiKey'] == {'source': 'file', 'provider': provider, 'id': '/FIXTURE_API_KEY'}
+        assert settings['secrets']['providers'][provider]['path'] == str(destination_secret_file)
+        assert 'public-settings-fixture' not in restored_config
         probe = home / 'probe.json'
         t.native_data(home, 'export', agent, probe, agent_dir)
         restored = json.loads(probe.read_text())
@@ -91,4 +107,4 @@ for agent in ['main', 'helper']:
         expected_agents = {agent} if agent == 'main' else {'anchor', agent}
         assert {x['id'] for x in json.loads(t.native(home, 'agents', 'list', '--json'))} == expected_agents
         print(json.dumps({'agent': agent, 'native_roundtrip': True, 'auth_local': True, 'shared_auth_unchanged': True,
-                          'codex_binding': True, 'workspace': True}), flush=True)
+                          'codex_binding': True, 'workspace': True, 'settings_reference_preserved': True}), flush=True)
