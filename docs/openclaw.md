@@ -51,7 +51,7 @@ created through the native CLI. `main` is an ordinary native identity, not an
 immutable built-in agent. Commands with an omitted agent resolve the native
 selected default; use explicit `claw/main` or `claw/scout` while setting up.
 
-## Give the managed Gateway its credential
+## Give the managed Gateway its secret
 
 Generate a token directly into enclos's secret store; on macOS this is the
 Keychain. Its value never becomes a command argument:
@@ -82,7 +82,7 @@ enclos runtime configure claw/main \
 ```
 
 The quoted `${…}` is a reference, not shell interpolation. enclos translates it
-to a native file SecretRef and maintains a protected JSON credential file outside
+to a native file SecretRef and maintains a protected JSON secrets file outside
 the sandbox home. The background Gateway reads that file; its token is not kept
 in its startup environment or ordinary configuration. Interactive CLI sessions
 receive their policy grants. Never replace the reference with a literal token.
@@ -90,7 +90,7 @@ receive their policy grants. Never replace the reference with a literal token.
 ## Sign in and select a model
 
 `connect` and `exec` start the sandbox's required services, including its managed
-Gateway. Use the native credential-only ChatGPT device flow:
+Gateway. Use the native login-only ChatGPT device flow:
 
 ```bash
 enclos connect claw -- openclaw models auth login --provider openai --device-code --agent main
@@ -102,7 +102,7 @@ Open the displayed URL in your Mac's browser and enter the device code there.
 OpenClaw owns the resulting provider login inside the sandbox. Do not paste its
 access/refresh tokens into policy, `--set` arguments or chat. Auth selection is
 per native agent: inspect `scout` with the same commands and `--agent scout`, and
-sign it in if OpenClaw reports missing credentials.
+sign it in if OpenClaw reports a missing login.
 
 Login preserves model selection. Omit `--set-default`: the native online login
 rejects it while the Gateway owns this state. After choosing a model available
@@ -211,7 +211,7 @@ the [M5 feature matrix and order](m5-openclaw.md#implementation-order).
 The completed channel stack supplies direct/Home/group conversations, native
 events, files/static HTML, titles, exact cancellation and negotiated native
 approval scopes through the existing app. It does not expose Gateway admin
-credentials or general native RPC to the phone. Native questions retain readable
+secrets or general native RPC to the phone. Native questions retain readable
 text and trusted Control UI flows ([richer cards #225](https://github.com/victorbonnet/enclos/issues/225));
 the app's native routine inventory is read-only
 ([mutation follow-up #226](https://github.com/victorbonnet/enclos/issues/226)).
