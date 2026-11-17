@@ -561,7 +561,7 @@ pub trait RuntimeAdapter {
     fn agent_files(&self, name: &AgentName) -> String;
     fn talk(&self, agent: &AgentName) -> String;
     fn services(&self) -> Vec<RuntimeService>;
-    fn listener(&self) -> Option<RuntimeListener>;
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener>;
     fn dashboard(&self) -> Option<RuntimeDashboard>;
     fn secret_files(&self) -> Option<SecretFiles>;
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath>;
