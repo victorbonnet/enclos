@@ -292,7 +292,8 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
             fds.to_str().unwrap()
         ]
     );
-    assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
+    assert_eq!(&args[..2], ["--tmpfs", "/"]);
+    assert!(args.windows(2).any(|words| words == ["--remount-ro", "/"]));
     // The session joined the namespace holder first, which became
     // bubblewrap.
     let join = stood.read("join");

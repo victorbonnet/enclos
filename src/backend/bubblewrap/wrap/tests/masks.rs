@@ -42,16 +42,76 @@ fn a_denied_path_in_the_home_is_left_out_of_its_folders_and_the_rest_bound_back(
 }
 
 #[test]
-fn the_home_is_masked_after_the_root_and_before_the_compiled_rest() {
+fn the_root_view_builds_and_seals_each_home_ancestor_once() {
+    use crate::backend::bubblewrap::wrap::host::Entry;
+
     let home = Home::new();
-    let c = compiled(&home, Lists::default());
-    let host = read(&home, &c, None).unwrap();
+    let mut c = compiled(&home, Lists::default());
+    c.bubblewrap.root_masks.home = "/home/alice".to_owned();
+    let mut host = Host::default();
+    host.entries.insert(
+        PathBuf::from("/"),
+        vec![
+            Entry {
+                name: "home".into(),
+                link: None,
+            },
+            Entry {
+                name: "usr".into(),
+                link: None,
+            },
+        ],
+    );
+    host.entries.insert(
+        PathBuf::from("/home"),
+        vec![Entry {
+            name: "alice".into(),
+            link: None,
+        }],
+    );
+    host.entries.insert(
+        PathBuf::from("/home/alice"),
+        vec![Entry {
+            name: "keep".into(),
+            link: None,
+        }],
+    );
     let args = strings(&arguments(&c, &host, &[]));
-    let user = text(&home.user());
-    assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
-    assert_eq!(&args[3..5], ["--tmpfs", user.as_str()]);
-    let home_bind = position(&args, &["--bind", &text(&home.sandbox_home())]);
-    assert!(home_bind > position(&args, &["--tmpfs", &user]));
+    let mut expected: Vec<String> = [
+        "--tmpfs",
+        "/",
+        "--tmpfs",
+        "/home",
+        "--tmpfs",
+        "/home/alice",
+        "--ro-bind-try",
+        "/home/alice/keep",
+        "/home/alice/keep",
+        "--ro-bind-try",
+        "/usr",
+        "/usr",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    expected.extend(c.bubblewrap.mounts.iter().cloned());
+    expected.extend(
+        [
+            "--remount-ro",
+            "/",
+            "--remount-ro",
+            "/home",
+            "--remount-ro",
+            "/home/alice",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    for dir in &c.bubblewrap.sealed {
+        expected.extend(["--remount-ro".to_owned(), dir.clone()]);
+    }
+    expected.extend(c.bubblewrap.options.iter().cloned());
+    assert_eq!(args, expected);
 }
 
 #[test]
