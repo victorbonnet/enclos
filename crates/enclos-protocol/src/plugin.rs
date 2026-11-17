@@ -133,6 +133,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "policy.context",
     "hello",
     "message.in",
+    "turn.abort",
     "conversation.rename",
     "conversation.delete",
     "ack",
