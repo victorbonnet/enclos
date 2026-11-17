@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { message } from '../protocol.js';
@@ -205,4 +205,27 @@ test('files enter the native context and an HTML artefact leaves through ordinar
   assert.equal(outgoing.text, 'Open the page'); assert.equal(outgoing.attachments[0].mime, 'text/html');
   assert.equal(outgoing.attachments[0].name, 'answer.html');
   assert.equal(readFileSync(path.join(mediaFolder(account), outgoing.attachments[0].file), 'utf8'), '<!doctype html><p>Static answer</p>');
+});
+
+test('failed native and direct sends remove staged files', async t => {
+  const account = accountFixture(t), cfg = configured(account), folder = mediaFolder(account);
+  const sdk = {
+    mediaRoots: () => [path.dirname(account.socket)],
+    loadMedia: async () => ({ buffer: Buffer.from('test'), fileName: 'file.txt', contentType: 'text/plain' }),
+  };
+  const channel = createChannel(sdk), native = nativeHarness(cfg);
+  channel.setRuntime(native.api);
+  native.api.channel.inbound.dispatch = params => params.delivery.deliver({ mediaUrl: '/fixture.txt' });
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const ctx = { cfg, accountId: 'main', to: 'files', mediaUrl: '/fixture.txt' };
+  const fail = () => { assert.equal(readdirSync(folder).length, 1); throw new Error('send refused'); };
+  await assert.rejects(channel.plugin.outbound.sendMedia({ ...ctx, onPlatformSendDispatch: fail }), /send refused/);
+  assert.deepEqual(readdirSync(folder), []);
+  const active = channel.running.get('main');
+  active.transport.send = fail;
+  const input = message('message.in', { conversation: 'files', person: 'alice', text: 'hello' });
+  owner.send(input);
+  assert.equal((await owner.next('error', input.id)).code, 'agent_unavailable');
+  assert.deepEqual(readdirSync(folder), []);
 });

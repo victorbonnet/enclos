@@ -39,6 +39,20 @@ export function inboundMedia(account, attachments = [], messageId) {
   });
 }
 
+export async function withStagedMedia(account, urls, options, send) {
+  const staged = urls.length ? await stageMedia(account, urls, options) : [];
+  try {
+    return await send(staged);
+  } catch (error) {
+    discardMedia(path.join(path.dirname(account.socket), 'media'), staged);
+    throw error;
+  }
+}
+
+function discardMedia(folder, staged) {
+  for (const attachment of staged) fs.rmSync(path.join(folder, attachment.file), { force: true });
+}
+
 export async function stageMedia(account, urls, { sdk, cfg, access = {}, assertCurrent = () => {} }) {
   if (!Array.isArray(urls) || urls.length > MAX_FILES) throw new Error('a message carries at most ten files');
   const folder = mediaFolder(account); let total = 0; const staged = [];
@@ -65,12 +79,12 @@ export async function stageMedia(account, urls, { sdk, cfg, access = {}, assertC
       metadata(attachment);
       const target = path.join(folder, attachment.file);
       const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-      try { fs.writeFileSync(fd, media.buffer); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       staged.push(attachment);
+      try { fs.writeFileSync(fd, media.buffer); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     }
     return staged;
   } catch (error) {
-    for (const attachment of staged) fs.rmSync(path.join(folder, attachment.file), { force: true });
+    discardMedia(folder, staged);
     throw error;
   }
 }
