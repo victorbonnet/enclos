@@ -51,8 +51,9 @@ pub(in crate::backend::bubblewrap) struct Entry {
 /// What the masks of one launch depend on, read from the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::backend::bubblewrap) struct Host {
-    /// Each folder from the user's home down that holds a hidden path, with
-    /// what it holds. A folder that went away lists nothing.
+    /// The root view's rebuilt folders and what they hold. This includes
+    /// the real ancestors of the user's home and the holders of hidden paths.
+    /// A folder that went away lists nothing.
     pub entries: BTreeMap<PathBuf, Vec<Entry>>,
     /// The paths the home's folders leave out.
     pub hidden: BTreeSet<PathBuf>,
@@ -222,16 +223,23 @@ pub(in crate::backend::bubblewrap) fn read_host(
         ..Host::default()
     };
     let roots: Vec<PathBuf> = grants.present.into_iter().map(|(_, real)| real).collect();
-    walk(&grants.home, &masks.hidden, &roots, &mut host.entries)?;
+    // Rebuild the folders a symlinked home reaches. Keep the links visible
+    // at their own names and carry the home-relative masks to that view.
+    host.hidden = masks
+        .hidden
+        .into_iter()
+        .map(|path| match path.strip_prefix(&grants.home) {
+            Ok(relative) => grants.real_home.join(relative),
+            Err(_) => path,
+        })
+        .collect();
+    walk(&grants.real_home, &host.hidden, &roots, &mut host.entries)?;
     // A bind of the host's `/` is owned by an unmapped uid in the user
-    // namespace. Native private-file checks cannot trust that ancestor,
-    // even when its mount is read-only. Rebuild the root and the home's
-    // ancestors as session-owned, sealed directories, retaining every
-    // other entry read-only. The existing home masks still apply below.
-    for ancestor in grants.home.ancestors().skip(1) {
+    // namespace. Native private-file checks cannot trust that ancestor.
+    // Rebuild the root and the real ancestors and seal them after setup.
+    for ancestor in grants.real_home.ancestors().skip(1) {
         walk(ancestor, &BTreeSet::new(), &[], &mut host.entries)?;
     }
-    host.hidden = masks.hidden;
     Ok(host)
 }
 
