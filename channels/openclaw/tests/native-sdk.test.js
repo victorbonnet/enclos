@@ -1,7 +1,7 @@
 import { bridgeApprovalFixtureKey } from './helpers.js';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -263,4 +263,49 @@ test('an installed native resolver failure reaches the app and settles answering
   owner.send(input); await owner.next('error', input.id);
   assert.equal(resolverCalls, 1, 'a failed native turn is never replayed');
   assert.equal(channel.running.get('main').transport.state.outbox.length, 1);
+});
+
+
+test('the native message target resolver accepts owned bridge conversations without directory lookup', { skip: !installed }, async t => {
+  // The native message tool's resolver is not a public SDK export. Probe the
+  // installed implementation only in this compatibility test; the plugin uses
+  // the public messaging.targetResolver contract.
+  const file = readdirSync(path.join(installed, 'dist')).find(name => /^target-resolver-[^.]+\.mjs$/.test(name));
+  assert.ok(file, 'installed native target resolver exists');
+  const native = await import(pathToFileURL(path.join(installed, 'dist', file)));
+  const resolveTarget = Object.values(native).find(value => typeof value === 'function' && value.name === 'resolveChannelTarget');
+  assert.equal(typeof resolveTarget, 'function');
+  const routing = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/routing.js')));
+  const account = accountFixture(t), cfg = { channels: { enclos: { accounts: { main: account } } },
+    agents: { ownership: 'explicit', entries: { main: {} } }, bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] };
+  const channel = createChannel();
+  channel.setRuntime({ version: TESTED_OPENCLAW, config: { current: () => cfg }, channel: { routing,
+    inbound: { ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true } }) },
+      buildContext: value => value, dispatch: async () => {} } } });
+  const abort = new AbortController(), lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: 'main', abortSignal: abort.signal, setStatus() {} });
+  t.after(async () => { abort.abort(); await lifetime; });
+  await waitFor(() => existsSync(account.socket));
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const resolve = input => resolveTarget({ cfg, channel: 'enclos', accountId: 'main', plugin: channel.plugin, input });
+  for (const input of [account.home, `enclos:${account.home}`, 'home']) {
+    const result = await resolve(input);
+    assert.equal(result.ok, true, `${input} must resolve through the native message tool`);
+    assert.equal(result.target.to, account.home);
+  }
+  const conversation = '433e2a62-bbcb-46e6-ae80-ff16bc3ad239';
+  const input = message('message.in', { conversation, person: 'alice', text: 'fixture only' });
+  owner.send(input); await owner.next('ack', input.id);
+  const resolved = await resolve(conversation);
+  assert.equal(resolved.target.to, conversation);
+  const sent = await channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: resolved.target.to,
+    text: 'native message-tool delivery fixture', replyToId: input.id });
+  const delivered = await owner.next('message.out');
+  assert.equal(delivered.id, sent.messageId);
+  assert.equal(delivered.conversation, conversation);
+  assert.equal(delivered.reply_to, input.id);
+  assert.equal(delivered.kind, 'reply');
+  assert.equal((await resolve('home.other.scout')).ok, false);
+  assert.equal((await resolve('alice@example.com')).ok, false);
+  abort.abort(); await lifetime;
+  assert.equal((await resolve(account.home)).ok, false, 'a stopped account cannot resolve a target');
 });
