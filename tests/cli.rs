@@ -2762,6 +2762,28 @@ fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn app_chat_without_an_agent_resolves_the_runtime_default_target() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let make = record_hermes(&home, "home");
+    make("scout");
+
+    let omitted = home.run(&["app", "chat", "home"]);
+    let explicit = home.run(&["app", "chat", "home/default"]);
+    assert_ne!(omitted.code(), 0);
+    assert_eq!(omitted.code(), explicit.code());
+    assert_eq!(omitted.stderr(), explicit.stderr());
+    assert!(
+        omitted
+            .stderr()
+            .contains("agent home/default has no app channel")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let home = Home::new();
     home.init(1);
