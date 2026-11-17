@@ -103,9 +103,7 @@ impl Host {
         RuntimeKind::ALL.into_iter().map(|kind| RuntimeInfo {
             runtime: kind.to_string(),
             name: kind.display_name().to_owned(),
-            description: match kind {
-                RuntimeKind::Hermes => "An agent runtime installed inside this sandbox. Login and app channel setup follow on the host.".to_owned(),
-            },
+            description: "An agent runtime installed inside this sandbox. Login and app channel setup follow on the host.".to_owned(),
         }).collect()
     }
 
