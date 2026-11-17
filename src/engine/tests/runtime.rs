@@ -4943,6 +4943,47 @@ fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
             .install_runtime_with(&alice(), &other, &runtime, Confirm::Yes)
             .unwrap(),
     );
+    let before = lab.engine.layout.read_policy(other.as_str()).unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"other/target-api".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("destination-key".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let mut conflicting = before.parse::<toml_edit::DocumentMut>().unwrap();
+    conflicting["secrets"]["env"]["API_TOKEN"] = toml_edit::value("secret:other/target-api");
+    let conflicting = conflicting.to_string();
+    lab.engine
+        .policy_edit(&alice(), &other, &before, &conflicting, Confirm::Yes)
+        .unwrap();
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &other,
+            "comptoir-dev".parse().unwrap(),
+            &archive,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("API_TOKEN"));
+    assert!(
+        !lab.engine
+            .sandbox_home(&other)
+            .join(".hermes/profiles/comptoir-dev")
+            .exists(),
+        "a credential policy conflict must refuse before importing runtime data"
+    );
+    assert_eq!(
+        lab.engine.layout.read_policy(other.as_str()).unwrap(),
+        conflicting
+    );
+    lab.engine
+        .policy_edit(&alice(), &other, &conflicting, &before, Confirm::Yes)
+        .unwrap();
     let policy_before = lab.engine.policy(&other).unwrap().snapshot.policy;
     // An agent of the destination's name was forgotten in the app: the
     // import claims a new Home for it (ADR 0067, proposed).
