@@ -561,7 +561,7 @@ pub trait RuntimeAdapter {
     fn agent_files(&self, agent: &AgentName) -> String;                         // where the runtime keeps the agent's files, for messages
     fn talk(&self, agent: &AgentName) -> String;                               // shown, never run by enclos
     fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
-    fn listener(&self) -> Option<RuntimeListener> { None }                     // ADR 0028: the service that listens, whose port the sandbox's sessions reach
+    fn listener(&self, proxy_port: u16) -> Option<RuntimeListener> { None }                     // ADR 0028: the service that listens, whose port the sandbox's sessions reach
     fn dashboard(&self) -> Option<RuntimeDashboard> { None }                   // ADR 0040: namespace relay; ADR 0063 (proposed): inherited Unix listener on macOS
     fn secret_files(&self) -> Option<SecretFiles> { None }                     // explicit sandbox/agent file formats and optional folder variable
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> { /* those of the built-in agent and of `agents` */ }  // ADR 0031: read only as its services start; a change restarts each service with a `restart` signal
