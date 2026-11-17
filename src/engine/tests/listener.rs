@@ -215,6 +215,42 @@ fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
 }
 
 #[test]
+fn a_declared_service_port_is_owned_even_with_auxiliary_listeners() {
+    let (_dir, engine, name) = with_sandbox();
+    let (child, port) = gateway(&engine, &name, 3);
+    let selected = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(port),
+    );
+    let absent = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(0),
+    );
+    let (foreign, foreign_ports) = perl(&listening(1, "127.0.0.1"), 1);
+    let wrong_owner = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(foreign_ports[0]),
+    );
+    end(foreign);
+    end(child);
+    assert_eq!(selected, Ok(port));
+    assert!(matches!(absent, Err(NoPort::NotYet(_))), "{absent:?}");
+    assert!(
+        matches!(wrong_owner, Err(NoPort::NotYet(_))),
+        "{wrong_owner:?}"
+    );
+}
+
+#[test]
 fn two_open_gateway_sessions_get_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (one, _) = gateway(&engine, &name, 1);
@@ -341,6 +377,13 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &Network::Host,
         ListenerPorts::SingleLoopback,
     );
+    let declared = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(port[0]),
+    );
     end(owner);
     end(other);
     let why = got.unwrap_err();
@@ -352,6 +395,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         matches!(&configured, Err(NoPort::Refused(why)) if why.contains("also listens at 127.0.0.1")),
         "{configured:?}"
     );
+    assert!(matches!(declared, Err(NoPort::Refused(_))), "{declared:?}");
 }
 
 fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatus {

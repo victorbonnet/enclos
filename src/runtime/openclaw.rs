@@ -368,12 +368,14 @@ impl RuntimeAdapter for OpenClaw {
             restart: None,
         }]
     }
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, proxy_port: u16) -> Option<RuntimeListener> {
         // The authenticated dashboard needs a native one-use handoff, never
         // an unauthenticated URL invented by status. Use native dashboard.
         Some(RuntimeListener {
             service: GATEWAY,
-            ports: ListenerPorts::SingleLoopback,
+            // The launcher pins this port from the same sandbox allocation.
+            // Native Codex can add auxiliary loopback servers after a turn.
+            ports: ListenerPorts::Loopback(proxy_port.checked_add(2000)?),
         })
     }
     fn secret_files(&self) -> Option<SecretFiles> {
@@ -876,6 +878,14 @@ mod tests {
                 .is_none()
         );
         assert!(OpenClaw.import_agent(&name, &export.archive).is_none());
+    }
+
+    #[test]
+    fn gateway_listener_matches_the_launchers_allocated_port() {
+        assert_eq!(
+            OpenClaw.listener(41007).unwrap().ports,
+            ListenerPorts::Loopback(43007)
+        );
     }
 
     #[test]

@@ -306,8 +306,9 @@ pub trait RuntimeAdapter {
     fn services(&self) -> Vec<RuntimeService>;
     /// The service that listens in the sandbox, whose port the sandbox's
     /// sessions then reach (ADR 0028). `None` (the default): the runtime has
-    /// no service its sessions must reach.
-    fn listener(&self) -> Option<RuntimeListener> {
+    /// no service its sessions must reach. The sandbox's allocated proxy
+    /// port lets an adapter declare the same port its launcher configures.
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         None
     }
     /// The runtime's dashboard, a page for a browser on the host, served by
@@ -691,6 +692,9 @@ pub enum ListenerPorts {
     /// Exactly one positive port at 127.0.0.1 must be held by its recorded
     /// root process. Multiple ports are refused rather than guessed among.
     SingleLoopback,
+    /// The adapter knows the exact port its launcher configures. Auxiliary
+    /// sockets do not become candidates; recorded ownership is still required.
+    Loopback(u16),
 }
 
 /// A runtime service that listens in its sandbox, whose port the runtime's

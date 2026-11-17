@@ -243,6 +243,15 @@ fn chosen(
     let selected = match selection {
         ListenerPorts::Ephemeral => one_port(held, &ephemeral().map_err(refused)?),
         ListenerPorts::SingleLoopback => one_loopback_port(held),
+        ListenerPorts::Loopback(port) => {
+            if port != 0 && held.contains(&SocketAddr::from(([127, 0, 0, 1], port))) {
+                Ok(port)
+            } else {
+                Err(NotOnePort::None(format!(
+                    "it holds no TCP listener at the declared 127.0.0.1:{port}"
+                )))
+            }
+        }
     };
     selected.map_err(|e| {
         let why = format!("the {service} (pid {program}): {e}");
@@ -350,7 +359,9 @@ pub struct ServiceWait {
 impl Engine {
     /// The runtime's listening service, when the sandbox's runtime has one.
     pub(super) fn listener(record: &SandboxRecord) -> Option<RuntimeListener> {
-        record.runtime.and_then(|kind| adapter(kind).listener())
+        record
+            .runtime
+            .and_then(|kind| adapter(kind).listener(record.proxy_port))
     }
 
     /// Where `record`'s runtime service listens: the host's loopback, or the
@@ -616,6 +627,22 @@ mod tests {
             outside_proxy_range(PORT_FIRST),
             Err(NoPort::Refused(_))
         ));
+    }
+
+    #[test]
+    fn a_declared_port_requires_its_exact_ipv4_loopback_socket() {
+        for held in [
+            vec![SocketAddr::from(([0, 0, 0, 0], 43004))],
+            vec![SocketAddr::from(([127, 0, 0, 1], 43005))],
+            vec![SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 43004))],
+        ] {
+            assert!(matches!(
+                chosen("gateway", 1, &held, ListenerPorts::Loopback(43004), || {
+                    panic!("declared selection must not read an ephemeral range")
+                }),
+                Err(NoPort::NotYet(_))
+            ));
+        }
     }
 
     #[test]
