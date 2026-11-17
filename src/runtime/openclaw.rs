@@ -459,7 +459,7 @@ impl RuntimeAdapter for OpenClaw {
         socket: &Path,
         token_file: &Path,
         home: &str,
-        _bridge_key: &str,
+        bridge_key: &str,
     ) -> Option<AppChannel> {
         if !socket.is_absolute() || !token_file.is_absolute() {
             return None;
@@ -467,7 +467,7 @@ impl RuntimeAdapter for OpenClaw {
         let plugin = at(APP_PLUGIN);
         let state = socket.parent()?.join("openclaw-state").join(agent.as_str());
         let account = json!({"enabled":false, "agentId":agent.as_str(), "socket":socket.to_str()?,
-            "tokenFile":token_file.to_str()?, "home":home, "stateDir":state.to_str()?})
+            "tokenFile":token_file.to_str()?, "home":home, "stateDir":state.to_str()?, "bridgeKey":bridge_key})
         .to_string();
         Some(AppChannel {
             // One package per sandbox; every account has its own socket,
@@ -1105,6 +1105,7 @@ mod tests {
         assert_eq!(account["socket"], socket.to_str().unwrap());
         assert_eq!(account["agentId"], "main");
         assert_eq!(account["home"], "home.lab.main");
+        assert_eq!(account["bridgeKey"], "key");
         assert_eq!(account["enabled"], false);
         assert_ne!(account["stateDir"], other_account["stateDir"]);
         assert!(!app.settings[0].1.contains("MOBILE_APP_TOKEN"));

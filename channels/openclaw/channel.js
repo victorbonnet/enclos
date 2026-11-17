@@ -26,7 +26,7 @@ export function resolveAccount(cfg, accountId) {
   checkedId(value.home, 'home');
   return {
     accountId: id, agentId: value.agentId, socket: value.socket,
-    tokenFile: value.tokenFile, home: value.home,
+    tokenFile: value.tokenFile, home: value.home, bridgeKey: value.bridgeKey,
     stateDir: value.stateDir ?? path.join(path.dirname(value.socket), 'openclaw-state', id),
     enabled: section?.enabled !== false && value.enabled !== false,
   };
@@ -37,7 +37,7 @@ export function sessionPeer(conversation, person) {
   return createHash('sha256').update(JSON.stringify([conversation, person])).digest('hex');
 }
 
-function accountKey(account) { return JSON.stringify([account.accountId, account.agentId, account.socket, account.tokenFile, account.stateDir]); }
+function accountKey(account) { return JSON.stringify([account.accountId, account.agentId, account.socket, account.tokenFile, account.stateDir, account.bridgeKey]); }
 function target(raw, account) {
   const value = typeof raw === 'string' && raw.startsWith('enclos:') ? raw.slice(7) : raw;
   return checkedId(!value || value === 'home' ? account.home : value, 'conversation');
@@ -215,7 +215,7 @@ export function createChannel(sdk = {}) {
     try {
       titles = createNativeTitles(runtime, account, transport, { currentConfig: () => currentConfig(ctx.cfg),
         assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
-      approvals = sdk.nativeApprovals?.attach(account, transport, { cfg: ctx.cfg, channelRuntime: channel, abortSignal: ctx.abortSignal,
+      approvals = sdk.nativeApprovals?.attach(account, transport, { cfg: ctx.cfg, channelRuntime: channel, abortSignal: ctx.abortSignal, sandbox: process.env.ENCLOS_SANDBOX, log: ctx.log,
         assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
       await transport.start();
       ctx.setStatus?.({ accountId: account.accountId, running: true, connected: true });

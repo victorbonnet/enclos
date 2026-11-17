@@ -1133,6 +1133,15 @@ fn group_stop_targets_the_original_ingress_only_when_the_plugin_can_abort() {
 
         hub.group_stop(&store, "group");
         assert_eq!(hub.groups.lock().unwrap()["group"].state, "stopped");
+        let reason = hub.group_state(&store, "group").unwrap().reason;
+        if supports_abort {
+            assert!(reason.is_none());
+        } else {
+            assert_eq!(
+                reason.as_deref(),
+                Some("The run continues in the runtime. Its reply will be dropped.")
+            );
+        }
         assert_eq!(
             store
                 .turn_sent("original-ingress", "group", "main")
