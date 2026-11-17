@@ -87,6 +87,21 @@ class TransferTests(unittest.TestCase):
         for value in ['codex@latest', '--option@1.2.3', 'https://untrusted/package.tgz']:
             self.assertFalse(transfer.valid_plugin_spec(value))
 
+    def test_native_host_update_captures_are_never_shared_agent_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); capture = home / '.openclaw.update-captures'; capture.mkdir()
+            (capture / 'host-recovery').symlink_to('/outside-host-state')
+            notes = home / '.openclaw-project-notes'; notes.mkdir(); (notes / 'memory').write_text('kept')
+            files = []
+            for item in home.iterdir():
+                files.extend(transfer.regular_tree(item, home, Path(item.name), lambda rel: transfer.home_skip(rel, transfer.HELPERS)))
+            self.assertEqual([str(rel) for rel, _ in files], ['.openclaw-project-notes/memory'])
+            archive = home / 'untrusted.tar.gz'; destination = home / 'restored'; destination.mkdir()
+            with tarfile.open(archive, 'w:gz') as out:
+                entry = tarfile.TarInfo('home/.openclaw.update-captures/host-state'); entry.size = 1
+                out.addfile(entry, io.BytesIO(b'x'))
+            with self.assertRaises(ValueError): transfer.extract(archive, destination)
+
     def test_user_links_are_materialized_only_within_the_home_and_without_cycles(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp).resolve(); data = home / 'data'; data.mkdir(); (data / 'memory').write_text('kept')

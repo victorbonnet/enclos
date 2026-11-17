@@ -27,7 +27,7 @@ FORMAT = 'openclaw-data-v1'
 VERSION = '2026.11.3'
 MAX_BYTES = 32 * 1024**3
 REBUILDABLE = {'node_modules', '__pycache__', '.venv', 'venv'}
-HOME_SKIP = {'.openclaw', '.cache', '.npm', '.bun', '.rustup', '.profile', '.bashrc', '.bash_profile', '.zshrc', 'tmp'}
+HOME_SKIP = {'.openclaw', '.openclaw.update-captures', '.cache', '.npm', '.bun', '.rustup', '.profile', '.bashrc', '.bash_profile', '.zshrc', 'tmp'}
 HELPERS = {'openclaw', 'enclos-openclaw-agent', 'enclos-openclaw-delete.mjs', 'enclos-openclaw-enable-telegram', 'uv', 'uvx'}
 NATIVE_SOURCE = ''
 
