@@ -299,9 +299,11 @@ impl Store {
             .collect())
     }
 
+    // Expired runtime approvals are not attention items. Exclude them before
+    // validating historical definitions written under an older approval schema.
     fn open_question_rows(&self, person: &str) -> rusqlite::Result<Vec<QuestionRow>> {
         let sql = format!(
-            "{QUESTION_COLUMNS} WHERE c.owner=?1 AND q.state IN ('pending','expired') AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=q.id AND x.person=c.owner) ORDER BY q.rowid"
+            "{QUESTION_COLUMNS} WHERE c.owner=?1 AND (q.state='pending' OR (q.state='expired' AND CASE WHEN json_valid(q.definition) THEN COALESCE(json_type(q.definition,'$.approval'),'null') != 'object' ELSE 1 END)) AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=q.id AND x.person=c.owner) ORDER BY q.rowid"
         );
         self.db
             .prepare(&sql)?

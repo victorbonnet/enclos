@@ -2672,3 +2672,55 @@ fn live_open_item_snapshots_require_opt_in_and_current_person_pairing() {
     hub.publish_open_items(&store, OWNER);
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn outdated_expired_approvals_do_not_hide_current_or_expired_information_questions() {
+    let (_dir, hub, store, _device, _rx) = fixture();
+    let ordinary = definition("still-needs-you");
+    let approval = approval_definition("old-expired-approval", false);
+    for (id, q) in [("ordinary-index", &ordinary), ("approval-index", &approval)] {
+        store
+            .ask_question(
+                AGENT,
+                &ConversationId::new("owned").unwrap(),
+                q,
+                id,
+                Some(OWNER),
+            )
+            .unwrap();
+    }
+    store
+        .settle_question(
+            AGENT,
+            &approval.id,
+            Settlement::reported(QuestionState::Expired, None),
+            "expire-approval-index",
+        )
+        .unwrap();
+    let mut historical = serde_json::to_value(&approval).unwrap();
+    historical["approval"]["actions"] = serde_json::json!(["once", "session", "always", "deny"]);
+    historical["approval"]["patterns"] = serde_json::json!([]);
+    store
+        .db
+        .execute(
+            "UPDATE questions SET definition=?2 WHERE id=?1",
+            rusqlite::params![approval.id.as_str(), historical.to_string()],
+        )
+        .unwrap();
+    for expired in [false, true] {
+        if expired {
+            store
+                .settle_question(
+                    AGENT,
+                    &ordinary.id,
+                    Settlement::reported(QuestionState::Expired, None),
+                    "expire-ordinary-index",
+                )
+                .unwrap();
+        }
+        let frames = hub.open_item_frames(&store, OWNER).unwrap();
+        assert!(
+            matches!(&frames[0],ToDevice::OpenItems { unavailable:false,items,.. } if items.len()==1 && items[0].id==ordinary.id.as_str() && items[0].expired==expired)
+        );
+    }
+}
