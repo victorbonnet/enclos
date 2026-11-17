@@ -52,7 +52,11 @@ for agent in ['main', 'kilian']:
         workspace = home / '.openclaw' / ('workspace' if agent == 'main' else f'workspace-{agent}')
         t.initialize_config(home, agent, {'workspace': str(workspace)})
         workspace.mkdir()
-        (workspace / 'MEMORY.md').write_text('native migration fixture memory\n')
+        if agent == 'main':
+            (workspace / 'MEMORY.md').write_text('native migration fixture memory\n')
+            (workspace / 'uv.lock').write_text('fixture-lock\n')
+        else:
+            (workspace / 'empty').mkdir()
         result = subprocess.run([str(prefix / 'tools/node/bin/node'), '--input-type=module', '-e', shared_writer],
                                 env=t.native_env(home), capture_output=True, timeout=120)
         assert result.returncode == 0, 'native shared-auth fixture setup refused'
@@ -67,6 +71,9 @@ for agent in ['main', 'kilian']:
         t.export(home, agent, archive)
         home.rename(root / 'saved-source')
         fixture_home(home)
+        if agent == 'kilian':
+            t.initialize_config(home, 'anchor', {'workspace': str(home / '.openclaw/workspace-anchor')})
+            t.native(home, 'config', 'set', 'cron.enabled', 'true', '--json')
         t.restore(home, agent, archive, {'conversations': {}, 'destination_person': 'fixture-owner'})
         probe = home / 'probe.json'
         t.native_data(home, 'export', agent, probe, agent_dir)
@@ -75,7 +82,13 @@ for agent in ['main', 'kilian']:
         assert restored['localAuth']['profiles']['fixture-priority']['key'] == 'public-local-fixture'
         assert restored['sharedAuth']['profiles'] == {}, 'agent restoration changed shared auth'
         assert restored['bindings'] == [binding]
-        assert (workspace / 'MEMORY.md').read_text() == 'native migration fixture memory\n'
-        assert [x['id'] for x in json.loads(t.native(home, 'agents', 'list', '--json'))] == [agent]
+        if agent == 'main':
+            assert (workspace / 'MEMORY.md').read_text() == 'native migration fixture memory\n'
+            assert (workspace / 'uv.lock').read_text() == 'fixture-lock\n'
+        else:
+            assert (workspace / 'empty').is_dir()
+            assert json.loads((home / '.openclaw/openclaw.json').read_text())['cron']['enabled'] is True
+        expected_agents = {agent} if agent == 'main' else {'anchor', agent}
+        assert {x['id'] for x in json.loads(t.native(home, 'agents', 'list', '--json'))} == expected_agents
         print(json.dumps({'agent': agent, 'native_roundtrip': True, 'auth_local': True, 'shared_auth_unchanged': True,
                           'codex_binding': True, 'workspace': True}), flush=True)
