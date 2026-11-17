@@ -644,7 +644,7 @@ pub enum ListenerPorts {
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
-    /// How to select its port from the recorded service process’s sockets.
+    /// How to select its port from the recorded service process's sockets.
     pub ports: ListenerPorts,
 }
 
