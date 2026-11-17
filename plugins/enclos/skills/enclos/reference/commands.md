@@ -282,6 +282,7 @@ enclos agent import [OPTIONS] --from <FILE> <AGENT>
 - `<AGENT>`
 - `--from <FILE>`
 - `--metadata-only`: Restore only the name and image of an existing agent.
+- `--accept-plugin <PACKAGE@VERSION>`: Authorize this exact npm package and its declared capabilities during import.
 
 #### `enclos agent list`
 
