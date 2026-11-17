@@ -1,5 +1,6 @@
 // OpenClaw public channel contract. Native imports live in index.js.
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
@@ -55,6 +56,7 @@ function target(raw, account) {
 export function createChannel(sdk = {}) {
   let runtime;
   const running = new Map();
+  const outboundCaller = new AsyncLocalStorage();
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   let hooks = { tools: false, policy: false };
@@ -202,7 +204,8 @@ export function createChannel(sdk = {}) {
           transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
           failureReported = true;
         };
-        try { await channel.inbound.dispatch({
+        const caller = { agentId: nativeRoute.agentId, live: true, assertAuthority };
+        try { await outboundCaller.run(caller, () => channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
@@ -224,12 +227,12 @@ export function createChannel(sdk = {}) {
                 { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
             });
           } },
-        }); } catch (error) {
+        })); } catch (error) {
           reportFailure();
           // Native dispatch may have started work before failing. Preserve the
           // uncertain receipt so reconnects cannot replay that work.
           throw error;
-        } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
+        } finally { caller.live = false; finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
         } finally { execution.finish(); }
       },
     });
@@ -309,9 +312,15 @@ export function createChannel(sdk = {}) {
       targetResolver: {
         hint: 'Use home or a known bridge conversation id for this account.',
         async resolveTarget(params) {
-          const account = resolveAccount(params.cfg, params.accountId);
+          // The current upstream target resolver has no agent field. A
+          // resolver invoked during native dispatch inherits that caller.
+          const caller = outboundCaller.getStore();
+          if (caller && (!caller.live || (params.agentId != null && params.agentId !== caller.agentId))) return undefined;
+          caller?.assertAuthority();
+          const agentId = params.agentId ?? caller?.agentId;
+          if (!agentId) return undefined;
           const route = await plugin.messaging.resolveOutboundSessionRoute({ ...params,
-            agentId: account.agentId, target: params.normalized });
+            agentId, target: params.normalized });
           return route ? { to: route.to, kind: 'user' } : undefined;
         },
       },
