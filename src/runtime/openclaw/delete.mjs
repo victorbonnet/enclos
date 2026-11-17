@@ -15,15 +15,20 @@ export async function deleteAgent({ agentId, readConfig, resolveSecret, callGate
   let snapshot;
   try { ({ snapshot } = await readConfig()); }
   catch { throw new OwnerRefusal('OpenClaw could not read its native settings for agent deletion. Run OpenClaw doctor and check its settings.'); }
-  if (!snapshot?.valid || !snapshot.sourceConfig || snapshot.sourceConfig.gateway?.mode === 'remote') throw unavailable();
+  if (!snapshot?.valid || !snapshot.sourceConfig) throw new OwnerRefusal('OpenClaw has invalid native settings. Run OpenClaw doctor and correct them before deleting an agent.');
+  if (snapshot.sourceConfig.gateway?.mode === 'remote') throw new OwnerRefusal('OpenClaw native agent deletion requires a local Gateway. Check gateway.mode before retrying.');
   const config = snapshot.sourceConfig, auth = config.gateway?.auth;
-  if (!auth || !['token', 'password'].includes(auth.mode)) throw unavailable();
+  if (!auth || !['token', 'password'].includes(auth.mode)) {
+    throw new OwnerRefusal('OpenClaw native agent deletion requires Gateway token or password authentication. Check gateway.auth.mode.');
+  }
   const field = auth.mode === 'password' ? 'password' : 'token';
   let resolved;
   try {
     resolved = await resolveSecret({ config, env, value: auth[field], path: `gateway.auth.${field}` });
   } catch { throw new OwnerRefusal('OpenClaw could not resolve its configured Gateway secret for agent deletion. Check the Gateway secret settings.'); }
-  if (typeof resolved.value !== 'string' || !resolved.value.trim() || resolved.unresolvedRefReason) throw unavailable();
+  if (typeof resolved?.value !== 'string' || !resolved.value.trim() || resolved.unresolvedRefReason) {
+    throw new OwnerRefusal('OpenClaw could not resolve its configured Gateway secret for agent deletion. Check the Gateway secret settings.');
+  }
   const options = { [field]: resolved.value, port: String(port), expectUrl: `ws://127.0.0.1:${port}`, json: true, timeout: '10000' };
   // A failed readiness/auth probe cannot dispatch a deletion. No fallback
   // edits native files, changes auth, or guesses whether a write succeeded.

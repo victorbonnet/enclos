@@ -26,10 +26,19 @@ test('owner deletion resolves the configured native ref and authenticates only t
   assert.deepEqual(f.params.env, envBefore);
 });
 
-test('missing auth, wrong target and failed readiness refuse before mutation', async () => {
-  for (const invalidate of [f => { f.sourceConfig.gateway.mode = 'remote'; }, f => { f.params.env.OPENCLAW_GATEWAY_PORT = '18789'; }, f => { f.params.resolveSecret = async () => ({}); }, f => { f.params.callGateway = async (method) => { f.calls.push({ method }); throw new Error('failure'); }; }]) {
-    const f = fixture(); invalidate(f);
-    await assert.rejects(deleteAgent(f.params), /Start this sandbox/);
+test('unusable settings and a failed readiness check report why mutation was refused', async () => {
+  const cases = [
+    [f => { f.params.readConfig = async () => ({ snapshot: { valid: false } }); }, /invalid native settings/],
+    [f => { f.sourceConfig.gateway.mode = 'remote'; }, /requires a local Gateway/],
+    [f => { delete f.sourceConfig.gateway.auth; }, /requires Gateway token or password/],
+    [f => { f.params.env.OPENCLAW_GATEWAY_PORT = '18789'; }, /Start this sandbox/],
+    [f => { f.params.resolveSecret = async () => ({}); }, /could not resolve its configured Gateway secret/],
+    [f => { f.params.callGateway = async method => { f.calls.push({ method }); throw new Error('failure'); }; }, /Start this sandbox/],
+  ];
+  for (const [invalidate, message] of cases) {
+    const f = fixture();
+    invalidate(f);
+    await assert.rejects(deleteAgent(f.params), message);
     assert.equal(f.calls.some(c => c.method === 'agents.delete'), false);
   }
 });
