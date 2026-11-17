@@ -8,7 +8,9 @@ import io
 import json
 import os
 import platform
+import pty
 import re
+import select
 from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
@@ -17,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 FORMAT = 'openclaw-data-v1'
 VERSION = '2026.11.3'
@@ -126,8 +129,35 @@ def equal_files(first, second):
     return True
 
 
-def native(home, *args):
-    result = subprocess.run([str(home / '.local/share/openclaw/bin/openclaw'), *args], capture_output=True, env=native_env(home), timeout=600)
+def terminal_command(command, env, timeout=600):
+    # The pinned CLI requires a terminal before honoring global --yes for
+    # npm provenance consent. Keep install mode (no --force/update), so its
+    # native installer still refuses a concurrently created target plugin.
+    master, slave = pty.openpty()
+    output = bytearray(); deadline = time.monotonic() + timeout
+    try:
+        with subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env) as child:
+            os.close(slave); slave = None
+            try:
+                while child.poll() is None or select.select([master], [], [], 0)[0]:
+                    if time.monotonic() > deadline: raise subprocess.TimeoutExpired(command, timeout)
+                    if not select.select([master], [], [], 0.1)[0]: continue
+                    try: chunk = os.read(master, 8192)
+                    except OSError: break  # The terminal slave closed.
+                    if not chunk: break
+                    output.extend(chunk[:max(0, 65536 - len(output))])
+                child.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except BaseException:
+                child.kill(); child.wait(); raise
+            return subprocess.CompletedProcess(command, child.returncode, bytes(output), b'')
+    finally:
+        os.close(master)
+        if slave is not None: os.close(slave)
+
+
+def native(home, *args, terminal=False):
+    command = [str(home / '.local/share/openclaw/bin/openclaw'), *args]
+    result = terminal_command(command, native_env(home)) if terminal else subprocess.run(command, capture_output=True, env=native_env(home), timeout=600)
     if result.returncode:
         fd, diagnostic = tempfile.mkstemp(prefix='.enclos-native-transfer-error-', suffix='.log', dir=home)
         with os.fdopen(fd, 'wb') as out: out.write((result.stderr + result.stdout)[:65536])
@@ -206,7 +236,8 @@ def assert_local_codex(config, own):
     if codex.get('homeScope', 'agent') != 'agent' or codex.get('transport', 'stdio') != 'stdio' or any(
             codex.get(k) for k in ['url', 'command', 'args', 'remoteWorkspaceRoot', 'nativeHookRelay']):
         fail('external or user-scoped Codex state needs a supported native export')
-    if own.get('runtime', {}).get('type', 'native') != 'native':
+    runtime = own.get('runtime', config.get('agents', {}).get('defaults', {}).get('runtime', {}))
+    if runtime.get('type', 'native') != 'native':
         fail('external agent harness state needs a supported native export')
 
 
@@ -401,7 +432,7 @@ def restore(home, agent, source, context):
         # The destination's system agent selection is not imported authority.
         if 'agents' in projected: projected['agents'] = {'defaults': {k: v for k, v in projected['agents'].get('defaults', {}).items() if k not in {'workspace', 'systemAgent'}}}
         merge_shared(projected, meta['shared_config'])
-        assert_local_codex(meta['shared_config'], meta['agent_config'])
+        assert_local_codex(projected, meta['agent_config'])
         routes = imported_routes(meta['routes'], context.get('conversations', {}), context.get('destination_person'), agent)
         extras = stage / 'home'
         shared = stage / 'shared-skills'
@@ -427,7 +458,7 @@ def restore(home, agent, source, context):
         native_data(home, 'prepare', agent, stage / 'native-prepare.json', agent_dir)
         inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
         for spec in missing_plugins(inspections, meta['plugins']):
-            native(home, 'plugins', 'install', spec, '--pin', '--no-enable')
+            native(home, '--yes', 'plugins', 'install', spec, '--pin', '--no-enable', terminal=True)
         # Foreign user executables are data, not runnable target installations.
         expected = {'x86_64': 62, 'aarch64': 183, 'arm64': 183}.get(platform.machine())
         for tree in ['agent', 'workspace', 'home', 'shared-skills']:
