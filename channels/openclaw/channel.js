@@ -1,4 +1,4 @@
-// OpenClaw 2026.11.3 public channel contract. Native imports live in index.js.
+// OpenClaw public channel contract. Native imports live in index.js.
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
@@ -10,7 +10,15 @@ import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
 
-export const TESTED_OPENCLAW = '2026.11.3';
+export const TESTED_OPENCLAW = '2026.11.5';
+const MINIMUM_OPENCLAW = '2026.11.5';
+const release = /^v?(\d+\.\d+\.\d+)([+-].+)?$/u;
+function supportsRelease(version) {
+  const parts = typeof version === 'string' && release.exec(version);
+  if (!parts) return false;
+  const order = parts[1].localeCompare(MINIMUM_OPENCLAW, 'en', { numeric: true });
+  return order > 0 || (order === 0 && !parts[2]?.startsWith('-'));
+}
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 
 export function resolveAccount(cfg, accountId) {
@@ -61,7 +69,7 @@ export function createChannel(sdk = {}) {
 
   function setRuntime(value) {
     // version is part of the installed public PluginRuntimeCore contract.
-    if (value?.version !== TESTED_OPENCLAW) throw new Error(`enclos channel is tested with OpenClaw ${TESTED_OPENCLAW}; install a matching enclos channel before enabling it with ${value?.version ?? 'an unknown version'}`);
+    if (!supportsRelease(value?.version)) throw new Error(`Update OpenClaw to ${MINIMUM_OPENCLAW} or newer before enabling the enclos channel.`);
     runtime = value;
   }
 
@@ -80,11 +88,17 @@ export function createChannel(sdk = {}) {
   }
 
   async function startAccount(ctx) {
-    if (!runtime || runtime.version !== TESTED_OPENCLAW) throw new Error(`enclos requires the tested OpenClaw ${TESTED_OPENCLAW} plugin runtime`);
+    if (!runtime) throw new Error('Load the OpenClaw plugin runtime before starting the enclos channel.');
     const channel = ctx.channelRuntime ?? runtime.channel;
-    if (!channel?.inbound?.ingress?.resolve || !channel.inbound.buildContext || !channel.inbound.dispatch || !channel.routing?.resolveAgentRoute || !channel.routing.buildAgentSessionKey) {
-      throw new Error('OpenClaw did not supply its public channel ingress/dispatch runtime; update the enclos channel compatibility pair');
-    }
+    const required = {
+      'inbound.ingress.resolve': channel?.inbound?.ingress?.resolve,
+      'inbound.buildContext': channel?.inbound?.buildContext,
+      'inbound.dispatch': channel?.inbound?.dispatch,
+      'routing.resolveAgentRoute': channel?.routing?.resolveAgentRoute,
+      'routing.buildAgentSessionKey': channel?.routing?.buildAgentSessionKey,
+    };
+    const missing = Object.keys(required).filter(name => typeof required[name] !== 'function');
+    if (missing.length) throw new Error(`OpenClaw is missing channel interfaces: ${missing.join(', ')}. Update the enclos channel or OpenClaw.`);
     const account = resolveAccount(ctx.cfg, ctx.accountId);
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');

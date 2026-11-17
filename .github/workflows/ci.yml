@@ -530,7 +530,7 @@ jobs:
           sdk_prefix="$RUNNER_TEMP/enclos-openclaw-sdk"
           npm install --prefix "$sdk_prefix" --cache "$RUNNER_TEMP/enclos-openclaw-npm-cache" \
             --registry=https://registry.npmjs.org --ignore-scripts --omit=dev \
-            --no-audit --no-fund --package-lock=false openclaw@2026.11.3
+            --no-audit --no-fund --package-lock=false openclaw@2026.11.5
           echo "ENCLOS_OPENCLAW_PACKAGE=$sdk_prefix/node_modules/openclaw" >>"$GITHUB_ENV"
       - name: Channel tests including installed SDK probes
         run: node --test channels/openclaw/tests/*.test.js
