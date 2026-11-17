@@ -445,3 +445,41 @@ fn a_proxy_port_is_never_a_sessions_service_port() {
     assert!(outside_proxy_range(PORT_LAST).is_err());
     assert_eq!(outside_proxy_range(61374), Ok(61374));
 }
+
+#[test]
+fn a_second_sandbox_does_not_select_another_sandbox_declared_listener() {
+    let (_dir, engine, first) = with_sandbox();
+    let second = "other".parse::<SandboxName>().unwrap();
+    done(
+        engine
+            .create_sandbox(
+                &alice(),
+                crate::engine::SandboxSpec {
+                    name: second.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "assistant".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let (first_service, first_port) = gateway(&engine, &first, 1);
+    let (second_service, second_port) = gateway(&engine, &second, 1);
+    let select = |sandbox, port| {
+        service_listener(
+            engine.state.as_ref(),
+            sandbox,
+            "gateway",
+            &Network::Host,
+            ListenerPorts::Loopback(port),
+        )
+    };
+    let first_result = select(&first, first_port);
+    let second_result = select(&second, second_port);
+    let other_result = select(&second, first_port);
+    end(first_service);
+    end(second_service);
+    assert_eq!(first_result, Ok(first_port));
+    assert_eq!(second_result, Ok(second_port));
+    assert!(matches!(other_result, Err(NoPort::NotYet(_))));
+}
