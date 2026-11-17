@@ -15,8 +15,8 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
     ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat, SecretFiles, ServiceName, Signal, Unreadable,
-    ValueAt,
+    RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat, SecretFiles,
+    ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
