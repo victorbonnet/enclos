@@ -56,7 +56,7 @@ pub(in crate::backend::bubblewrap) struct Host {
     pub entries: BTreeMap<PathBuf, Vec<Entry>>,
     /// The paths the home's folders leave out.
     pub hidden: BTreeSet<PathBuf>,
-    /// The masks after the `/` bind, outside the home.
+    /// The masks after the root view is built, outside the home.
     pub elsewhere: Vec<(PathBuf, Kind)>,
     /// The folders inside a grant that hold a mask, bound on themselves.
     pub unmovable: Vec<PathBuf>,
@@ -223,6 +223,14 @@ pub(in crate::backend::bubblewrap) fn read_host(
     };
     let roots: Vec<PathBuf> = grants.present.into_iter().map(|(_, real)| real).collect();
     walk(&grants.home, &masks.hidden, &roots, &mut host.entries)?;
+    // A bind of the host's `/` is owned by an unmapped uid in the user
+    // namespace. Native private-file checks cannot trust that ancestor,
+    // even when its mount is read-only. Rebuild the root and the home's
+    // ancestors as session-owned, sealed directories, retaining every
+    // other entry read-only. The existing home masks still apply below.
+    for ancestor in grants.home.ancestors().skip(1) {
+        walk(ancestor, &BTreeSet::new(), &[], &mut host.entries)?;
+    }
     host.hidden = masks.hidden;
     Ok(host)
 }
