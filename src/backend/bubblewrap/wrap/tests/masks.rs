@@ -48,10 +48,13 @@ fn the_home_is_masked_after_the_root_and_before_the_compiled_rest() {
     let host = read(&home, &c, None).unwrap();
     let args = strings(&arguments(&c, &host, &[]));
     let user = text(&home.user());
-    assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
-    assert_eq!(&args[3..5], ["--tmpfs", user.as_str()]);
+    assert_eq!(&args[..2], ["--tmpfs", "/"]);
+    assert!(position(&args, &["--tmpfs", &user]) > 0);
     let home_bind = position(&args, &["--bind", &text(&home.sandbox_home())]);
     assert!(home_bind > position(&args, &["--tmpfs", &user]));
+    // Private staging paths have session-owned ancestors all the way to
+    // `/`, and those directories cannot be changed by the session.
+    assert!(position(&args, &["--remount-ro", "/"]) > home_bind);
 }
 
 #[test]

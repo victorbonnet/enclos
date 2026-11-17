@@ -321,9 +321,14 @@ impl Engine {
             }
             None => Default::default(),
         };
-        let context =
-            serde_json::json!({"source_agent":manifest.source_agent,"conversations":conversations})
-                .to_string();
+        let destination_person = if self.app_store_path().exists() {
+            Store::read_host_person(&self.app_store_path()).map_err(failed)?
+        } else {
+            None
+        };
+        let context = serde_json::json!({"source_agent":manifest.source_agent,
+            "conversations":conversations,"destination_person":destination_person})
+        .to_string();
         let paused = if !metadata_only {
             if confirm == Confirm::Ask {
                 self.plan_restart(name)?

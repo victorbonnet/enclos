@@ -508,6 +508,8 @@ jobs:
         with:
           node-version: '24'
       - run: node --test src/runtime/openclaw/*.test.mjs
+      - name: OpenClaw transfer tests
+        run: python3 -I -m unittest discover -s src/runtime/openclaw/tests
 
   # The exact native SDK is the channel's tested contract. Install it only in
   # a disposable prefix; no package lifecycle scripts or onboarding run.

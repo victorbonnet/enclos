@@ -23,6 +23,10 @@ openclaw-channel:
     node channels/openclaw/scripts/build.mjs --check
     node --test channels/openclaw/tests/*.test.js
 
+# Complete OpenClaw data transfer (standard library only)
+openclaw-transfer:
+    python3 -I -m unittest discover -s src/runtime/openclaw/tests
+
 # Needs gitleaks on the PATH; CI runs it in the `secrets` job.
 gitleaks-rule:
     sh tests/gitleaks_rule.sh
@@ -30,4 +34,4 @@ gitleaks-rule:
 openclaw-launchers:
     node --test src/runtime/openclaw/*.test.mjs
 
-ci: fmt clippy test deny hermes-plugin hermes-transfer openclaw-launchers openclaw-channel
+ci: fmt clippy test deny hermes-plugin hermes-transfer openclaw-transfer openclaw-launchers openclaw-channel

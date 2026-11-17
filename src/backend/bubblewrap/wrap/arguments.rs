@@ -30,7 +30,11 @@ pub(super) fn arguments(
         args.extend(words.iter().map(|w| w.to_os_string()));
     };
     let bubblewrap = &compiled.bubblewrap;
-    args.extend(bubblewrap.root.iter().map(OsString::from));
+    if host.entries.contains_key(Path::new("/")) {
+        hide(Path::new("/"), host, &mut args, &mut made);
+    } else {
+        args.extend(bubblewrap.root.iter().map(OsString::from));
+    }
     let home = PathBuf::from(&bubblewrap.root_masks.home);
     if host.entries.contains_key(&home) {
         hide(&home, host, &mut args, &mut made);
