@@ -913,11 +913,11 @@ Each milestone holds only what its goal needs; everything else waits for a later
    The mobile Inbox also projects each host's open questions, runtime approvals, held tasks and policy requests into one Needs you list (`docs/protocol.md`, Open items). This is discovery over canonical records, not another task queue. An expired ordinary question stays visible until explicitly dismissed, with read-only history and no late-reply action. Literal suggested replies accompany ordinary messages and use the existing message-send path, without decision authority. Android implements these views; iOS remains unbuilt.
 
    Done when the acceptance scenario for milestone 4 below passes.
-5. **Breadth**, in this order unless needs change:
-   1. The host-service forward (one named host port to one sandbox).
-   2. Runtimes: an OpenClaw adapter, then the coding agents, Claude Code and Codex adapters (interactive) with the `coding` template writing in place to the selected project folder, then DeepSeek Harness.
-   3. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
-   4. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
+5. **OpenClaw alongside Hermes** — goal: install and operate OpenClaw in a sandbox and use the same mobile app through runtime-neutral interfaces. [The M5 plan](m5-openclaw.md) defines the contracts, parity matrix, native gaps and acceptance gates; [issue #218](https://github.com/victorbonnet/enclos/issues/218) tracks the stacked PRs. Start from the final mobile M4 head, not an older mobile checkout. Protect the host's OpenClaw state before a disposable Seatbelt prototype on this Mac, then implement the proven adapter/plugin behavior. Keep Linux-specific implementation and real acceptance as the final step on the new Linux host; the Pi is not a prerequisite. macOS acceptance alone does not complete M5.
+
+   Match Hermes's end-of-M4 behavior through the runtime adapter and channel plugin. Keep native scheduling, conversation context, questions and approvals with the runtime, and bridge-owned history, groups, metadata and authority in the bridge. Unsupported native behavior is explicit; a missing safe native seam cannot silently count as parity. The source findings are evidence of upstream contracts, not proof that OpenClaw runs under enclos.
+
+**After milestone 5:** host-service forwards (one named host port to one sandbox per grant); the coding runtimes Claude Code and Codex with the `coding` template, then DeepSeek Harness; `enclos ui`; OpenShell and a microVM (libkrun first, macOS and Linux); host-owned subscription refresh. Their order is open and none is a prerequisite for OpenClaw.
 
 **Acceptance scenario (milestone 1).** On a Mac, with the user logged in and an existing ChatGPT subscription:
 
