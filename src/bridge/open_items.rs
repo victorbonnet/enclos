@@ -12,12 +12,15 @@ pub(super) struct ReminderRef<'a> {
 
 fn summary(text: &str) -> String {
     let line = enclos_protocol::visible::stripped(text, true);
-    line.split_whitespace()
+    let cut: String = line
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(300)
-        .collect()
+        .collect();
+    // Cutting a valid emoji sequence can expose a now-hidden trailing joiner.
+    enclos_protocol::visible::stripped(&cut, false)
 }
 
 impl Hub {
@@ -46,6 +49,7 @@ impl Hub {
         };
         items.sort_by(|a, b| b.since.cmp(&a.since).then(a.id.cmp(&b.id)));
         if items.len() > 8192 {
+            eprintln!("enclos app: open requests exceed the 8192-item snapshot limit");
             return Ok(vec![ToDevice::OpenItems {
                 revision,
                 reset: true,
@@ -260,7 +264,15 @@ impl Hub {
         }
         match self.open_item_frames(store, person) {
             Ok(frames) => {
-                let paired = store.devices().unwrap_or_default();
+                let paired = match store.devices() {
+                    Ok(devices) => devices,
+                    Err(error) => {
+                        eprintln!(
+                            "enclos app: open requests could not check paired devices: {error}"
+                        );
+                        return;
+                    }
+                };
                 let devices = self.devices.lock().expect("not poisoned");
                 for (id, (owner, sender, _)) in devices.iter() {
                     if owner == person
@@ -298,5 +310,18 @@ impl Store {
     ) -> rusqlite::Result<()> {
         self.db.execute("INSERT INTO open_item_dismissals(person,kind,agent,item,version,request) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(person,kind,agent,item) DO UPDATE SET version=excluded.version,request=excluded.request",
             rusqlite::params![person,item.kind.as_str(),item.agent.as_deref().unwrap_or(""),item.id,item.version,request]).map(drop)
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn review_summary_cuts_never_leave_a_hidden_joiner() {
+        let text = format!("{}👩‍💻", "a".repeat(298));
+        let shown = summary(&text);
+        assert!(shown.chars().count() <= 300);
+        assert!(!enclos_protocol::visible::has_hidden(&shown, false));
+        assert_eq!(summary(&shown), shown);
     }
 }

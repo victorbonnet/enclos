@@ -3146,10 +3146,13 @@ fn run_session(
                     }
                 }
                 // Pending cards must refresh even when their introduction predates `since`.
-                for question in store
-                    .open_questions_for(person)
-                    .map_err(|e| e.to_string())?
-                {
+                let questions = if open_items {
+                    store.open_questions_for(person)
+                } else {
+                    store.pending_questions_for(person)
+                }
+                .map_err(|e| e.to_string())?;
+                for question in questions {
                     if hub.shows_question(person, &question.info.definition) {
                         link.send(ToDevice::Question {
                             question: question.info,
@@ -4187,6 +4190,7 @@ mod connection_end_tests {
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs
     /// answering `node`.
     struct Bridge {
+        hub: Arc<Hub>,
         port: u16,
         public: Vec<u8>,
         store: PathBuf,
@@ -4261,8 +4265,10 @@ mod connection_end_tests {
         let hub = Arc::new(hub);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
+        let server_hub = Arc::clone(&hub);
+        std::thread::spawn(move || serve_on(listener, server_hub, Duration::from_millis(100)));
         Bridge {
+            hub,
             port,
             public: keys.public,
             store,
@@ -4478,6 +4484,46 @@ mod connection_end_tests {
             }
         });
         got
+    }
+
+    #[test]
+    fn authentication_clears_the_previous_connections_open_items_subscription() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut first, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        first.send(
+            "subscribe",
+            FromDevice::Sync {
+                since: 0,
+                open_items: true,
+            },
+        );
+        loop {
+            if matches!(first.receive(), Some(ToDevice::Synced { .. })) {
+                break;
+            }
+        }
+        assert!(
+            bridge
+                .hub
+                .open_item_devices
+                .lock()
+                .unwrap()
+                .contains(&phone.id)
+        );
+        first.socket.close(None).unwrap();
+        let (_next, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(
+            !bridge
+                .hub
+                .open_item_devices
+                .lock()
+                .unwrap()
+                .contains(&phone.id)
+        );
     }
 
     #[test]

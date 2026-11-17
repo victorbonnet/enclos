@@ -987,6 +987,20 @@ mod tests {
                 sig: "c2ln".into(),
             },
             FromDevice::Agents,
+            FromDevice::HeldTaskGet {
+                agent: "lab/lead".into(),
+                task: crate::HeldTaskId::new("app/t_same").unwrap(),
+            },
+            FromDevice::QuestionClose {
+                question: crate::QuestionId::new("q1").unwrap(),
+                revision: 2,
+            },
+            FromDevice::OpenItemDismiss {
+                kind: crate::open_items::OpenItemKind::Question,
+                item: "q1".into(),
+                agent: Some("lab/main".into()),
+                version: "question:1".into(),
+            },
             FromDevice::Audit { before: None },
             FromDevice::Audit { before: Some(42) },
             FromDevice::MessageSend {

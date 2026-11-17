@@ -504,6 +504,16 @@ CREATE TABLE IF NOT EXISTS messages (
     suggested_replies TEXT
 );
 CREATE TABLE IF NOT EXISTS open_item_dismissals (person TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT NOT NULL, item TEXT NOT NULL, version TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(person,kind,agent,item), UNIQUE(person,request));
+-- Reminder state follows its source through deletion/agent forgetting.
+CREATE TRIGGER IF NOT EXISTS delete_question_reminders AFTER DELETE ON questions BEGIN
+ DELETE FROM open_item_dismissals WHERE kind IN ('question','runtime_approval') AND item=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS delete_held_reminders AFTER DELETE ON held_tasks BEGIN
+ DELETE FROM open_item_dismissals WHERE kind='held_task' AND agent=OLD.agent AND item=OLD.task;
+END;
+CREATE TRIGGER IF NOT EXISTS delete_policy_reminders AFTER DELETE ON approvals BEGIN
+ DELETE FROM open_item_dismissals WHERE kind='policy_request' AND item=OLD.id;
+END;
 CREATE TABLE IF NOT EXISTS question_closures (question TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE, person TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(question,person), UNIQUE(person,request));
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,

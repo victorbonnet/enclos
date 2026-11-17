@@ -66,6 +66,9 @@ pub const MAX_PENDING_PER_CONVERSATION: i64 = 4;
 /// At most this many pending questions of one agent, across its
 /// conversations: each is sent to the person's devices at every sync.
 pub const MAX_PENDING_PER_AGENT: i64 = 32;
+/// Discovery keeps only the newest recent expired information questions.
+pub const MAX_EXPIRED_QUESTIONS: usize = 256;
+const EXPIRED_QUESTION_DAYS: i64 = 30;
 
 fn json_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
@@ -299,15 +302,25 @@ impl Store {
             .collect())
     }
 
-    // Expired runtime approvals are not attention items. Exclude them before
-    // validating historical definitions written under an older approval schema.
+    // Pending questions retain their existing limits. Expired information
+    // questions are a bounded discovery aid, not an unlimited history replay.
     fn open_question_rows(&self, person: &str) -> rusqlite::Result<Vec<QuestionRow>> {
         let sql = format!(
-            "{QUESTION_COLUMNS} WHERE c.owner=?1 AND (q.state='pending' OR (q.state='expired' AND CASE WHEN json_valid(q.definition) THEN COALESCE(json_type(q.definition,'$.approval'),'null') != 'object' ELSE 1 END)) AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=q.id AND x.person=c.owner) ORDER BY q.rowid"
+            "{QUESTION_COLUMNS} WHERE c.owner=?1 AND (q.state='pending' OR q.id IN (
+                SELECT e.id FROM questions e JOIN conversations ec ON ec.id=e.conversation
+                JOIN messages em ON em.id=e.ask_message
+                WHERE ec.owner=?1 AND e.state='expired' AND em.at>=?2
+                AND CASE WHEN json_valid(e.definition) THEN COALESCE(json_type(e.definition,'$.approval'),'null') != 'object' ELSE 1 END
+                AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=e.id AND x.person=ec.owner)
+                ORDER BY em.at DESC,e.rowid DESC LIMIT {MAX_EXPIRED_QUESTIONS}
+            )) AND NOT EXISTS (SELECT 1 FROM question_closures x WHERE x.question=q.id AND x.person=c.owner) ORDER BY q.rowid"
         );
         self.db
             .prepare(&sql)?
-            .query_map([person], read_question)?
+            .query_map(
+                params![person, now() - EXPIRED_QUESTION_DAYS * 24 * 60 * 60],
+                read_question,
+            )?
             .collect()
     }
 
@@ -323,19 +336,9 @@ impl Store {
     }
 
     pub fn indexed_questions_for(&self, person: &str) -> rusqlite::Result<Vec<StoredQuestion>> {
-        let rows = self.open_question_rows(person)?;
-        rows.into_iter()
-            .map(|(_, parsed)| {
-                parsed.map_err(|why| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(why)))
-                })
-            })
-            .filter(|q| {
-                q.as_ref().map_or(true, |q| {
-                    q.info.state == QuestionState::Pending || q.info.definition.approval.is_none()
-                })
-            })
-            .collect()
+        // Invalid historical records are omitted and logged by usable;
+        // SQL failures still fail the entire snapshot rather than clearing it.
+        self.open_questions_for(person)
     }
 
     /// Every pending question: its agent, id, and when it was asked

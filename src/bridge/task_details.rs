@@ -334,9 +334,18 @@ impl Hub {
     /// Sends `answer` to the device that asked, if it is still connected
     /// and still paired to the same person.
     fn deliver_task_device(&self, store: &Store, pending: &Pending, answer: ToDevice) {
-        if store.host_person().ok().flatten().as_deref() != Some(pending.person.as_str()) {
-            return;
-        }
+        let answer = match store.host_person() {
+            Ok(person) if person.as_deref() == Some(pending.person.as_str()) => answer,
+            Ok(_) => return,
+            Err(error) => {
+                eprintln!("enclos app: cannot recheck task-detail host ownership: {error}");
+                ToDevice::Error(failure(
+                    pending.original.clone(),
+                    ErrorCode::Internal,
+                    "The bridge could not check host ownership. Try again.",
+                ))
+            }
+        };
         let answer = match store.devices() {
             Ok(devices)
                 if devices.iter().any(|d| {
@@ -773,5 +782,83 @@ mod tests {
             matches!(next(&rx),ToDevice::TaskDetail{task,detail,..} if task == "app/t1" && detail.body.as_deref()==Some("Description"))
         );
         assert_eq!(store.held_task(AGENT, "app/t1").unwrap().unwrap(), before);
+    }
+    #[test]
+    fn review_task_details_recheck_owner_and_both_pairing_keys_before_delivery() {
+        for changed in ["owner", "noise", "signing", "database"] {
+            let (_dir, hub, store, phone, rx) = fixture();
+            let (_plugin, frames) =
+                reported(&hub, &rx, vec![Capability::Tasks, Capability::TaskDetails]);
+            get(&hub, &store, &phone, "review-private-detail").unwrap();
+            let rpc = asked(&frames);
+            let pending = hub
+                .task_details
+                .lock()
+                .unwrap()
+                .pending
+                .remove(rpc.as_str())
+                .unwrap();
+            match changed {
+                "owner" => {
+                    store.set_host("other@example.com").unwrap();
+                }
+                "database" => {
+                    store.db.execute("DROP TABLE settings", []).unwrap();
+                }
+                key => {
+                    let mut swapped = phone.clone();
+                    if key == "noise" {
+                        swapped.noise_key = vec![77; 32];
+                    } else {
+                        swapped.device_key = vec![88; 32];
+                    }
+                    store.remove_device(&phone.id).unwrap();
+                    store.add_device(&swapped).unwrap();
+                }
+            }
+            hub.deliver_task_device(
+                &store,
+                &pending,
+                ToDevice::TaskDetail {
+                    of: pending.original.clone(),
+                    agent: AGENT.into(),
+                    task: "t1".into(),
+                    detail: TaskDetail {
+                        body: Some("Private".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+            if changed == "database" {
+                assert!(matches!(next(&rx),ToDevice::Error(e) if e.code==ErrorCode::Internal));
+            } else {
+                assert!(
+                    rx.recv_timeout(Duration::from_millis(30)).is_err(),
+                    "{changed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_generic_task_detail_capability_does_not_allow_held_reads() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        let (_plugin, frames) = fake_plugin(&hub, vec![Capability::TaskDetails]);
+        let task=serde_json::from_value(serde_json::json!({"task":"app/t1","title":"Review","reason":"Decision","since":1,"revision":"v1","resume":"Review","resumable":false})).unwrap();
+        store
+            .report_held_tasks(AGENT, &crate::bridge::store::home_id(AGENT), &[task])
+            .unwrap();
+        let error = hub
+            .held_task_get(
+                &store,
+                &phone,
+                &phone.person,
+                MessageId::new("review-cap").unwrap(),
+                AGENT.into(),
+                "app/t1".into(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(frames.try_recv().is_err());
     }
 }

@@ -290,6 +290,17 @@ class DetailTest(unittest.TestCase):
 
 
 class HeldDetailTest(unittest.TestCase):
+    def test_review_board_without_db_path_uses_the_pinned_native_resolver(self):
+        with tempfile.TemporaryDirectory() as folder:
+            board=Scratch(folder)
+            board.task("same-id","blocked",assignee="reviewer",created_by="lead",body="Exact board")
+            native=types.SimpleNamespace(DEFAULT_BOARD="default",list_tasks=lambda:[],list_boards=lambda **_: [{"slug":"app"}],kanban_db_path=lambda slug: board.path,pin_first_board_resolution=contextlib.nullcontext)
+            package=types.ModuleType("hermes_cli");package.kanban_db=native
+            constants=types.SimpleNamespace(profile_name_for_home=lambda _:"lead")
+            with patch.dict(sys.modules,{"hermes_cli":package,"hermes_cli.kanban_db":native,"hermes_constants":constants}):
+                actual=tasks.hermes_board(Path(folder),"enclos")
+                self.assertEqual(actual.held_detail("app/same-id")["body"],"Exact board")
+
     def test_exact_board_reference_and_creator_with_description_and_comments(self):
         with tempfile.TemporaryDirectory() as folder:
             first, second = Scratch(folder), Scratch(folder)

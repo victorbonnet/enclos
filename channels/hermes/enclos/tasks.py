@@ -386,6 +386,30 @@ class Board:
         return None
 
 
+def board_databases(kb) -> list[tuple[str, Path]]:
+    """Each existing live board, resolved under the runtime's board pin, once per file."""
+    found = []
+    seen = set()
+    pin = getattr(kb, "pin_first_board_resolution", contextlib.nullcontext)
+    with pin():
+        for meta in kb.list_boards(include_archived=False):
+            slug = str(meta.get("slug") or getattr(kb, "DEFAULT_BOARD", "default"))
+            resolve = getattr(kb, "kanban_db_path", None)
+            raw = meta.get("db_path") or (resolve(slug) if callable(resolve) else None)
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            found.append((slug, path))
+    return found
+
+
 def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
     """The board of the Hermes this plugin runs in, for the profile whose home
     is `home`; None when this Hermes has no board, which turns `tasks` off."""
@@ -404,19 +428,11 @@ def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
         return None
 
     def files() -> list[str]:
-        found: list[str] = []
-        for board in kanban_db.list_boards(include_archived=False):
-            path = str(board.get("db_path") or "")
-            # A board with no database yet has no task.
-            if path and path not in found and os.path.isfile(path):
-                found.append(path)
-        return found
+        return [str(path) for _, path in board_databases(kanban_db)]
 
     default_board = getattr(kanban_db, "DEFAULT_BOARD", None)
     def held_boards():
-        return [(str(board.get("slug") or default_board), str(board.get("db_path")))
-                for board in kanban_db.list_boards(include_archived=False)
-                if board.get("db_path") and os.path.isfile(str(board["db_path"]))]
+        return board_databases(kanban_db)
     return Board(profile, files, platform, held_boards=held_boards, default_board=default_board)
 
 

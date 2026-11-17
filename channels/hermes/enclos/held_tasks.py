@@ -250,23 +250,7 @@ class Board:
             logger.warning(text, *args)
 
     def _databases(self) -> list[tuple[str, Path]]:
-        """(board, database) of each live board that has one, the default
-        first, each database once."""
-        found: list[tuple[str, Path]] = []
-        seen: set[str] = set()
-        with self.kb.pin_first_board_resolution():
-            for meta in self.kb.list_boards(include_archived=False):
-                slug = str(meta.get("slug") or self.kb.DEFAULT_BOARD)
-                path = Path(meta.get("db_path") or self.kb.kanban_db_path(slug)).expanduser()
-                try:
-                    key = str(path.resolve())
-                except OSError:
-                    key = str(path)
-                if key in seen or not path.is_file():
-                    continue
-                seen.add(key)
-                found.append((slug, path))
-        return found
+        return tasks.board_databases(self.kb)
 
     def _ref(self, slug: str, task_id: str) -> str:
         return task_id if slug == self.kb.DEFAULT_BOARD else f"{slug}/{task_id}"

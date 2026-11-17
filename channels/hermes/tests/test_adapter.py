@@ -118,6 +118,8 @@ def line(message_type: str, **fields) -> bytes:
     return (json.dumps({"v": 1, "type": message_type, "id": os.urandom(8).hex(), **fields}) + "\n").encode()
 
 
+from enclos import suggested_replies
+
 class AdapterTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.dir = tempfile.mkdtemp()
@@ -145,7 +147,7 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         now = asyncio.get_running_loop().time()
         self.adapter._last_in["c-1"] = ("m1", now)
         replies = ["Fix Inbox filters", "Keep paused"]
-        self.adapter._suggested_replies["c-1"] = (("m1", now), now, replies)
+        self.adapter._suggested_replies["c-1"] = suggested_replies.Pending(("m1", now), now, replies)
         await self.adapter.send("c-1", "♻️ Gateway online", None)
         notice = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertNotIn("suggested_replies", notice)
@@ -157,6 +159,21 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         following = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertNotIn("suggested_replies", following)
         writer.close()
+
+    async def test_review_replies_remain_staged_after_outbox_rejection(self):
+        for with_files in (False, True):
+            now = asyncio.get_running_loop().time()
+            self.adapter._last_in["c-review"] = ("m-review", now)
+            self.adapter._suggested_replies["c-review"] = suggested_replies.Pending(("m-review", now), now, ["Fix it"])
+            with patch.object(self.adapter._outbox, "put", return_value=False):
+                result = await (self.adapter._send_files("c-review", [], "Decision", "m-review") if with_files
+                                else self.adapter.send("c-review", "Decision", "m-review"))
+            self.assertFalse(result.success)
+            self.assertIn("c-review", self.adapter._suggested_replies)
+            result = await self.adapter.send("c-review", "Decision", "m-review")
+            self.assertTrue(result.success)
+            self.assertEqual(self.adapter._outbox.pending()[-1]["suggested_replies"], ["Fix it"])
+            self.assertNotIn("c-review", self.adapter._suggested_replies)
 
     async def test_a_message_longer_than_64_kib_reaches_the_runtime(self):
         reader, writer = await self.bridge()
