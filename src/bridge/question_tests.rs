@@ -3482,6 +3482,7 @@ fn encrypted_session_subscribes_before_synced_and_delivers_dismissal_receipts() 
             socket: tungstenite::accept(stream).unwrap(),
             session: bridge_session,
             heard: std::time::Instant::now(),
+            scoped_approvals: false,
         };
         run_session(
             &server_hub,
