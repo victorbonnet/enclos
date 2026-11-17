@@ -288,6 +288,15 @@ export function createChannel(sdk = {}) {
     outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText, ...(hasMedia ? { sendMedia } : {}) },
     messaging: {
       targetPrefixes: ['enclos'], targetIdComparison: 'case-sensitive',
+      targetResolver: {
+        hint: 'Use home or a known bridge conversation id for this account.',
+        async resolveTarget(params) {
+          const account = resolveAccount(params.cfg, params.accountId);
+          const route = await plugin.messaging.resolveOutboundSessionRoute({ ...params,
+            agentId: account.agentId, target: params.normalized });
+          return route ? { to: route.to, kind: 'user' } : undefined;
+        },
+      },
       normalizeTarget(raw) { try { return checkedId(raw.startsWith('enclos:') ? raw.slice(7) : raw); } catch { return undefined; } },
       inferTargetChatType: () => 'direct',
       resolveInboundAttachmentRoots: ({ cfg, accountId }) => [path.join(path.dirname(resolveAccount(cfg, accountId).socket), 'media')],
@@ -296,6 +305,7 @@ export function createChannel(sdk = {}) {
         if (account.agentId !== params.agentId) return null;
         const active = running.get(account.accountId);
         if (!active) return null;
+        assertCurrent(params.cfg, account, active.transport);
         const to = target(params.target, { ...account, home: active.transport.home });
         const saved = active.transport.state.routes[to] ?? (to === active.transport.home ? active.transport.homeRoute() : undefined);
         // First-use Home owns a dedicated native session without asserting a
