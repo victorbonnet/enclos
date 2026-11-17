@@ -171,3 +171,22 @@ test('asynchronous controls retain their exact peer and protected token authorit
   assert.equal(effects, 0);
   assert.throws(() => channel.assertControlPeer(oldPeer), error => error.code === 'agent_unavailable');
 });
+
+
+test('imported routes preserve native peers while binding remapped conversations to the destination person', async t => {
+  const account = accountFixture(t);
+  const original = new ChannelTransport(account, { onMessage: async () => {} });
+  const direct = original.route('source-conversation', 'source-person');
+  const home = original.homeRoute();
+  original.state.routes = {
+    'destination-conversation': { ...direct, person: 'destination-person', origin: { v: 1, conversation: 'source-conversation', person: 'source-person' } },
+    [account.home]: { ...home, person: 'destination-person', origin: { v: 1, conversation: account.home, person: null } },
+  };
+  original.save();
+  const imported = new ChannelTransport(account, { onMessage: async () => {} });
+  assert.equal(imported.route('destination-conversation', 'destination-person').peer, direct.peer);
+  assert.equal(imported.route(account.home, 'destination-person').peer, home.peer);
+  assert.throws(() => imported.route('destination-conversation', 'source-person'), { code: 'not_allowed' });
+  imported.state.routes['destination-conversation'].origin.conversation = 'forged-source'; imported.save();
+  assert.throws(() => new ChannelTransport(account, { onMessage: async () => {} }), /invalid enclos channel conversation route/);
+});
