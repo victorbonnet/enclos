@@ -326,12 +326,12 @@ impl RuntimeAdapter for OpenClaw {
             restart: None,
         }]
     }
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, proxy_port: u16) -> Option<RuntimeListener> {
         // The authenticated dashboard needs a native one-use handoff, never
         // an unauthenticated URL invented by status. Use native dashboard.
         Some(RuntimeListener {
             service: GATEWAY,
-            ports: ListenerPorts::SingleLoopback,
+            ports: ListenerPorts::Loopback(proxy_port.checked_add(2000)?),
         })
     }
     fn secret_files(&self) -> Option<SecretFiles> {
@@ -526,7 +526,13 @@ impl RuntimeAdapter for OpenClaw {
         }))
     }
     fn inspect_settings(&self, files: &[SettingsFile]) -> Result<Vec<SettingsFinding>, String> {
-        fn walk(value: &Value, path: &str, file: &SettingsFile, out: &mut Vec<SettingsFinding>) {
+        fn walk(
+            value: &Value,
+            path: &str,
+            file: &SettingsFile,
+            plain: &mut std::collections::BTreeSet<String>,
+            out: &mut Vec<SettingsFinding>,
+        ) {
             if out.len() >= 2048 {
                 return;
             }
@@ -549,26 +555,30 @@ impl RuntimeAdapter for OpenClaw {
                             && !credential_file_field(&path, value)
                             && value.as_str().is_some_and(|s| !s.is_empty())
                         {
-                            out.push(SettingsFinding::Plain {
-                                agent: file.agent.clone(),
-                                file: file.path.clone(),
-                                line: 1,
-                                held: Held::Key(path),
-                            });
+                            if plain.insert(path.clone()) {
+                                out.push(SettingsFinding::Plain {
+                                    agent: file.agent.clone(),
+                                    file: file.path.clone(),
+                                    line: 1,
+                                    held: Held::Key(path),
+                                });
+                            }
                         } else {
-                            walk(value, &path, file, out);
+                            walk(value, &path, file, plain, out);
                         }
                     }
                 }
                 Value::Array(values) => {
                     for (i, value) in values.iter().enumerate() {
-                        walk(value, &format!("{path}/{i}"), file, out);
+                        walk(value, &format!("{path}/{i}"), file, plain, out);
                     }
                 }
                 _ => {}
             }
         }
         let mut result = Vec::new();
+        let mut plain = std::collections::BTreeSet::new();
+        let mut dotenv = std::collections::BTreeSet::new();
         for file in files {
             if file.path.as_path() == Path::new(".openclaw/.env") {
                 for (n, line) in file.text.lines().enumerate() {
@@ -591,13 +601,27 @@ impl RuntimeAdapter for OpenClaw {
                 continue;
             }
             let config = parse(&file.text)?;
-            for key in ["gateway", "models", "env"] {
+            for key in [
+                "gateway", "models", "env", "tools", "skills", "plugins", "hooks",
+            ] {
                 if let Some(value) = config.get(key) {
-                    walk(value, key, file, &mut result);
+                    walk(value, key, file, &mut plain, &mut result);
                 }
             }
-            if let Some(value) = config.pointer(&format!("/agents/entries/{}", file.agent)) {
-                walk(value, "agents", file, &mut result);
+            for key in ["list", "defaults"] {
+                if let Some(value) = config.pointer(&format!("/agents/{key}")) {
+                    walk(
+                        value,
+                        &format!("agents/{key}"),
+                        file,
+                        &mut plain,
+                        &mut result,
+                    );
+                }
+            }
+            let entry = format!("agents/entries/{}", file.agent);
+            if let Some(value) = config.pointer(&format!("/{entry}")) {
+                walk(value, &entry, file, &mut plain, &mut result);
             }
             if let Some(channels) = config.get("channels").and_then(Value::as_object) {
                 for (name, channel) in channels {
@@ -606,6 +630,7 @@ impl RuntimeAdapter for OpenClaw {
                             account,
                             &format!("channels/{name}/accounts/{}", file.agent),
                             file,
+                            &mut plain,
                             &mut result,
                         );
                     }
@@ -617,6 +642,7 @@ impl RuntimeAdapter for OpenClaw {
                                 &json!({(key):value}),
                                 &format!("channels/{name}"),
                                 file,
+                                &mut plain,
                                 &mut result,
                             );
                         }
@@ -848,6 +874,41 @@ mod tests {
                 .set_setting(&a, "gateway", "{auth:{token:null}}")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn declared_gateway_port_matches_the_launcher() {
+        assert_eq!(
+            OpenClaw.listener(41007).unwrap().ports,
+            ListenerPorts::Loopback(43007)
+        );
+    }
+
+    #[test]
+    fn shared_openclaw_settings_report_each_plain_secret_once() {
+        let text = json!({
+            "agents": {"list": [{"id": "other", "token": "fixture"}], "defaults": {"apiKey": "fixture"}},
+            "tools": {"key": "fixture"}, "skills": {"one": {"apiKey": "fixture"}},
+            "plugins": {"entries": {"one": {"token": "fixture"}}}, "hooks": {"token": "fixture"}
+        }).to_string();
+        let files = ["scout", "other"].map(|agent| SettingsFile {
+            agent: RuntimeAgentName::new(agent).unwrap(),
+            path: at(CONFIG),
+            granted: Default::default(),
+            text: text.clone(),
+        });
+        let found = OpenClaw.inspect_settings(&files).unwrap();
+        assert_eq!(found.len(), 6, "{found:?}");
+        for path in [
+            "agents/list/0/token",
+            "agents/defaults/apiKey",
+            "tools/key",
+            "skills/one/apiKey",
+            "plugins/entries/one/token",
+            "hooks/token",
+        ] {
+            assert!(found.iter().any(|finding| matches!(finding, SettingsFinding::Plain { held: Held::Key(key), .. } if key == path)), "{found:?}");
+        }
     }
 
     #[test]
