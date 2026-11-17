@@ -253,6 +253,7 @@ fn a_late_answer_never_revives_an_expired_runtime_approval() {
         ],
         smart_denied: false,
         patterns: vec![],
+        scopes: None,
     });
     store
         .ask_question(
