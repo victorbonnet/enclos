@@ -146,6 +146,10 @@ class TransferTests(unittest.TestCase):
         projected = {'plugins': {'entries': {'codex': {'config': {'appServer': {'homeScope': 'user'}}}}}}
         transfer.merge_shared(projected, shared)
         with self.assertRaises(ValueError): transfer.assert_local_codex(projected, own)
+        cfg = {'agents': {'defaults': {'runtime': {'type': 'acp'}}}}
+        projected = {key: cfg.get(key, {}) for key in shared}
+        transfer.merge_shared(projected, shared)
+        with self.assertRaises(ValueError): transfer.assert_local_codex({**cfg, **projected}, own)
 
     def test_plugin_provenance_consent_uses_a_terminal_without_overwrite_mode(self):
         result = transfer.terminal_command([sys.executable, '-I', '-c', 'import sys; print(sys.stdin.isatty(), sys.stdout.isatty()); print("no overwrite mode")'], os.environ)
