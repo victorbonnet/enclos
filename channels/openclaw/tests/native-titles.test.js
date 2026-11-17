@@ -49,7 +49,7 @@ test('human rename uses a guarded native prepared patch and clearing restores th
   assert.equal(f.rows.get('session:c').displayName, undefined); assert.equal(f.outbox.at(-1).title, 'Native generated title');
   await f.titles.handleControl({ type: 'conversation.rename', conversation: 'unused', title: 'Name before use' });
   assert.equal(f.writes.length, 2);
-  await assert.rejects(f.titles.handleControl({ type: 'conversation.rename', conversation: 'c', title: 'Rejected title' }), error => error.code === 'conflict');
+  await assert.rejects(f.titles.handleControl({ type: 'conversation.rename', conversation: 'c', title: 'Rejected title' }), error => error.code === 'conflict' && error.message.includes('native chat kept its current title'));
   assert.equal(f.rows.get('session:c').displayName, undefined);
 });
 
