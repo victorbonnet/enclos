@@ -4527,6 +4527,77 @@ mod connection_end_tests {
     }
 
     #[test]
+    fn publishing_a_question_preserves_live_updates_and_reconnect_sync() {
+        use enclos_protocol::QuestionId;
+        use enclos_protocol::question::QuestionDefinition;
+
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("owned", "lab", "main", PERSON).unwrap();
+
+        let sync = |device: &mut PhoneLink| {
+            device.send(
+                "sync-questions",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: true,
+                },
+            );
+            let mut saw_question = false;
+            loop {
+                match device.receive().expect("the bridge closed during sync") {
+                    ToDevice::OpenItems { items, .. } => {
+                        saw_question |= items.iter().any(|item| item.id == "live-question");
+                    }
+                    ToDevice::Synced { .. } => return saw_question,
+                    _ => {}
+                }
+            }
+        };
+        let (mut device, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(!sync(&mut device));
+
+        let hub = Arc::clone(&bridge.hub);
+        let publishing = std::thread::spawn(move || {
+            let origin = questions::Origin {
+                agent: "lab/main",
+                connection: "test-plugin",
+            };
+            hub.question_connected(None, origin, &[Capability::Questions]);
+            hub.question_ask(
+                &hub.store().unwrap(),
+                origin,
+                &ConversationId::new("owned").unwrap(),
+                &QuestionDefinition {
+                    id: QuestionId::new("live-question").unwrap(),
+                    text: "Continue the review?".into(),
+                    choices: vec!["Continue".into(), "Pause".into()],
+                    multiple: false,
+                    approval: None,
+                },
+                &MessageId::new("ask-live-question").unwrap(),
+            )
+        });
+        loop {
+            if let ToDevice::OpenItems { items, .. } =
+                device.receive().expect("the bridge closed after the ask")
+            {
+                assert!(items.iter().any(|item| item.id == "live-question"));
+                break;
+            }
+        }
+        publishing.join().unwrap().unwrap();
+
+        device.socket.close(None).unwrap();
+        let (mut reconnected, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(sync(&mut reconnected));
+    }
+
+    #[test]
     fn provisioning_capability_follows_confirmed_host_and_transfer_on_existing_connection() {
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge(folder.path());
