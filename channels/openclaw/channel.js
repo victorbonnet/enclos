@@ -53,8 +53,9 @@ export function createChannel(sdk = {}) {
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
-    const now = resolveAccount(currentConfig(cfg), account.accountId);
-    if (!now.enabled || accountKey(now) !== accountKey(account) || transport.closed || running.get(account.accountId)?.transport !== transport) {
+    const now = resolveAccount(currentConfig(cfg), account.accountId), active = running.get(account.accountId);
+    if (!now.enabled || accountKey(now) !== accountKey(account) || transport.closed || active?.transport !== transport ||
+        accountKey(active.account) !== accountKey(account)) {
       throw new Error('enclos channel account was stopped or reconfigured');
     }
   };
