@@ -48,6 +48,7 @@ impl Engine {
             credentials,
             history,
             source_policy: Some(policy),
+            runtime_packages: Vec::new(),
         };
         state.validate().map_err(failed)?;
         Ok(state)

@@ -77,18 +77,40 @@ async function main() {
   if (!/^[a-z][a-z0-9-]{1,40}$/.test(agent ?? '')) throw new Error('invalid agent');
   const nodeRoot = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
   const packageFile = path.join(nodeRoot, 'lib/node_modules/openclaw/package.json');
-  if (JSON.parse(fs.readFileSync(packageFile)).version !== '2026.11.3') throw new Error('native transfer needs the matching runtime');
+  const { version } = JSON.parse(fs.readFileSync(packageFile));
+  const release = typeof version === 'string' && /^(\d+\.\d+\.\d+)([+-].+)?$/u.exec(version);
+  const order = release ? release[1].localeCompare('2026.11.5', 'en', { numeric: true }) : -1;
+  if (order < 0 || (order === 0 && release[2]?.startsWith('-'))) throw new Error('Update OpenClaw to 2026.11.5 or newer before transferring agent data.');
   const require = createRequire(packageFile);
   const sdk = name => import(pathToFileURL(require.resolve(`openclaw/plugin-sdk/${name}`)));
+  const contracts = {
+    'agent-runtime': ['loadAuthProfileStoreWithoutExternalProfilesAsync', 'resolveAgentDir'],
+    'provider-auth': ['updateAuthProfileStoreWithLock'],
+    'config-mutation': ['readConfigFileSnapshotForWrite'],
+    'plugin-state-store-runtime': ['createPluginStateKeyedStoreV2'],
+    'secret-input-runtime': ['resolveConfiguredSecretInputString'],
+  };
+  const [{ loadAuthProfileStoreWithoutExternalProfilesAsync, resolveAgentDir }, auth, config, state, secrets] = await Promise.all(
+    Object.entries(contracts).map(async ([name, methods]) => {
+      let module;
+      try { module = await sdk(name); }
+      catch { throw new Error(`OpenClaw could not load plugin-sdk/${name}. Update OpenClaw or enclos.`); }
+      for (const method of methods) if (typeof module[method] !== 'function') {
+        throw new Error(`OpenClaw plugin-sdk/${name} is missing ${method}. Update OpenClaw or enclos.`);
+      }
+      return module;
+    }),
+  );
+  if (operation === 'check') {
+    fs.writeFileSync(file, JSON.stringify(version), { mode: 0o600, flag: 'wx' });
+    return;
+  }
   const stateDir = path.join(process.env.HOME, '.openclaw');
   const configFile = path.join(stateDir, 'openclaw.json');
   const signature = () => createHash('sha256').update(fs.readFileSync(configFile)).digest('hex');
   const initial = signature(); let live = true;
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => { live = false; });
   const assertCurrent = () => { if (!live || signature() !== initial) throw new Error('native transfer authority changed'); };
-  const [{ loadAuthProfileStoreWithoutExternalProfilesAsync, resolveAgentDir }, auth, config, state, secrets] = await Promise.all([
-    sdk('agent-runtime'), sdk('provider-auth'), sdk('config-mutation'), sdk('plugin-state-store-runtime'), sdk('secret-input-runtime'),
-  ]);
   const store = state.createPluginStateKeyedStoreV2('codex', {
     namespace: 'app-server-thread-bindings', maxEntries: 50000, overflowPolicy: 'reject-new', env: process.env,
   }, { assertCurrent });
@@ -121,6 +143,7 @@ async function main() {
     }
     const resolve = async (value, location) => {
       if (value && typeof value === 'object' && ['env', 'file', 'exec', 'store'].includes(value.source) && typeof value.provider === 'string' && typeof value.id === 'string') {
+        if (value.source === 'file' && /^(?:enclos-sandbox|enclos-[0-9a-f]{16})$/u.test(value.provider)) return value;
         const resolved = await secrets.resolveConfiguredSecretInputString({ config: resolutionConfig, env: process.env, value, path: location });
         if (typeof resolved.value !== 'string' || resolved.unresolvedRefReason) throw new Error(`source credential could not be resolved at ${location}`);
         return resolved.value;
@@ -143,11 +166,10 @@ async function main() {
     const sourceConfig = structuredClone(snapshot.sourceConfig);
     const agentNames = Object.keys(sourceConfig.agents?.entries ?? {});
     if (sourceConfig.agents?.entries) sourceConfig.agents.entries = { [agent]: sourceConfig.agents.entries[agent] };
-    for (const key of ['agents', 'tools', 'skills', 'models', 'messages', 'commands', 'session', 'plugins', 'auth']) {
-      if (sourceConfig[key] != null) sourceConfig[key] = await resolve(sourceConfig[key], key);
-    }
+    // Keep native settings references intact. The enclos envelope carries
+    // the granted values separately, and import rebinds the reference.
     assertCurrent();
-    fs.writeFileSync(file, JSON.stringify({ config: sourceConfig, agentNames, sharedAuth: await materializeAuth(shared), localAuth: await materializeAuth(own), bindings, legacyBindings }), { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(file, JSON.stringify({ version, config: sourceConfig, agentNames, sharedAuth: await materializeAuth(shared), localAuth: await materializeAuth(own), bindings, legacyBindings }), { mode: 0o600, flag: 'wx' });
   } else if (operation === 'import') {
     const input = JSON.parse(fs.readFileSync(file));
     for (const [key, value] of input.bindings) {

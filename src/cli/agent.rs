@@ -54,6 +54,13 @@ enum AgentVerb {
         /// Restore only the name and image of an existing agent.
         #[arg(long)]
         metadata_only: bool,
+        /// Authorize this exact npm package and its declared capabilities during import.
+        #[arg(
+            long = "accept-plugin",
+            value_name = "PACKAGE@VERSION",
+            conflicts_with = "metadata_only"
+        )]
+        approved_plugins: Vec<String>,
     },
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
@@ -107,13 +114,17 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             agent: AgentTarget { sandbox, agent },
             from,
             metadata_only,
+            approved_plugins,
         } => {
             match engine.import_agent_export(
                 by,
                 &sandbox,
                 agent.clone(),
                 &from,
-                metadata_only,
+                enclos::engine::AgentImportOptions {
+                    metadata_only,
+                    approved_plugins: &approved_plugins,
+                },
                 confirm,
             )? {
                 Planned::DryRun(plan) => output::show_plan(&plan),

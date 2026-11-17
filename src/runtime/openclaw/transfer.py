@@ -1,4 +1,4 @@
-"""OpenClaw 2026.11.3 portable agent data; runs only inside the sandbox.
+"""OpenClaw portable agent data; runs only inside the sandbox.
 
 Native snapshots and public native APIs own database/auth/binding writes. The
 archive retains native IDs and paths: upstream offers no lossless rekey/relocate.
@@ -24,7 +24,7 @@ import time
 import uuid
 
 FORMAT = 'openclaw-data-v1'
-VERSION = '2026.11.3'
+MINIMUM_OPENCLAW = '2026.11.5'
 MAX_BYTES = 32 * 1024**3
 REBUILDABLE = {'node_modules', '__pycache__', '.venv', 'venv'}
 HOME_SKIP = {'.openclaw', '.openclaw.update-captures', '.cache', '.npm', '.bun', '.rustup', '.profile', '.bashrc', '.bash_profile', '.zshrc', 'tmp'}
@@ -132,9 +132,9 @@ def equal_files(first, second):
 
 
 def terminal_command(command, env, timeout=600):
-    # The pinned CLI exposes provenance consent only through a terminal
-    # or --force, which also enables overwrites. Answer that exact prompt
-    # once, preserving native install mode and its concurrent-target refusal.
+    # The import has checked the exact package consent before calling this.
+    # Answer only the native provenance prompt for that package. Native
+    # install still refuses a concurrent installation without --force.
     master, slave = pty.openpty()
     output = bytearray(); prompt = bytearray(); consented = False; deadline = time.monotonic() + timeout
     try:
@@ -172,7 +172,7 @@ def native(home, *args, terminal=False):
 
 def native_env(home):
     return {**os.environ, 'HOME': str(home), 'OPENCLAW_HOME': str(home), 'OPENCLAW_STATE_DIR': str(home / '.openclaw'),
-            'OPENCLAW_CONFIG_PATH': str(home / '.openclaw/openclaw.json'), 'OPENCLAW_VERSION': VERSION,
+            'OPENCLAW_CONFIG_PATH': str(home / '.openclaw/openclaw.json'),
             'OPENCLAW_NO_RESPAWN': '1', 'OPENCLAW_LOAD_SHELL_ENV': '0', 'OPENCLAW_EXEC_SHELL_SNAPSHOT': '0',
             'OPENCLAW_SUPERVISOR_MODE': 'external', 'OPENCLAW_SERVICE_REPAIR_POLICY': 'external',
             'ENCLOS_OPENCLAW_TRANSFER': '1'}
@@ -279,19 +279,64 @@ def missing_plugins(inspections, wanted):
     return missing
 
 
-def merge_shared(target, source):
+def secret_ref(value):
+    return isinstance(value, dict) and value.get('source') in ('env', 'file', 'exec', 'store') and ('provider' in value or 'id' in value)
+
+
+def settings_refs(value, agent, variables, *, exporting=False):
+    """Copy settings with only the references covered by enclos grants."""
+    provider = 'enclos-' + hashlib.sha256(agent.encode()).hexdigest()[:16]
+    if secret_ref(value):
+        source = value.get('provider')
+        pointer = value.get('id')
+        variable = pointer[1:] if isinstance(pointer, str) and pointer.startswith('/') else ''
+        if set(value) != {'source', 'provider', 'id'} or value['source'] != 'file' or source not in (provider, 'enclos-sandbox') or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', variable):
+            fail('transferable settings need a file reference from enclos runtime configure --secret')
+        if exporting:
+            # The outer envelope keeps one binding per variable. Its agent
+            # grant shadows a sandbox grant with the same variable name.
+            allowed = variables.get('agent', []) if source == provider else set(variables.get('sandbox', [])) - set(variables.get('agent', []))
+        else:
+            allowed = variables
+        if variable not in allowed:
+            fail(f'no matching enclos grant in the export for protected variable {variable}')
+        return value if exporting else {'source': 'file', 'provider': provider, 'id': pointer}
+    if isinstance(value, dict):
+        return {key: settings_refs(child, agent, variables, exporting=exporting) for key, child in value.items()}
+    if isinstance(value, list):
+        return [settings_refs(child, agent, variables, exporting=exporting) for child in value]
+    return value
+
+
+def merge_shared(target, source, path=()):
     for key, value in source.items():
+        location = (*path, key)
         if key not in target: target[key] = value
-        elif isinstance(target[key], dict) and isinstance(value, dict): merge_shared(target[key], value)
-        elif target[key] != value: fail('conflicting destination runtime settings; use a fresh matching sandbox')
+        elif target[key] == value: continue
+        elif secret_ref(target[key]) or secret_ref(value):
+            fail('conflicting destination secret reference at ' + '.'.join(location))
+        elif isinstance(target[key], dict) and isinstance(value, dict): merge_shared(target[key], value, location)
+        else: fail('conflicting destination runtime setting at ' + '.'.join(location))
     return target
 
 
-def validate_manifest(meta, home, agent):
+def release_version(value):
+    version = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)([-+].+)?', value) if isinstance(value, str) else None
+    if not version: fail('invalid OpenClaw release version')
+    suffix = version[4] or ''
+    return (*map(int, version.groups()[:3]), not suffix.startswith('-'))
+
+
+def validate_manifest(meta, home, agent, destination_version):
     fields = {'format', 'version', 'home', 'agent', 'snapshot', 'workspace', 'agent_config', 'shared_config',
               'plugins', 'routes', 'sharedAuth', 'localAuth', 'bindings', 'legacy_bindings', 'host_reference'}
     if not isinstance(meta, dict) or set(meta) != fields: fail('invalid OpenClaw export manifest')
-    if meta['format'] != FORMAT or meta['version'] != VERSION: fail('unsupported OpenClaw data format or version')
+    if meta['format'] != FORMAT: fail('unsupported OpenClaw data format')
+    source = release_version(meta['version'])
+    if source < release_version(MINIMUM_OPENCLAW):
+        fail(f're-export using enclos with OpenClaw {MINIMUM_OPENCLAW} or newer to preserve secret references')
+    if release_version(destination_version) < source:
+        fail(f'update destination OpenClaw to {meta["version"]} or newer before importing')
     if meta['agent'] != agent: fail('OpenClaw native data currently retains its original agent id')
     if meta['home'] != str(home): fail('OpenClaw Codex continuation currently requires the same internal sandbox home path')
     if not isinstance(meta['snapshot'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', meta['snapshot']): fail('invalid native snapshot reference')
@@ -371,7 +416,7 @@ def preserve_adjacent_files(agent_dir, home, destination):
             else: copy_consistent(file, target)
 
 
-def export(home, agent, output, limit=MAX_BYTES, credential_files=None):
+def export(home, agent, output, limit=MAX_BYTES, credential_files=None, settings_grants=None, write_package_plan=False):
     checked_name(agent)
     with tempfile.TemporaryDirectory(prefix='.enclos-openclaw-export-', dir=home) as tmp:
         stage = Path(tmp); data = stage / 'data'; data.mkdir()
@@ -388,6 +433,10 @@ def export(home, agent, output, limit=MAX_BYTES, credential_files=None):
         workspace_rel = relative(str(workspace), home)
         if not workspace.is_dir(): fail('agent workspace is missing')
         own, shared = projected_config(cfg, agent)
+        own = settings_refs(own, agent, settings_grants or {}, exporting=True)
+        shared = settings_refs(shared, agent, settings_grants or {}, exporting=True)
+        shared_auth = settings_refs(meta['sharedAuth'], agent, settings_grants or {}, exporting=True)
+        local_auth = settings_refs(meta['localAuth'], agent, settings_grants or {}, exporting=True)
         inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
         plugins = []
         for inspection in inspections:
@@ -418,14 +467,17 @@ def export(home, agent, output, limit=MAX_BYTES, credential_files=None):
                 else: copy_consistent(file, data / 'home' / rel)
         state = home / '.enclos-app/openclaw-state' / agent / 'state.json'
         routes = json.loads(state.read_text()).get('routes', {}) if state.exists() else {}
-        manifest = {'format': FORMAT, 'version': VERSION, 'home': str(home), 'agent': agent, 'snapshot': snapshot.name,
+        manifest = {'format': FORMAT, 'version': meta['version'], 'home': str(home), 'agent': agent, 'snapshot': snapshot.name,
                     'workspace': workspace_rel, 'agent_config': own, 'shared_config': shared,
-                    'plugins': plugins, 'routes': routes, 'sharedAuth': meta['sharedAuth'], 'localAuth': meta['localAuth'],
+                    'plugins': plugins, 'routes': routes, 'sharedAuth': shared_auth, 'localAuth': local_auth,
                     'bindings': meta['bindings'], 'legacy_bindings': meta['legacyBindings'], 'host_reference': {'channels': sorted(cfg.get('channels', {})), 'bindings': [b for b in cfg.get('bindings', []) if b.get('agentId') == agent], 'cron_enabled': cfg.get('cron', {}).get('enabled'), 'hooks_enabled': cfg.get('hooks', {}).get('enabled')}}
         text = json.dumps(manifest)
         if len(text.encode()) > 4 * 1024**2: fail('runtime manifest is too large')
         (data / 'manifest.json').write_text(text); (data / 'manifest.json').chmod(0o600)
         write_archive(data, output, limit)
+        if write_package_plan:
+            with output.with_suffix('.plugins.json').open('x') as plan:
+                json.dump(sorted(p['spec'] for p in plugins), plan)
 
 
 def extract(source, destination, limit=MAX_BYTES):
@@ -454,7 +506,20 @@ def restore(home, agent, source, context):
     checked_name(agent)
     with tempfile.TemporaryDirectory(prefix='.enclos-openclaw-import-', dir=home) as tmp:
         stage = Path(tmp); meta = extract(source, stage)
-        validate_manifest(meta, home, agent)
+        version_file = stage / 'version.json'
+        native_data(home, 'check', agent, version_file, home / '.openclaw/agents' / agent / 'agent')
+        validate_manifest(meta, home, agent, json.loads(version_file.read_text()))
+        planned = sorted(plugin['spec'] for plugin in meta['plugins'])
+        if sorted(context.get('approved_plugins', [])) != planned:
+            fail('runtime plugin consent does not match the packages in this export; run the dry-run plan and confirm each exact package')
+        variables = context.get('secret_variables', [])
+        provider_path = context.get('agent_secrets_file')
+        if variables and (not isinstance(provider_path, str) or not Path(provider_path).is_absolute()):
+            fail('enclos did not provide a protected destination secrets file')
+        own_settings = settings_refs(meta['agent_config'], agent, variables)
+        shared_settings = settings_refs(meta['shared_config'], agent, variables)
+        for field in ('sharedAuth', 'localAuth'):
+            meta[field] = settings_refs(meta[field], agent, variables)
         for record in meta['legacy_bindings']:
             if not (stage / 'agent' / record['rollout']).is_file(): fail('legacy native rollout bytes are missing')
         assert_idle_codex(stage / 'agent')
@@ -470,11 +535,11 @@ def restore(home, agent, source, context):
         cfg_path = home / '.openclaw/openclaw.json'
         cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
         if agent in cfg.get('agents', {}).get('entries', {}): fail('destination native agent already exists')
-        projected = {key: cfg.get(key, {}) for key in meta['shared_config']}
+        projected = {key: cfg.get(key, {}) for key in shared_settings}
         # The destination's system agent selection is not imported authority.
         if 'agents' in projected: projected['agents'] = {'defaults': {k: v for k, v in projected['agents'].get('defaults', {}).items() if k not in {'workspace', 'systemAgent'}}}
-        merge_shared(projected, meta['shared_config'])
-        assert_local_codex({**cfg, **projected}, meta['agent_config'])
+        merge_shared(projected, shared_settings)
+        assert_local_codex({**cfg, **projected}, own_settings)
         routes = imported_routes(meta['routes'], context.get('conversations', {}), context.get('destination_person'), agent)
         extras = stage / 'home'
         shared = stage / 'shared-skills'
@@ -494,13 +559,23 @@ def restore(home, agent, source, context):
         snapshot = stage / 'snapshot' / meta['snapshot']
         assert_snapshot_identity(snapshot, agent)
         assert_idle_database(snapshot / 'database.sqlite')
-        entry = {**meta['agent_config'], 'agentDir': str(agent_dir), 'workspace': str(workspace)}
-        initialize_config(home, agent, entry)
+        entry = {**own_settings, 'agentDir': str(agent_dir), 'workspace': str(workspace)}
+        # A new roster owns the restore before optional settings and their
+        # references are applied together in one native config patch.
+        initialize_config(home, agent, {'agentDir': str(agent_dir), 'workspace': str(workspace)})
         native(home, 'backup', 'sqlite', 'verify', str(snapshot), '--json')
         native_data(home, 'prepare', agent, stage / 'native-prepare.json', agent_dir)
         inspections = json.loads(native(home, 'plugins', 'inspect', '--all', '--json'))
-        for spec in missing_plugins(inspections, meta['plugins']):
+        bundled = {inspection['plugin']['id'] for inspection in inspections if inspection['plugin'].get('origin') == 'bundled'}
+        confirmed_ids = {plugin['id'] for plugin in meta['plugins']}
+        entries = shared_settings.get('plugins', {}).get('entries', {})
+        if any(entry.get('enabled') is True and name not in bundled | confirmed_ids for name, entry in entries.items()):
+            fail('the archive enables a native plugin without verified package consent')
+        missing = missing_plugins(inspections, meta['plugins'])
+        for spec in missing:
             native(home, 'plugins', 'install', spec, '--pin', '--no-enable', '--accept-capabilities', terminal=True)
+        if missing and missing_plugins(json.loads(native(home, 'plugins', 'inspect', '--all', '--json')), meta['plugins']):
+            fail('the native installer did not confirm the approved plugin packages')
         # Foreign user executables are data, not runnable target installations.
         expected = {'x86_64': 62, 'aarch64': 183, 'arm64': 183}.get(platform.machine())
         for tree in ['agent', 'workspace', 'home', 'shared-skills']:
@@ -509,7 +584,7 @@ def restore(home, agent, source, context):
             for executable in list(root.rglob('*')):
                 if not executable.is_file(): continue
                 with executable.open('rb') as f: header = f.read(20)
-                if len(header) >= 20 and header[:4] == b'\x7fELF' and (sys.platform != 'linux' or int.from_bytes(header[18:20], 'little' if header[5] == 1 else 'big') != expected):
+                if len(header) >= 20 and header[:4] == b'\x7fELF' and expected is not None and header[5] in (1, 2) and int.from_bytes(header[18:20], 'little' if header[5] == 1 else 'big') != expected:
                     saved = stage / 'agent/enclos-foreign-executables' / tree / executable.relative_to(root)
                     saved.parent.mkdir(parents=True, exist_ok=True); executable.rename(saved)
         # Publish new agent-owned paths only. No existing destination data is replaced.
@@ -526,6 +601,9 @@ def restore(home, agent, source, context):
                 elif not destination.exists(): copy_consistent(file, destination)
         patch = {**projected, 'agents': {**projected.get('agents', {}), 'ownership': 'explicit',
             'entries': {agent: entry}}}
+        if variables:
+            provider = 'enclos-' + hashlib.sha256(agent.encode()).hexdigest()[:16]
+            patch['secrets'] = {'providers': {provider: {'source': 'file', 'path': provider_path, 'mode': 'json'}}}
         # Source host messaging/schedules are omitted. Existing destination
         # switches stay unchanged; only a newly authored config disables them.
         file = stage / 'config-patch.json'; file.write_text(json.dumps(patch)); file.chmod(0o600)
@@ -552,7 +630,7 @@ if __name__ == '__main__':
         NATIVE_SOURCE, operation, name, file, context = sys.argv[1:]
         os.umask(0o077)
         home = Path.home().resolve(); context = json.loads(context)
-        if operation == 'export': export(home, name, Path(file), context.get('max_bytes', MAX_BYTES), context.get('credential_files'))
+        if operation == 'export': export(home, name, Path(file), context.get('max_bytes', MAX_BYTES), context.get('credential_files'), context.get('settings_grants'), context.get('write_package_plan', False))
         elif operation == 'import': restore(home, name, Path(file), context)
         else: fail('unknown transfer operation')
     except Exception as error:

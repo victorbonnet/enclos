@@ -35,6 +35,8 @@ pub struct HostState {
     pub credentials: Vec<Credential>,
     pub history: History,
     pub source_policy: Option<crate::model::policy::Policy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_packages: Vec<String>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,6 +132,26 @@ fn id(s: &str) -> bool {
 }
 impl HostState {
     pub fn validate(&self) -> io::Result<()> {
+        let packages: BTreeSet<_> = self.runtime_packages.iter().collect();
+        if packages.len() > 256
+            || packages.len() != self.runtime_packages.len()
+            || packages.iter().any(|spec| {
+                let Some((pkg, version)) = spec.rsplit_once('@') else {
+                    return true;
+                };
+                pkg.is_empty()
+                    || version.is_empty()
+                    || spec.len() > 256
+                    || !pkg
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"@/._-".contains(&c))
+                    || !version
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b".+-".contains(&c))
+            })
+        {
+            return Err(invalid());
+        }
         let mut variables = BTreeSet::new();
         for c in &self.credentials {
             if !crate::model::secret::is_variable_name(&c.variable)

@@ -417,6 +417,7 @@ impl RuntimeAdapter for Hermes {
             format: "hermes-data-v1",
             command: transfer("export", name, &archive, context),
             archive,
+            package_plan: None,
         })
     }
 
