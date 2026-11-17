@@ -432,7 +432,7 @@ def restore(home, agent, source, context):
         # The destination's system agent selection is not imported authority.
         if 'agents' in projected: projected['agents'] = {'defaults': {k: v for k, v in projected['agents'].get('defaults', {}).items() if k not in {'workspace', 'systemAgent'}}}
         merge_shared(projected, meta['shared_config'])
-        assert_local_codex(projected, meta['agent_config'])
+        assert_local_codex({**cfg, **projected}, meta['agent_config'])
         routes = imported_routes(meta['routes'], context.get('conversations', {}), context.get('destination_person'), agent)
         extras = stage / 'home'
         shared = stage / 'shared-skills'
