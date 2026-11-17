@@ -127,3 +127,9 @@ test('missing native binding and unsupported controls have no hidden fallback di
   owner.send(control); assert.equal((await owner.next('error', control.id)).code, 'unsupported');
   assert.equal(native.calls.dispatch.length, 0);
 });
+
+test('channel accounts sharing a socket folder get separate state folders by default', () => {
+  const account = id => ({ agentId: id, socket: `/sandbox/sockets/${id}.sock`, tokenFile: '/sandbox/token.json', home: `home.lab.${id}` });
+  const cfg = { channels: { enclos: { accounts: { first: account('first'), second: account('second') } } } };
+  assert.notEqual(resolveAccount(cfg, 'first').stateDir, resolveAccount(cfg, 'second').stateDir);
+});
