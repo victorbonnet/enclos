@@ -12,7 +12,8 @@ For Hermes the relay allows reads of the selected board, and uses Hermes's task 
 
 ## Consequences
 
-The bridge's HTTPS origin now serves Hermes's page, scripts and assets from inside the sandbox that controls them. The page can run same-origin and inline scripts. Those scripts can make same-origin requests to which `tailscale serve` attaches the caller's transport identity. The bridge's pairing page is static and receives its pairing code in the URL fragment. A board exchange requires a single-use ticket, other boards require their own browser session, and the device WebSocket requires the device's Noise keys or a one-time pairing code. The relay refuses workers and WebSocket upgrades. A future HTTP endpoint on this origin will be reachable from sandbox-supplied scripts and needs its own authorization beyond transport identity.
+- The bridge's HTTPS origin now serves Hermes's page, scripts and assets from inside the sandbox that controls them. The page can run same-origin and inline scripts. Those scripts can make same-origin requests to which `tailscale serve` attaches the caller's transport identity. A future HTTP endpoint on this origin will be reachable from sandbox-supplied scripts and needs its own authorization beyond transport identity.
+- The bridge's pairing page is static and receives its pairing code in the URL fragment. A board exchange requires a single-use ticket, other boards require their own browser session, and the device WebSocket requires the device's Noise keys or a one-time pairing code. The relay refuses workers and WebSocket upgrades.
 
 ## Considered options
 
