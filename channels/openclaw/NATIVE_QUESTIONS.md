@@ -1,6 +1,6 @@
 # Native question boundary
 
-Tested source: the installed public OpenClaw **2026.11.2** package. This channel
+Tested source: the installed public OpenClaw **2026.11.5** package. This channel
 preserves native question text and trusted Control UI flows. It does not advertise
 the enclos `questions` capability or accept `question.answer`/`question.sync`.
 Unsupported controls remain explicit `unsupported` errors.

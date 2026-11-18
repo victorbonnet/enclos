@@ -12,13 +12,23 @@ export async function deleteAgent({ agentId, readConfig, resolveSecret, callGate
   if (!/^[a-z0-9_][a-z0-9_-]{0,63}$/u.test(agentId ?? '')) throw new Error('Invalid OpenClaw agent id.');
   const port = Number(env.OPENCLAW_GATEWAY_PORT);
   if (!/^\d+$/u.test(env.OPENCLAW_GATEWAY_PORT ?? '') || port < 43000 || port > 43999) throw unavailable();
-  const { snapshot } = await readConfig();
-  if (!snapshot?.valid || !snapshot.sourceConfig || snapshot.sourceConfig.gateway?.mode === 'remote') throw unavailable();
+  let snapshot;
+  try { ({ snapshot } = await readConfig()); }
+  catch { throw new OwnerRefusal('OpenClaw could not read its native settings for agent deletion. Run OpenClaw doctor and check its settings.'); }
+  if (!snapshot?.valid || !snapshot.sourceConfig) throw new OwnerRefusal('OpenClaw has invalid native settings. Run OpenClaw doctor and correct them before deleting an agent.');
+  if (snapshot.sourceConfig.gateway?.mode === 'remote') throw new OwnerRefusal('OpenClaw native agent deletion requires a local Gateway. Check gateway.mode before retrying.');
   const config = snapshot.sourceConfig, auth = config.gateway?.auth;
-  if (!auth || !['token', 'password'].includes(auth.mode)) throw unavailable();
+  if (!auth || !['token', 'password'].includes(auth.mode)) {
+    throw new OwnerRefusal('OpenClaw native agent deletion requires Gateway token or password authentication. Check gateway.auth.mode.');
+  }
   const field = auth.mode === 'password' ? 'password' : 'token';
-  const resolved = await resolveSecret({ config, env, value: auth[field], path: `gateway.auth.${field}` });
-  if (typeof resolved.value !== 'string' || !resolved.value.trim() || resolved.unresolvedRefReason) throw unavailable();
+  let resolved;
+  try {
+    resolved = await resolveSecret({ config, env, value: auth[field], path: `gateway.auth.${field}` });
+  } catch { throw new OwnerRefusal('OpenClaw could not resolve its configured Gateway secret for agent deletion. Check the Gateway secret settings.'); }
+  if (typeof resolved?.value !== 'string' || !resolved.value.trim() || resolved.unresolvedRefReason) {
+    throw new OwnerRefusal('OpenClaw could not resolve its configured Gateway secret for agent deletion. Check the Gateway secret settings.');
+  }
   const options = { [field]: resolved.value, port: String(port), expectUrl: `ws://127.0.0.1:${port}`, json: true, timeout: '10000' };
   // A failed readiness/auth probe cannot dispatch a deletion. No fallback
   // edits native files, changes auth, or guesses whether a write succeeded.
@@ -33,18 +43,39 @@ export async function deleteAgent({ agentId, readConfig, resolveSecret, callGate
     ...(result.purgeFailed === true ? { purgeFailed: true } : {}) };
 }
 
+export async function ownerSdk(version, sdk) {
+  const minimum = '2026.11.5';
+  const parts = typeof version === 'string' && /^v?(\d+\.\d+\.\d+)([+-].+)?$/u.exec(version);
+  const order = parts ? parts[1].localeCompare(minimum, 'en', { numeric: true }) : -1;
+  if (order < 0 || (order === 0 && parts[2]?.startsWith('-'))) {
+    throw new Error(`Update OpenClaw to ${minimum} or newer before using native agent deletion.`);
+  }
+  async function method(subpath, name) {
+    let api;
+    try { api = await sdk(subpath); }
+    catch (error) {
+      throw new Error(`OpenClaw could not load plugin-sdk/${subpath}: ${error.message}. Update OpenClaw or enclos.`);
+    }
+    if (typeof api?.[name] !== 'function') throw new Error(`OpenClaw plugin-sdk/${subpath} is missing ${name}. Update OpenClaw or enclos.`);
+    return api[name];
+  }
+  const [readConfig, resolveSecret, callGateway] = await Promise.all([
+    method('config-mutation', 'readConfigFileSnapshotForWrite'),
+    method('secret-input-runtime', 'resolveConfiguredSecretInputString'),
+    method('gateway-runtime', 'callGatewayFromCli'),
+  ]);
+  return { readConfig, resolveSecret, callGateway };
+}
+
 export async function nativeOwnerSdk() {
   // The official rootless installer maintains tools/node -> private Node.
   // Resolve its own package exports; cwd/NODE_PATH never select a host SDK.
   const nodeRoot = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
   const packageFile = path.join(nodeRoot, 'lib/node_modules/openclaw/package.json');
-  if (JSON.parse(fs.readFileSync(packageFile)).version !== '2026.11.2') throw new Error('OpenClaw owner helpers need the matching tested runtime version.');
+  const { version } = JSON.parse(fs.readFileSync(packageFile));
   const require = createRequire(packageFile);
   const sdk = async subpath => import(pathToFileURL(require.resolve(`openclaw/plugin-sdk/${subpath}`)));
-  const [{ readConfigFileSnapshotForWrite }, { resolveConfiguredSecretInputString }, { callGatewayFromCli }] = await Promise.all([
-    sdk('config-mutation'), sdk('secret-input-runtime'), sdk('gateway-runtime'),
-  ]);
-  return { readConfig: readConfigFileSnapshotForWrite, resolveSecret: resolveConfiguredSecretInputString, callGateway: callGatewayFromCli };
+  return ownerSdk(version, sdk);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
@@ -55,7 +86,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   } catch (error) {
     // Upstream exceptions can contain source details; never print resolved
     // credentials or a serialized config, even on a native client failure.
-    console.error(error instanceof OwnerRefusal ? error.message : unavailable().message);
+    console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
 }

@@ -135,16 +135,25 @@ async function start(t, channel, cfg, account) {
   return controller;
 }
 
-test('only the tested native version is accepted and accounts are explicit', t => {
+test('the minimum native version and explicit accounts are required', t => {
   const one = accountFixture(t, 'main'), two = accountFixture(t, 'scout');
   const cfg = configured(one, two);
-  assert.throws(() => createChannel().setRuntime({ version: '2026.11.3' }), /matching enclos channel/);
+  assert.throws(() => createChannel().setRuntime({ version: '2026.11.2' }), /Update OpenClaw to 2026.11.5 or newer/);
   assert.throws(() => resolveAccount(cfg), /explicit configured account/);
   assert.equal(resolveAccount(configured(one)).agentId, 'main');
   assert.equal(resolveAccount(cfg, 'scout').tokenFile, two.tokenFile);
   assert.equal(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-a', 'alice'));
   assert.notEqual(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-b', 'alice'));
   assert.notEqual(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-a', 'bob'));
+});
+
+test('a newer native runtime is accepted when its channel interfaces are available', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const native = nativeHarness(cfg);
+  const channel = createChannel();
+  channel.setRuntime({ ...native.api, version: '2026.11.10' });
+  const incomplete = { ...native.api.channel, routing: {} };
+  await assert.rejects(channel.plugin.gateway.startAccount({ cfg, channelRuntime: incomplete }), /missing channel interfaces: routing.resolveAgentRoute/);
 });
 
 test('native inbound keeps account, conversation, person and group-member contexts separate', async t => {
