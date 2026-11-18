@@ -4354,6 +4354,10 @@ mod connection_end_tests {
 
         /// The next message, conversations' details included.
         fn receive_any(&mut self) -> Option<ToDevice> {
+            self.receive_any_with_timeout_message("nothing from the bridge in time")
+        }
+
+        fn receive_any_with_timeout_message(&mut self, timeout_message: &str) -> Option<ToDevice> {
             loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
@@ -4366,7 +4370,7 @@ mod connection_end_tests {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        panic!("nothing from the bridge in time")
+                        panic!("{timeout_message}")
                     }
                     Err(_) => return None,
                 }
@@ -4524,6 +4528,80 @@ mod connection_end_tests {
                 .unwrap()
                 .contains(&phone.id)
         );
+    }
+
+    #[test]
+    fn publishing_a_question_preserves_live_updates_and_reconnect_sync() {
+        use enclos_protocol::QuestionId;
+        use enclos_protocol::question::QuestionDefinition;
+
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("owned", "lab", "main", PERSON).unwrap();
+
+        let sync = |device: &mut PhoneLink| {
+            device.send(
+                "sync-questions",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: true,
+                },
+            );
+            let mut saw_question = false;
+            loop {
+                match device.receive().expect("the bridge closed during sync") {
+                    ToDevice::OpenItems { items, .. } => {
+                        saw_question |= items.iter().any(|item| item.id == "live-question");
+                    }
+                    ToDevice::Synced { .. } => return saw_question,
+                    _ => {}
+                }
+            }
+        };
+        let (mut device, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(!sync(&mut device));
+
+        let hub = Arc::clone(&bridge.hub);
+        let publishing = std::thread::spawn(move || {
+            let origin = questions::Origin {
+                agent: "lab/main",
+                connection: "test-plugin",
+            };
+            hub.question_connected(None, origin, &[Capability::Questions]);
+            hub.question_ask(
+                &hub.store().unwrap(),
+                origin,
+                &ConversationId::new("owned").unwrap(),
+                &QuestionDefinition {
+                    id: QuestionId::new("live-question").unwrap(),
+                    text: "Continue the review?".into(),
+                    choices: vec!["Continue".into(), "Pause".into()],
+                    multiple: false,
+                    approval: None,
+                },
+                &MessageId::new("ask-live-question").unwrap(),
+            )
+        });
+        loop {
+            if let ToDevice::OpenItems { items, .. } = device
+                .receive_any_with_timeout_message(
+                    "no live open-items snapshot within the read timeout",
+                )
+                .expect("the connection ended before the live open-items snapshot")
+            {
+                assert!(items.iter().any(|item| item.id == "live-question"));
+                break;
+            }
+        }
+        publishing.join().unwrap().unwrap();
+
+        device.socket.close(None).unwrap();
+        let (mut reconnected, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(sync(&mut reconnected));
     }
 
     #[test]

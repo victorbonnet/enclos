@@ -876,6 +876,8 @@ impl Hub {
                 }
             }
         }
+        // Publishing the open-item snapshot takes the device routes lock again.
+        drop(devices);
         self.publish_open_items(store, &current.owner);
     }
 
