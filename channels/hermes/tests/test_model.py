@@ -307,7 +307,13 @@ class Adapter(unittest.IsolatedAsyncioTestCase):
     async def test_the_adapter_announces_model_and_answers_a_request(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import test_adapter
-        test_adapter.setUpModule()
+        from unittest.mock import patch
+        # The adapter tests' stand-ins for this test only: kept, they would
+        # hide an installed Hermes from the tests that run after it.
+        stand_ins = patch.dict(sys.modules, test_adapter._hermes_stand_ins())
+        stand_ins.start()
+        self.addCleanup(stand_ins.stop)
+        sys.modules.pop("enclos.adapter", None)
         from enclos.adapter import EnclosAdapter
         from gateway.config import PlatformConfig
         directory = tempfile.mkdtemp()

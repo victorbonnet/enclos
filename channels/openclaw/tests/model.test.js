@@ -15,7 +15,7 @@ function harness({ models = ['model-1', 'model-2'], config, requiresRestart = fa
     const byProvider = view === 'all' ? all : new Map([['provider-a', all.get('provider-a')], ['provider-b', new Set()]]);
     return { providers: [...byProvider.keys()], byProvider, resolvedDefault: { provider: 'provider-a', model: 'model-1' },
       modelNames: new Map([['provider-a/model-2', 'Model Two']]),
-      modelMenu: { byProvider: new Map([['provider-b', { available: 0, notice: 'provider-b: missing auth.' }]]) } };
+      modelMenu: { byProvider: new Map([['provider-a', { available: 2, notice: '' }], ['provider-b', { available: 0, notice: 'provider-b: missing auth.' }]]) } };
   };
   const runtime = { config: {
     current: () => structuredClone(cfg),
@@ -91,6 +91,16 @@ test('an agent on the shared default keeps that default\'s fallbacks', async () 
   const { revision } = await h.request({ action: 'options' });
   await h.request({ action: 'set', provider: 'provider-a', model: 'model-2', revision });
   assert.deepEqual(h.config().agents.entries.scout.model, { primary: 'provider-a/model-2', fallbacks: ['provider-b/b-1'] });
+});
+
+test('a model provider listed with its default model but none available is not usable', async () => {
+  // As OpenClaw 2026.11.5 lists one the agent is not signed in to.
+  const catalogue = async () => ({ providers: ['openai'], byProvider: new Map([['openai', new Set(['gpt-5.1'])]]),
+    resolvedDefault: { provider: 'openai', model: 'gpt-5.1' },
+    modelMenu: { byProvider: new Map([['openai', { available: 0, notice: 'openai: Connection not confirmed. Connect with /login openai' }]]) } });
+  const options = await harness({ catalogue }).request({ action: 'options' });
+  assert.deepEqual(options.providers.map(p => [p.id, p.usable]), [['openai', false]]);
+  assert.match(options.providers[0].setup, /Connection not confirmed/);
 });
 
 test('a config with the older agents.list is read and written there, its roster kept', async () => {

@@ -4,7 +4,7 @@
 // the plugin takes only a model it lists. The agent's primary model is
 // saved through OpenClaw's own config write, which validates the config;
 // OpenClaw's reload rules hot-apply agent settings (read in its source,
-// 2026.11.3; to verify on a host, enclos design, section 14).
+// 2026.11.5; to verify on a host, enclos design, section 14).
 import { createHash } from 'node:crypto';
 import { message, ProtocolError } from './protocol.js';
 
@@ -98,8 +98,8 @@ export class ModelSettings {
     return hash([primary(agentEntry(cfg, agentId)?.model) ?? null, primary(cfg?.agents?.defaults?.model) ?? null]);
   }
 
-  // OpenClaw's view of every model provider (`all`) and of those the agent
-  // can use now (`default`: signed in, and within its model allowlist).
+  // OpenClaw's view of every model provider (`all`), and its `default` view,
+  // which lists the agent's own default model whether or not it is signed in.
   async views(cfg, agentId) {
     const [all, usable] = await Promise.all([this.catalogue(cfg, agentId, { view: 'all' }), this.catalogue(cfg, agentId, { view: 'default' })]);
     for (const view of [all, usable]) {
@@ -118,7 +118,14 @@ export class ModelSettings {
     return Buffer.byteLength(text) <= MAX_SETUP ? text : `To use it, ${how}.`;
   }
 
-  isUsable(usable, provider) {
+  // Whether the agent can use `provider` now, as OpenClaw's own `/models`
+  // menu counts it: models available (signed in, and within the agent's
+  // model allowlist). Shown with OpenClaw 2026.11.5, a model provider the
+  // agent is not signed in to is listed with its default model and none
+  // available. Without that count, the models of the `default` view.
+  isUsable(all, usable, provider) {
+    const menu = all.modelMenu?.byProvider;
+    if (menu instanceof Map) return (menu.get(provider)?.available ?? 0) > 0;
     return (usable.byProvider.get(provider)?.size ?? 0) > 0;
   }
 
@@ -152,7 +159,7 @@ export class ModelSettings {
       const providers = [];
       for (const provider of all.providers) {
         if (!id(provider) || providers.some(p => p.id === provider)) continue;
-        const ok = this.isUsable(usable, provider);
+        const ok = this.isUsable(all, usable, provider);
         providers.push({ id: provider, label: provider, usable: ok, ...(ok ? {} : { setup: this.setup(all, provider, agentId) }) });
         if (providers.length === MAX_PROVIDERS) break;
       }
@@ -185,7 +192,7 @@ export class ModelSettings {
     const { all, usable } = await this.views(cfg, agentId);
     const listed = all.byProvider.get(control.provider);
     if (!listed) fail('not_found', 'OpenClaw does not list that model provider.');
-    if (!this.isUsable(usable, control.provider)) fail('not_allowed', `The agent cannot use ${control.provider} yet. ${this.setup(all, control.provider, agentId)}`);
+    if (!this.isUsable(all, usable, control.provider)) fail('not_allowed', `The agent cannot use ${control.provider} yet. ${this.setup(all, control.provider, agentId)}`);
     if (!listed.has(control.model)) fail('not_found', 'OpenClaw does not list that model for this model provider.');
     const previous = split(configured(cfg, agentId));
     assertCurrent();
