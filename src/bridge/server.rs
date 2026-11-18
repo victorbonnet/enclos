@@ -912,7 +912,7 @@ impl Hub {
                         hub.routine_response(&store, &agent, &routine_connection, reply);
                     }
                     FromPlugin::ModelResponse(reply) => {
-                        hub.model_response(&store, &agent, &routine_connection, reply);
+                        hub.model_response(&store, &agent, generation, reply);
                     }
                     // An error naming one of the bridge's messages: a group
                     // turn sent as that message (a line too long for the
@@ -933,7 +933,7 @@ impl Hub {
                         if hub.task_detail_error(&store, &agent, &routine_connection, &error) {
                             continue;
                         }
-                        if hub.model_error(&store, &agent, &routine_connection, &error) {
+                        if hub.model_error(&store, &agent, generation, &error) {
                             continue;
                         }
                         hub.question_error(&store, origin(), error.clone());
@@ -1305,7 +1305,7 @@ impl Hub {
             hub.delete_disconnected(&agent, generation);
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
-            hub.model_disconnected(&store, &agent, &routine_connection);
+            hub.model_disconnected(&store, &agent, generation);
             hub.held_task_disconnected(&store, &agent, &routine_connection);
             hub.task_details_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group

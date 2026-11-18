@@ -123,9 +123,12 @@ successful status check does not establish that a model request succeeds.
 
 Once the agent is signed in, the host's person can also choose its model from
 the app (the agent's page, **Model**): the channel lists OpenClaw's own `/models`
-catalogue for that agent and writes the same `agents.entries.<agent>.model.primary`
-through OpenClaw's config write, which the Gateway applies without a restart
-(`docs/protocol.md`, An agent's model).
+catalogue for that agent and writes its primary model (in `agents.entries`, or in
+`agents.list` for a config with that older roster) through OpenClaw's config
+write. An agent that used the shared default keeps that default's fallbacks.
+OpenClaw's reload rules hot-apply the change, as read in its source; that the
+Gateway does so is to verify on a host (design §14). See `docs/protocol.md`, An
+agent's model.
 
 On macOS, the current wrapper supplies the readable public system CA bundle to
 native Codex through `CODEX_CA_CERTIFICATE` when neither it nor `SSL_CERT_FILE`

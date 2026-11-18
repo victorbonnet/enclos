@@ -120,11 +120,11 @@ What an agent's model calls consumed, as its runtime counts them: requests, inpu
 _Avoid_: consumption, spend, billing, quota (a provider's limit)
 
 **Model provider**:
-A service an agent's runtime calls a model through, such as OpenAI or OpenRouter, reached with a login or a key the runtime keeps. A runtime lists the providers it knows; the agent can use only those set up for it.
+A service, such as OpenAI or OpenRouter, through which an agent's runtime calls a model, with the runtime's own login or a secret granted to the agent. An agent can use only the model providers set up for it.
 _Avoid_: provider alone (it also names other things), backend, vendor
 
 **Agent model**:
-The model provider and model an agent's runtime uses for all the agent's conversations unless one says otherwise. It is the runtime's setting: the host's person may change it from the app, through the agent's channel.
+The model provider and model an agent's runtime uses for all the agent's conversations, unless a conversation sets its own. The runtime keeps it.
 _Avoid_: default model (Hermes's key, also OpenClaw's shared default), engine, LLM
 
 **Secret**:

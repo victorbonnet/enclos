@@ -107,6 +107,29 @@ test('a native service-backed routine response is live, agent-bound and read-onl
   assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, []);
 });
 
+test('a model request goes through the channel to the agent\'s own catalogue and is answered on its connection', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const asked = [];
+  const catalogue = async (_cfg, agentId, { view }) => {
+    asked.push([agentId, view]);
+    return { providers: ['provider-a'], byProvider: new Map([['provider-a', new Set(['model-1'])]]),
+      resolvedDefault: { provider: 'provider-a', model: 'model-1' } };
+  };
+  const channel = createChannel({ models: catalogue });
+  const native = nativeHarness(cfg);
+  native.api.config.mutateConfigFile = async () => { throw new Error('no write in this test'); };
+  channel.setRuntime(native.api);
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('model'));
+  const request = message('model.request', { person: 'p@example.com', device: 'd', action: 'options' }); owner.send(request);
+  const options = await owner.next('model.response', request.id);
+  assert.equal(options.result, 'options');
+  assert.deepEqual(options.providers.map(p => [p.id, p.usable]), [['provider-a', true]]);
+  assert.ok(asked.every(([agentId]) => agentId === account.agentId), 'the account\'s own agent');
+  assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, [], 'never kept for replay');
+});
+
 test('an awaited routine response never moves to a replacement bridge connection', async t => {
   const account = accountFixture(t), cfg = configured(account), channel = createChannel();
   channel.setRuntime(nativeHarness(cfg).api); let service, release, entered = false;

@@ -409,13 +409,16 @@ class EnclosAdapter(BasePlatformAdapter):
         """Answers one request about the agent's model (`model.request`)."""
         try:
             result = await asyncio.to_thread(self._model.handle, message)
-            await self._write(protocol._message("model.response", of=message["id"], **result))
+            sent = await self._write(protocol._message("model.response", of=message["id"], **result))
+            if not sent and result.get("result") == "set":
+                # The change is saved; only its confirmation is lost.
+                logger.error("[%s] The agent's model was set to %s, but the bridge could not be told",
+                             self.name, result.get("current"))
         except model.ModelError as error:
             await self._write(protocol.error(error.code, str(error), message["id"]))
         except Exception:
-            logger.warning("[%s] A model request could not answer", self.name, exc_info=True)
-            await self._write(protocol.error(
-                "unknown", "The outcome is unknown: open the agent's model again before retrying.", message["id"]))
+            logger.error("[%s] A model request could not answer", self.name, exc_info=True)
+            await self._write(protocol.error("unknown", model.UNKNOWN, message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
         if message["id"] in self._seen:

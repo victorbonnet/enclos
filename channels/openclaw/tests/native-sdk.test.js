@@ -319,3 +319,17 @@ test('the installed SDK builds the model catalogue the app lists, per agent and 
     for (const [provider, models] of data.byProvider) assert.ok(typeof provider === 'string' && models instanceof Set, view);
   }
 });
+
+test('with no login, the installed SDK lists model providers the agent cannot use', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/models-provider-runtime.js')));
+  const { ModelSettings } = await import('../model.js');
+  const cfg = { agents: { defaults: { model: { primary: 'openai/gpt-5.1' } }, entries: { main: {} } } };
+  const settings = new ModelSettings({ catalogue: sdk.buildModelsProviderData,
+    runtime: () => ({ config: { current: () => cfg, mutateConfigFile: async () => { throw new Error('no write'); } } }) });
+  const replies = [];
+  await settings.handle(message('model.request', { person: 'p@example.com', device: 'd', action: 'options' }),
+    { account: { agentId: 'main' }, assertCurrent() {}, write(reply) { replies.push(reply); } });
+  const providers = replies[0].providers;
+  assert.ok(providers.length > 0, 'the catalogue lists model providers');
+  assert.ok(providers.some(p => !p.usable && p.setup), 'one not signed in is shown with how to set it up');
+});

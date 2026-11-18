@@ -73,8 +73,13 @@ pub enum FromBridge {
     },
     /// A live request about the agent's model from the host's person
     /// (`model` capability): the plugin answers `model.response` or an
-    /// `error` (`conflict` for a stale revision, `not_allowed` for a
-    /// provider the agent cannot use yet, `not_found` for an unknown one).
+    /// `error`: `conflict` for a stale revision; `not_found` for a model
+    /// provider the runtime does not list, or a model it does not list when
+    /// it takes no other; `not_allowed` for a model provider the agent
+    /// cannot use yet, or a model the runtime refuses; `unsupported` for an
+    /// answer too large to send; `agent_unavailable` when the runtime could
+    /// not be read and nothing changed; `unknown` when a change may have
+    /// been made but was not confirmed.
     #[serde(rename = "model.request")]
     ModelRequest {
         /// Who asked, from which of their paired devices, as the bridge

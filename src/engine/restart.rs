@@ -271,6 +271,41 @@ mod tests {
         HomePath::new(p).unwrap()
     }
 
+    /// The watch `launch` builds for a Hermes gateway compares what Hermes's
+    /// adapter says needs a restart: an agent's model alone does not.
+    #[test]
+    fn a_hermes_gateways_watch_leaves_out_an_agents_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = crate::layout::Layout::at(dir.path().join("enclos"));
+        let state = crate::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
+        let audit = crate::audit::jsonl::JsonlAuditLog::new(layout.audit_log());
+        let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
+        let name: SandboxName = "lab".parse().unwrap();
+        let config = engine.sandbox_home(&name).join(".hermes/config.yaml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let text = "model:\n  default: model-1\nterminal:\n  backend: local\n";
+        std::fs::write(&config, text).unwrap();
+        let (mut watch, signal) = engine
+            .settings_watch(&name, RuntimeKind::Hermes, "gateway")
+            .unwrap();
+        assert_eq!(signal, Signal::Usr1);
+        let t = Instant::now();
+        std::fs::write(&config, text.replace("model-1", "model-2")).unwrap();
+        assert_eq!(watch.settled(t), None);
+        assert_eq!(watch.settled(t + READ_EVERY + 2 * SETTLE), None);
+        std::fs::write(&config, text.replace("local", "docker")).unwrap();
+        let later = t + 2 * READ_EVERY + 2 * SETTLE;
+        assert_eq!(watch.settled(later), None);
+        assert_eq!(
+            watch.settled(later + 2 * SETTLE),
+            Some(vec![rel(".hermes/config.yaml")])
+        );
+    }
+
     fn watched() -> (tempfile::TempDir, SettingsWatch) {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("a"), "1").unwrap();

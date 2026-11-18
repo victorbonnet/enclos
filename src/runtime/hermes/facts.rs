@@ -131,23 +131,52 @@ fn scalar(rest: &str) -> Yaml {
 
 /// `text` without its top-level `key` and what it holds, such as the
 /// `model` block Hermes writes for `/model --global`; `None` when the file
-/// uses YAML this reader does not follow (a tab in the indentation, a
-/// document marker or directive, a flow mapping, an anchor, alias or merge
-/// key, or `key` given twice), which the caller compares whole.
+/// uses YAML this reader does not follow, which the caller compares whole:
+/// a tab in the indentation, a document marker or directive, a flow
+/// collection at the left margin, an anchor, alias or merge key anywhere
+/// (an anchor on `key` reused elsewhere would carry its change there), a
+/// sequence at the left margin under `key`, or `key` given twice. The text
+/// of a block scalar (`|`, `>`), such as a prompt, is not YAML and is never
+/// read for these. The channel's `model.py` follows the same rules.
 pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
-    let unsure = |line: &str| {
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start_matches(' ').len()
+    }
+    // `&name` or `*name` where a YAML token starts.
+    fn anchor_or_alias(line: &str) -> bool {
+        let chars: Vec<char> = line.chars().collect();
+        chars.iter().enumerate().any(|(i, &c)| {
+            (c == '&' || c == '*')
+                && (i == 0 || matches!(chars[i - 1], ' ' | '[' | '{' | ','))
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|n| n.is_alphanumeric() || *n == '_' || *n == '-')
+        })
+    }
+    fn unsure(line: &str) -> bool {
+        let leading = &line[..line.len() - line.trim_start().len()];
         let trimmed = line.trim_start();
-        line.starts_with('\t')
+        leading.contains('\t')
             || line.starts_with("---")
             || line.starts_with("...")
             || line.starts_with('%')
             || line.starts_with('{')
+            || line.starts_with('[')
             || trimmed.starts_with("<<")
-            || trimmed.contains(": &")
-            || trimmed.contains(": *")
-            || trimmed.starts_with("- &")
-            || trimmed.starts_with("- *")
-    };
+            || anchor_or_alias(line)
+    }
+    // `key: |`, `- >-`: the lines below, deeper, are the scalar's text.
+    fn opens_block_scalar(line: &str) -> bool {
+        let content = line.split(" #").next().unwrap_or(line).trim_end();
+        let Some(last) = content.split(' ').next_back() else {
+            return false;
+        };
+        let before = content[..content.len() - last.len()].trim_end();
+        let mut marks = last.chars();
+        matches!(marks.next(), Some('|' | '>'))
+            && marks.all(|c| c == '+' || c == '-' || c.is_ascii_digit())
+            && (before.ends_with(':') || before.ends_with('-'))
+    }
     fn top_key(line: &str) -> Option<&str> {
         let starts = line.chars().next();
         (starts.is_some_and(|c| !c.is_whitespace() && c != '#' && c != '-'))
@@ -156,7 +185,18 @@ pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
     let mut kept = Vec::new();
     let mut inside = false;
     let mut seen = false;
+    // The indentation of the line that opened a block scalar.
+    let mut scalar: Option<usize> = None;
     for line in text.lines() {
+        if let Some(at) = scalar {
+            if line.trim().is_empty() || indent(line) > at {
+                if !inside {
+                    kept.push(line);
+                }
+                continue;
+            }
+            scalar = None;
+        }
         if unsure(line) {
             return None;
         }
@@ -178,6 +218,9 @@ pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
             None if inside && line.starts_with('-') => return None,
             None if inside => {}
             None => kept.push(line),
+        }
+        if opens_block_scalar(line) {
+            scalar = Some(indent(line));
         }
     }
     Some(kept.join("\n"))
@@ -275,8 +318,44 @@ mod tests {
             "{model: x}\n",
             "base: &b\n  x: 1\nmodel:\n  <<: *b\n",
             "model:\n- x\n",
+            "model:  &route\n  default: x\nvision: *route\n",
+            "model: !!map &route\n  default: x\n",
+            "model:\n  default: x\nfallbacks: [*route]\n",
+            "[model, x]\n",
+            "model:\n \tdefault: x\n",
         ] {
             assert_eq!(without_top_level(unsure, "model"), None, "{unsure:?}");
         }
+    }
+
+    #[test]
+    fn the_text_of_a_block_scalar_is_not_read_as_yaml() {
+        // A prompt in markdown: bullets and emphasis that, read as YAML,
+        // would look like aliases.
+        let before = "model:\n  default: model-1\nagent:\n  system_prompt: |\n    - **Be brief**\n    Note: *always* cite.\n\n    ---\n  max_turns: 9\n";
+        let after = before.replace("model-1", "model-2");
+        let rest = without_top_level(before, "model").expect("read");
+        assert_eq!(rest, without_top_level(&after, "model").unwrap());
+        assert!(
+            rest.contains("    - **Be brief**"),
+            "the prompt is kept: {rest}"
+        );
+        let other = after.replace("max_turns: 9", "max_turns: 10");
+        assert_ne!(rest, without_top_level(&other, "model").unwrap());
+        // The same text outside a block scalar is not followed.
+        assert_eq!(
+            without_top_level("model: x\nnote: *always*\n", "model"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_model_key_deeper_in_another_block_still_counts() {
+        let before = "model:\n  default: m\nauxiliary:\n  vision:\n    model: small-1\n";
+        let after = before.replace("small-1", "small-2");
+        assert_ne!(
+            without_top_level(before, "model").unwrap(),
+            without_top_level(&after, "model").unwrap()
+        );
     }
 }

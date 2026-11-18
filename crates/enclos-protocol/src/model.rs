@@ -1,6 +1,6 @@
 //! An agent's model: its runtime's own setting, read and changed through
 //! the agent's channel (`model` capability, issue #325). The runtime
-//! keeps the setting and its catalogue of providers and models; the bridge
+//! keeps the setting and its catalogue of model providers and models; the bridge
 //! only authorizes the host's person and checks what passes.
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +15,13 @@ pub const MAX_MODELS: usize = 300;
 pub const MAX_ID_BYTES: usize = 200;
 /// The most bytes of a label.
 pub const MAX_LABEL_BYTES: usize = 200;
-/// The most bytes of what to do on the host to set a provider up.
+/// The most bytes of what to do on the host to set a model provider up.
 pub const MAX_SETUP_BYTES: usize = 500;
+/// The most bytes of a plugin's `model.response` line, which both plugins
+/// keep under by listing fewer models (`limited`) or refusing a read
+/// (`unsupported`): under the bridge's 60 KiB device-message budget, with
+/// room for the envelope the bridge adds.
+pub const MAX_REPLY_BYTES: usize = 44 * 1024;
 
 /// What a device asks of an agent's model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,8 +56,7 @@ pub struct ModelSelection {
 pub enum ModelApply {
     /// On the agent's next turn, with no restart.
     Live,
-    /// Once the runtime's service restarts, after the turns running then:
-    /// every agent the service serves restarts with it.
+    /// Once the runtime's service restarts, with every agent it serves.
     Restart,
     #[serde(other)]
     Unknown,
@@ -63,9 +67,10 @@ pub enum ModelApply {
 pub struct ModelProvider {
     pub id: String,
     pub label: String,
-    /// Whether the agent can use it now: false without a login or a key.
+    /// Whether the agent can use it now: false when the runtime has no
+    /// login or secret for it, or its settings rule it out.
     pub usable: bool,
-    /// For one not usable, what to do on the host to set it up.
+    /// Present exactly when it is not usable: what to do on the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
 }
@@ -119,17 +124,21 @@ pub struct ModelReply {
     pub result: ModelResult,
 }
 
-/// Whether `value` can stand as an id: the runtime or a person chooses it,
-/// and it reaches the bridge's log and a person's screen, so it is short,
-/// not blank, and holds no control or hidden character.
-fn valid_id(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= MAX_ID_BYTES
-        && !crate::visible::has_hidden(value, false)
-}
-
+/// Whether `value` can be shown: the runtime or a person chooses it, and
+/// it reaches the bridge's log and a person's screen, so it is short, not
+/// blank, and holds no control or hidden character.
 fn valid_text(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum && !crate::visible::has_hidden(value, false)
+}
+
+fn valid_id(value: &str) -> bool {
+    valid_text(value, MAX_ID_BYTES)
+}
+
+/// Whether no two of `ids` are the same: the app keys its rows by id.
+fn distinct<'a>(ids: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter().all(|id| seen.insert(id))
 }
 
 impl ModelSelection {
@@ -157,8 +166,9 @@ impl ModelRequest {
     }
 
     /// Whether `result` is an answer to this request, within the bounds:
-    /// the kind it asked for, the provider it named, and every id and
-    /// label short and visible.
+    /// the kind it asked for, the model provider it named, every id and
+    /// label short and visible and no id twice, and a `setup` exactly for
+    /// a model provider not usable.
     pub fn accepts(&self, result: &ModelResult) -> bool {
         match (self, result) {
             (
@@ -175,9 +185,11 @@ impl ModelRequest {
                     && valid_id(revision)
                     && current.as_ref().is_none_or(ModelSelection::valid)
                     && providers.len() <= MAX_PROVIDERS
+                    && distinct(providers.iter().map(|p| p.id.as_str()))
                     && providers.iter().all(|p| {
                         valid_id(&p.id)
                             && valid_text(&p.label, MAX_LABEL_BYTES)
+                            && p.usable == p.setup.is_none()
                             && p.setup
                                 .as_deref()
                                 .is_none_or(|s| valid_text(s, MAX_SETUP_BYTES))
@@ -193,12 +205,13 @@ impl ModelRequest {
             ) => {
                 provider == listed
                     && models.len() <= MAX_MODELS
+                    && distinct(models.iter().map(|m| m.id.as_str()))
                     && models
                         .iter()
                         .all(|m| valid_id(&m.id) && valid_text(&m.label, MAX_LABEL_BYTES))
             }
             (
-                ModelRequest::Set { .. },
+                ModelRequest::Set { provider, .. },
                 ModelResult::Set {
                     previous,
                     current,
@@ -209,6 +222,9 @@ impl ModelRequest {
                 *applies != ModelApply::Unknown
                     && valid_id(revision)
                     && current.valid()
+                    // The runtime may write the model's id in its own form,
+                    // never under another model provider.
+                    && current.provider.as_deref() == Some(provider.as_str())
                     && previous.as_ref().is_none_or(ModelSelection::valid)
             }
             _ => false,
@@ -216,10 +232,13 @@ impl ModelRequest {
     }
 }
 
+/// The model, then its model provider in brackets: a model id may itself
+/// hold a `/` (`anthropic/x` through OpenRouter), so `provider/model` would
+/// be ambiguous in the bridge's log.
 impl std::fmt::Display for ModelSelection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.provider {
-            Some(provider) => write!(f, "{provider}/{}", self.model),
+            Some(provider) => write!(f, "{} ({provider})", self.model),
             None => f.write_str(&self.model),
         }
     }
@@ -341,7 +360,70 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_shows_its_provider_first() {
+    fn duplicate_ids_and_a_setup_out_of_place_are_refused() {
+        let ModelResult::Options {
+            current,
+            revision,
+            applies,
+            providers,
+            custom_models,
+        } = options()
+        else {
+            unreachable!()
+        };
+        let with = |providers: Vec<ModelProvider>| ModelResult::Options {
+            current: current.clone(),
+            revision: revision.clone(),
+            applies,
+            providers,
+            custom_models,
+        };
+        let twice = vec![providers[0].clone(), providers[0].clone()];
+        assert!(!ModelRequest::Options.accepts(&with(twice)));
+        let mut usable_with_setup = providers.clone();
+        usable_with_setup[0].setup = Some("Log in.".into());
+        assert!(!ModelRequest::Options.accepts(&with(usable_with_setup)));
+        let mut unusable_without = providers.clone();
+        unusable_without[1].setup = None;
+        assert!(!ModelRequest::Options.accepts(&with(unusable_without)));
+        let models = ModelRequest::Models {
+            provider: "p".into(),
+        };
+        let choice = ModelChoice {
+            id: "m".into(),
+            label: "M".into(),
+        };
+        let repeated = ModelResult::Models {
+            provider: "p".into(),
+            models: vec![choice.clone(), choice],
+            limited: false,
+        };
+        assert!(!models.accepts(&repeated));
+    }
+
+    #[test]
+    fn a_set_answered_under_another_provider_is_refused() {
+        let set = ModelRequest::Set {
+            provider: "provider-a".into(),
+            model: "model-2".into(),
+            revision: "r1".into(),
+        };
+        let answer = |provider: Option<&str>| ModelResult::Set {
+            previous: None,
+            current: ModelSelection {
+                provider: provider.map(str::to_owned),
+                model: "model-2-canonical".into(),
+            },
+            revision: "r2".into(),
+            applies: ModelApply::Live,
+        };
+        assert!(set.accepts(&answer(Some("provider-a"))), "a canonical id");
+        assert!(!set.accepts(&answer(Some("provider-b"))));
+        assert!(!set.accepts(&answer(None)));
+    }
+
+    #[test]
+    fn a_selection_shows_its_model_then_its_provider() {
         let with = ModelSelection {
             provider: Some("p".into()),
             model: "m".into(),
@@ -350,7 +432,7 @@ mod tests {
             provider: None,
             model: "m".into(),
         };
-        assert_eq!(with.to_string(), "p/m");
+        assert_eq!(with.to_string(), "m (p)");
         assert_eq!(without.to_string(), "m");
     }
 }

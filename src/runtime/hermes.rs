@@ -586,10 +586,11 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn restart_relevant(&self, file: &HomePath, text: &str) -> String {
-        // The gateway reads `config.yaml` again for each turn's model
-        // (`_load_gateway_config`, ADR 0069, proposed): a change of the
-        // `model` block alone restarts nothing. YAML this reader does not
-        // follow is compared whole, as before.
+        // By Hermes's source, its gateway loads `config.yaml` for each turn
+        // (`_load_gateway_config`; to verify on a host, design §14): a change
+        // of the `model` block alone restarts nothing (ADR 0069, proposed).
+        // YAML this reader does not follow is compared whole, as before; the
+        // channel's `model.py` follows the same rules for its `applies`.
         let config = file.as_path().file_name() == Some(std::ffi::OsStr::new("config.yaml"));
         match config
             .then(|| facts::without_top_level(text, "model"))
