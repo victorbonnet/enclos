@@ -226,3 +226,41 @@ test('installed native inbound dispatch retains each exact upstream run abort si
   assert.ok(ended.includes('owned-third'));
   assert.deepEqual(failures, []);
 });
+
+test('an installed native resolver failure reaches the app and settles answering', { skip: !installed }, async t => {
+  const load = name => import(pathToFileURL(path.join(installed, `dist/plugin-sdk/${name}.js`)));
+  const [sdk, routing] = await Promise.all(['channel-inbound', 'routing'].map(load));
+  const account = accountFixture(t), folder = path.dirname(account.socket);
+  const cfg = { channels: { enclos: { accounts: { main: account } } },
+    agents: { ownership: 'explicit', entries: { main: { workspace: folder } } },
+    bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }],
+    session: { store: path.join(folder, 'sessions.json') } };
+  let resolverCalls = 0;
+  const channel = createChannel();
+  channel.setRuntime({ version: TESTED_OPENCLAW, config: { current: () => cfg }, channel: { routing,
+    inbound: {
+      ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true }, activationAccess: {}, commandAccess: {} }) },
+      buildContext: sdk.buildChannelInboundEventContext,
+      dispatch: params => sdk.dispatchChannelInboundTurn({ ...params, replyResolver: async () => {
+        resolverCalls++; throw new Error('codex app-server request timed out: PRIVATE_DIAGNOSTIC');
+      } }),
+    },
+  } });
+  const abort = new AbortController();
+  const lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: 'main', abortSignal: abort.signal, setStatus() {} });
+  t.after(async () => { abort.abort(); await lifetime; });
+  await waitFor(() => existsSync(account.socket));
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  await owner.hello({ capabilities: ['activity'] }); await owner.next('agent.activity');
+  const input = message('message.in', { conversation: 'native-failure', person: 'alice', text: 'test-owned failing resolver fixture' });
+  owner.send(input);
+  assert.equal((await owner.next('agent.activity')).doing.length, 1);
+  const reply = await owner.next('message.out');
+  assert.equal(resolverCalls, 1); assert.equal(reply.reply_to, input.id);
+  assert.match(reply.text, /could not respond/); assert.equal(reply.text.includes('PRIVATE_DIAGNOSTIC'), false);
+  assert.deepEqual((await owner.next('agent.activity')).doing, []);
+  await owner.next('error', input.id);
+  owner.send(input); await owner.next('error', input.id);
+  assert.equal(resolverCalls, 1, 'a failed native turn is never replayed');
+  assert.equal(channel.running.get('main').transport.state.outbox.length, 1);
+});
