@@ -339,6 +339,13 @@ pub trait RuntimeAdapter {
     fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath> {
         Vec::new()
     }
+    /// The part of `text`, the settings file `file`, whose change needs
+    /// the services restarted (ADR 0031): a runtime leaves out what it
+    /// applies on its own, such as an agent's model it reads again for each
+    /// turn (ADR 0069, proposed). By default, all of it.
+    fn restart_relevant(&self, _file: &HomePath, text: &str) -> String {
+        text.to_owned()
+    }
     /// Whether `text`, a settings file of an agent, has it read its secrets
     /// from `secrets_file`, as [`RuntimeAdapter::agent_secrets_source`] sets
     /// up (ADR 0036).

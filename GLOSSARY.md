@@ -119,6 +119,14 @@ _Avoid_: session (a sandbox's word), thread
 What an agent's model calls consumed, as its runtime counts them: requests, input, output, cache-read, cache-write and reasoning tokens, and cost. A runtime counts it inside the sandbox, so it guides, and bills nothing.
 _Avoid_: consumption, spend, billing, quota (a provider's limit)
 
+**Model provider**:
+A service an agent's runtime calls a model through, such as OpenAI or OpenRouter, reached with a login or a key the runtime keeps. A runtime lists the providers it knows; the agent can use only those set up for it.
+_Avoid_: provider alone (it also names other things), backend, vendor
+
+**Agent model**:
+The model provider and model an agent's runtime uses for all the agent's conversations unless one says otherwise. It is the runtime's setting: the host's person may change it from the app, through the agent's channel.
+_Avoid_: default model (Hermes's key, also OpenClaw's shared default), engine, LLM
+
 **Secret**:
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key

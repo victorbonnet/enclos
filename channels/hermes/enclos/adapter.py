@@ -36,6 +36,7 @@ from .outbox import Outbox
 from . import approvals
 from . import decisions
 from . import held_tasks
+from . import model
 from . import routines
 from . import questions
 from . import interrupts
@@ -100,6 +101,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
+        self._model = model.Manager(self._agent)
         # What checks the bridge's signature of each runtime-approval decision
         # (ADR 0060): its public key comes from `runtime configure`, never this
         # socket, which the agent can speak on too.
@@ -212,6 +214,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("conversation_delete")
             if self._routines.available:
                 capabilities.append("routines")
+            if self._model.available:
+                capabilities.append("model")
             if self._questions.available:
                 capabilities.append("questions")
             if self._questions.approvals_available:
@@ -357,6 +361,12 @@ class EnclosAdapter(BasePlatformAdapter):
             task = asyncio.create_task(self._routine(message))
             self._routine_tasks.add(task)
             task.add_done_callback(self._routine_tasks.discard)
+        elif kind == "model.request":
+            # Hermes's inventory and model check can take a while: beside
+            # the connection, as a routine control.
+            task = asyncio.create_task(self._model_request(message))
+            self._routine_tasks.add(task)
+            task.add_done_callback(self._routine_tasks.discard)
         elif kind == "held_task.resume":
             # Hermes's unblock waits on the board's write lock: it runs
             # beside the connection, as a routine control does.
@@ -394,6 +404,18 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.warning("[%s] A routine control could not answer", self.name, exc_info=True)
             await self._write(protocol.error(
                 "unknown", "The operation's outcome is unknown. Refresh before trying again.", message["id"]))
+
+    async def _model_request(self, message: dict[str, Any]) -> None:
+        """Answers one request about the agent's model (`model.request`)."""
+        try:
+            result = await asyncio.to_thread(self._model.handle, message)
+            await self._write(protocol._message("model.response", of=message["id"], **result))
+        except model.ModelError as error:
+            await self._write(protocol.error(error.code, str(error), message["id"]))
+        except Exception:
+            logger.warning("[%s] A model request could not answer", self.name, exc_info=True)
+            await self._write(protocol.error(
+                "unknown", "The outcome is unknown: open the agent's model again before retrying.", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
         if message["id"] in self._seen:

@@ -23,6 +23,7 @@ pub mod device;
 mod envelope;
 pub mod held_task;
 mod ids;
+pub mod model;
 pub mod noise;
 pub mod pairing;
 pub mod plugin;

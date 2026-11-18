@@ -178,7 +178,10 @@ fn replay(
 }
 
 impl Hub {
-    fn routine_authority(
+    /// Whether `person`, on `device`, may control `agent` through its
+    /// runtime (its routines, its model): the host's person on a device
+    /// still paired, for an agent the bridge serves.
+    pub(super) fn agent_control_authority(
         &self,
         store: &Store,
         device: &Device,
@@ -240,7 +243,7 @@ impl Hub {
         original: MessageId,
         request: RoutineRequest,
     ) -> Result<(), ErrorBody> {
-        self.routine_authority(store, device, person, agent)
+        self.agent_control_authority(store, device, person, agent)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         request
             .validate()
@@ -269,7 +272,7 @@ impl Hub {
         let requester = Person::new(person)
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e.to_string()))?;
         let answered = |hub: &Hub, response: ToDevice| {
-            hub.deliver_routine_device(store, &device.id, person, response);
+            hub.deliver_live_reply(store, &device.id, person, response);
             Ok(())
         };
         {
@@ -399,7 +402,9 @@ impl Hub {
         connection
     }
 
-    fn deliver_routine_device(
+    /// Sends the answer to a live control to the device that asked, while
+    /// it is still paired to the same person.
+    pub(super) fn deliver_live_reply(
         &self,
         store: &Store,
         device: &str,
@@ -416,6 +421,7 @@ impl Hub {
                 eprintln!("enclos app: cannot read the paired devices to answer {device}: {e}");
                 let of = match &response {
                     ToDevice::RoutineResponse { reply, .. } => Some(reply.of.clone()),
+                    ToDevice::ModelResponse { reply, .. } => Some(reply.of.clone()),
                     ToDevice::Error(error) => error.of.clone(),
                     _ => None,
                 };
@@ -473,7 +479,7 @@ impl Hub {
                 drop(requests);
                 audit(store, &pending, "unknown: bridge database unreadable");
                 let error = failure(pending.original, ErrorCode::Unknown, NOT_READ_AFTER);
-                self.deliver_routine_device(
+                self.deliver_live_reply(
                     store,
                     &pending.device,
                     &pending.person,
@@ -515,7 +521,7 @@ impl Hub {
         }
         drop(requests);
         audit(store, &pending, &outcome);
-        self.deliver_routine_device(store, &pending.device, &pending.person, response);
+        self.deliver_live_reply(store, &pending.device, &pending.person, response);
     }
 
     pub(super) fn routine_error(
@@ -545,7 +551,7 @@ impl Hub {
         error.message = error.message.chars().take(1000).collect();
         let response = ToDevice::Error(error);
         drop(requests);
-        self.deliver_routine_device(store, &pending.device, &pending.person, response);
+        self.deliver_live_reply(store, &pending.device, &pending.person, response);
     }
 
     pub(super) fn routine_disconnected(&self, store: &Store, agent: &str, connection: &str) {
@@ -570,7 +576,7 @@ impl Hub {
         drop(requests);
         for p in pending {
             audit(store, &p, "unknown: disconnected");
-            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The agent disconnected. The outcome may be unknown; refresh routines before retrying.")));
+            self.deliver_live_reply(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The agent disconnected. The outcome may be unknown; refresh routines before retrying.")));
         }
     }
 
@@ -586,6 +592,7 @@ impl Hub {
                     self.expire_questions(&store);
                     self.expire_held_resumes(&store);
                     self.expire_task_gets(&store);
+                    self.expire_models(&store);
                 },
                 Err(e) => {
                     eprintln!(
@@ -612,7 +619,7 @@ impl Hub {
         drop(requests);
         for p in pending {
             audit(store, &p, "unknown: timed out");
-            self.deliver_routine_device(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The routine request timed out. The outcome may be unknown; refresh routines before retrying.")));
+            self.deliver_live_reply(store, &p.device, &p.person, ToDevice::Error(failure(p.original, ErrorCode::Unknown, "The routine request timed out. The outcome may be unknown; refresh routines before retrying.")));
         }
     }
 }
@@ -722,15 +729,18 @@ mod tests {
     }
 
     #[test]
-    fn routine_authority_and_delivery_catalog_exclude_other_people_agents_and_groups() {
+    fn agent_control_authority_and_delivery_catalog_exclude_other_people_agents_and_groups() {
         let (_dir, hub, store, device, _rx) = fixture();
-        assert!(hub.routine_authority(&store, &device, OWNER, AGENT).is_ok());
         assert!(
-            hub.routine_authority(&store, &device, "guest@example.com", AGENT)
+            hub.agent_control_authority(&store, &device, OWNER, AGENT)
+                .is_ok()
+        );
+        assert!(
+            hub.agent_control_authority(&store, &device, "guest@example.com", AGENT)
                 .is_err()
         );
         assert!(
-            hub.routine_authority(&store, &device, OWNER, "missing/agent")
+            hub.agent_control_authority(&store, &device, OWNER, "missing/agent")
                 .is_err()
         );
         let choices = hub.routine_deliveries(&store, OWNER, AGENT).unwrap();
@@ -751,7 +761,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::NotAllowed);
         store.remove_device(&device.id).unwrap();
         assert!(
-            hub.routine_authority(&store, &device, OWNER, AGENT)
+            hub.agent_control_authority(&store, &device, OWNER, AGENT)
                 .is_err()
         );
     }

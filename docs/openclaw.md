@@ -121,6 +121,12 @@ agents.entries.scout.model.primary=PROVIDER/MODEL`. Ordinary settings use native
 keys; secrets still require granted `${VAR}` references. A saved login or a
 successful status check does not establish that a model request succeeds.
 
+Once the agent is signed in, the host's person can also choose its model from
+the app (the agent's page, **Model**): the channel lists OpenClaw's own `/models`
+catalogue for that agent and writes the same `agents.entries.<agent>.model.primary`
+through OpenClaw's config write, which the Gateway applies without a restart
+(`docs/protocol.md`, An agent's model).
+
 On macOS, the current wrapper supplies the readable public system CA bundle to
 native Codex through `CODEX_CA_CERTIFICATE` when neither it nor `SSL_CERT_FILE`
 is already set. This fixes the observed confined `UnknownIssuer` failure while

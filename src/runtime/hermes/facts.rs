@@ -129,6 +129,60 @@ fn scalar(rest: &str) -> Yaml {
     }
 }
 
+/// `text` without its top-level `key` and what it holds, such as the
+/// `model` block Hermes writes for `/model --global`; `None` when the file
+/// uses YAML this reader does not follow (a tab in the indentation, a
+/// document marker or directive, a flow mapping, an anchor, alias or merge
+/// key, or `key` given twice), which the caller compares whole.
+pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
+    let unsure = |line: &str| {
+        let trimmed = line.trim_start();
+        line.starts_with('\t')
+            || line.starts_with("---")
+            || line.starts_with("...")
+            || line.starts_with('%')
+            || line.starts_with('{')
+            || trimmed.starts_with("<<")
+            || trimmed.contains(": &")
+            || trimmed.contains(": *")
+            || trimmed.starts_with("- &")
+            || trimmed.starts_with("- *")
+    };
+    fn top_key(line: &str) -> Option<&str> {
+        let starts = line.chars().next();
+        (starts.is_some_and(|c| !c.is_whitespace() && c != '#' && c != '-'))
+            .then(|| line.split(':').next().unwrap_or("").trim())
+    }
+    let mut kept = Vec::new();
+    let mut inside = false;
+    let mut seen = false;
+    for line in text.lines() {
+        if unsure(line) {
+            return None;
+        }
+        match top_key(line) {
+            Some(name)
+                if name == key || name == format!("\"{key}\"") || name == format!("'{key}'") =>
+            {
+                if seen {
+                    return None;
+                }
+                seen = true;
+                inside = true;
+            }
+            Some(_) => {
+                inside = false;
+                kept.push(line);
+            }
+            // A sequence item at the left margin is the block's own value.
+            None if inside && line.starts_with('-') => return None,
+            None if inside => {}
+            None => kept.push(line),
+        }
+    }
+    Some(kept.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +243,40 @@ mod tests {
             yaml_value("\"model.default\": x\n", "model.default"),
             Yaml::Missing
         );
+    }
+
+    #[test]
+    fn a_change_of_the_model_block_alone_leaves_the_rest_the_same() {
+        let before = "# Hermes\nmodel:\n  default: model-1\n  provider: provider-a\n\n  base_url: ''\nterminal:\n  backend: local\nplatforms:\n  - x\n";
+        let after = "# Hermes\nmodel:\n  default: model-2\n  provider: provider-b\nterminal:\n  backend: local\nplatforms:\n  - x\n";
+        let one_line = "# Hermes\nmodel: model-3\nterminal:\n  backend: local\nplatforms:\n  - x\n";
+        let rest = without_top_level(before, "model").unwrap();
+        assert_eq!(
+            rest,
+            "# Hermes\nterminal:\n  backend: local\nplatforms:\n  - x"
+        );
+        assert_eq!(without_top_level(after, "model").unwrap(), rest);
+        assert_eq!(without_top_level(one_line, "model").unwrap(), rest);
+        let other = after.replace("backend: local", "backend: docker");
+        assert_ne!(without_top_level(&other, "model").unwrap(), rest);
+        // Another key whose name starts the same is kept.
+        assert_eq!(
+            without_top_level("model_catalog:\n  x: 1\n", "model").unwrap(),
+            "model_catalog:\n  x: 1"
+        );
+    }
+
+    #[test]
+    fn yaml_this_reader_does_not_follow_is_compared_whole() {
+        for unsure in [
+            "model:\n\tdefault: x\n",
+            "---\nmodel:\n  default: x\n",
+            "model:\n  default: x\nmodel:\n  default: y\n",
+            "{model: x}\n",
+            "base: &b\n  x: 1\nmodel:\n  <<: *b\n",
+            "model:\n- x\n",
+        ] {
+            assert_eq!(without_top_level(unsure, "model"), None, "{unsure:?}");
+        }
     }
 }

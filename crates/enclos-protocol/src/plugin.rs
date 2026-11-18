@@ -71,6 +71,19 @@ pub enum FromBridge {
         #[serde(flatten)]
         request: Box<crate::routine::RoutineRequest>,
     },
+    /// A live request about the agent's model from the host's person
+    /// (`model` capability): the plugin answers `model.response` or an
+    /// `error` (`conflict` for a stale revision, `not_allowed` for a
+    /// provider the agent cannot use yet, `not_found` for an unknown one).
+    #[serde(rename = "model.request")]
+    ModelRequest {
+        /// Who asked, from which of their paired devices, as the bridge
+        /// authenticated them.
+        person: Person,
+        device: String,
+        #[serde(flatten)]
+        request: crate::model::ModelRequest,
+    },
     /// First on every connection: the agent's token, and its Home
     /// conversation, where what has no conversation of its own goes (the
     /// runtime's home channel: Hermes's cron jobs, `send_message` with no
@@ -130,6 +143,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "held_task.resume",
     "task.get",
     "routine.request",
+    "model.request",
     "policy.context",
     "hello",
     "message.in",
@@ -160,6 +174,8 @@ pub enum FromPlugin {
     },
     #[serde(rename = "routine.response")]
     RoutineResponse(crate::routine::RoutineReply),
+    #[serde(rename = "model.response")]
+    ModelResponse(crate::model::ModelReply),
     /// Every task of this agent's runtime held now, whole (at most
     /// [`crate::held_task::MAX_HELD_TASKS`]): after the `hello`, and again
     /// whenever one is held, changes or is no longer held. The bridge
@@ -257,6 +273,7 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "question.ask",
     "question.update",
     "routine.response",
+    "model.response",
     "held_tasks",
     "held_task.resumed",
     "hello",
@@ -388,6 +405,9 @@ pub enum Capability {
     /// It reports the agent's model calls outside app conversations too
     /// (`usage.agent`); a bridge that takes them names it in its `hello`.
     AgentUsage,
+    /// It reads and changes the agent's model with the runtime's own
+    /// catalogue and setting (`model.request`).
+    Model,
     #[serde(other)]
     Unknown,
 }

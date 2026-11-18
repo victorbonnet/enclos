@@ -21,6 +21,14 @@ const TO_DEVICE: &[(&str, &str)] = &[
         "task_detail",
         include_str!("fixtures/device/to_device_task_detail.json"),
     ),
+    (
+        "model_options",
+        include_str!("fixtures/device/to_device_model_options.json"),
+    ),
+    (
+        "model_models",
+        include_str!("fixtures/device/to_device_model_models.json"),
+    ),
 ];
 
 const FROM_DEVICE: &[(&str, &str)] = &[
@@ -31,6 +39,14 @@ const FROM_DEVICE: &[(&str, &str)] = &[
     (
         "task_get",
         include_str!("fixtures/device/from_device_task_get.json"),
+    ),
+    (
+        "model_models",
+        include_str!("fixtures/device/from_device_model_models.json"),
+    ),
+    (
+        "model_set",
+        include_str!("fixtures/device/from_device_model_set.json"),
     ),
 ];
 

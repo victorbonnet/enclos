@@ -47,6 +47,15 @@ pub enum FromDevice {
         #[serde(flatten)]
         request: crate::routine::RoutineRequest,
     },
+    /// The agent's model, its runtime's providers and their models, or a
+    /// change of it: the host's person only, for an agent whose channel
+    /// has `model`.
+    #[serde(rename = "model.request")]
+    ModelRequest {
+        agent: String,
+        #[serde(flatten)]
+        request: crate::model::ModelRequest,
+    },
     #[serde(rename = "agent.avatar.get")]
     AgentAvatarGet { agent: String },
     #[serde(rename = "agent.avatar.set")]
@@ -227,6 +236,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "agent.name.get",
     "agent.name.set",
     "routine.request",
+    "model.request",
     "agent.avatar.get",
     "agent.avatar.set",
     "sandbox.policy.get",
@@ -292,6 +302,12 @@ pub enum ToDevice {
         agent: String,
         #[serde(flatten)]
         reply: crate::routine::RoutineReply,
+    },
+    #[serde(rename = "model.response")]
+    ModelResponse {
+        agent: String,
+        #[serde(flatten)]
+        reply: crate::model::ModelReply,
     },
     #[serde(rename = "agent.avatar")]
     AgentAvatar(crate::avatar::AgentAvatar),
@@ -466,6 +482,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "held_task.result",
     "agent.name",
     "routine.response",
+    "model.response",
     "agent.avatar",
     "sandbox.policy",
     "sandbox.policy.preview",
@@ -602,6 +619,10 @@ pub struct AgentInfo {
     /// person only. Absent (an older host) means no.
     #[serde(default)]
     pub can_manage_routines: bool,
+    /// Whether this person may change the agent's model (`model.request`):
+    /// the host's person only. Absent (an older host) means no.
+    #[serde(default)]
+    pub can_manage_model: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,

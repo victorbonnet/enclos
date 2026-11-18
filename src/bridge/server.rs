@@ -38,6 +38,8 @@ mod forget;
 mod group_turns;
 #[path = "held_tasks.rs"]
 mod held_tasks;
+#[path = "models.rs"]
+mod models;
 #[path = "policy.rs"]
 mod policy;
 #[path = "questions.rs"]
@@ -196,6 +198,7 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     routines: Mutex<routines::RoutineRequests>,
+    models: Mutex<models::ModelRequests>,
     deletions: Mutex<HashMap<String, deletions::PendingDelete>>,
     deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     deletion_jobs: Mutex<HashSet<(String, String)>>,
@@ -460,6 +463,7 @@ impl Hub {
             provisioning_busy: Mutex::new(HashSet::new()),
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
+            models: Mutex::new(Default::default()),
             deletions: Mutex::new(HashMap::new()),
             deletion_locks: Mutex::new(HashMap::new()),
             deletion_jobs: Mutex::new(HashSet::new()),
@@ -907,6 +911,9 @@ impl Hub {
                     FromPlugin::RoutineResponse(reply) => {
                         hub.routine_response(&store, &agent, &routine_connection, reply);
                     }
+                    FromPlugin::ModelResponse(reply) => {
+                        hub.model_response(&store, &agent, &routine_connection, reply);
+                    }
                     // An error naming one of the bridge's messages: a group
                     // turn sent as that message (a line too long for the
                     // plugin) fails now, not after 15 minutes; a routine
@@ -924,6 +931,9 @@ impl Hub {
                             continue;
                         }
                         if hub.task_detail_error(&store, &agent, &routine_connection, &error) {
+                            continue;
+                        }
+                        if hub.model_error(&store, &agent, &routine_connection, &error) {
                             continue;
                         }
                         hub.question_error(&store, origin(), error.clone());
@@ -1295,6 +1305,7 @@ impl Hub {
             hub.delete_disconnected(&agent, generation);
             hub.question_disconnected(&store, origin());
             hub.routine_disconnected(&store, &agent, &routine_connection);
+            hub.model_disconnected(&store, &agent, &routine_connection);
             hub.held_task_disconnected(&store, &agent, &routine_connection);
             hub.task_details_disconnected(&store, &agent, &routine_connection);
             // Closed: the next message to this agent opens it again. A group
@@ -2768,6 +2779,13 @@ fn run_session(
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::ModelRequest { agent, request } => {
+                if let Err(error) =
+                    hub.model_request(store, device, person, &agent, message.id, request)
                 {
                     link.send(ToDevice::Error(error))?;
                 }

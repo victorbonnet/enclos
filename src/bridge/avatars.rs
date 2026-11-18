@@ -144,6 +144,7 @@ impl Hub {
                 avatar: photos.get(&a.name).cloned().unwrap_or_default(),
                 can_edit_avatar: host.as_deref() == Some(person),
                 can_manage_routines: host.as_deref() == Some(person),
+                can_manage_model: host.as_deref() == Some(person),
                 agent: a.name.clone(),
                 runtime: a.runtime.clone(),
                 capabilities: plugins

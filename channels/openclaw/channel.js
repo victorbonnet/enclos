@@ -5,6 +5,7 @@ import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
 import { RoutineInventory } from './routines.js';
+import { ModelSettings } from './model.js';
 import { inboundMedia, mediaFolder, stageMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
@@ -49,6 +50,7 @@ export function createChannel(sdk = {}) {
   const running = new Map();
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
+  const models = new ModelSettings({ catalogue: sdk.models, runtime: () => runtime });
   let hooks = { tools: false, policy: false };
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
@@ -102,7 +104,7 @@ export function createChannel(sdk = {}) {
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
@@ -110,6 +112,14 @@ export function createChannel(sdk = {}) {
       },
       async onControl(control, owner, requestPeer) {
         owner.assertControlPeer(requestPeer);
+        if (control.type === 'model.request') {
+          return models.handle(control, { account,
+            assertCurrent: () => {
+              assertCurrent(currentConfig(ctx.cfg), account, owner);
+              owner.assertControlPeer(requestPeer);
+            },
+            write: response => owner.write(response, requestPeer) });
+        }
         if (control.type === 'routine.request') {
           return routines.handle(control, { account,
             assertCurrent: () => {
@@ -330,5 +340,5 @@ export function createChannel(sdk = {}) {
       ] }),
     },
   };
-  return { plugin, setRuntime, registerFull, running, routines };
+  return { plugin, setRuntime, registerFull, running, routines, models };
 }

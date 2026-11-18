@@ -306,3 +306,16 @@ test('the native message target resolver accepts owned bridge conversations with
   abort.abort(); await lifetime;
   assert.equal((await resolve(account.home)).ok, false, 'a stopped account cannot resolve a target');
 });
+
+test('the installed SDK builds the model catalogue the app lists, per agent and per view', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/models-provider-runtime.js')));
+  assert.equal(typeof sdk.buildModelsProviderData, 'function');
+  const cfg = { agents: { defaults: { model: { primary: 'openai/gpt-5.1' } }, entries: { main: {} } } };
+  for (const view of ['all', 'default']) {
+    const data = await sdk.buildModelsProviderData(cfg, 'main', { view });
+    assert.ok(Array.isArray(data.providers), view);
+    assert.ok(data.byProvider instanceof Map, view);
+    assert.equal(typeof data.resolvedDefault?.provider, 'string', view);
+    for (const [provider, models] of data.byProvider) assert.ok(typeof provider === 'string' && models instanceof Set, view);
+  }
+});
