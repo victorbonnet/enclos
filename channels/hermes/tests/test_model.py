@@ -147,15 +147,17 @@ class ModelTest(unittest.TestCase):
         self.assertIn("Model not found", str(caught.exception))
         self.assertEqual(self.hermes.persisted, [])
 
-    def test_a_hermes_without_the_functions_turns_the_capability_off(self):
-        functions = self.hermes.functions()
-        del functions["persist"]
-        manager = model.Manager("coder", home=self.home, functions=functions)
-        self.assertTrue(manager.available, "given functions are trusted as given")
-        off = model.Manager("coder", home=self.home, functions=None)
-        if off.available:
-            self.skipTest("a real Hermes is importable here")
-        self.assertIsNotNone(off.unavailable)
+    def test_the_capability_follows_the_functions_the_installed_hermes_has(self):
+        # With a Hermes installed (CI's `hermes-latest`), the latest release
+        # must still have every function the plugin uses; without one, the
+        # capability is off and says why.
+        import importlib.util
+        real = model.Manager("coder", home=self.home, functions=None)
+        if importlib.util.find_spec("hermes_constants") is not None:
+            self.assertTrue(real.available, real.unavailable)
+        else:
+            self.assertFalse(real.available)
+            self.assertIsNotNone(real.unavailable)
 
     def test_requests_are_validated_when_decoded(self):
         line = json.dumps({"v": 1, "id": "m-1", "type": "model.request", "person": "p@example.com", "device": "d",
