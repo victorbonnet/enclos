@@ -45,6 +45,7 @@ const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/ap
 const APP_PLUGIN_INTERRUPTS: &str = include_str!("../../channels/hermes/enclos/interrupts.py");
 const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
 const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
+const APP_PLUGIN_MODEL: &str = include_str!("../../channels/hermes/enclos/model.py");
 const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.py");
 const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
 const APP_PLUGIN_RUNTIME_APPROVALS: &str =
@@ -337,6 +338,7 @@ impl RuntimeAdapter for Hermes {
                 file("outbox.py", APP_PLUGIN_OUTBOX)?,
                 file("approvals.py", APP_PLUGIN_APPROVALS)?,
                 file("routines.py", APP_PLUGIN_ROUTINES)?,
+                file("model.py", APP_PLUGIN_MODEL)?,
                 file("lines.py", APP_PLUGIN_LINES)?,
                 file("questions.py", APP_PLUGIN_QUESTIONS)?,
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
@@ -585,6 +587,22 @@ impl RuntimeAdapter for Hermes {
         ["config.yaml", ".env"]
             .map(|name| folder.child(name).expect("a plain file name"))
             .to_vec()
+    }
+
+    fn restart_relevant(&self, file: &HomePath, text: &str) -> String {
+        // By Hermes's source, its gateway loads `config.yaml` for each turn
+        // (`_load_gateway_config`; to verify on a host, design §14): a change
+        // of the `model` block alone restarts nothing (ADR 0069, proposed).
+        // YAML this reader does not follow is compared whole, as before; the
+        // channel's `model.py` follows the same rules for its `applies`.
+        let config = file.as_path().file_name() == Some(std::ffi::OsStr::new("config.yaml"));
+        match config
+            .then(|| facts::without_top_level(text, "model"))
+            .flatten()
+        {
+            Some(rest) => rest,
+            None => text.to_owned(),
+        }
     }
 
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool {
@@ -861,6 +879,25 @@ mod tests {
                 "~/.hermes/profiles/main/.env",
             ]
         );
+    }
+
+    #[test]
+    fn a_change_of_an_agents_model_alone_does_not_restart_the_gateway() {
+        let config = at(".hermes/profiles/main/config.yaml");
+        let env = at(".hermes/profiles/main/.env");
+        let before =
+            "model:\n  default: model-1\n  provider: provider-a\nterminal:\n  backend: local\n";
+        let after =
+            "model:\n  default: model-2\n  provider: provider-b\nterminal:\n  backend: local\n";
+        let relevant = |file: &HomePath, text: &str| Hermes.restart_relevant(file, text);
+        assert_eq!(relevant(&config, before), relevant(&config, after));
+        let other = after.replace("local", "docker");
+        assert_ne!(relevant(&config, before), relevant(&config, &other));
+        // `.env` is compared whole: a key there needs a restart.
+        assert_ne!(relevant(&env, "model: 1\n"), relevant(&env, "model: 2\n"));
+        // YAML the reader does not follow is compared whole.
+        let tabbed = "model:\n\tdefault: model-1\n";
+        assert_eq!(relevant(&config, tabbed), tabbed);
     }
 
     /// An agent reads its own secrets file through its own
@@ -1305,6 +1342,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
                 ".hermes/profiles/main/plugins/enclos/approvals.py",
                 ".hermes/profiles/main/plugins/enclos/routines.py",
+                ".hermes/profiles/main/plugins/enclos/model.py",
                 ".hermes/profiles/main/plugins/enclos/lines.py",
                 ".hermes/profiles/main/plugins/enclos/questions.py",
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",

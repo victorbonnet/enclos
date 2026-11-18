@@ -41,6 +41,14 @@ const TO_DEVICE: &[(&str, &str)] = &[
         "to_device_message_suggested_replies",
         include_str!("fixtures/device/to_device_message_suggested_replies.json"),
     ),
+    (
+        "model_options",
+        include_str!("fixtures/device/to_device_model_options.json"),
+    ),
+    (
+        "model_models",
+        include_str!("fixtures/device/to_device_model_models.json"),
+    ),
 ];
 
 const FROM_DEVICE: &[(&str, &str)] = &[
@@ -67,6 +75,14 @@ const FROM_DEVICE: &[(&str, &str)] = &[
     (
         "from_device_question_close",
         include_str!("fixtures/device/from_device_question_close.json"),
+    ),
+    (
+        "model_models",
+        include_str!("fixtures/device/from_device_model_models.json"),
+    ),
+    (
+        "model_set",
+        include_str!("fixtures/device/from_device_model_set.json"),
     ),
 ];
 

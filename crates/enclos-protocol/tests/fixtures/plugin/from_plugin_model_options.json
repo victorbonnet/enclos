@@ -1,0 +1,1 @@
+{"v":1,"id":"model-response-1","type":"model.response","of":"model-options-1","result":"options","current":{"provider":"provider-a","model":"model-1"},"revision":"r-7","applies":"live","providers":[{"id":"provider-a","label":"Provider A","usable":true},{"id":"provider-b","label":"Provider B","usable":false,"setup":"Log in on the host."}],"custom_models":true}

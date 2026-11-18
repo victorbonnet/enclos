@@ -544,6 +544,10 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/routines.js"),
                 ),
                 (
+                    plugin.child("model.js")?,
+                    include_str!("../../channels/openclaw/model.js"),
+                ),
+                (
                     plugin.child("native-titles.js")?,
                     include_str!("../../channels/openclaw/native-titles.js"),
                 ),

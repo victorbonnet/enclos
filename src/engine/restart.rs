@@ -25,6 +25,9 @@ const RETRY: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(64 * 60);
 
 type Read = std::result::Result<Option<String>, Unreadable>;
+/// The part of a settings file whose change needs a restart, as the
+/// runtime says ([`crate::runtime::RuntimeAdapter::restart_relevant`]).
+type Relevant = Box<dyn Fn(&HomePath, &str) -> String>;
 
 /// Where a service session's program runs, which the restart signal must
 /// reach (ADR 0031).
@@ -44,6 +47,7 @@ pub(super) enum ProgramAt {
 pub(super) struct SettingsWatch {
     home: PathBuf,
     files: Vec<HomePath>,
+    relevant: Relevant,
     started: Vec<Read>,
     /// The last read that differs from `started`, and since when.
     changed: Option<(Vec<Read>, Instant)>,
@@ -53,14 +57,19 @@ pub(super) struct SettingsWatch {
 }
 
 impl SettingsWatch {
-    pub(super) fn new(home: PathBuf, files: Vec<HomePath>) -> Option<SettingsWatch> {
+    pub(super) fn new(
+        home: PathBuf,
+        files: Vec<HomePath>,
+        relevant: Relevant,
+    ) -> Option<SettingsWatch> {
         if files.is_empty() {
             return None;
         }
-        let started = read_all(&home, &files);
+        let started = read_all(&home, &files, &relevant);
         Some(SettingsWatch {
             home,
             files,
+            relevant,
             started,
             changed: None,
             read_at: None,
@@ -78,7 +87,7 @@ impl SettingsWatch {
             return None;
         }
         self.read_at = Some(now);
-        let read = read_all(&self.home, &self.files);
+        let read = read_all(&self.home, &self.files, &self.relevant);
         if read == self.started {
             self.changed = None;
             self.retry_at = None;
@@ -112,10 +121,14 @@ impl SettingsWatch {
     }
 }
 
-fn read_all(home: &Path, files: &[HomePath]) -> Vec<Read> {
+/// Each file's part that needs a restart: a change the runtime applies on
+/// its own (ADR 0069, proposed) compares equal.
+fn read_all(home: &Path, files: &[HomePath], relevant: &Relevant) -> Vec<Read> {
     files
         .iter()
-        .map(|file| read_text(home, file, MAX_SETTINGS))
+        .map(|file| {
+            read_text(home, file, MAX_SETTINGS).map(|text| text.map(|text| relevant(file, &text)))
+        })
         .collect()
 }
 
@@ -135,7 +148,9 @@ impl Engine {
             .restart?;
         let home = self.sandbox_home(name);
         let agents = runtime.agents_in(&home).unwrap_or_default();
-        let watch = SettingsWatch::new(home, runtime.settings_files(&agents))?;
+        let files = runtime.settings_files(&agents);
+        let relevant: Relevant = Box::new(move |file, text| runtime.restart_relevant(file, text));
+        let watch = SettingsWatch::new(home, files, relevant)?;
         Some((watch, signal))
     }
 
@@ -256,11 +271,74 @@ mod tests {
         HomePath::new(p).unwrap()
     }
 
+    /// The watch `launch` builds for a Hermes gateway compares what Hermes's
+    /// adapter says needs a restart: an agent's model alone does not.
+    #[test]
+    fn a_hermes_gateways_watch_leaves_out_an_agents_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = crate::layout::Layout::at(dir.path().join("enclos"));
+        let state = crate::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
+        let audit = crate::audit::jsonl::JsonlAuditLog::new(layout.audit_log());
+        let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
+        let name: SandboxName = "lab".parse().unwrap();
+        let config = engine.sandbox_home(&name).join(".hermes/config.yaml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let text = "model:\n  default: model-1\nterminal:\n  backend: local\n";
+        std::fs::write(&config, text).unwrap();
+        let (mut watch, signal) = engine
+            .settings_watch(&name, RuntimeKind::Hermes, "gateway")
+            .unwrap();
+        assert_eq!(signal, Signal::Usr1);
+        let t = Instant::now();
+        std::fs::write(&config, text.replace("model-1", "model-2")).unwrap();
+        assert_eq!(watch.settled(t), None);
+        assert_eq!(watch.settled(t + READ_EVERY + 2 * SETTLE), None);
+        std::fs::write(&config, text.replace("local", "docker")).unwrap();
+        let later = t + 2 * READ_EVERY + 2 * SETTLE;
+        assert_eq!(watch.settled(later), None);
+        assert_eq!(
+            watch.settled(later + 2 * SETTLE),
+            Some(vec![rel(".hermes/config.yaml")])
+        );
+    }
+
     fn watched() -> (tempfile::TempDir, SettingsWatch) {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("a"), "1").unwrap();
-        let watch = SettingsWatch::new(home.path().to_owned(), vec![rel("a"), rel("b")]).unwrap();
+        let watch = SettingsWatch::new(
+            home.path().to_owned(),
+            vec![rel("a"), rel("b")],
+            Box::new(|_, text| text.to_owned()),
+        )
+        .unwrap();
         (home, watch)
+    }
+
+    #[test]
+    fn a_change_the_runtime_applies_on_its_own_restarts_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("a"), "model: 1\nother: 1").unwrap();
+        // As a runtime that reads its model again for each turn says.
+        let relevant: Relevant = Box::new(|_, text| {
+            text.lines()
+                .filter(|l| !l.starts_with("model:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let mut watch =
+            SettingsWatch::new(home.path().to_owned(), vec![rel("a")], relevant).unwrap();
+        let t = Instant::now();
+        std::fs::write(home.path().join("a"), "model: 2\nother: 1").unwrap();
+        assert_eq!(watch.settled(t), None);
+        assert_eq!(watch.settled(t + READ_EVERY + 2 * SETTLE), None);
+        std::fs::write(home.path().join("a"), "model: 2\nother: 2").unwrap();
+        let later = t + 2 * READ_EVERY + 2 * SETTLE;
+        assert_eq!(watch.settled(later), None);
+        assert_eq!(watch.settled(later + 2 * SETTLE), Some(vec![rel("a")]));
     }
 
     #[test]
@@ -402,6 +480,13 @@ mod tests {
     #[test]
     fn no_files_is_no_watch() {
         let home = tempfile::tempdir().unwrap();
-        assert!(SettingsWatch::new(home.path().to_owned(), Vec::new()).is_none());
+        assert!(
+            SettingsWatch::new(
+                home.path().to_owned(),
+                Vec::new(),
+                Box::new(|_, t| t.to_owned())
+            )
+            .is_none()
+        );
     }
 }

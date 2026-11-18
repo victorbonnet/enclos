@@ -8,13 +8,14 @@ import { createChannelApprovalCapability } from 'openclaw/plugin-sdk/approval-de
 import { createChannelApprovalNativeRuntimeAdapterAsync, CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from 'openclaw/plugin-sdk/approval-handler-runtime';
 import { resolveApprovalOverGateway } from 'openclaw/plugin-sdk/approval-gateway-runtime';
 import { registerChannelRuntimeContext } from 'openclaw/plugin-sdk/channel-runtime-context';
+import { buildModelsProviderData } from 'openclaw/plugin-sdk/models-provider-runtime';
 import { createChannel } from './channel.js';
 import { createNativeApprovals } from './native-approvals.js';
 
 const nativeApprovals = createNativeApprovals({ createChannelApprovalCapability, createChannelApprovalNativeRuntimeAdapterAsync,
   CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY, resolveApprovalOverGateway, registerChannelRuntimeContext });
 const channel = createChannel({ commands: listNativeCommandSpecsForConfig, loadMedia: loadWebMediaRaw, mediaRoots: getAgentScopedMediaLocalRoots,
-  renderPayload: payload => renderPresentationForDelivery({}, payload), nativeApprovals });
+  renderPayload: payload => renderPresentationForDelivery({}, payload), nativeApprovals, models: buildModelsProviderData });
 export default defineChannelPluginEntry({
   id: 'enclos',
   name: 'enclos app',

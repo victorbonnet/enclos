@@ -5,7 +5,7 @@ export const VERSION = 1;
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const known = new Set(['hello', 'message.in', 'ack', 'error', 'policy.context',
-  'conversation.rename', 'conversation.delete', 'held_task.resume', 'task.get', 'turn.abort', 'routine.request', 'question.answer', 'question.sync']);
+  'conversation.rename', 'conversation.delete', 'held_task.resume', 'task.get', 'turn.abort', 'routine.request', 'model.request', 'question.answer', 'question.sync']);
 
 export class ProtocolError extends Error {
   constructor(code, message, of) { super(message); this.code = code; this.of = of; }

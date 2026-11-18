@@ -1933,6 +1933,7 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
             },
             can_edit_avatar: true,
             can_manage_routines: true,
+            can_manage_model: true,
             can_edit_name: true,
             display_name: (i > 1).then(|| "🦀".repeat(100)),
             name_revision: u64::try_from(i).unwrap(),

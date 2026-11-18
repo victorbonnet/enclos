@@ -319,3 +319,30 @@ test('the native message target resolver accepts owned bridge conversations with
   abort.abort(); await lifetime;
   assert.equal((await resolve(account.home)).ok, false, 'a stopped account cannot resolve a target');
 });
+
+test('the installed SDK builds the model catalogue the app lists, per agent and per view', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/models-provider-runtime.js')));
+  assert.equal(typeof sdk.buildModelsProviderData, 'function');
+  const cfg = { agents: { defaults: { model: { primary: 'openai/gpt-5.1' } }, entries: { main: {} } } };
+  for (const view of ['all', 'default']) {
+    const data = await sdk.buildModelsProviderData(cfg, 'main', { view });
+    assert.ok(Array.isArray(data.providers), view);
+    assert.ok(data.byProvider instanceof Map, view);
+    assert.equal(typeof data.resolvedDefault?.provider, 'string', view);
+    for (const [provider, models] of data.byProvider) assert.ok(typeof provider === 'string' && models instanceof Set, view);
+  }
+});
+
+test('with no login, the installed SDK lists model providers the agent cannot use', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/models-provider-runtime.js')));
+  const { ModelSettings } = await import('../model.js');
+  const cfg = { agents: { defaults: { model: { primary: 'openai/gpt-5.1' } }, entries: { main: {} } } };
+  const settings = new ModelSettings({ catalogue: sdk.buildModelsProviderData,
+    runtime: () => ({ config: { current: () => cfg, mutateConfigFile: async () => { throw new Error('no write'); } } }) });
+  const replies = [];
+  await settings.handle(message('model.request', { person: 'p@example.com', device: 'd', action: 'options' }),
+    { account: { agentId: 'main' }, assertCurrent() {}, write(reply) { replies.push(reply); } });
+  const providers = replies[0].providers;
+  assert.ok(providers.length > 0, 'the catalogue lists model providers');
+  assert.ok(providers.some(p => !p.usable && p.setup), 'one not signed in is shown with how to set it up');
+});

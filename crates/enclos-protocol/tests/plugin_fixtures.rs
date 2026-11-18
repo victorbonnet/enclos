@@ -35,6 +35,14 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_bridge_routine_create.json"),
     ),
     (
+        "model_options",
+        include_str!("fixtures/plugin/from_bridge_model_options.json"),
+    ),
+    (
+        "model_set",
+        include_str!("fixtures/plugin/from_bridge_model_set.json"),
+    ),
+    (
         "conversation_delete",
         include_str!("fixtures/plugin/from_bridge_conversation_delete.json"),
     ),
@@ -104,6 +112,14 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "routine_response",
         include_str!("fixtures/plugin/from_plugin_routine_response.json"),
+    ),
+    (
+        "model_options_response",
+        include_str!("fixtures/plugin/from_plugin_model_options.json"),
+    ),
+    (
+        "model_set_response",
+        include_str!("fixtures/plugin/from_plugin_model_set.json"),
     ),
     (
         "usage",

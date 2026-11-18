@@ -1,0 +1,1 @@
+{"v":1,"id":"models-reply","type":"model.response","agent":"lab/engineer","of":"models-1","result":"models","provider":"provider-a","models":[{"id":"model-1","label":"Model 1"},{"id":"model-2","label":"Model 2"}],"limited":true}

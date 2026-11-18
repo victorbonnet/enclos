@@ -15,7 +15,7 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "turn.abort", "conversation.delete", "routine.request",
+FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "turn.abort", "conversation.delete", "routine.request", "model.request",
                      "question.answer", "question.sync", "held_task.resume", "task.get", "ack", "error")
 CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
@@ -213,6 +213,12 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
             try:
                 validate_request(message)
             except RoutineError as error:
+                raise ValueError(str(error)) from None
+        elif kind == "model.request":
+            from .model import ModelError, validate_request as validate_model
+            try:
+                validate_model(message)
+            except ModelError as error:
                 raise ValueError(str(error)) from None
         elif kind == "question.answer":
             from .questions import validate_answer
