@@ -499,3 +499,15 @@ test('cancellation retains answering until native cleanup finishes and old peers
   finish();
   assert.deepEqual((await replacement.next('agent.activity')).doing, []);
 });
+
+test('native target resolution requires the owning caller', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const native = nativeHarness(cfg), channel = createChannel();
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const resolver = channel.plugin.messaging.targetResolver;
+  const params = { cfg, accountId: 'main', normalized: 'home' };
+  assert.equal(await resolver.resolveTarget(params), undefined);
+  assert.equal(await resolver.resolveTarget({ ...params, agentId: 'scout' }), undefined);
+  assert.deepEqual(await resolver.resolveTarget({ ...params, agentId: 'main' }), { to: account.home, kind: 'user' });
+});

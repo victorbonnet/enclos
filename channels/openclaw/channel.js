@@ -1,5 +1,6 @@
 // OpenClaw public channel contract. Native imports live in index.js.
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
@@ -55,14 +56,16 @@ function target(raw, account) {
 export function createChannel(sdk = {}) {
   let runtime;
   const running = new Map();
+  const outboundCaller = new AsyncLocalStorage();
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   let hooks = { tools: false, policy: false };
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
-    const now = resolveAccount(currentConfig(cfg), account.accountId);
-    if (!now.enabled || accountKey(now) !== accountKey(account) || transport.closed || running.get(account.accountId)?.transport !== transport) {
+    const now = resolveAccount(currentConfig(cfg), account.accountId), active = running.get(account.accountId);
+    if (!now.enabled || accountKey(now) !== accountKey(account) || transport.closed || active?.transport !== transport ||
+        accountKey(active.account) !== accountKey(account)) {
       throw new Error('enclos channel account was stopped or reconfigured');
     }
   };
@@ -201,7 +204,8 @@ export function createChannel(sdk = {}) {
           transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
           failureReported = true;
         };
-        try { await channel.inbound.dispatch({
+        const caller = { agentId: nativeRoute.agentId, live: true, assertAuthority };
+        try { await outboundCaller.run(caller, () => channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
@@ -223,12 +227,12 @@ export function createChannel(sdk = {}) {
                 { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
             });
           } },
-        }); } catch (error) {
+        })); } catch (error) {
           reportFailure();
           // Native dispatch may have started work before failing. Preserve the
           // uncertain receipt so reconnects cannot replay that work.
           throw error;
-        } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
+        } finally { caller.live = false; finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
         } finally { execution.finish(); }
       },
     });
@@ -305,6 +309,21 @@ export function createChannel(sdk = {}) {
     outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText, ...(hasMedia ? { sendMedia } : {}) },
     messaging: {
       targetPrefixes: ['enclos'], targetIdComparison: 'case-sensitive',
+      targetResolver: {
+        hint: 'Use home or a known bridge conversation id for this account.',
+        async resolveTarget(params) {
+          // The current upstream target resolver has no agent field. A
+          // resolver invoked during native dispatch inherits that caller.
+          const caller = outboundCaller.getStore();
+          if (caller && (!caller.live || (params.agentId != null && params.agentId !== caller.agentId))) return undefined;
+          caller?.assertAuthority();
+          const agentId = params.agentId ?? caller?.agentId;
+          if (!agentId) return undefined;
+          const route = await plugin.messaging.resolveOutboundSessionRoute({ ...params,
+            agentId, target: params.normalized });
+          return route ? { to: route.to, kind: 'user' } : undefined;
+        },
+      },
       normalizeTarget(raw) { try { return checkedId(raw.startsWith('enclos:') ? raw.slice(7) : raw); } catch { return undefined; } },
       inferTargetChatType: () => 'direct',
       resolveInboundAttachmentRoots: ({ cfg, accountId }) => [path.join(path.dirname(resolveAccount(cfg, accountId).socket), 'media')],
@@ -313,6 +332,7 @@ export function createChannel(sdk = {}) {
         if (account.agentId !== params.agentId) return null;
         const active = running.get(account.accountId);
         if (!active) return null;
+        assertCurrent(params.cfg, account, active.transport);
         const to = target(params.target, { ...account, home: active.transport.home });
         const saved = active.transport.state.routes[to] ?? (to === active.transport.home ? active.transport.homeRoute() : undefined);
         // First-use Home owns a dedicated native session without asserting a
