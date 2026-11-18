@@ -55,6 +55,33 @@ MAX_UNANSWERED = 1024
 # Hermes's hooks after a board write, taken as a cue to read it again.
 HOOKS = ("kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked", "on_kanban_task_updated")
 
+# What the agent is told, in each model call (a `pre_llm_call` context), about
+# the text it writes on the board: the app draws a task's body and comments as
+# markdown, as it draws what an agent says, and its title as one plain line
+# (docs/protocol.md, Task details). Hermes keeps the board's text as written,
+# so whoever writes it, a coordinator or a worker, formats it for the phone.
+# Short, as it is in every call; it changes when the app's list does.
+WRITING_HINT = (
+    "The person reads this agent's kanban tasks in the enclos mobile app. A task's body and its "
+    "comments render as Markdown: bold, italic, strikethrough, inline code, headings, lists, quotes, fenced code "
+    "blocks, narrow tables and links. Start a body with one plain sentence on what the task is for, "
+    "then short sections. A task's title shows as one plain line, without Markdown."
+)
+
+
+def writing_context(**_) -> dict[str, str]:
+    """The `pre_llm_call` context telling the agent how the app draws the board's text."""
+    return {"context": WRITING_HINT}
+
+
+def has_board() -> bool:
+    """Whether this Hermes has the kanban board the plugin reads."""
+    try:
+        from hermes_cli import kanban_db
+    except Exception:
+        return False
+    return callable(getattr(kanban_db, "list_tasks", None)) and callable(getattr(kanban_db, "list_boards", None))
+
 # What is read of a task: its row, when its state last changed (its newest
 # event, and its newest claim for a run), and the enclos conversation it was
 # asked from, which `kanban_create` subscribes to it.

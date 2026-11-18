@@ -321,6 +321,22 @@ class HeldDetailTest(unittest.TestCase):
             self.assertIsNone(board.held_detail("same-id"))
 
 
+class WritingHintTest(unittest.TestCase):
+    """The hint promises what the app draws of a task, as the platform hint does of a message."""
+
+    def test_it_names_what_the_app_draws_of_a_body_and_comments(self):
+        for element in ("body", "comments", "Markdown", "bold", "italic", "strikethrough", "inline code",
+                        "headings", "lists", "quotes", "code blocks", "tables", "links"):
+            with self.subTest(element):
+                self.assertIn(element, tasks.WRITING_HINT)
+
+    def test_it_says_the_title_is_plain(self):
+        self.assertIn("title shows as one plain line", tasks.WRITING_HINT)
+
+    def test_it_stays_short_for_every_call(self):
+        self.assertLess(len(tasks.WRITING_HINT), 500)
+
+
 class ListTest(unittest.TestCase):
     def task(self, n, state="queued", since=NOW):
         return {"id": f"t-{n}", "title": "x", "assignee": "engineer", "state": state, "since": since}
