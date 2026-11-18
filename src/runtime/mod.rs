@@ -286,7 +286,7 @@ pub trait RuntimeAdapter {
     /// The service that listens in the sandbox, whose port the sandbox's
     /// sessions then reach (ADR 0028). `None` (the default): the runtime has
     /// no service its sessions must reach.
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         None
     }
     /// The runtime's dashboard, a page for a browser on the host, served by
@@ -623,12 +623,27 @@ pub struct RuntimeService {
     pub restart: Option<Signal>,
 }
 
-/// A runtime service that listens in its sandbox, on a loopback port it
-/// picks when it starts, which the runtime's own clients dial (ADR 0028).
+/// Which of a service root process's own IPv4 loopback ports may be its
+/// listener. This selects candidates, never grants access: the engine still
+/// requires one port, exclusive ownership by the recorded process and a
+/// port outside enclos's proxy range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerPorts {
+    /// A bind on port 0, as Hermes uses. Fixed auxiliary listeners outside
+    /// the host's ephemeral range do not become candidates.
+    Ephemeral,
+    /// The exact IPv4 loopback port configured by the runtime launcher.
+    Loopback(u16),
+}
+
+/// A runtime service that listens in its sandbox, whose port the runtime's
+/// own clients dial (ADR 0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
+    /// How to select its port from the recorded service process's sockets.
+    pub ports: ListenerPorts,
 }
 
 /// A runtime's dashboard, served by a command run in its sandbox as a

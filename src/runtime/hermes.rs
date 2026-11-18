@@ -13,10 +13,10 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
-    ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat, SecretFiles,
-    ServiceName, Signal, Unreadable, ValueAt,
+    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, ListenerPorts,
+    NotRead, ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts,
+    RuntimeListener, RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat,
+    SecretFiles, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -622,14 +622,17 @@ impl RuntimeAdapter for Hermes {
         })
     }
 
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         // Hermes 0.22.3's chat (CLI, TUI, stream-json) cannot run without the
         // gateway: it finds it, gets a ticket for its own agent (a Hermes
         // profile) over
         // `gateway.sock` in the home, and dials the WebSocket the gateway
         // serves on 127.0.0.1:0 (`gateway/run_api.py`,
         // `hermes_cli/gateway_client.py`).
-        Some(RuntimeListener { service: GATEWAY })
+        Some(RuntimeListener {
+            service: GATEWAY,
+            ports: ListenerPorts::Ephemeral,
+        })
     }
 
     fn dashboard(&self) -> Option<RuntimeDashboard> {
@@ -926,8 +929,9 @@ mod tests {
 
     #[test]
     fn the_listening_service_is_one_of_its_services() {
-        let listener = Hermes.listener().unwrap();
+        let listener = Hermes.listener(41000).unwrap();
         assert_eq!(listener.service.as_str(), "gateway");
+        assert_eq!(listener.ports, ListenerPorts::Ephemeral);
         assert!(Hermes.services().iter().any(|s| s.name == listener.service));
     }
 
