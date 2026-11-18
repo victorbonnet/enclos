@@ -83,12 +83,23 @@ export class ChannelTransport {
     }
     for (const [conversation, route] of Object.entries(this.state.routes)) {
       checkedId(conversation, 'conversation');
+      // A complete import rebinds bridge identifiers/persons, while native
+      // histories retain their original peer. Validate that peer's provenance;
+      // only the destination person below authorizes new inbound messages.
+      const origin = route?.origin;
+      if (origin != null) {
+        if (origin.v !== 1 || Object.keys(origin).some(key => !['v', 'conversation', 'person'].includes(key))) throw new Error('invalid enclos imported route origin');
+        checkedId(origin.conversation, 'source conversation');
+        if (origin.person != null) checkedId(origin.person, 'source person');
+      }
+      const sourceConversation = origin?.conversation ?? conversation;
       if (route?.kind === 'home') {
         if (route.person != null) checkedId(route.person, 'person');
-        if (route.peer !== this.homePeer(conversation)) throw new Error('invalid enclos channel Home route');
+        if (route.peer !== this.homePeer(sourceConversation)) throw new Error('invalid enclos channel Home route');
       } else {
         checkedId(route?.person, 'person');
-        if (route.peer !== digest([conversation, route.person])) throw new Error('invalid enclos channel conversation route');
+        const sourcePerson = origin ? checkedId(origin.person, 'source person') : route.person;
+        if (route.peer !== digest([sourceConversation, sourcePerson])) throw new Error('invalid enclos channel conversation route');
       }
     }
     for (const pending of this.state.outbox) {

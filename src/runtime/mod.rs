@@ -87,6 +87,8 @@ pub struct RuntimeExport {
     pub format: &'static str,
     pub command: SandboxCommand,
     pub archive: PathBuf,
+    /// The optional export sidecar containing exact package specs, never secrets.
+    pub package_plan: Option<PathBuf>,
 }
 
 /// A command that runs inside a sandbox, under its policy. Anyone can make
@@ -395,7 +397,12 @@ pub trait RuntimeAdapter {
         None
     }
     /// Export one agent with the runtime's own command, inside its sandbox.
-    fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport> {
+    fn export_agent(
+        &self,
+        _name: &AgentName,
+        _prefix: &Path,
+        _context: &str,
+    ) -> Option<RuntimeExport> {
         None
     }
     /// Restores a complete adapter-owned payload; raw runtime exports keep

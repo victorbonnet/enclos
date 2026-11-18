@@ -48,6 +48,7 @@ impl Engine {
             credentials,
             history,
             source_policy: Some(policy),
+            runtime_packages: Vec::new(),
         };
         state.validate().map_err(failed)?;
         Ok(state)
@@ -83,6 +84,17 @@ impl Engine {
         }
         if let Some(state) = state {
             state.validate().map_err(failed)?;
+            if let Some(credential) = state.credentials.iter().find(|credential| {
+                view.snapshot
+                    .policy
+                    .secrets
+                    .contains_key(&credential.variable)
+            }) {
+                return Err(failed(format!(
+                    "{} is already granted to the whole destination sandbox; reconcile its global and imported agent grants before importing (ADR 0036)",
+                    credential.variable
+                )));
+            }
             if state
                 .credentials
                 .iter()

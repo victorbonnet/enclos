@@ -65,6 +65,37 @@ impl Drop for Temporary {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentImportOptions<'a> {
+    pub metadata_only: bool,
+    pub approved_plugins: &'a [String],
+}
+
+fn check_plugin_consent(planned: &[String], provided: &[String], confirm: Confirm) -> Result<()> {
+    let expected: std::collections::BTreeSet<_> = planned.iter().collect();
+    let approved: std::collections::BTreeSet<_> = provided.iter().collect();
+    if expected.is_empty() && approved.is_empty() {
+        return Ok(());
+    }
+    if confirm != Confirm::Yes || approved != expected || approved.len() != provided.len() {
+        let flags = planned
+            .iter()
+            .map(|spec| format!("--accept-plugin {spec}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let what = if flags.is_empty() {
+            "importing this export without any --accept-plugin flags".to_owned()
+        } else {
+            format!(
+                "authorizing these runtime plugin packages and their declared capabilities ({}) with {flags}",
+                planned.join(", ")
+            )
+        };
+        return Err(Error::NeedsConfirmation { what });
+    }
+    Ok(())
+}
+
 impl Engine {
     /// Exports runtime data inside the sandbox, then wraps it with host-owned presentation.
     pub fn export_agent(
@@ -84,15 +115,15 @@ impl Engine {
             ".enclos-export-{}.archive",
             new_id().map_err(failed)?
         ));
-        let export = runtime.export_agent(agent, &prefix).ok_or_else(|| {
+        let export = runtime.export_agent(agent, &prefix, "{}").ok_or_else(|| {
             failed(format!(
                 "{} has no agent export command",
                 kind.display_name()
             ))
         })?;
         let runtime_path = export.archive;
+        let package_plan = export.package_plan;
         let format = export.format;
-        let command = export.command;
         if runtime_path.parent() != Some(home.as_path()) {
             return Err(failed(
                 "the runtime export must be a file in the sandbox home",
@@ -110,14 +141,59 @@ impl Engine {
         }
         let paused = self.pause_runtime(by, name, "agent export")?;
         let result = (|| {
-            let state = self.export_host_state(name, agent)?;
+            let mut state = self.export_host_state(name, agent)?;
+            let source_policy = state
+                .source_policy
+                .as_ref()
+                .expect("export includes its source policy");
+            let sandbox_variables: Vec<_> = source_policy.secrets.keys().collect();
+            let agent_variables: Vec<_> = source_policy
+                .agent_secrets
+                .get(agent)
+                .into_iter()
+                .flat_map(|grants| grants.keys())
+                .collect();
+            let (credential_files, _credential_cleanup) =
+                self.export_credential_files(name, agent, runtime.as_ref())?;
+            let context = serde_json::json!({"max_bytes":agent_export::MAX_PAYLOAD_BYTES,
+                "credential_files":credential_files, "write_package_plan":package_plan.is_some(),
+                "settings_grants":{"sandbox":sandbox_variables,"agent":agent_variables}})
+            .to_string();
+            let mut command = runtime
+                .export_agent(agent, &prefix, &context)
+                .ok_or_else(|| failed("runtime export became unavailable"))?
+                .command;
+            let reads = command
+                .reads()
+                .iter()
+                .cloned()
+                .chain(credential_files.values().cloned())
+                .collect();
+            command = command.reading(reads);
             let _runtime_cleanup = Temporary::runtime_output(runtime_path.clone())?;
+            let _plan_cleanup = package_plan
+                .clone()
+                .map(Temporary::runtime_output)
+                .transpose()?;
             let ended = self.run_in_sandbox(by, name, command, "agent export session")?;
             if ended.exit != 0 {
                 return Err(failed(format!(
                     "the runtime export exited with {}",
                     ended.exit
                 )));
+            }
+            if let Some(path) = &package_plan {
+                let file = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(crate::runtime::HomePath::new)
+                    .ok_or_else(|| failed("invalid runtime package plan path"))?;
+                let text = crate::runtime::home::read_text(&home, &file, 64 * 1024)
+                    .map_err(failed)?
+                    .ok_or_else(|| failed("the runtime did not write its plugin plan"))?;
+                state.runtime_packages = serde_json::from_str(&text)
+                    .map_err(|_| failed("invalid runtime plugin plan"))?;
+                state.validate().map_err(failed)?;
             }
             let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits();
             let mut payload = OpenOptions::new()
@@ -188,7 +264,55 @@ impl Engine {
         }
     }
 
-    /// Imports an Enclos export; the runtime still extracts its own payload inside the sandbox.
+    /// Give only this export private copies of declared runtime credential
+    /// files. Service paths are references, never written or removed.
+    fn export_credential_files(
+        &self,
+        name: &SandboxName,
+        agent: &AgentName,
+        runtime: &dyn crate::runtime::RuntimeAdapter,
+    ) -> Result<(std::collections::BTreeMap<PathBuf, PathBuf>, Vec<Temporary>)> {
+        let mut sources = std::collections::BTreeMap::new();
+        let mut cleanup = Vec::new();
+        let Some(delivery) = runtime.secret_files() else {
+            return Ok((sources, cleanup));
+        };
+        let policy = self.policy(name)?.snapshot.policy;
+        let directory = self.layout.sandbox_installers(name.as_str());
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .map_err(failed)?;
+        let mut stage = |source: PathBuf,
+                         values: Vec<(String, crate::model::secret::SecretValue)>,
+                         format|
+         -> Result<()> {
+            let file = format!("export-{}.credentials", new_id().map_err(failed)?);
+            let target = directory.join(&file);
+            let guard = Temporary::runtime_output(target.clone())?;
+            super::secrets::write_secrets_file(name, &directory, &file, &values, format)?;
+            sources.insert(source, target);
+            cleanup.push(guard);
+            Ok(())
+        };
+        stage(
+            self.layout.sandbox_secrets_dir(name.as_str()).join(".env"),
+            self.granted_values(&policy.secrets)?,
+            delivery.sandbox,
+        )?;
+        if let Some(grants) = policy.agent_secrets.get(agent.as_str()) {
+            stage(
+                self.layout
+                    .agent_secrets_file(name.as_str(), agent.as_str()),
+                self.granted_values(grants)?,
+                delivery.agent,
+            )?;
+        }
+        Ok((sources, cleanup))
+    }
+
+    /// Imports an Enclos export without package authorizations.
     pub fn import_agent_export(
         &self,
         by: &Actor,
@@ -198,6 +322,33 @@ impl Engine {
         metadata_only: bool,
         confirm: Confirm,
     ) -> Result<Planned<ImportedAgentExport>> {
+        self.import_agent_export_with_options(
+            by,
+            name,
+            agent,
+            from,
+            AgentImportOptions {
+                metadata_only,
+                ..AgentImportOptions::default()
+            },
+            confirm,
+        )
+    }
+
+    /// Imports an Enclos export; the runtime extracts its own payload inside the sandbox.
+    pub fn import_agent_export_with_options(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        from: &Path,
+        options: AgentImportOptions<'_>,
+        confirm: Confirm,
+    ) -> Result<Planned<ImportedAgentExport>> {
+        let AgentImportOptions {
+            metadata_only,
+            approved_plugins,
+        } = options;
         let kind = self.runtime_of(name)?;
         let mut source = Source::open(&self.layout, from)?;
         if !metadata_only {
@@ -227,6 +378,9 @@ impl Engine {
             } else {
                 self.plan_restart(name)?.plan(&format!("{name}/{agent}"))
             };
+            let packages = state.iter().filter(|_| !metadata_only)
+                .flat_map(|state| &state.runtime_packages)
+                .map(|spec| format!("authorize runtime plugin {spec} and its declared capabilities (--accept-plugin {spec})"));
             return Ok(Planned::DryRun(Plan {
                 changes: vec![
                     format!(
@@ -240,7 +394,7 @@ impl Engine {
                     ),
                     "restore presentation and, for a complete import, agent credentials and app history; retain destination host policy and pairings"
                         .into(),
-                ].into_iter().chain(services).collect(),
+                ].into_iter().chain(packages).chain(services).collect(),
                 ..Plan::default()
             }));
         }
@@ -303,6 +457,17 @@ impl Engine {
                 return Err(failed("unsupported runtime export format"));
             }
         }
+        let runtime_packages = state
+            .as_ref()
+            .map_or(&[][..], |state| state.runtime_packages.as_slice());
+        if !metadata_only {
+            check_plugin_consent(runtime_packages, approved_plugins, confirm)?;
+        }
+        let secret_variables: Vec<_> = state
+            .iter()
+            .flat_map(|state| &state.credentials)
+            .map(|credential| &credential.variable)
+            .collect();
         let conversations = match &state {
             Some(s) => {
                 // The destination's Home: a new one if an agent of its name
@@ -321,9 +486,16 @@ impl Engine {
             }
             None => Default::default(),
         };
-        let context =
-            serde_json::json!({"source_agent":manifest.source_agent,"conversations":conversations})
-                .to_string();
+        let destination_person = if self.app_store_path().exists() {
+            Store::read_host_person(&self.app_store_path()).map_err(failed)?
+        } else {
+            None
+        };
+        let context = serde_json::json!({"source_agent":manifest.source_agent,
+            "conversations":conversations,"destination_person":destination_person,
+            "approved_plugins":approved_plugins, "secret_variables":secret_variables,
+            "agent_secrets_file":self.layout.agent_secrets_file(name.as_str(), agent.as_str())})
+        .to_string();
         let paused = if !metadata_only {
             if confirm == Confirm::Ask {
                 self.plan_restart(name)?
@@ -509,5 +681,34 @@ mod tests {
         guard.disarm();
         drop(guard);
         assert!(kept.exists());
+    }
+}
+
+#[cfg(test)]
+mod plugin_consent_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_plugin_consent_must_match_every_exact_spec() {
+        let planned = [
+            "example-plugin@1.2.3".to_owned(),
+            "@example/other@3.2.1".to_owned(),
+        ];
+        for (given, confirm) in [
+            (&[][..], Confirm::Yes),
+            (&planned[..1], Confirm::Yes),
+            (&planned[..], Confirm::Ask),
+        ] {
+            let error = check_plugin_consent(&planned, given, confirm)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                planned
+                    .iter()
+                    .all(|spec| error.contains(&format!("--accept-plugin {spec}")))
+            );
+        }
+        assert!(check_plugin_consent(&planned, &planned, Confirm::Yes).is_ok());
+        assert!(check_plugin_consent(&[], &planned, Confirm::Yes).is_err());
     }
 }
