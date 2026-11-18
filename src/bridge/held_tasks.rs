@@ -20,6 +20,7 @@ const TIMEOUT: Duration = Duration::from_secs(25);
 
 const NOT_READ: &str =
     "The bridge could not read or write its database, so nothing was sent to the agent. Try again.";
+const NOT_RESUMABLE: &str = "This task cannot be resumed from the app. Nothing was sent.";
 const UNCONFIRMED: &str = "The agent may have resumed the task, but did not confirm it. Its card shows what happened after the next sync.";
 
 /// What a device asked: resume `task` of `agent`, at card `revision`.
@@ -347,17 +348,16 @@ impl Hub {
                 return Ok(());
             }
         }
+        // A first check, so that a resume refused as the card is now opens
+        // no channel. It decides nothing else: admission, below, checks
+        // everything again.
         let card = self
             .resume_authority(store, device, person, &request)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         // Said only to whoever may resume the card as it is, and before the
         // channel is opened: the runtime is not asked.
         if !card.info.resumable {
-            return Err(failure(
-                original,
-                ErrorCode::Unsupported,
-                "This task cannot be resumed from the app. Nothing was sent.",
-            ));
+            return Err(failure(original, ErrorCode::Unsupported, NOT_RESUMABLE));
         }
         let requester = Person::new(person)
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e.to_string()))?;
@@ -391,6 +391,12 @@ impl Hub {
                 ));
             }
         };
+        // Admission (`docs/protocol.md`, Held tasks): the plugin's writer is taken
+        // first and kept until the resume is written, so nothing waits
+        // between admission and the write but the write itself. Opening
+        // the channel and waiting for the writer come before it, and decide
+        // nothing.
+        let mut out = out.lock().expect("not poisoned");
         let mut requests = self.held_tasks.lock().expect("not poisoned");
         // Another device thread may have claimed the same id meanwhile.
         if let Some(answer) = self.replayed(&requests, &rpc, &request, &original)? {
@@ -419,31 +425,56 @@ impl Hub {
                     "The agent's channel is disconnected. Nothing was sent.",
                 )
             })?;
-        let pending = Pending {
-            device: device.id.clone(),
-            person: person.into(),
-            connection,
-            original: original.clone(),
-            request: request.clone(),
-            sent: card.runtime_revision.clone(),
-            started: Instant::now(),
+        // The host's person and this device's keys, the card's owner, state
+        // and revision, then `resumable`, read again and the resume logged,
+        // in one write transaction: a report is stored either before it,
+        // and refuses this resume here, or after it, and does not stop the
+        // resume admitted. What is sent is the card read here.
+        let admitted = store.admit_held_resume(|store| {
+            let card = self.resume_authority(store, device, person, &request)?;
+            if !card.info.resumable {
+                return Err((ErrorCode::Unsupported, NOT_RESUMABLE.to_owned()));
+            }
+            let pending = Pending {
+                device: device.id.clone(),
+                person: person.into(),
+                connection,
+                original: original.clone(),
+                request: request.clone(),
+                sent: card.runtime_revision,
+                started: Instant::now(),
+            };
+            // No resume the log cannot name: the runtime would change with
+            // no record of who asked.
+            if !audit(store, &pending, "requested") {
+                return Err((ErrorCode::Internal, NOT_READ.to_owned()));
+            }
+            Ok(pending)
+        });
+        let pending = match admitted {
+            Ok(Ok(pending)) => pending,
+            Ok(Err((code, why))) => return Err(failure(original, code, why)),
+            Err(e) => {
+                eprintln!(
+                    "enclos app: a resume of {}'s held task was not admitted: {e}",
+                    request.agent
+                );
+                return Err(failure(original, ErrorCode::Internal, NOT_READ));
+            }
         };
-        // No resume the log cannot name: the runtime would change with no
-        // record of who asked.
-        if !audit(store, &pending, "requested") {
-            return Err(failure(original, ErrorCode::Internal, NOT_READ));
-        }
+        let revision = pending.sent.clone();
         requests.pending.insert(rpc.to_string(), pending);
         drop(requests);
-        let sent = out.lock().expect("not poisoned").writer.send_with_id(
+        let sent = out.writer.send_with_id(
             rpc.clone(),
             FromBridge::HeldTaskResume {
                 task: request.task.clone(),
-                revision: card.runtime_revision,
+                revision,
                 person: requester,
                 device: device.id.clone(),
             },
         );
+        drop(out);
         if let Err(e) = sent {
             let taken = self.take_pending(&request.agent, None, &rpc);
             if let Some((key, pending)) = taken {
@@ -1623,6 +1654,285 @@ mod tests {
             state(&store, "t1"),
             HeldTaskState::Held,
             "the card not resumable here is as it was"
+        );
+    }
+
+    /// A plugin on the agent's socket that holds its `hello` back: the
+    /// first receiver says the bridge sent its own, the sender lets the
+    /// plugin answer. What the bridge sends after comes on the last one.
+    fn stalled_plugin(
+        hub: &Arc<Hub>,
+    ) -> (
+        Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        Receiver<Envelope<FromBridge>>,
+    ) {
+        let listener = UnixListener::bind(&hub.agents()[0].socket).unwrap();
+        let (seen_tx, seen) = channel();
+        let (go, go_rx) = channel::<()>();
+        let (frames, received) = channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).unwrap();
+            let _ = seen_tx.send(());
+            if go_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                return;
+            }
+            writer
+                .write_all(&encode_line(&Envelope::new(
+                    MessageId::new("hello").unwrap(),
+                    FromPlugin::Hello {
+                        runtime: "synthetic".into(),
+                        agent: "main".into(),
+                        capabilities: vec![Capability::HeldTasks],
+                    },
+                )))
+                .unwrap();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if let Ok(frame) = decode_from_bridge(&line) {
+                    let _ = frames.send(frame);
+                }
+            }
+        });
+        (seen, go, received)
+    }
+
+    /// The resume's thread, what lets the plugin answer its `hello`, and
+    /// what the bridge sends the plugin after.
+    type Opening = (
+        std::thread::JoinHandle<Result<(), ErrorBody>>,
+        std::sync::mpsc::Sender<()>,
+        Receiver<Envelope<FromBridge>>,
+    );
+
+    /// A resume of a card resumable when it was asked, whose channel takes
+    /// its time to open: on its own connection to the database, as a
+    /// device's thread has. Returns once the bridge sent its `hello`, after
+    /// the first check and before anything is pending, logged or sent.
+    fn resume_while_opening(hub: &Arc<Hub>, store: &Store, phone: &Device) -> Opening {
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[task("t1")])
+            .unwrap();
+        let (seen, go, frames) = stalled_plugin(hub);
+        let worker_hub = Arc::clone(hub);
+        let worker_phone = phone.clone();
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &worker_phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        seen.recv_timeout(Duration::from_secs(5))
+            .expect("the bridge opens the channel");
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(store).is_empty());
+        (worker, go, frames)
+    }
+
+    /// The runtime says, while the channel opens, that the task can no
+    /// longer be resumed from the app, at the same revision of its own:
+    /// the report is stored first, so the resume is refused with nothing
+    /// pending, logged or sent.
+    #[test]
+    fn a_task_no_longer_resumable_while_the_channel_opens_is_not_sent() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        let (worker, go, frames) = resume_while_opening(&hub, &store, &phone);
+        let changes = store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[not_resumable("t1")])
+            .unwrap();
+        assert_eq!(
+            (
+                changes[0].card.info.resumable,
+                changes[0].card.info.revision,
+                changes[0].card.runtime_revision.as_str()
+            ),
+            (false, 1, "e:7"),
+            "only `resumable` changed, not the runtime's revision"
+        );
+        hub.publish_held(&store, changes);
+        go.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            (error.code, error.of.as_ref().map(MessageId::as_str)),
+            (ErrorCode::Conflict, Some("tap"))
+        );
+        assert!(
+            frames.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing reaches the runtime"
+        );
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(&store).is_empty());
+        assert!(
+            !store
+                .held_task(AGENT, "t1")
+                .unwrap()
+                .unwrap()
+                .info
+                .resumable
+        );
+    }
+
+    /// The runtime reports, while another write holds the channel's
+    /// writer, that the task can no longer be resumed from the app: its
+    /// report is stored and acknowledged before the resume waiting for the
+    /// writer is admitted, so the resume is refused with nothing pending,
+    /// logged or sent.
+    #[test]
+    fn a_task_no_longer_resumable_while_the_writer_is_busy_is_not_sent() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        let out = Arc::clone(&hub.plugins.lock().unwrap().get(AGENT).unwrap().out);
+        let busy = out.lock().unwrap();
+        let worker_hub = Arc::clone(&hub);
+        let worker_phone = phone.clone();
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &worker_phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        // The channel is open: past its first check, the resume can wait
+        // only for the writer.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!worker.is_finished());
+        assert!(
+            hub.held_tasks.lock().unwrap().pending.is_empty(),
+            "nothing admitted while the writer is busy"
+        );
+        assert!(resume_lines(&store).is_empty());
+        say(
+            &mut plugin,
+            "no-longer",
+            FromPlugin::HeldTasks {
+                tasks: vec![not_resumable("t1")],
+            },
+        );
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::Ack { ref of } if of.as_str() == "no-longer"
+        ));
+        let updated = card(next(&rx));
+        assert_eq!((updated.resumable, updated.revision), (false, 1));
+        drop(busy);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "nothing reaches the runtime"
+        );
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(&store).is_empty());
+    }
+
+    /// Admission checks the device as the first check did, before the
+    /// card: a device unpaired while the channel opened is refused as one,
+    /// even when the card changed too, and nothing is sent.
+    #[test]
+    fn a_device_unpaired_while_the_channel_opens_is_refused_before_its_card() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        let (worker, go, frames) = resume_while_opening(&hub, &store, &phone);
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[not_resumable("t1")])
+            .unwrap();
+        store.remove_device(&phone.id).unwrap();
+        go.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotAllowed);
+        assert!(frames.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(
+            store
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .all(|l| l.event != "held_task.resume")
+        );
+    }
+
+    /// The same opening with no change meanwhile: admitted, logged once,
+    /// and sent at the runtime's revision.
+    #[test]
+    fn a_task_still_resumable_once_the_channel_opens_is_sent() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        let (worker, go, frames) = resume_while_opening(&hub, &store, &phone);
+        go.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        let sent = plugin_frame(&frames);
+        assert!(matches!(
+            sent.body,
+            FromBridge::HeldTaskResume { ref task, ref revision, .. }
+                if task.as_str() == "t1" && revision.as_str() == "e:7"
+        ));
+        assert_eq!(hub.held_tasks.lock().unwrap().pending.len(), 1);
+        assert_eq!(resume_lines(&store), ["lab/main t1 requested"]);
+    }
+
+    /// A report stored after a resume was admitted does not take it back:
+    /// the resume is sent at the runtime's revision admission read, and the
+    /// runtime's answer to it is the person's. A report can be stored, and
+    /// acknowledged, while the admitted resume's write is still blocked on
+    /// the socket; the runtime decides on its own state.
+    #[test]
+    fn a_report_stored_after_admission_does_not_take_the_resume_back() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        let original = MessageId::new("tap").unwrap();
+        hub.held_task_resume(&store, &phone, OWNER, original.clone(), resume("t1", 0))
+            .unwrap();
+        let sent = plugin_frame(&from_bridge);
+        assert!(matches!(
+            sent.body,
+            FromBridge::HeldTaskResume { ref revision, .. } if revision.as_str() == "e:7"
+        ));
+        say(
+            &mut plugin,
+            "no-longer",
+            FromPlugin::HeldTasks {
+                tasks: vec![not_resumable("t1")],
+            },
+        );
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::Ack { ref of } if of.as_str() == "no-longer"
+        ));
+        let updated = card(next(&rx));
+        assert_eq!((updated.resumable, updated.revision), (false, 1));
+        assert_eq!(hub.held_tasks.lock().unwrap().pending.len(), 1);
+        say(
+            &mut plugin,
+            "resumed",
+            FromPlugin::HeldTaskResumed { of: sent.id },
+        );
+        assert_eq!(card(next(&rx)).state, HeldTaskState::Resumed);
+        next(&rx);
+        assert!(matches!(
+            next(&rx),
+            ToDevice::HeldTaskResult { ref of, .. } if *of == original
+        ));
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
         );
     }
 

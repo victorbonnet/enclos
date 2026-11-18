@@ -344,6 +344,30 @@ impl Store {
         Ok(changes)
     }
 
+    /// Runs `admit`, a resume's admission, in one immediate transaction of
+    /// this connection, committed only when it returns `Ok`: what it reads
+    /// and what it writes (the resume's line in the log) are one step
+    /// against every other write transaction, on any connection. A report
+    /// ([`Store::report_held_tasks`]) is one too, so it is either committed
+    /// before this begins, and read here, or begins after this commits.
+    /// `Err` when the transaction could not begin or commit, the database
+    /// busy past its timeout included: nothing was written then.
+    pub fn admit_held_resume<T, E>(
+        &self,
+        admit: impl FnOnce(&Store) -> Result<T, E>,
+    ) -> rusqlite::Result<Result<T, E>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let admitted = admit(self);
+        if admitted.is_ok() {
+            tx.commit()?;
+        }
+        // Refused: dropped, so rolled back.
+        Ok(admitted)
+    }
+
     /// The runtime confirmed a device's resume of `task`, sent at the
     /// runtime's revision `sent`: its card is `resumed`, with its line. A
     /// card already released by a report that came first is marked resumed
