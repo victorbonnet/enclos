@@ -22,6 +22,26 @@ const TO_DEVICE: &[(&str, &str)] = &[
         include_str!("fixtures/device/to_device_task_detail.json"),
     ),
     (
+        "to_device_open_item_dismissed",
+        include_str!("fixtures/device/to_device_open_item_dismissed.json"),
+    ),
+    (
+        "to_device_question_closed",
+        include_str!("fixtures/device/to_device_question_closed.json"),
+    ),
+    (
+        "to_device_open_items",
+        include_str!("fixtures/device/to_device_open_items.json"),
+    ),
+    (
+        "to_device_open_items_unavailable",
+        include_str!("fixtures/device/to_device_open_items_unavailable.json"),
+    ),
+    (
+        "to_device_message_suggested_replies",
+        include_str!("fixtures/device/to_device_message_suggested_replies.json"),
+    ),
+    (
         "model_options",
         include_str!("fixtures/device/to_device_model_options.json"),
     ),
@@ -39,6 +59,22 @@ const FROM_DEVICE: &[(&str, &str)] = &[
     (
         "task_get",
         include_str!("fixtures/device/from_device_task_get.json"),
+    ),
+    (
+        "from_device_sync_open_items",
+        include_str!("fixtures/device/from_device_sync_open_items.json"),
+    ),
+    (
+        "from_device_held_task_get",
+        include_str!("fixtures/device/from_device_held_task_get.json"),
+    ),
+    (
+        "from_device_open_item_dismiss",
+        include_str!("fixtures/device/from_device_open_item_dismiss.json"),
+    ),
+    (
+        "from_device_question_close",
+        include_str!("fixtures/device/from_device_question_close.json"),
     ),
     (
         "model_models",

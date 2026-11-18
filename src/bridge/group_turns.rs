@@ -322,6 +322,7 @@ impl Hub {
             .lock()
             .expect("not poisoned")
             .get_mut(id)
+            .filter(|discussion| discussion.state != "stopped")
             .and_then(Discussion::stop);
         if let Some(run) = running {
             let _ = store.turn_status(&run.turn, "cancelled", None);
@@ -329,24 +330,34 @@ impl Hub {
             // plugin advertises `abort`; an older one is sent no runtime
             // text command. Written through the plugin's own lock.
             let name = format!("{sandbox}/{}", run.member);
-            if self.plugin(&name).is_ok() {
-                let out = {
-                    let plugins = self.plugins.lock().expect("not poisoned");
-                    plugins
-                        .get(&name)
-                        .filter(|p| p.capabilities.contains(&Capability::Abort))
-                        .map(|p| Arc::clone(&p.out))
+            let out = if self.plugin(&name).is_ok() {
+                self.plugins
+                    .lock()
+                    .expect("not poisoned")
+                    .get(&name)
+                    .filter(|plugin| plugin.capabilities.contains(&Capability::Abort))
+                    .map(|plugin| Arc::clone(&plugin.out))
+            } else {
+                None
+            };
+            let sent = out.is_some_and(|out| {
+                let (Ok(conversation), Ok(of)) =
+                    (ConversationId::new(id), MessageId::new(&run.sent))
+                else {
+                    return false;
                 };
-                if let Some(out) = out
-                    && let (Ok(conversation), Ok(of)) =
-                        (ConversationId::new(id), MessageId::new(&run.sent))
-                {
-                    let _ = out
-                        .lock()
-                        .expect("not poisoned")
-                        .writer
-                        .send(FromBridge::TurnAbort { conversation, of });
-                }
+                out.lock()
+                    .expect("not poisoned")
+                    .writer
+                    .send(FromBridge::TurnAbort { conversation, of })
+                    .is_ok()
+            });
+            if !sent
+                && let Some(discussion) = self.groups.lock().expect("not poisoned").get_mut(id)
+                && discussion.state == "stopped"
+            {
+                discussion.reason =
+                    Some("The run continues in the runtime. Its reply will be dropped.".to_owned());
             }
         }
         self.deliver_group_state(store, id);

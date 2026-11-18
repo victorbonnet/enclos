@@ -108,6 +108,7 @@ fn member(
 
 fn says(group: &str, text: &str, kind: OutKind, reply_to: Option<&MessageId>) -> FromPlugin {
     FromPlugin::MessageOut {
+        suggested_replies: Vec::new(),
         conversation: ConversationId::new(group).unwrap(),
         text: text.to_owned(),
         kind,

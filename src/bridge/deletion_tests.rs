@@ -437,6 +437,7 @@ fn kept_message(conversation: &str) -> Vec<u8> {
     encode_line(&Envelope::new(
         MessageId::new("out-1").unwrap(),
         FromPlugin::MessageOut {
+            suggested_replies: Vec::new(),
             conversation: ConversationId::new(conversation).unwrap(),
             text: "kept".into(),
             kind: OutKind::Reply,

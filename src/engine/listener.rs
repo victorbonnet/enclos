@@ -18,8 +18,8 @@ use crate::backend::HeldNamespace;
 use crate::error::Result;
 use crate::layout::LayoutError;
 use crate::lifecycle::listeners::{
-    ListenersError, NotOnePort, ephemeral_ports, one_loopback_port, one_port, tcp_listeners,
-    tcp_listeners_at, tcp_listeners_at_in, tcp_listeners_in,
+    ListenersError, NotOnePort, ephemeral_ports, one_port, tcp_listeners, tcp_listeners_at,
+    tcp_listeners_at_in, tcp_listeners_in,
 };
 use crate::lifecycle::proc::{program_in_pid_namespace, same_network};
 use crate::lifecycle::process::{is_same, reference};
@@ -242,7 +242,6 @@ fn chosen(
 ) -> std::result::Result<u16, NoPort> {
     let selected = match selection {
         ListenerPorts::Ephemeral => one_port(held, &ephemeral().map_err(refused)?),
-        ListenerPorts::SingleLoopback => one_loopback_port(held),
         ListenerPorts::Loopback(port) => {
             if port != 0 && held.contains(&SocketAddr::from(([127, 0, 0, 1], port))) {
                 Ok(port)
@@ -618,9 +617,13 @@ mod tests {
         // selection accepts it, while on_host separately excludes it.
         let held = [SocketAddr::from(([127, 0, 0, 1], PORT_FIRST))];
         assert_eq!(
-            chosen("gateway", 1, &held, ListenerPorts::SingleLoopback, || {
-                panic!("configured selection must not read an ephemeral range")
-            }),
+            chosen(
+                "gateway",
+                1,
+                &held,
+                ListenerPorts::Loopback(PORT_FIRST),
+                || { panic!("configured selection must not read an ephemeral range") }
+            ),
             Ok(PORT_FIRST)
         );
         assert!(matches!(
@@ -630,12 +633,9 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_port_requires_its_exact_ipv4_loopback_socket() {
-        for held in [
-            vec![SocketAddr::from(([0, 0, 0, 0], 43004))],
-            vec![SocketAddr::from(([127, 0, 0, 1], 43005))],
-            vec![SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 43004))],
-        ] {
+    fn another_sandbox_listener_is_not_a_candidate_for_the_declared_port() {
+        for address in ["127.0.0.1:43005", "0.0.0.0:43004", "[::1]:43004"] {
+            let held = [address.parse().unwrap()];
             assert!(matches!(
                 chosen("gateway", 1, &held, ListenerPorts::Loopback(43004), || {
                     panic!("declared selection must not read an ephemeral range")
@@ -657,11 +657,11 @@ mod tests {
                 Ok(port)
             );
         }
-        assert!(matches!(
-            chosen("gateway", 1, &held, ListenerPorts::SingleLoopback, || {
-                panic!("configured selection must not read an ephemeral range")
+        assert_eq!(
+            chosen("gateway", 1, &held, ListenerPorts::Loopback(18789), || {
+                panic!("declared selection must not read an ephemeral range")
             }),
-            Err(NoPort::Refused(_))
-        ));
+            Ok(18789)
+        );
     }
 }

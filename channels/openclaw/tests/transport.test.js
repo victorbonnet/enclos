@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -104,6 +105,52 @@ test('a damaged route cannot collapse a conversation into a native default sessi
     conversation: { person: 'alice', peer: 'not-a-valid-route' },
   } }));
   assert.throws(() => new ChannelTransport(account, { onMessage: async () => {} }), /invalid enclos channel conversation route/);
+});
+
+test('a full persisted registry accepts new input and retains recent deduplication across restart', async t => {
+  const account = accountFixture(t);
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const input = i => message('message.in', { id: `ingress-${i}`, conversation: `chat-${i}`, person: 'alice', text: 'hello' });
+  const receipts = Object.fromEntries(Array.from({ length: 10_000 }, (_, i) => {
+    const incoming = input(i);
+    return [incoming.id, { hash: hash([incoming.conversation, incoming.person, incoming.text]), status: 'received' }];
+  }));
+  const routes = Object.fromEntries(Array.from({ length: 4096 }, (_, i) => {
+    const conversation = `chat-${i}`;
+    return [conversation, { person: 'alice', peer: hash([conversation, 'alice']) }];
+  }));
+  mkdirSync(account.stateDir, { mode: 0o700 });
+  writeFileSync(path.join(account.stateDir, 'state.json'), JSON.stringify({ v: 1, outbox: [], receipts, routes }));
+  const seen = [];
+  const onMessage = async incoming => seen.push(incoming.id);
+  let channel = new ChannelTransport(account, { onMessage });
+  await channel.accept(input(9999));
+  for (const i of [10000, 10001, 10002]) await channel.accept(input(i));
+  assert.equal(Object.keys(channel.state.receipts).length, 10000);
+  assert.equal(Object.keys(channel.state.routes).length, 4096);
+  assert.equal(channel.state.receipts['ingress-0'], undefined);
+  assert.equal(channel.state.routes['chat-0'], undefined);
+  channel = new ChannelTransport(account, { onMessage });
+  await channel.accept(input(9999));
+  await channel.accept(input(10002));
+  assert.deepEqual(seen, ['ingress-10000', 'ingress-10001', 'ingress-10002']);
+  const original = routes['chat-0'];
+  assert.deepEqual(channel.route('chat-0', 'alice').peer, original.peer);
+});
+
+test('only new ingress gets the busy error while eight native deliveries are in flight', async t => {
+  const account = accountFixture(t);
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const channel = new ChannelTransport(account, { onMessage: () => blocked });
+  const input = () => message('message.in', { conversation: 'chat', person: 'alice', text: 'hello' });
+  const pending = Array.from({ length: 8 }, () => channel.accept(input()));
+  try {
+    await assert.rejects(channel.accept(input()), { code: 'agent_unavailable', message: /agent is busy/ });
+  } finally {
+    release();
+    await Promise.all(pending);
+  }
 });
 
 test('asynchronous controls retain their exact peer and protected token authority', async t => {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { message } from '../protocol.js';
@@ -158,16 +158,25 @@ async function start(t, channel, cfg, account) {
   return controller;
 }
 
-test('only the tested native version is accepted and accounts are explicit', t => {
+test('the minimum native version and explicit accounts are required', t => {
   const one = accountFixture(t, 'main'), two = accountFixture(t, 'scout');
   const cfg = configured(one, two);
-  assert.throws(() => createChannel().setRuntime({ version: '2026.11.2' }), /matching enclos channel/);
+  assert.throws(() => createChannel().setRuntime({ version: '2026.11.2' }), /Update OpenClaw to 2026.11.5 or newer/);
   assert.throws(() => resolveAccount(cfg), /explicit configured account/);
   assert.equal(resolveAccount(configured(one)).agentId, 'main');
   assert.equal(resolveAccount(cfg, 'scout').tokenFile, two.tokenFile);
   assert.equal(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-a', 'alice'));
   assert.notEqual(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-b', 'alice'));
   assert.notEqual(sessionPeer('conversation-a', 'alice'), sessionPeer('conversation-a', 'bob'));
+});
+
+test('a newer native runtime is accepted when its channel interfaces are available', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const native = nativeHarness(cfg);
+  const channel = createChannel();
+  channel.setRuntime({ ...native.api, version: '2026.11.10' });
+  const incomplete = { ...native.api.channel, routing: {} };
+  await assert.rejects(channel.plugin.gateway.startAccount({ cfg, channelRuntime: incomplete }), /missing channel interfaces: routing.resolveAgentRoute/);
 });
 
 test('native inbound keeps account, conversation, person and group-member contexts separate', async t => {
@@ -243,6 +252,12 @@ test('missing native binding and unsupported controls have no hidden fallback di
   assert.equal(native.calls.dispatch.length, 0);
 });
 
+test('channel accounts sharing a socket folder get separate state folders by default', () => {
+  const account = id => ({ agentId: id, socket: `/sandbox/sockets/${id}.sock`, tokenFile: '/sandbox/token.json', home: `home.lab.${id}` });
+  const cfg = { channels: { enclos: { accounts: { first: account('first'), second: account('second') } } } };
+  assert.notEqual(resolveAccount(cfg, 'first').stateDir, resolveAccount(cfg, 'second').stateDir);
+});
+
 test('typing, exact tool events, native commands and policy requests keep their separate contracts', async t => {
   const account = accountFixture(t); const cfg = configured(account);
   const channel = createChannel({ commands: () => [{ name: 'help', description: 'Native help\non one line', acceptsArgs: false }, { name: 'sethome', description: 'excluded' }] });
@@ -284,6 +299,8 @@ test('typing, exact tool events, native commands and policy requests keep their 
   let live = true;
   const tool = toolFactory.create({ ...ctx, messageChannel: 'enclos', assertInvocationCurrent() { if (!live) throw new Error('retired invocation'); } });
   assert.equal(toolFactory.create({ sessionKey: 'unrelated', assertInvocationCurrent() {} }), null);
+  assert.match(tool.description, /policy request/);
+  assert.doesNotMatch(tool.description, /scope/);
   const result = await tool.execute('tool-call', { kind: 'read', target: requestedPath, action: 'Read the requested file' });
   const request = await owner.next('approval.request');
   assert.equal(request.id, result.details.request); assert.equal(result.details.status, 'requested');
@@ -314,6 +331,29 @@ test('files enter the native context and an HTML artefact leaves through ordinar
   assert.equal(outgoing.text, 'Open the page'); assert.equal(outgoing.attachments[0].mime, 'text/html');
   assert.equal(outgoing.attachments[0].name, 'answer.html');
   assert.equal(readFileSync(path.join(mediaFolder(account), outgoing.attachments[0].file), 'utf8'), '<!doctype html><p>Static answer</p>');
+});
+
+test('failed native and direct sends remove staged files', async t => {
+  const account = accountFixture(t), cfg = configured(account), folder = mediaFolder(account);
+  const sdk = {
+    mediaRoots: () => [path.dirname(account.socket)],
+    loadMedia: async () => ({ buffer: Buffer.from('test'), fileName: 'file.txt', contentType: 'text/plain' }),
+  };
+  const channel = createChannel(sdk), native = nativeHarness(cfg);
+  channel.setRuntime(native.api);
+  native.api.channel.inbound.dispatch = params => params.delivery.deliver({ mediaUrl: '/fixture.txt' });
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const ctx = { cfg, accountId: 'main', to: 'files', mediaUrl: '/fixture.txt' };
+  const fail = () => { assert.equal(readdirSync(folder).length, 1); throw new Error('send refused'); };
+  await assert.rejects(channel.plugin.outbound.sendMedia({ ...ctx, onPlatformSendDispatch: fail }), /send refused/);
+  assert.deepEqual(readdirSync(folder), []);
+  const active = channel.running.get('main');
+  active.transport.send = fail;
+  const input = message('message.in', { conversation: 'files', person: 'alice', text: 'hello' });
+  owner.send(input);
+  assert.equal((await owner.next('error', input.id)).code, 'agent_unavailable');
+  assert.deepEqual(readdirSync(folder), []);
 });
 
 test('native fallback rendering precedes delivery and rechecks the account after awaiting', async t => {
@@ -481,4 +521,16 @@ test('cancellation retains answering until native cleanup finishes and old peers
   assert.equal((await replacement.next('agent.activity')).doing.length, 1, 'an abort acknowledgement is not completed cleanup');
   finish();
   assert.deepEqual((await replacement.next('agent.activity')).doing, []);
+});
+
+test('native target resolution requires the owning caller', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const native = nativeHarness(cfg), channel = createChannel();
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const resolver = channel.plugin.messaging.targetResolver;
+  const params = { cfg, accountId: 'main', normalized: 'home' };
+  assert.equal(await resolver.resolveTarget(params), undefined);
+  assert.equal(await resolver.resolveTarget({ ...params, agentId: 'scout' }), undefined);
+  assert.deepEqual(await resolver.resolveTarget({ ...params, agentId: 'main' }), { to: account.home, kind: 'user' });
 });

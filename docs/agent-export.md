@@ -35,7 +35,7 @@ Hermes exports preserve raw profile files, memories, skills, plugin source, runt
 
 ## OpenClaw transfers
 
-OpenClaw 2026.11.3 exports use `openclaw-data-v1`. They preserve the native agent ID and require the same absolute sandbox home path on the destination: native database ownership and opaque Codex continuation records cannot currently be renamed or relocated through a supported native API. Use matching sandbox names and host user/home paths. The destination native agent and workspace must be fresh.
+OpenClaw 2026.11.5 or newer exports use `openclaw-data-v1`. They preserve the native agent ID and require the same absolute sandbox home path on the destination: native database ownership and opaque Codex continuation records cannot currently be renamed or relocated through a supported native API. Use matching sandbox names and host user/home paths. The destination native agent and workspace must be fresh.
 
 The adapter creates, verifies and restores native SQLite snapshots, retains per-agent Codex files and agent-scoped global Codex bindings, and materializes persisted shared provider logins into the destination agent’s local store through native APIs. Destination global accounts are retained. Workspaces, authored shared skills and shared home files are preserved; conflicting shared settings or files refuse the import. Enabled npm plugins with verified exact versions are installed for the destination CPU. Enabled local plugins and custom shared native session stores currently refuse export.
 
@@ -55,3 +55,16 @@ The framing remains the ASCII prefix `ENCLOS_AGENT_EXPORT_V1\n`, a four-byte big
 The Enclos section contains credential bindings, logical app history and attachments, and source policy context. It is bounded at 256 MiB; each app attachment is at most 25 MiB. The runtime section is bounded at 32 GiB, including both export passes and import validation. The Hermes exporter also enforces that bound as it writes. An export exceeding a bound fails explicitly and does not publish a partial file. Runtime payloads are streamed from the opened export into one protected staged file; the runtime reads that same file without another copy. Whole-file audit digests are computed during IO. Unsupported versions/formats, unknown fields, invalid names/photos, invalid cross-references, truncation, checksum mismatches and trailing bytes are refused before restoring data. Checksums detect corruption; they do not authenticate an export's author.
 
 Version 1 presentation-only exports remain readable. They do not acquire credentials or app history that were absent when written. Raw runtime imports through `agent add --from` retain the runtime's own export/import behavior, including any runtime redaction.
+
+
+OpenClaw imports require a destination at least as recent as the source runtime.
+The export keeps settings as native file references to enclos secrets. The
+destination creates fresh secret names, grants them to the imported agent and
+points the imported references at its protected secrets file. Older OpenClaw
+exports made before settings references were preserved need to be exported again.
+
+Run the import with `--dry-run` to see each npm package and its declared
+capabilities as part of the plan. To authorize the import, pass `--yes` and
+one `--accept-plugin PACKAGE@VERSION` flag for each listed package. enclos
+compares that list with the packages in the runtime archive before installing.
+The import quarantines ELF executables built for another architecture.

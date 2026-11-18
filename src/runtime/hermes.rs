@@ -54,6 +54,8 @@ const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/de
 const APP_PLUGIN_HELD_TASKS: &str = include_str!("../../channels/hermes/enclos/held_tasks.py");
 const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
 const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.py");
+const APP_PLUGIN_SUGGESTED_REPLIES: &str =
+    include_str!("../../channels/hermes/enclos/suggested_replies.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
@@ -344,6 +346,7 @@ impl RuntimeAdapter for Hermes {
                 file("held_tasks.py", APP_PLUGIN_HELD_TASKS)?,
                 file("visible.py", APP_PLUGIN_VISIBLE)?,
                 file("tasks.py", APP_PLUGIN_TASKS)?,
+                file("suggested_replies.py", APP_PLUGIN_SUGGESTED_REPLIES)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
@@ -416,6 +419,7 @@ impl RuntimeAdapter for Hermes {
             format: "hermes-data-v1",
             command: transfer("export", name, &archive, context),
             archive,
+            package_plan: None,
         })
     }
 
@@ -1346,6 +1350,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/held_tasks.py",
                 ".hermes/profiles/main/plugins/enclos/visible.py",
                 ".hermes/profiles/main/plugins/enclos/tasks.py",
+                ".hermes/profiles/main/plugins/enclos/suggested_replies.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );

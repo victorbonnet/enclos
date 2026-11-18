@@ -144,19 +144,7 @@ impl Engine {
         let source = runtime.agent_secrets_source(&agent, &secrets_file);
         let view = self.policy(name)?;
         let policy = &view.snapshot.policy;
-        let mut commands = match source {
-            Some(commands) => commands,
-            None if policy
-                .agent_secrets
-                .get(agent.as_str())
-                .is_some_and(|grants| !grants.is_empty()) =>
-            {
-                return Err(session(format!(
-                    "{shown} cannot set up the protected secrets granted to agent {agent}, so enclos changes none of its settings"
-                )));
-            }
-            None => Vec::new(),
-        };
+        let mut commands = secret_source_commands(source, policy, &agent, shown)?;
         let pending = view.pending.as_ref().map(|(_, p)| &p.policy);
         let set = |key: &str, value: &str| {
             let variable = value
@@ -637,5 +625,61 @@ mod tests {
         ] {
             assert!(!names_a_secret(plain), "{plain}");
         }
+    }
+}
+
+/// Prepare the agent's secret source before staging plugins or running any settings commands.
+fn secret_source_commands(
+    source: Option<Vec<SandboxCommand>>,
+    policy: &Policy,
+    agent: &RuntimeAgentName,
+    runtime: &str,
+) -> Result<Vec<SandboxCommand>> {
+    match source {
+        Some(commands) => Ok(commands),
+        None if policy
+            .agent_secrets
+            .get(agent.as_str())
+            .is_some_and(|grants| !grants.is_empty()) =>
+        {
+            Err(Error::Session {
+                what: format!(
+                    "{runtime} cannot set up the protected secrets granted to agent {agent}, so enclos changes none of its settings"
+                ),
+            })
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod secret_source_tests {
+    use super::*;
+
+    #[test]
+    fn plain_settings_need_no_agent_secret_source() {
+        let agent = RuntimeAgentName::new("scout").unwrap();
+        let commands = secret_source_commands(None, &Policy::default(), &agent, "runtime").unwrap();
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn a_missing_agent_secret_source_refuses_grants_before_settings_are_prepared() {
+        let agent = RuntimeAgentName::new("scout").unwrap();
+        let mut policy = Policy::default();
+        policy
+            .agent_secrets
+            .entry(agent.as_str().parse().unwrap())
+            .or_default()
+            .insert(
+                "EXAMPLE_TOKEN".to_owned(),
+                "secret:lab/example".parse().unwrap(),
+            );
+        let failure = secret_source_commands(None, &policy, &agent, "runtime").unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("cannot set up the protected secrets granted to agent scout")
+        );
     }
 }

@@ -114,6 +114,7 @@ fn connect_within(
             Capability::Abort,
             Capability::Activity,
             Capability::Tasks,
+            Capability::HeldTaskDetails,
             Capability::TaskDetails,
             Capability::Usage,
             Capability::HeldTasks,
@@ -475,6 +476,7 @@ mod tests {
                     send(
                         &mut out,
                         FromPlugin::MessageOut {
+                            suggested_replies: Vec::new(),
                             conversation,
                             text: format!("echo: {text}"),
                             kind: OutKind::Reply,
@@ -492,10 +494,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         ours.set_write_timeout(Some(Duration::from_millis(200)))
             .unwrap();
-        let mut writer = PluginWriter {
-            stream: ours,
-            lock: Arc::new(Mutex::new(())),
-        };
+        let mut writer = PluginWriter::for_test(ours);
         // The plugin reads nothing: a line far larger than the socket's
         // buffer times out after part of it was written.
         let conversation = ConversationId::new("c-1").unwrap();
@@ -630,6 +629,7 @@ mod tests {
 
     fn out_line(id: &str, text: &str) -> Vec<u8> {
         let body = FromPlugin::MessageOut {
+            suggested_replies: Vec::new(),
             conversation: ConversationId::new("c-1").unwrap(),
             text: text.into(),
             kind: OutKind::Reply,

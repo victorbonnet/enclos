@@ -4,6 +4,7 @@ use crate::bridge::store::MAX_MIME_BYTES;
 /// An agent's text in its own conversation, as the bridge stores it.
 fn agent_text(text: &str) -> ConversationMessage {
     ConversationMessage {
+        suggested_replies: Vec::new(),
         conversation: ConversationId::new("c-1").unwrap(),
         agent: "lab/main".to_owned(),
         from: "agent".to_owned(),
@@ -1132,6 +1133,15 @@ fn group_stop_targets_the_original_ingress_only_when_the_plugin_can_abort() {
 
         hub.group_stop(&store, "group");
         assert_eq!(hub.groups.lock().unwrap()["group"].state, "stopped");
+        let reason = hub.group_state(&store, "group").unwrap().reason;
+        if supports_abort {
+            assert!(reason.is_none());
+        } else {
+            assert_eq!(
+                reason.as_deref(),
+                Some("The run continues in the runtime. Its reply will be dropped.")
+            );
+        }
         assert_eq!(
             store
                 .turn_sent("original-ingress", "group", "main")
@@ -3799,6 +3809,7 @@ fn a_forgotten_device_is_unpaired_and_logged() {
 /// An agent's message in `c-1` of `lab/main`, as the plugin leg gives it.
 fn agent_says(text: &str) -> ConversationMessage {
     ConversationMessage {
+        suggested_replies: Vec::new(),
         question: None,
         held_task: None,
         conversation: ConversationId::new("c-1").unwrap(),

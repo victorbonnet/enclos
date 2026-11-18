@@ -54,6 +54,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "task_get",
         include_str!("fixtures/plugin/from_bridge_task_get.json"),
     ),
+    (
+        "from_bridge_task_get_held",
+        include_str!("fixtures/plugin/from_bridge_task_get_held.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -136,6 +140,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "task_detail",
         include_str!("fixtures/plugin/from_plugin_task_detail.json"),
+    ),
+    (
+        "from_plugin_message_out_suggested_replies",
+        include_str!("fixtures/plugin/from_plugin_message_out_suggested_replies.json"),
     ),
 ];
 

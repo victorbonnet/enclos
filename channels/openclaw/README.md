@@ -7,8 +7,8 @@ route to the host. Text and unsolicited output are baseline. Typing, native
 command discovery, files, exact tool events and sandbox policy requests are negotiated
 only when their native adapters/hooks have been registered.
 
-The package is tested against **OpenClaw 2026.11.3**. `PluginRuntime.version` is
-checked before activation: an untested version gets an actionable failure. The
+The package is tested against **OpenClaw 2026.11.5**. The channel requires
+that release or newer and checks the native interfaces at account startup. The
 SDK is experimental. This does not change enclos's installer-as-served policy.
 There are no runtime dependencies besides Node's standard library and the host's
 public `openclaw/plugin-sdk` entry points.
@@ -213,6 +213,11 @@ Live gateway/plugin loading, Seatbelt socket reachability and real model/schedul
 output are recorded separately in `prototype/m5/`; source/fixture tests alone do
 not establish those behaviors.
 
+The channel keeps the latest 10,000 inbound receipts per account and preserves
+in-flight receipts until dispatch finishes. It retains up to 4,096 conversation
+routes, keeping Home and routes with pending delivery. A new inbound message
+reestablishes an evicted route with the same native chat for that person.
+
 ## Answering activity
 
 The channel advertises `activity` and publishes `agent.activity` only when the
@@ -227,3 +232,7 @@ frames never enter the durable outbox, and account shutdown revokes reporting.
 This covers answering through this channel. It does not report CLI work,
 scheduled runs or native background tasks, and native deferred ingress is not
 a complete Gateway run inventory. `tasks` and `held_tasks` remain unavailable.
+
+Native message targets require the calling agent's identity. OpenClaw's target
+resolver can inherit that identity during an enclos dispatch. A target lookup
+with no authenticated dispatch or caller identity returns no enclos route.

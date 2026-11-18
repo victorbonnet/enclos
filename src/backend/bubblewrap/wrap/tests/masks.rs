@@ -42,19 +42,100 @@ fn a_denied_path_in_the_home_is_left_out_of_its_folders_and_the_rest_bound_back(
 }
 
 #[test]
-fn the_home_is_masked_after_the_root_and_before_the_compiled_rest() {
+fn a_home_reached_by_symlink_is_rebuilt_at_its_target_with_its_deny_masks() {
     let home = Home::new();
-    let c = compiled(&home, Lists::default());
+    let actual = home.user();
+    let alias = actual.with_file_name("via-link");
+    symlink(&actual, &alias).unwrap();
+    let denied = home.folder(".private");
+    let visible = home.file("visible");
+    let mut c = compiled(&home, Lists::default());
+    c.bubblewrap.root_masks.home = text(&alias);
+    c.bubblewrap.root_masks.denied =
+        vec![text(&alias.join(".private")), text(&alias.join(".enclos"))];
+
     let host = read(&home, &c, None).unwrap();
     let args = strings(&arguments(&c, &host, &[]));
-    let user = text(&home.user());
-    assert_eq!(&args[..2], ["--tmpfs", "/"]);
-    assert!(position(&args, &["--tmpfs", &user]) > 0);
-    let home_bind = position(&args, &["--bind", &text(&home.sandbox_home())]);
-    assert!(home_bind > position(&args, &["--tmpfs", &user]));
-    // Private staging paths have session-owned ancestors all the way to
-    // `/`, and those directories cannot be changed by the session.
-    assert!(position(&args, &["--remount-ro", "/"]) > home_bind);
+    assert!(host.hidden.contains(&denied));
+    let tmpfs = ["--tmpfs", actual.to_str().unwrap()];
+    assert_eq!(args.windows(2).filter(|words| *words == tmpfs).count(), 1);
+    position(&args, &["--remount-ro", &text(&actual)]);
+    position(&args, &["--symlink", &text(&actual), &text(&alias)]);
+    position(&args, &["--ro-bind-try", &text(&visible), &text(&visible)]);
+    assert!(!args.contains(&text(&denied)), "{args:?}");
+}
+
+#[test]
+fn the_root_view_builds_and_seals_each_home_ancestor_once() {
+    use crate::backend::bubblewrap::wrap::host::Entry;
+
+    let home = Home::new();
+    let mut c = compiled(&home, Lists::default());
+    c.bubblewrap.root_masks.home = "/home/alice".to_owned();
+    let mut host = Host::default();
+    host.entries.insert(
+        PathBuf::from("/"),
+        vec![
+            Entry {
+                name: "home".into(),
+                link: None,
+            },
+            Entry {
+                name: "usr".into(),
+                link: None,
+            },
+        ],
+    );
+    host.entries.insert(
+        PathBuf::from("/home"),
+        vec![Entry {
+            name: "alice".into(),
+            link: None,
+        }],
+    );
+    host.entries.insert(
+        PathBuf::from("/home/alice"),
+        vec![Entry {
+            name: "keep".into(),
+            link: None,
+        }],
+    );
+    let args = strings(&arguments(&c, &host, &[]));
+    let mut expected: Vec<String> = [
+        "--tmpfs",
+        "/",
+        "--tmpfs",
+        "/home",
+        "--tmpfs",
+        "/home/alice",
+        "--ro-bind-try",
+        "/home/alice/keep",
+        "/home/alice/keep",
+        "--ro-bind-try",
+        "/usr",
+        "/usr",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    expected.extend(c.bubblewrap.mounts.iter().cloned());
+    expected.extend(
+        [
+            "--remount-ro",
+            "/",
+            "--remount-ro",
+            "/home",
+            "--remount-ro",
+            "/home/alice",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    for dir in &c.bubblewrap.sealed {
+        expected.extend(["--remount-ro".to_owned(), dir.clone()]);
+    }
+    expected.extend(c.bubblewrap.options.iter().cloned());
+    assert_eq!(args, expected);
 }
 
 #[test]

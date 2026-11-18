@@ -83,6 +83,10 @@ _Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
 _Avoid_: main agent, root profile, default profile
 
+**Runtime default target**:
+The agent a runtime selects when a person omits the agent name. The selection can name a built-in agent or an ordinary agent.
+_Avoid_: built-in agent (for the selection)
+
 **Removed agent**:
 An agent that enclos has confirmed is gone from its host, with no runtime identity or data left, as after its sandbox was removed with its folder. The person's conversations with it remain until they are deleted.
 _Avoid_: deleted agent, orphan agent
@@ -221,6 +225,12 @@ _Avoid_: busy state, presence, status (enclos's own)
 **Question**:
 An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
 _Avoid_: runtime approval, policy request (different authority)
+
+**Open item**:
+A question, runtime approval, held task or policy request still waiting for a person on a host. An unanswered ordinary question can remain an open item after its native waiting call expires.
+
+**Suggested reply**:
+An agent's proposed literal response to an ordinary message, which a person can choose to send as their own message.
 
 **Held task**:
 Background work an agent's runtime started that has stopped and waits for a person before it runs again. The runtime keeps it; the app shows it and may resume it.

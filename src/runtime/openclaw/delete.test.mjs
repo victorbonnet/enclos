@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deleteAgent } from './delete.mjs';
+import { deleteAgent, ownerSdk } from './delete.mjs';
 
 function fixture() {
   const ref = { source: 'file', provider: 'enclos-sandbox', id: '/OPENCLAW_GATEWAY_TOKEN' };
@@ -26,10 +26,19 @@ test('owner deletion resolves the configured native ref and authenticates only t
   assert.deepEqual(f.params.env, envBefore);
 });
 
-test('missing auth, wrong target and failed readiness refuse before mutation', async () => {
-  for (const invalidate of [f => { f.sourceConfig.gateway.mode = 'remote'; }, f => { f.params.env.OPENCLAW_GATEWAY_PORT = '18789'; }, f => { f.params.resolveSecret = async () => ({}); }, f => { f.params.callGateway = async (method) => { f.calls.push({ method }); throw new Error('failure'); }; }]) {
-    const f = fixture(); invalidate(f);
-    await assert.rejects(deleteAgent(f.params), /Start this sandbox/);
+test('unusable settings and a failed readiness check report why mutation was refused', async () => {
+  const cases = [
+    [f => { f.params.readConfig = async () => ({ snapshot: { valid: false } }); }, /invalid native settings/],
+    [f => { f.sourceConfig.gateway.mode = 'remote'; }, /requires a local Gateway/],
+    [f => { delete f.sourceConfig.gateway.auth; }, /requires Gateway token or password/],
+    [f => { f.params.env.OPENCLAW_GATEWAY_PORT = '18789'; }, /Start this sandbox/],
+    [f => { f.params.resolveSecret = async () => ({}); }, /could not resolve its configured Gateway secret/],
+    [f => { f.params.callGateway = async method => { f.calls.push({ method }); throw new Error('failure'); }; }, /Start this sandbox/],
+  ];
+  for (const [invalidate, message] of cases) {
+    const f = fixture();
+    invalidate(f);
+    await assert.rejects(deleteAgent(f.params), message);
     assert.equal(f.calls.some(c => c.method === 'agents.delete'), false);
   }
 });
@@ -39,4 +48,17 @@ test('an ambiguous native deletion failure is never retried or sent through anot
   f.params.callGateway = async method => { f.calls.push({ method }); if (method === 'agents.delete') throw new Error('connection lost'); return {}; };
   await assert.rejects(deleteAgent(f.params));
   assert.deepEqual(f.calls.map(c => c.method), ['health', 'agents.delete']);
+});
+
+test('the owner helper checks the minimum and names a missing native capability', async () => {
+  const sdk = {
+    'config-mutation': { readConfigFileSnapshotForWrite() {} },
+    'secret-input-runtime': { resolveConfiguredSecretInputString() {} },
+    'gateway-runtime': { callGatewayFromCli() {} },
+  };
+  const load = async name => sdk[name];
+  await assert.rejects(ownerSdk('2026.11.3', load), /Update OpenClaw to 2026.11.5 or newer/);
+  assert.equal((await ownerSdk('2026.11.10', load)).callGateway, sdk['gateway-runtime'].callGatewayFromCli);
+  sdk['gateway-runtime'] = {};
+  await assert.rejects(ownerSdk('2026.11.10', load), /missing callGatewayFromCli/);
 });

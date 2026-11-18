@@ -1128,6 +1128,7 @@ mod tests {
             assert!(fallback.contains("Always allow"));
             assert!(!fallback.contains("skip"));
             let body = ToDevice::Message(ConversationMessage {
+                suggested_replies: Vec::new(),
                 conversation: info().conversation,
                 agent: "lab/main".into(),
                 from: "agent".into(),

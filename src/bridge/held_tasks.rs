@@ -43,6 +43,8 @@ struct Pending {
 
 #[derive(Default)]
 pub(super) struct HeldTaskRequests {
+    #[cfg(test)]
+    before_open: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     /// Each agent's current plugin connection, as `held_task_connected` saw it.
     connections: HashMap<String, String>,
     pending: HashMap<String, Pending>,
@@ -209,9 +211,12 @@ impl Hub {
             .ensure_home(agent, host.as_deref().unwrap_or(""), host.is_some())
             .map_err(internal)?;
         self.record_unrecorded(store, Some(agent));
+        // The same lock linearizes capability updates with resume admission and dispatch.
+        let admission = self.held_tasks.lock().expect("not poisoned");
         let changes = store
             .report_held_tasks(agent, &home, &tasks)
             .map_err(internal)?;
+        drop(admission);
         self.publish_held(store, changes);
         Ok(())
     }
@@ -262,8 +267,23 @@ impl Hub {
                 return;
             }
         };
+        let owners: std::collections::HashSet<_> =
+            changes.iter().map(|c| c.card.owner.clone()).collect();
         for change in changes {
             let owner = change.card.owner.clone();
+            if let Some(message) = &change.message
+                && message.kind == "notify"
+                && change.card.info.state == HeldTaskState::Held
+            {
+                self.push_if_away(
+                    store,
+                    &owner,
+                    &change.card.info.agent,
+                    change.card.info.conversation.as_str(),
+                    message.seq,
+                    &format!("Needs you: {}", change.card.info.title),
+                );
+            }
             let mut frames = vec![ToDevice::HeldTask {
                 held_task: change.card.info,
             }];
@@ -290,6 +310,9 @@ impl Hub {
                     }
                 }
             }
+        }
+        for owner in owners {
+            self.publish_open_items(store, &owner);
         }
     }
 
@@ -350,6 +373,28 @@ impl Hub {
         let card = self
             .resume_authority(store, device, person, &request)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
+        // Said only to whoever may resume the card as it is, and before the
+        // channel is opened: the runtime is not asked.
+        if !card.info.resumable {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This task cannot be resumed from the app. Nothing was sent.",
+            ));
+        }
+        #[cfg(test)]
+        {
+            let checkpoint = self
+                .held_tasks
+                .lock()
+                .expect("not poisoned")
+                .before_open
+                .take();
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.0.wait();
+                checkpoint.1.wait();
+            }
+        }
         let requester = Person::new(person)
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e.to_string()))?;
         // Opened if it is not: a resume is live, but the connection may
@@ -410,6 +455,19 @@ impl Hub {
                     "The agent's channel is disconnected. Nothing was sent.",
                 )
             })?;
+        // Opening a channel may have taken time. Read authority again under the
+        // lock that reports hold through their store write, and retain it through
+        // admission/audit and the actual send: no accepted revocation can slip in.
+        let card = self
+            .resume_authority(store, device, person, &request)
+            .map_err(|(code, why)| failure(original.clone(), code, why))?;
+        if !card.info.resumable {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This task cannot be resumed from the app. Nothing was sent.",
+            ));
+        }
         let pending = Pending {
             device: device.id.clone(),
             person: person.into(),
@@ -425,7 +483,6 @@ impl Hub {
             return Err(failure(original, ErrorCode::Internal, NOT_READ));
         }
         requests.pending.insert(rpc.to_string(), pending);
-        drop(requests);
         let sent = out.lock().expect("not poisoned").writer.send_with_id(
             rpc.clone(),
             FromBridge::HeldTaskResume {
@@ -435,6 +492,7 @@ impl Hub {
                 device: device.id.clone(),
             },
         );
+        drop(requests);
         if let Err(e) = sent {
             let taken = self.take_pending(&request.agent, None, &rpc);
             if let Some((key, pending)) = taken {
@@ -755,7 +813,7 @@ pub(super) fn acknowledge_report(
 mod tests {
     use super::*;
     use enclos_protocol::held_task::HeldTaskInfo;
-    use enclos_protocol::plugin::decode_from_bridge;
+    use enclos_protocol::plugin::{decode_from_bridge, decode_from_plugin};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -823,6 +881,7 @@ mod tests {
             since: 1_763_000_000,
             revision: HeldTaskRevision::new("e:7").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
+            resumable: true,
         }
     }
 
@@ -934,6 +993,40 @@ mod tests {
         next(rx);
         next(rx);
         (plugin, from_bridge)
+    }
+
+    #[test]
+    fn a_resume_revoked_while_opening_the_channel_has_no_admission_side_effects() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        let checkpoint = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        hub.held_tasks.lock().unwrap().before_open = Some(Arc::clone(&checkpoint));
+        let worker_hub = Arc::clone(&hub);
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("revoked-before-admission").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        checkpoint.0.wait();
+        // The same opaque runtime hold gets a new bridge revision when capability
+        // is revoked. An in-flight request must recheck it after opening.
+        hub.held_tasks_report(&store, AGENT, vec![not_resumable("t1")])
+            .unwrap();
+        checkpoint.1.wait();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(resume_lines(&store).is_empty());
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(
+            from_bridge
+                .try_iter()
+                .all(|f| !matches!(f.body, FromBridge::HeldTaskResume { .. }))
+        );
     }
 
     #[test]
@@ -1074,6 +1167,545 @@ mod tests {
         assert!(
             resume_lines(&store).is_empty(),
             "nothing was sent, nothing logged"
+        );
+    }
+
+    fn not_resumable(id: &str) -> HeldTask {
+        HeldTask {
+            resumable: false,
+            resume: "Decide on the agent's task board.".into(),
+            ..task(id)
+        }
+    }
+
+    /// A card the runtime says cannot be resumed from the app: the host's
+    /// person's resume of it, current, is answered `unsupported` before any
+    /// channel is opened, with nothing logged, pending or changed.
+    #[test]
+    fn a_task_not_resumable_here_is_refused_before_the_channel_is_opened() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[not_resumable("t1")])
+            .unwrap();
+        // `Hub::plugin` counts a generation before it opens anything, even
+        // an opening that then fails: unchanged, it was not called.
+        let generations = hub.generations.load(Ordering::Relaxed);
+        // No plugin listens: what answers is the card, not the channel.
+        let error = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            (error.code, error.of.as_ref().map(MessageId::as_str)),
+            (ErrorCode::Unsupported, Some("tap"))
+        );
+        assert!(error.message.contains("cannot be resumed from the app"));
+        assert_eq!(hub.generations.load(Ordering::Relaxed), generations);
+        assert!(hub.opening.lock().unwrap().is_empty());
+        assert!(!hub.plugins.lock().unwrap().contains_key(AGENT));
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(&store).is_empty());
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert_eq!(
+            (
+                card.info.state,
+                card.info.revision,
+                card.runtime_revision.as_str()
+            ),
+            (HeldTaskState::Held, 0, "e:7")
+        );
+    }
+
+    /// Whether it can be resumed is said only to whoever may resume the card
+    /// as it is: every other request is answered as before.
+    #[test]
+    fn a_task_not_resumable_here_is_answered_as_any_card_to_whoever_may_not_resume_it() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[not_resumable("t1")])
+            .unwrap();
+        let answer = |device: &Device, person: &str, request: ResumeRequest| {
+            hub.held_task_resume(
+                &store,
+                device,
+                person,
+                MessageId::new("tap").unwrap(),
+                request,
+            )
+            .unwrap_err()
+            .code
+        };
+        let guest = device("guest-phone", GUEST);
+        store.add_device(&guest).unwrap();
+        let unpaired = device("tablet", OWNER);
+        let other_noise = Device {
+            noise_key: b"another noise key".to_vec(),
+            ..phone.clone()
+        };
+        let other_signing = Device {
+            device_key: b"another signing key".to_vec(),
+            ..phone.clone()
+        };
+        let elsewhere = ResumeRequest {
+            agent: "lab/other".into(),
+            ..resume("t1", 0)
+        };
+        assert_eq!(
+            [
+                answer(&guest, GUEST, resume("t1", 0)),
+                answer(&unpaired, OWNER, resume("t1", 0)),
+                answer(&other_noise, OWNER, resume("t1", 0)),
+                answer(&other_signing, OWNER, resume("t1", 0)),
+                answer(&phone, OWNER, resume("t9", 0)),
+                answer(&phone, OWNER, elsewhere),
+                answer(&phone, OWNER, resume("t1", 1)),
+                answer(&phone, OWNER, resume("t1", 0)),
+            ],
+            [
+                ErrorCode::NotAllowed,
+                ErrorCode::NotAllowed,
+                ErrorCode::NotAllowed,
+                ErrorCode::NotAllowed,
+                ErrorCode::NotFound,
+                ErrorCode::NotFound,
+                ErrorCode::Conflict,
+                ErrorCode::Unsupported,
+            ]
+        );
+        // No longer held: a conflict, as for any card.
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[])
+            .unwrap();
+        assert_eq!(answer(&phone, OWNER, resume("t1", 1)), ErrorCode::Conflict);
+        // Held again, then the host's person changes: not theirs to resume.
+        store
+            .report_held_tasks(AGENT, &home_id(AGENT), &[not_resumable("t1")])
+            .unwrap();
+        assert_eq!(
+            answer(&phone, OWNER, resume("t1", 2)),
+            ErrorCode::Unsupported
+        );
+        store.set_host(GUEST).unwrap();
+        assert_eq!(
+            answer(&phone, OWNER, resume("t1", 2)),
+            ErrorCode::NotAllowed
+        );
+        assert!(!hub.plugins.lock().unwrap().contains_key(AGENT));
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(&store).is_empty());
+    }
+
+    /// A card not resumable here in another person's Home reads, to the
+    /// host's person, exactly as a card that does not exist: no oracle.
+    #[test]
+    fn another_persons_card_not_resumable_here_reads_as_an_unknown_one() {
+        let (_dir, hub, store, phone, _rx) = fixture();
+        const THEIRS: &str = "lab/theirs";
+        store.ensure_home(THEIRS, GUEST, true).unwrap();
+        store
+            .report_held_tasks(THEIRS, &home_id(THEIRS), &[not_resumable("t1")])
+            .unwrap();
+        let theirs = store.held_task(THEIRS, "t1").unwrap().unwrap();
+        assert_eq!(
+            (theirs.owner.as_str(), theirs.info.resumable),
+            (GUEST, false)
+        );
+        let generations = hub.generations.load(Ordering::Relaxed);
+        let answer = |request: ResumeRequest| {
+            hub.held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                request,
+            )
+            .unwrap_err()
+        };
+        let other = answer(ResumeRequest {
+            agent: THEIRS.into(),
+            ..resume("t1", 0)
+        });
+        let unknown = answer(resume("t9", 0));
+        assert_eq!(other.code, ErrorCode::NotFound);
+        assert_eq!(other, unknown);
+        assert_eq!(hub.generations.load(Ordering::Relaxed), generations);
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+        assert!(resume_lines(&store).is_empty());
+        assert_eq!(store.held_task(THEIRS, "t1").unwrap().unwrap(), theirs);
+    }
+
+    /// Writes `line` to the bridge as the plugin, as it is: what `say`
+    /// cannot, a message the protocol's types would not make.
+    fn say_raw(writer: &mut UnixStream, line: &serde_json::Value) {
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+    }
+
+    /// A report whose `resumable` is not a JSON boolean is refused whole,
+    /// on the socket, answered to its id: the card already held stays as it
+    /// was, nothing is released, and a valid report after it is read.
+    #[test]
+    fn a_report_whose_resumable_is_not_a_boolean_is_refused_and_releases_nothing() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = fake_plugin(&hub, vec![Capability::HeldTasks]);
+        say(
+            &mut plugin,
+            "report-1",
+            FromPlugin::HeldTasks {
+                tasks: vec![not_resumable("t1")],
+            },
+        );
+        plugin_frame(&from_bridge);
+        assert!(!card(next(&rx)).resumable);
+        next(&rx);
+        let before = store.held_task(AGENT, "t1").unwrap().unwrap();
+        let seq = store.newest_seq().unwrap();
+        for (n, bad) in [
+            serde_json::Value::Null,
+            serde_json::json!("false"),
+            serde_json::json!("true"),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([false]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("bad-{n}");
+            let mut listed = serde_json::to_value(not_resumable("t1")).unwrap();
+            listed["resumable"] = bad.clone();
+            say_raw(
+                &mut plugin,
+                &serde_json::json!({"v": 1, "id": id, "type": "held_tasks", "tasks": [listed]}),
+            );
+            let answer = plugin_frame(&from_bridge);
+            let FromBridge::Error(error) = answer.body else {
+                panic!("{bad}: refused, not {:?}", answer.body);
+            };
+            assert_eq!(
+                (error.of.as_ref().map(MessageId::as_str), error.code),
+                (Some(id.as_str()), ErrorCode::BadMessage),
+                "{bad}"
+            );
+            assert_eq!(
+                store.held_task(AGENT, "t1").unwrap().unwrap(),
+                before,
+                "{bad}"
+            );
+            assert_eq!(store.newest_seq().unwrap(), seq, "{bad}: no history");
+            assert!(rx.try_recv().is_err(), "{bad}: no device heard of it");
+        }
+        assert_eq!(store.held_tasks_for(OWNER).unwrap(), [before]);
+        // A valid report after them is read: the same task, held anew.
+        say(
+            &mut plugin,
+            "report-2",
+            FromPlugin::HeldTasks {
+                tasks: vec![HeldTask {
+                    reason: "Blocked again".into(),
+                    revision: HeldTaskRevision::new("e:8").unwrap(),
+                    ..task("t1")
+                }],
+            },
+        );
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::Ack { ref of } if of.as_str() == "report-2"
+        ));
+        let changed = card(next(&rx));
+        assert_eq!(
+            (
+                changed.state,
+                changed.revision,
+                changed.resumable,
+                changed.reason.as_str()
+            ),
+            (HeldTaskState::Held, 1, true, "Blocked again")
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(store.newest_seq().unwrap(), seq);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::HeldTaskResume { ref revision, .. } if revision.as_str() == "e:8"
+        ));
+    }
+
+    /// Only `resumable` changes, at the same runtime revision: the card is
+    /// sent once each way with the bridge's revision advanced, with no
+    /// message, and the same report again sends nothing.
+    #[test]
+    fn a_change_of_resumable_alone_is_sent_once_each_way_with_no_message() {
+        let (_dir, hub, store, _phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        let seq = store.newest_seq().unwrap();
+        for (n, (resumable, revision)) in [(false, 1), (true, 2)].into_iter().enumerate() {
+            let listed = HeldTask {
+                resumable,
+                ..task("t1")
+            };
+            for again in 0..2 {
+                let id = format!("report-{n}-{again}");
+                say(
+                    &mut plugin,
+                    &id,
+                    FromPlugin::HeldTasks {
+                        tasks: vec![listed.clone()],
+                    },
+                );
+                assert!(matches!(
+                    plugin_frame(&from_bridge).body,
+                    FromBridge::Ack { ref of } if *of.as_str() == id
+                ));
+                if again == 0 {
+                    let changed = card(next(&rx));
+                    assert_eq!(
+                        (changed.resumable, changed.revision, changed.state),
+                        (resumable, revision, HeldTaskState::Held)
+                    );
+                }
+                assert!(
+                    rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                    "{id}: no message, and a repeat sends nothing"
+                );
+                let stored = store.held_task(AGENT, "t1").unwrap().unwrap();
+                assert_eq!(
+                    (
+                        stored.info.resumable,
+                        stored.info.revision,
+                        stored.runtime_revision.as_str()
+                    ),
+                    (resumable, revision, "e:7")
+                );
+                assert_eq!(store.newest_seq().unwrap(), seq, "{id}: no history");
+            }
+        }
+    }
+
+    /// A card that turned not resumable while its resume ran: the result,
+    /// and the same request's replay, carry `resumable: false` on the wire.
+    #[test]
+    fn a_result_and_its_replay_carry_a_card_that_is_not_resumable() {
+        use enclos_protocol::device::decode_to_device;
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = reported(&hub, &rx);
+        let original = MessageId::new("tap").unwrap();
+        hub.held_task_resume(&store, &phone, OWNER, original.clone(), resume("t1", 0))
+            .unwrap();
+        let sent = plugin_frame(&from_bridge);
+        say(
+            &mut plugin,
+            "report-2",
+            FromPlugin::HeldTasks {
+                tasks: vec![HeldTask {
+                    resumable: false,
+                    ..task("t1")
+                }],
+            },
+        );
+        plugin_frame(&from_bridge);
+        assert!(!card(next(&rx)).resumable);
+        say(
+            &mut plugin,
+            "resumed",
+            FromPlugin::HeldTaskResumed { of: sent.id },
+        );
+        let resumed = card(next(&rx));
+        assert_eq!(
+            (resumed.state, resumed.revision, resumed.resumable),
+            (HeldTaskState::Resumed, 2, false)
+        );
+        let ToDevice::Message(_) = next(&rx) else {
+            panic!("the quiet line");
+        };
+        let answer = next(&rx);
+        assert!(matches!(&answer, ToDevice::HeldTaskResult { of, .. } if *of == original));
+        let on_the_wire = |answer: &ToDevice| {
+            let line = encode_line(&Envelope::new(
+                MessageId::new("out").unwrap(),
+                answer.clone(),
+            ));
+            let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(value["held_task"]["resumable"], false, "{value}");
+            assert_eq!(decode_to_device(&line).unwrap().body, *answer);
+        };
+        on_the_wire(&answer);
+        hub.held_task_resume(&store, &phone, OWNER, original, resume("t1", 0))
+            .unwrap();
+        let replay = next(&rx);
+        assert_eq!(replay, answer);
+        on_the_wire(&replay);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// From the plugin's JSON to a reopened store, a task not resumable
+    /// here stays so at every step, cut to the bridge's bounds.
+    #[test]
+    fn a_task_not_resumable_here_stays_so_and_bounded_from_its_report_to_a_reopened_store() {
+        let (dir, hub, store, _phone, rx) = fixture();
+        let mut listed = serde_json::to_value(not_resumable("t1")).unwrap();
+        listed["title"] = format!("Pay \u{202E}gpj.exe{}", "x".repeat(500)).into();
+        listed["resume"] = format!("Decide\u{200B} on the\nboard {}", "y".repeat(500)).into();
+        listed["resumable"] = false.into();
+        let line =
+            serde_json::json!({"v": 1, "id": "report-1", "type": "held_tasks", "tasks": [listed]});
+        let bounded = |title: &str, resume: &str, resumable: bool, at: &str| {
+            assert!(!resumable, "{at}");
+            assert!(
+                title.chars().count() <= enclos_protocol::held_task::MAX_TITLE_CHARS,
+                "{at}"
+            );
+            assert!(
+                resume.chars().count() <= enclos_protocol::held_task::MAX_RESUME_CHARS,
+                "{at}"
+            );
+            for text in [title, resume] {
+                assert!(
+                    !text.contains(['\u{202E}', '\u{200B}', '\n']),
+                    "{at}: {text:?}"
+                );
+            }
+        };
+        // Decoded.
+        let FromPlugin::HeldTasks { tasks } = decode_from_plugin(line.to_string().as_bytes())
+            .unwrap()
+            .body
+        else {
+            panic!("a report");
+        };
+        assert!(!tasks[0].resumable);
+        // Accepted.
+        let accepted = accept(tasks).unwrap();
+        bounded(
+            &accepted[0].title,
+            &accepted[0].resume,
+            accepted[0].resumable,
+            "accepted",
+        );
+        // Through the socket, stored and sent.
+        let (mut plugin, from_bridge) = fake_plugin(&hub, vec![Capability::HeldTasks]);
+        say_raw(&mut plugin, &line);
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::Ack { .. }
+        ));
+        let sent = card(next(&rx));
+        bounded(&sent.title, &sent.resume, sent.resumable, "sent");
+        assert_eq!(
+            (sent.title.as_str(), sent.resume.as_str()),
+            (accepted[0].title.as_str(), accepted[0].resume.as_str())
+        );
+        // Read again from the database by a store opened afresh.
+        drop(store);
+        let reopened = Store::open(&dir.path().join("app.db")).unwrap();
+        let stored = reopened.held_task(AGENT, "t1").unwrap().unwrap();
+        bounded(
+            &stored.info.title,
+            &stored.info.resume,
+            stored.info.resumable,
+            "reopened",
+        );
+        assert_eq!(stored.info, sent);
+        assert_eq!(reopened.held_tasks_for(OWNER).unwrap()[0].info, sent);
+    }
+
+    /// With the channel connected, a task it reports as not resumable here
+    /// is not sent to it; one it reports resumable, or says nothing of, is,
+    /// once.
+    #[test]
+    fn a_connected_channel_is_sent_only_the_resume_of_a_resumable_task() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (mut plugin, from_bridge) = fake_plugin(&hub, vec![Capability::HeldTasks]);
+        // t2 as an older plugin lists it: with no `resumable` at all.
+        let mut silent = serde_json::to_value(task("t2")).unwrap();
+        assert_eq!(
+            silent.as_object_mut().unwrap().remove("resumable"),
+            Some(true.into())
+        );
+        say_raw(
+            &mut plugin,
+            &serde_json::json!({"v": 1, "id": "report-1", "type": "held_tasks",
+                "tasks": [serde_json::to_value(not_resumable("t1")).unwrap(), silent]}),
+        );
+        assert!(matches!(
+            plugin_frame(&from_bridge).body,
+            FromBridge::Ack { .. }
+        ));
+        let first = card(next(&rx));
+        assert!(!first.resumable);
+        let ToDevice::Message(introduction) = next(&rx) else {
+            panic!("the card's message");
+        };
+        assert_eq!(
+            introduction.text,
+            "Held task: Task t1\nGave up after 3 failures\nDecide on the agent's task board."
+        );
+        assert!(card(next(&rx)).resumable);
+        next(&rx);
+        let error = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap-1").unwrap(),
+                resume("t1", 0),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "nothing reaches the runtime"
+        );
+        // The same request again: the same answer, still nothing sent.
+        let again = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap-1").unwrap(),
+                resume("t1", 0),
+            )
+            .unwrap_err();
+        assert_eq!(again.code, ErrorCode::Unsupported);
+        // A resumable task's resume is sent, once.
+        let original = MessageId::new("tap-2").unwrap();
+        hub.held_task_resume(&store, &phone, OWNER, original.clone(), resume("t2", 0))
+            .unwrap();
+        let sent = plugin_frame(&from_bridge);
+        assert_eq!(sent.id, rpc_id("phone", OWNER, &original));
+        assert!(matches!(
+            sent.body,
+            FromBridge::HeldTaskResume { ref task, .. } if task.as_str() == "t2"
+        ));
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(300))
+                .is_err()
+        );
+        assert_eq!(resume_lines(&store), ["lab/main t2 requested"]);
+        assert_eq!(
+            state(&store, "t1"),
+            HeldTaskState::Held,
+            "the card not resumable here is as it was"
         );
     }
 
@@ -1226,14 +1858,16 @@ mod tests {
         use enclos_protocol::noise::{Initiator, Responder, generate_keypair};
         let (_dir, hub, store, phone, rx) = fixture();
         let home = home_id(AGENT);
+        // t2 is not resumable from the app: its card says so at every sync.
         store
-            .report_held_tasks(AGENT, &home, &[task("t1"), task("t2")])
+            .report_held_tasks(AGENT, &home, &[task("t1"), not_resumable("t2")])
             .unwrap();
         let introduced = store.newest_seq().unwrap();
         // t1 is no longer held: its quiet line comes after `introduced`.
         store
-            .report_held_tasks(AGENT, &home, &[task("t2")])
+            .report_held_tasks(AGENT, &home, &[not_resumable("t2")])
             .unwrap();
+        let newest = store.newest_seq().unwrap();
         let bridge_key = generate_keypair().unwrap();
         let device_key = generate_keypair().unwrap();
         let mut initiator = Initiator::new(&device_key.private, &bridge_key.public).unwrap();
@@ -1267,7 +1901,10 @@ mod tests {
         let mut sync = |since| {
             let message = encode_line(&Envelope::new(
                 MessageId::new(format!("sync-{since}")).unwrap(),
-                FromDevice::Sync { since },
+                FromDevice::Sync {
+                    since,
+                    open_items: false,
+                },
             ));
             socket
                 .send(Message::Binary(
@@ -1291,19 +1928,28 @@ mod tests {
             messages
         };
         let after = sync(introduced);
-        let held: Vec<_> = after
-            .iter()
-            .filter_map(|m| match m {
-                ToDevice::HeldTask { held_task } if held_task.state == HeldTaskState::Held => {
-                    Some(held_task.task.as_str())
-                }
-                _ => None,
-            })
-            .collect();
+        let held = |messages: &[ToDevice]| -> Vec<(String, bool)> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    ToDevice::HeldTask { held_task } if held_task.state == HeldTaskState::Held => {
+                        Some((held_task.task.as_str().to_owned(), held_task.resumable))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         assert_eq!(
-            held,
-            ["t2"],
+            held(&after),
+            [("t2".to_owned(), false)],
             "a held card, though its message predates since"
+        );
+        // The highest since: nothing new, and still the held card, as it is.
+        let latest = sync(newest);
+        assert_eq!(held(&latest), [("t2".to_owned(), false)]);
+        assert!(
+            !latest.iter().any(|m| matches!(m, ToDevice::Message(_))),
+            "no line past the newest"
         );
         let line = after
             .iter()
@@ -1325,6 +1971,17 @@ mod tests {
                     matches!(&all[index - 1], ToDevice::HeldTask { held_task } if held_task.task == *task),
                     "each line comes after its card's state"
                 );
+                if task.as_str() == "t2" {
+                    // Its card, before it, is not resumable, and its text
+                    // offers no Resume.
+                    assert!(
+                        matches!(&all[index - 1], ToDevice::HeldTask { held_task } if !held_task.resumable)
+                    );
+                    assert_eq!(
+                        message.text,
+                        "Held task: Task t2\nGave up after 3 failures\nDecide on the agent's task board."
+                    );
+                }
             }
         }
         assert_eq!(linked, 3, "two holds and one release");

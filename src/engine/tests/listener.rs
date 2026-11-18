@@ -170,7 +170,7 @@ fn a_configured_service_port_does_not_have_to_be_ephemeral() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::SingleLoopback,
+        ListenerPorts::Loopback(ports[0]),
     );
     let unchanged = service_listener(
         engine.state.as_ref(),
@@ -188,7 +188,7 @@ fn a_configured_service_port_does_not_have_to_be_ephemeral() {
 #[test]
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
-    let (child, _) = gateway(&engine, &name, 2);
+    let (child, port) = gateway(&engine, &name, 2);
     let got = service_listener(
         engine.state.as_ref(),
         &name,
@@ -201,53 +201,14 @@ fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::SingleLoopback,
+        ListenerPorts::Loopback(port),
     );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
         "{got:?}"
     );
-    assert!(
-        matches!(&configured, Err(NoPort::Refused(why)) if why.contains("listens on 2 ports")),
-        "{configured:?}"
-    );
-}
-
-#[test]
-fn a_declared_service_port_is_owned_even_with_auxiliary_listeners() {
-    let (_dir, engine, name) = with_sandbox();
-    let (child, port) = gateway(&engine, &name, 3);
-    let selected = service_listener(
-        engine.state.as_ref(),
-        &name,
-        "gateway",
-        &Network::Host,
-        ListenerPorts::Loopback(port),
-    );
-    let absent = service_listener(
-        engine.state.as_ref(),
-        &name,
-        "gateway",
-        &Network::Host,
-        ListenerPorts::Loopback(0),
-    );
-    let (foreign, foreign_ports) = perl(&listening(1, "127.0.0.1"), 1);
-    let wrong_owner = service_listener(
-        engine.state.as_ref(),
-        &name,
-        "gateway",
-        &Network::Host,
-        ListenerPorts::Loopback(foreign_ports[0]),
-    );
-    end(foreign);
-    end(child);
-    assert_eq!(selected, Ok(port));
-    assert!(matches!(absent, Err(NoPort::NotYet(_))), "{absent:?}");
-    assert!(
-        matches!(wrong_owner, Err(NoPort::NotYet(_))),
-        "{wrong_owner:?}"
-    );
+    assert_eq!(configured, Ok(port));
 }
 
 #[test]
@@ -293,7 +254,7 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::SingleLoopback,
+        ListenerPorts::Loopback(12345),
     );
     assert!(
         matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
@@ -327,7 +288,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::SingleLoopback,
+        ListenerPorts::Loopback(held[0]),
     );
     end(child);
     assert!(
@@ -375,13 +336,6 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         "gateway",
         &Network::Host,
-        ListenerPorts::SingleLoopback,
-    );
-    let declared = service_listener(
-        engine.state.as_ref(),
-        &name,
-        "gateway",
-        &Network::Host,
         ListenerPorts::Loopback(port[0]),
     );
     end(owner);
@@ -395,7 +349,6 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         matches!(&configured, Err(NoPort::Refused(why)) if why.contains("also listens at 127.0.0.1")),
         "{configured:?}"
     );
-    assert!(matches!(declared, Err(NoPort::Refused(_))), "{declared:?}");
 }
 
 fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatus {
@@ -491,4 +444,42 @@ fn a_proxy_port_is_never_a_sessions_service_port() {
     assert!(outside_proxy_range(PORT_FIRST).is_err());
     assert!(outside_proxy_range(PORT_LAST).is_err());
     assert_eq!(outside_proxy_range(61374), Ok(61374));
+}
+
+#[test]
+fn a_second_sandbox_does_not_select_another_sandbox_declared_listener() {
+    let (_dir, engine, first) = with_sandbox();
+    let second = "other".parse::<SandboxName>().unwrap();
+    done(
+        engine
+            .create_sandbox(
+                &alice(),
+                crate::engine::SandboxSpec {
+                    name: second.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "assistant".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let (first_service, first_port) = gateway(&engine, &first, 1);
+    let (second_service, second_port) = gateway(&engine, &second, 1);
+    let select = |sandbox, port| {
+        service_listener(
+            engine.state.as_ref(),
+            sandbox,
+            "gateway",
+            &Network::Host,
+            ListenerPorts::Loopback(port),
+        )
+    };
+    let first_result = select(&first, first_port);
+    let second_result = select(&second, second_port);
+    let other_result = select(&second, first_port);
+    end(first_service);
+    end(second_service);
+    assert_eq!(first_result, Ok(first_port));
+    assert_eq!(second_result, Ok(second_port));
+    assert!(matches!(other_result, Err(NoPort::NotYet(_))));
 }

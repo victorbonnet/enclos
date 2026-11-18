@@ -1,3 +1,4 @@
+import { bridgeApprovalFixtureKey } from './helpers.js';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -49,7 +50,13 @@ test('the installed public SDK registers the package and builds isolated session
 test('the combined channel registers the native approval context with its actual persisted route', { skip: !installed }, async t => {
   const load = name => import(pathToFileURL(path.join(installed, `dist/plugin-sdk/${name}.js`)));
   const [delivery, handler, contexts, routing] = await Promise.all(['approval-delivery-runtime', 'approval-handler-runtime', 'channel-runtime-context', 'routing'].map(load));
-  const account = accountFixture(t), cfg = { channels: { enclos: { accounts: { main: account } } },
+  const sandbox = process.env.ENCLOS_SANDBOX;
+  process.env.ENCLOS_SANDBOX = 'lab';
+  t.after(() => {
+    if (sandbox === undefined) delete process.env.ENCLOS_SANDBOX;
+    else process.env.ENCLOS_SANDBOX = sandbox;
+  });
+  const account = { ...accountFixture(t), bridgeKey: bridgeApprovalFixtureKey }, cfg = { channels: { enclos: { accounts: { main: account } } },
     agents: { ownership: 'explicit', entries: { main: {} } }, bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] };
   let registration, disposed = false;
   const nativeApprovals = createNativeApprovals({ ...delivery, ...handler, ...contexts,
@@ -272,23 +279,27 @@ test('the native message target resolver accepts owned bridge conversations with
   const account = accountFixture(t), cfg = { channels: { enclos: { accounts: { main: account } } },
     agents: { ownership: 'explicit', entries: { main: {} } }, bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] };
   const channel = createChannel();
+  const targets = [];
+  let resolve;
   channel.setRuntime({ version: TESTED_OPENCLAW, config: { current: () => cfg }, channel: { routing,
     inbound: { ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true } }) },
-      buildContext: value => value, dispatch: async () => {} } } });
+      buildContext: value => value, dispatch: async () => {
+        for (const input of [account.home, `enclos:${account.home}`, 'home', conversation, 'home.other.scout', 'alice@example.com']) {
+          targets.push(await resolve(input));
+        }
+      } } } });
   const abort = new AbortController(), lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: 'main', abortSignal: abort.signal, setStatus() {} });
   t.after(async () => { abort.abort(); await lifetime; });
   await waitFor(() => existsSync(account.socket));
   const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
-  const resolve = input => resolveTarget({ cfg, channel: 'enclos', accountId: 'main', plugin: channel.plugin, input });
-  for (const input of [account.home, `enclos:${account.home}`, 'home']) {
-    const result = await resolve(input);
-    assert.equal(result.ok, true, `${input} must resolve through the native message tool`);
-    assert.equal(result.target.to, account.home);
-  }
+  resolve = input => resolveTarget({ cfg, channel: 'enclos', accountId: 'main', plugin: channel.plugin, input });
   const conversation = '433e2a62-bbcb-46e6-ae80-ff16bc3ad239';
   const input = message('message.in', { conversation, person: 'alice', text: 'fixture only' });
   owner.send(input); await owner.next('ack', input.id);
-  const resolved = await resolve(conversation);
+  assert.deepEqual(targets.slice(0, 3).map(result => result.target?.to), [account.home, account.home, account.home]);
+  const resolved = targets[3];
+  assert.equal(targets[4].ok, false);
+  assert.equal(targets[5].ok, false);
   assert.equal(resolved.target.to, conversation);
   const sent = await channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: resolved.target.to,
     text: 'native message-tool delivery fixture', replyToId: input.id });
@@ -297,11 +308,13 @@ test('the native message target resolver accepts owned bridge conversations with
   assert.equal(delivered.conversation, conversation);
   assert.equal(delivered.reply_to, input.id);
   assert.equal(delivered.kind, 'reply');
-  assert.equal((await resolve('home.other.scout')).ok, false);
-  assert.equal((await resolve('alice@example.com')).ok, false);
+  const target = channel.plugin.messaging.targetResolver;
+  const params = { cfg, accountId: 'main', normalized: account.home };
+  assert.equal(await target.resolveTarget(params), undefined);
+  assert.equal(await target.resolveTarget({ ...params, agentId: 'scout' }), undefined);
   cfg.channels.enclos.accounts.main = { ...account, agentId: 'scout',
     socket: `${account.socket}.new`, tokenFile: `${account.tokenFile}.new`, stateDir: `${account.stateDir}.new` };
-  await assert.rejects(resolve(account.home), /stopped or reconfigured/);
+  await assert.rejects(target.resolveTarget({ ...params, agentId: 'scout' }), /stopped or reconfigured/);
   await assert.rejects(channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: account.home, text: 'must not send' }), /stopped or reconfigured/);
   abort.abort(); await lifetime;
   assert.equal((await resolve(account.home)).ok, false, 'a stopped account cannot resolve a target');

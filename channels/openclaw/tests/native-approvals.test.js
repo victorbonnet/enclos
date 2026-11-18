@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
@@ -6,7 +7,10 @@ import { createNativeApprovals } from '../native-approvals.js';
 import { message } from '../protocol.js';
 
 const modern = { capabilities: ['runtime_approvals', 'runtime_approval_scopes'] };
-const account = { accountId: 'main', agentId: 'main' };
+const bridgeKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+const { x, y } = bridgeKey.publicKey.export({ format: 'jwk' });
+const publicKey = Buffer.concat([Buffer.from([4]), Buffer.from(x, 'base64url'), Buffer.from(y, 'base64url')]).toString('base64url');
+const account = { accountId: 'main', agentId: 'main', bridgeKey: publicKey };
 const sessionKeyFor = conversation => `agent:main:enclos:main:direct:${conversation}`;
 const nativeRequest = (overrides = {}) => ({ id: '7f8f0830-5598-4930-b4a5-2e9cd4effc50', createdAtMs: Date.now() - 100,
   expiresAtMs: Date.now() + 60000, request: { command: 'printf "complete command"', cwd: '/workspace', host: 'gateway',
@@ -31,6 +35,7 @@ function transport(saved) {
 
 function fixture(t, { hello = modern, saved, resolve, timeout, beforeAuthorize } = {}) {
   const wire = transport(saved); wire.bridgeHello = hello;
+  const warnings = [], decisions = [];
   let adapter, capability, context, disposed = false, current = true, calls = 0, authorized;
   const sdk = {
     CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY: 'approval.native',
@@ -38,7 +43,7 @@ function fixture(t, { hello = modern, saved, resolve, timeout, beforeAuthorize }
     createChannelApprovalCapability(spec) { return capability = spec; },
     registerChannelRuntimeContext(params) { context = params.context; return { dispose() { disposed = true; } }; },
     async resolveApprovalOverGateway(params) {
-      calls++;
+      calls++; decisions.push(params.decision);
       assert.equal(params.channel, 'enclos'); assert.equal(params.senderId, 'alice'); assert.equal(params.accountId, 'main');
       assert.equal(params.approvalKind, 'exec');
       if (beforeAuthorize) await beforeAuthorize();
@@ -48,12 +53,12 @@ function fixture(t, { hello = modern, saved, resolve, timeout, beforeAuthorize }
     },
   };
   const factory = createNativeApprovals(sdk, { ...(timeout ? { requestTimeoutMs: timeout } : {}) });
-  const controller = factory.attach(account, wire, { cfg: {}, channelRuntime: {}, sessionKeyFor,
+  const controller = factory.attach(account, wire, { sandbox: 'lab', log: { warn: text => warnings.push(text) }, cfg: {}, channelRuntime: {}, sessionKeyFor,
     assertCurrent() { if (!current) throw new Error('account replaced'); } });
   t.after(() => controller.close());
   let currentNative;
   const base = () => ({ accountId: 'main', cfg: {}, context });
-  return { wire, controller, factory, adapter, capability,
+  return { wire, controller, factory, adapter, capability, warnings, decisions,
     calls: () => calls, authorized: () => authorized, disposed: () => disposed, revoke() { current = false; },
     async deliver(request = nativeRequest(), view = viewFor(request)) {
       currentNative = request;
@@ -69,8 +74,21 @@ function fixture(t, { hello = modern, saved, resolve, timeout, beforeAuthorize }
   };
 }
 
-const answer = (delivery, action = 'once', fields = {}) => message('question.answer', { question: delivery.entry.question,
-  conversation: 'one', answer: { kind: 'approval', action }, ...fields });
+function signedAnswer(delivery, control, { at = Math.floor(Date.now() / 1000), key = bridgeKey.privateKey } = {}) {
+  const { command, reason } = delivery.definition.approval;
+  const fields = ['enclos/runtime-approval/1', 'lab/main', control.conversation, control.question, control.id,
+    control.answer.action, command, reason, '0', String(at)];
+  const statement = Buffer.concat(fields.map(field => {
+    const data = Buffer.from(field, 'utf8');
+    const result = Buffer.alloc(4 + data.length);
+    result.writeUInt32BE(data.length); data.copy(result, 4);
+    return result;
+  }));
+  return { ...control, signed: { at, sig: sign('sha256', statement, { key, dsaEncoding: 'ieee-p1363' }).toString('base64url') } };
+}
+
+const answer = (delivery, action = 'once', fields = {}) => signedAnswer(delivery, message('question.answer', { question: delivery.entry.question,
+  conversation: 'one', answer: { kind: 'approval', action }, ...fields }));
 const last = wire => wire.frames.at(-1);
 
 test('native actions and full command survive; exact canonical resolution alone yields an answer receipt', async t => {
@@ -79,8 +97,8 @@ test('native actions and full command survive; exact canonical resolution alone 
   assert.deepEqual(delivery.definition.approval.actions, ['once', 'always', 'deny']);
   assert.equal(delivery.definition.approval.command, delivery.request.request.command);
   assert.match(delivery.definition.approval.reason, /Native warning/);
-  assert.match(delivery.definition.approval.scopes.description, /executable and argument/);
-  assert.doesNotMatch(delivery.definition.approval.scopes.description, /session|exact argv/);
+  assert.match(delivery.definition.approval.scopes.description, /resolved executable, exact arguments and working directory/);
+  assert.doesNotMatch(delivery.definition.approval.scopes.description, /session/);
   const control = answer(delivery, 'always');
   await f.controller.handleControl(control);
   assert.equal(f.calls(), 1); assert.equal(last(f.wire).state, 'answered');
@@ -88,17 +106,42 @@ test('native actions and full command survive; exact canonical resolution alone 
   const receipt = last(f.wire);
   await f.controller.handleControl(control);
   assert.equal(f.calls(), 1); assert.deepEqual(last(f.wire), receipt);
-  await assert.rejects(f.controller.handleControl({ ...control, answer: { kind: 'approval', action: 'deny' } }), { code: 'conflict' });
+  await assert.rejects(f.controller.handleControl({ ...control, answer: { kind: 'approval', action: 'deny' } }), { code: 'not_allowed' });
 });
 
-test('unoffered session, extra fields, wrong conversation and unbound native commands cannot resolve', async t => {
+test('unoffered session, extra fields and unbound native commands cannot resolve', async t => {
   const f = fixture(t), delivery = await f.deliver();
   for (const control of [answer(delivery, 'session'), answer(delivery, 'once', { answer: { kind: 'approval', action: 'once', extra: true } })]) {
     await assert.rejects(f.controller.handleControl(control), { code: 'bad_message' });
   }
-  await assert.rejects(f.controller.handleControl(answer(delivery, 'once', { conversation: 'two' })), { code: 'conflict' });
   assert.equal((await f.capability.authorizeActorActionAsync({ accountId: 'main', senderId: 'alice', approvalKind: 'exec', request: delivery.request })).authorized, false);
   assert.equal(f.calls(), 0);
+});
+
+test('only a fresh bridge signature for this exact approval can authorize it', async t => {
+  const otherKey = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+  for (const variant of ['unsigned', 'wrong key', 'stale', 'changed action', 'different conversation', 'different request', 'different approval']) {
+    const f = fixture(t), delivery = await f.deliver();
+    const control = answer(delivery);
+    let invalid;
+    switch (variant) {
+      case 'unsigned': invalid = { ...control, signed: undefined }; break;
+      case 'wrong key': invalid = signedAnswer(delivery, control, { key: otherKey }); break;
+      case 'stale': invalid = signedAnswer(delivery, control, { at: Math.floor(Date.now() / 1000) - 61 }); break;
+      case 'changed action': invalid = { ...control, answer: { kind: 'approval', action: 'always' } }; break;
+      case 'different conversation': invalid = { ...control, conversation: 'two' }; break;
+      case 'different request': invalid = { ...control, id: 'different-request' }; break;
+      case 'different approval': {
+        const second = await f.deliver({ ...nativeRequest(), id: 'second-request' });
+        invalid = { ...control, question: second.entry.question };
+        break;
+      }
+    }
+    await assert.rejects(f.controller.handleControl(invalid), { code: 'not_allowed' }, variant);
+    assert.deepEqual(f.decisions, ['deny'], variant);
+    assert.equal(f.warnings.length, 1, variant);
+    assert.equal(last(f.wire).state, 'resolved', variant);
+  }
 });
 
 test('routes require exact account, agent, source, session, owner and local host', async t => {
@@ -301,7 +344,7 @@ test('installed public SDK delivers authoritative views and canonical resolver p
         return outcome(request);
       } } });
     } });
-  const controller = factory.attach(account, wire, { cfg: {}, sessionKeyFor, assertCurrent() {},
+  const controller = factory.attach(account, wire, { sandbox: 'lab', cfg: {}, sessionKeyFor, assertCurrent() {},
     channelRuntime: { runtimeContexts: { register(params) { context = params.context; assert.equal(params.capability, 'approval.native'); return { dispose() {} }; } } } });
   t.after(() => controller.close());
   const runtime = await handler.createChannelApprovalHandlerFromCapability({ capability: factory.approvalCapability,
@@ -313,7 +356,7 @@ test('installed public SDK delivers authoritative views and canonical resolver p
   assert.ok(ask); assert.equal(ask.question.approval.command, request.request.command);
   assert.deepEqual(ask.question.approval.actions, ['once', 'always', 'deny']);
   const control = message('question.answer', { question: ask.question.id, conversation: 'one', answer: { kind: 'approval', action: 'once' } });
-  await controller.handleControl(control);
+  await controller.handleControl(signedAnswer({ definition: ask.question }, control));
   assert.equal(calls, 1); assert.equal(last(wire).state, 'answered'); assert.equal(last(wire).of, control.id);
   await runtime.handleResolved({ id: request.id, decision: 'allow-once', ts: Date.now(), request: request.request });
   const oneShot = nativeRequest({ ask: 'always' }); oneShot.id = 'native-one-shot';

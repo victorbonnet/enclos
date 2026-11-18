@@ -289,6 +289,38 @@ class DetailTest(unittest.TestCase):
                 conn.execute("DELETE FROM tasks")
 
 
+class HeldDetailTest(unittest.TestCase):
+    def test_review_board_without_db_path_uses_the_pinned_native_resolver(self):
+        with tempfile.TemporaryDirectory() as folder:
+            board=Scratch(folder)
+            board.task("same-id","blocked",assignee="reviewer",created_by="lead",body="Exact board")
+            native=types.SimpleNamespace(DEFAULT_BOARD="default",list_tasks=lambda:[],list_boards=lambda **_: [{"slug":"app"}],kanban_db_path=lambda slug: board.path,pin_first_board_resolution=contextlib.nullcontext)
+            package=types.ModuleType("hermes_cli");package.kanban_db=native
+            constants=types.SimpleNamespace(profile_name_for_home=lambda _:"lead")
+            with patch.dict(sys.modules,{"hermes_cli":package,"hermes_cli.kanban_db":native,"hermes_constants":constants}):
+                actual=tasks.hermes_board(Path(folder),"enclos")
+                self.assertEqual(actual.held_detail("app/same-id")["body"],"Exact board")
+
+    def test_exact_board_reference_and_creator_with_description_and_comments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first, second = Scratch(folder), Scratch(folder)
+            for board, text in ((first, "First board"), (second, "Second board")):
+                board.task("same-id", "blocked", assignee="reviewer", created_by="lead", body=text)
+                board.comment("same-id", "reviewer", text + " comment", NOW)
+            board = tasks.Board("lead", lambda: [first.path, second.path], "enclos",
+                                held_boards=lambda: [("default", first.path), ("app", second.path)],
+                                default_board="default")
+            self.assertEqual(board.held_detail("app/same-id")["body"], "Second board")
+            self.assertEqual(board.held_detail("app/same-id")["comments"][0]["text"], "Second board comment")
+            self.assertEqual(board.held_detail("same-id")["body"], "First board")
+            self.assertIsNone(board.held_detail("missing/same-id"))
+            second.set("same-id", created_by="other")
+            self.assertIsNone(board.held_detail("app/same-id"))
+            self.assertEqual(board.held_detail("default/same-id")["body"], "First board")
+            first.set("same-id", status="archived")
+            self.assertIsNone(board.held_detail("same-id"))
+
+
 class ListTest(unittest.TestCase):
     def task(self, n, state="queued", since=NOW):
         return {"id": f"t-{n}", "title": "x", "assignee": "engineer", "state": state, "since": since}

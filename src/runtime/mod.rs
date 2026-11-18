@@ -87,6 +87,8 @@ pub struct RuntimeExport {
     pub format: &'static str,
     pub command: SandboxCommand,
     pub archive: PathBuf,
+    /// The optional export sidecar containing exact package specs, never secrets.
+    pub package_plan: Option<PathBuf>,
 }
 
 /// A command that runs inside a sandbox, under its policy. Anyone can make
@@ -306,8 +308,7 @@ pub trait RuntimeAdapter {
     fn services(&self) -> Vec<RuntimeService>;
     /// The service that listens in the sandbox, whose port the sandbox's
     /// sessions then reach (ADR 0028). `None` (the default): the runtime has
-    /// no service its sessions must reach. The sandbox's allocated proxy
-    /// port lets an adapter declare the same port its launcher configures.
+    /// no service its sessions must reach.
     fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         None
     }
@@ -695,12 +696,7 @@ pub enum ListenerPorts {
     /// A bind on port 0, as Hermes uses. Fixed auxiliary listeners outside
     /// the host's ephemeral range do not become candidates.
     Ephemeral,
-    /// The service uses a configured port rather than a bind on port 0.
-    /// Exactly one positive port at 127.0.0.1 must be held by its recorded
-    /// root process. Multiple ports are refused rather than guessed among.
-    SingleLoopback,
-    /// The adapter knows the exact port its launcher configures. Auxiliary
-    /// sockets do not become candidates; recorded ownership is still required.
+    /// The exact IPv4 loopback port configured by the runtime launcher.
     Loopback(u16),
 }
 

@@ -13,6 +13,20 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "held_task.get")]
+    HeldTaskGet { agent: String, task: HeldTaskId },
+    /// Hide only this reminder; no native request is resolved or resumed.
+    #[serde(rename = "open_item.dismiss")]
+    OpenItemDismiss {
+        kind: crate::open_items::OpenItemKind,
+        item: String,
+        #[serde(default)]
+        agent: Option<String>,
+        version: String,
+    },
+    /// Close discovery of an expired information question; native state stays expired.
+    #[serde(rename = "question.close")]
+    QuestionClose { question: QuestionId, revision: u64 },
     #[serde(rename = "question.answer")]
     QuestionAnswer {
         question: QuestionId,
@@ -202,7 +216,11 @@ pub enum FromDevice {
     #[serde(rename = "attachment.get")]
     AttachmentGet { attachment: String, offset: u64 },
     #[serde(rename = "sync")]
-    Sync { since: i64 },
+    Sync {
+        since: i64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open_items: bool,
+    },
     #[serde(rename = "push.token")]
     PushTokenUpdate(PushToken),
     /// The person forgets this host on the device: the bridge unpairs the
@@ -230,9 +248,12 @@ pub const USAGE_SERIES: &str = "usage.series";
 pub const AGENT_FORGET: &str = "agent.forget";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "question.close",
+    "open_item.dismiss",
     "question.answer",
     "held_task.resume",
     "task.get",
+    "held_task.get",
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -275,6 +296,26 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "open_item.dismissed")]
+    OpenItemDismissed {
+        of: MessageId,
+        kind: crate::open_items::OpenItemKind,
+        item: String,
+        #[serde(default)]
+        agent: Option<String>,
+        version: String,
+    },
+    #[serde(rename = "question.closed")]
+    QuestionClosed { of: MessageId, question: QuestionId },
+    #[serde(rename = "open_items")]
+    OpenItems {
+        revision: u64,
+        reset: bool,
+        complete: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unavailable: bool,
+        items: Vec<crate::open_items::OpenItem>,
+    },
     #[serde(rename = "question")]
     Question {
         question: crate::question::QuestionInfo,
@@ -476,6 +517,9 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "question.closed",
+    "open_item.dismissed",
+    "open_items",
     "question",
     "question.result",
     "held_task",
@@ -716,6 +760,12 @@ pub struct RuntimeInfo {
 /// One message of a conversation, sent or received alike.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMessage {
+    #[serde(
+        default,
+        deserialize_with = "crate::suggested_replies::deserialize",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub suggested_replies: Vec<String>,
     pub conversation: ConversationId,
     pub agent: String,
     /// `agent`, or the person who wrote it.
@@ -804,6 +854,7 @@ mod tests {
 
     fn agent_text(text: &str) -> ConversationMessage {
         ConversationMessage {
+            suggested_replies: Vec::new(),
             question: None,
             held_task: None,
             conversation: ConversationId::new("c-1").unwrap(),
@@ -965,13 +1016,30 @@ mod tests {
                 capabilities: vec![Capability::RuntimeApprovalScopes],
             },
             FromDevice::Agents,
+            FromDevice::HeldTaskGet {
+                agent: "lab/lead".into(),
+                task: crate::HeldTaskId::new("app/t_same").unwrap(),
+            },
+            FromDevice::QuestionClose {
+                question: crate::QuestionId::new("q1").unwrap(),
+                revision: 2,
+            },
+            FromDevice::OpenItemDismiss {
+                kind: crate::open_items::OpenItemKind::Question,
+                item: "q1".into(),
+                agent: Some("lab/main".into()),
+                version: "question:1".into(),
+            },
             FromDevice::Audit { before: None },
             FromDevice::Audit { before: Some(42) },
             FromDevice::MessageSend {
                 conversation: ConversationId::new("c-1").unwrap(),
                 text: "hi".into(),
             },
-            FromDevice::Sync { since: 4 },
+            FromDevice::Sync {
+                since: 4,
+                open_items: false,
+            },
             FromDevice::GroupNew {
                 conversation: ConversationId::new("g-1").unwrap(),
                 members: vec!["lab/main".into(), "lab/coder".into()],
@@ -1007,6 +1075,7 @@ mod tests {
             Err(DecodeError::Bad { .. })
         ));
         let body = ToDevice::Message(ConversationMessage {
+            suggested_replies: Vec::new(),
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
             from: "agent".into(),
@@ -1268,6 +1337,22 @@ mod tests {
         let wire = encode_line(&Envelope::new(MessageId::new("r2").unwrap(), list.clone()));
         assert_eq!(decode_to_device(&wire).unwrap().body, list);
         assert_eq!(AGENT_FORGET, "agent.forget");
+    }
+    #[test]
+    fn invalid_optional_reply_metadata_never_hides_the_message() {
+        let message = agent_text("Still readable");
+        for replies in [
+            serde_json::json!(["Same", "Same"]),
+            serde_json::json!([1]),
+            serde_json::json!(["two\nlines"]),
+            serde_json::json!("not an array"),
+        ] {
+            let mut json = serde_json::to_value(&message).unwrap();
+            json["suggested_replies"] = replies;
+            let decoded: ConversationMessage = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.text, "Still readable");
+            assert!(decoded.suggested_replies.is_empty());
+        }
     }
 }
 

@@ -40,6 +40,8 @@ mod group_turns;
 mod held_tasks;
 #[path = "models.rs"]
 mod models;
+#[path = "open_items.rs"]
+mod open_items;
 #[path = "policy.rs"]
 mod policy;
 #[path = "questions.rs"]
@@ -203,6 +205,8 @@ struct Hub {
     deletion_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     deletion_jobs: Mutex<HashSet<(String, String)>>,
     questions: Mutex<questions::QuestionRequests>,
+    open_items: Mutex<HashMap<String, u64>>,
+    open_item_devices: Mutex<HashSet<String>>,
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     /// Task details asked of plugins for devices.
@@ -470,6 +474,8 @@ impl Hub {
             opening: Mutex::new(HashMap::new()),
             opening_all: AtomicBool::new(false),
             questions: Mutex::new(Default::default()),
+            open_items: Mutex::new(HashMap::new()),
+            open_item_devices: Mutex::new(HashSet::new()),
             held_tasks: Mutex::new(Default::default()),
             task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
@@ -987,6 +993,7 @@ impl Hub {
                         questions::acknowledge_question(&mut acks, &message.id, result);
                     }
                     FromPlugin::MessageOut {
+                        suggested_replies,
                         conversation,
                         text,
                         kind,
@@ -1079,6 +1086,11 @@ impl Hub {
                             From::Agent
                         };
                         let whole = ConversationMessage {
+                            suggested_replies: if kind == "status" {
+                                vec![]
+                            } else {
+                                suggested_replies
+                            },
                             question: None,
                             held_task: None,
                             conversation: conversation.clone(),
@@ -1359,7 +1371,14 @@ impl Hub {
         let media = self.media();
         let taken = take_attachments(home, &media, &whole.agent, conversation, attachments)?;
         let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
-        let seqs = match store.add_pieces(&pieces, conversation, from, &whole.kind, &stored) {
+        let seqs = match store.add_pieces_with_replies(
+            &pieces,
+            conversation,
+            from,
+            &whole.kind,
+            &stored,
+            &whole.suggested_replies,
+        ) {
             Ok(Some(seqs)) => seqs,
             // Stored meanwhile, with copies of its own: the plugin's are
             // no longer needed either.
@@ -1404,6 +1423,11 @@ impl Hub {
                     ToDevice::Message(ConversationMessage {
                         text,
                         seq,
+                        suggested_replies: if Some(seq) == last {
+                            whole.suggested_replies.clone()
+                        } else {
+                            vec![]
+                        },
                         attachments: std::mem::take(&mut files),
                         ..whole.clone()
                     }),
@@ -1541,6 +1565,7 @@ pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<T
         .map(attachment_info)
         .collect();
     Ok(ToDevice::Message(ConversationMessage {
+        suggested_replies: m.suggested_replies,
         question: m.question,
         held_task: m.held_task,
         conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
@@ -2376,6 +2401,10 @@ fn connection(
             ));
         }
     };
+    hub.open_item_devices
+        .lock()
+        .expect("not poisoned")
+        .remove(&device.id);
     link.send(ToDevice::Authenticated {
         person: person.clone(),
         capabilities: hub.capabilities(&person),
@@ -2735,6 +2764,37 @@ fn run_session(
                     }
                 }
             }
+            FromDevice::OpenItemDismiss {
+                kind,
+                item,
+                agent,
+                version,
+            } => {
+                let result = hub.dismiss_open_item(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    open_items::ReminderRef {
+                        kind,
+                        id: &item,
+                        agent: agent.as_deref(),
+                        version: &version,
+                    },
+                );
+                link.send(result.unwrap_or_else(ToDevice::Error))?;
+            }
+            FromDevice::QuestionClose { question, revision } => {
+                let result = hub.question_close(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    question,
+                    revision,
+                );
+                link.send(result.unwrap_or_else(ToDevice::Error))?;
+            }
             FromDevice::QuestionAnswer {
                 question,
                 revision,
@@ -2768,6 +2828,18 @@ fn run_session(
                 };
                 if let Err(error) = hub.held_task_resume(store, device, person, message.id, request)
                 {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::HeldTaskGet { agent, task } => {
+                if let Err(error) = hub.held_task_get(
+                    store,
+                    device,
+                    person,
+                    message.id.clone(),
+                    agent,
+                    task.to_string(),
+                ) {
                     link.send(ToDevice::Error(error))?;
                 }
             }
@@ -3068,7 +3140,13 @@ fn run_session(
                 }
                 Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
             },
-            FromDevice::Sync { since } => {
+            FromDevice::Sync { since, open_items } => {
+                if open_items {
+                    hub.open_item_devices
+                        .lock()
+                        .expect("not poisoned")
+                        .insert(device.id.clone());
+                }
                 for id in store.deletions(person).map_err(|e| e.to_string())? {
                     if let Ok(conversation) = ConversationId::new(id) {
                         link.send(ToDevice::ConversationDeleted { conversation })?;
@@ -3113,10 +3191,13 @@ fn run_session(
                     }
                 }
                 // Pending cards must refresh even when their introduction predates `since`.
-                for question in store
-                    .pending_questions_for(person)
-                    .map_err(|e| e.to_string())?
-                {
+                let questions = if open_items {
+                    store.open_questions_for(person)
+                } else {
+                    store.pending_questions_for(person)
+                }
+                .map_err(|e| e.to_string())?;
+                for question in questions {
                     if link.supports_question(&question.info.definition)
                         && hub.shows_question(person, &question.info.definition)
                     {
@@ -3145,6 +3226,11 @@ fn run_session(
                 // higher `seq`
                 let newest = store.newest_seq().map_err(|e| e.to_string())?;
                 let last = send_history(hub, store, link, &device.id, person, since)?;
+                if open_items {
+                    for frame in hub.open_item_frames(store, person)? {
+                        link.send(frame)?;
+                    }
+                }
                 link.send(ToDevice::Synced { seq: last })?;
                 // What was stored meanwhile is in the history above, or
                 // comes after it. A `since` past every stored message (an
@@ -4050,6 +4136,7 @@ fn send(
         .is_some();
     let name = format!("{sandbox}/{agent}");
     let echo = ConversationMessage {
+        suggested_replies: Vec::new(),
         question: None,
         held_task: None,
         conversation: conversation.clone(),
@@ -4088,7 +4175,11 @@ fn send(
             let text = echo.text.clone();
             hub.deliver(
                 person,
-                ToDevice::Message(ConversationMessage { seq, ..echo }),
+                ToDevice::Message(ConversationMessage {
+                    suggested_replies: Vec::new(),
+                    seq,
+                    ..echo
+                }),
             );
             hub.group_said(store, conversation.as_str(), seq, &text);
         }
@@ -4108,7 +4199,11 @@ fn send(
     {
         hub.deliver(
             person,
-            ToDevice::Message(ConversationMessage { seq, ..echo }),
+            ToDevice::Message(ConversationMessage {
+                suggested_replies: Vec::new(),
+                seq,
+                ..echo
+            }),
         );
     }
     Ok(hub.forward(store, &name).err().map(|e| {
@@ -4143,6 +4238,7 @@ mod connection_end_tests {
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs
     /// answering `node`.
     struct Bridge {
+        hub: Arc<Hub>,
         port: u16,
         public: Vec<u8>,
         store: PathBuf,
@@ -4217,8 +4313,10 @@ mod connection_end_tests {
         let hub = Arc::new(hub);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || serve_on(listener, hub, Duration::from_millis(100)));
+        let server_hub = Arc::clone(&hub);
+        std::thread::spawn(move || serve_on(listener, server_hub, Duration::from_millis(100)));
         Bridge {
+            hub,
             port,
             public: keys.public,
             store,
@@ -4304,6 +4402,10 @@ mod connection_end_tests {
 
         /// The next message, conversations' details included.
         fn receive_any(&mut self) -> Option<ToDevice> {
+            self.receive_any_with_timeout_message("nothing from the bridge in time")
+        }
+
+        fn receive_any_with_timeout_message(&mut self, timeout_message: &str) -> Option<ToDevice> {
             loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
@@ -4316,7 +4418,7 @@ mod connection_end_tests {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        panic!("nothing from the bridge in time")
+                        panic!("{timeout_message}")
                     }
                     Err(_) => return None,
                 }
@@ -4420,6 +4522,7 @@ mod connection_end_tests {
                             answer(FromPlugin::Ack { of: message.id });
                             if long {
                                 answer(FromPlugin::MessageOut {
+                                    suggested_replies: Vec::new(),
                                     conversation,
                                     text: "é".repeat(150_000),
                                     kind: OutKind::Reply,
@@ -4434,6 +4537,120 @@ mod connection_end_tests {
             }
         });
         got
+    }
+
+    #[test]
+    fn authentication_clears_the_previous_connections_open_items_subscription() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let (mut first, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        first.send(
+            "subscribe",
+            FromDevice::Sync {
+                since: 0,
+                open_items: true,
+            },
+        );
+        loop {
+            if matches!(first.receive(), Some(ToDevice::Synced { .. })) {
+                break;
+            }
+        }
+        assert!(
+            bridge
+                .hub
+                .open_item_devices
+                .lock()
+                .unwrap()
+                .contains(&phone.id)
+        );
+        first.socket.close(None).unwrap();
+        let (_next, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(
+            !bridge
+                .hub
+                .open_item_devices
+                .lock()
+                .unwrap()
+                .contains(&phone.id)
+        );
+    }
+
+    #[test]
+    fn publishing_a_question_preserves_live_updates_and_reconnect_sync() {
+        use enclos_protocol::QuestionId;
+        use enclos_protocol::question::QuestionDefinition;
+
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("owned", "lab", "main", PERSON).unwrap();
+
+        let sync = |device: &mut PhoneLink| {
+            device.send(
+                "sync-questions",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: true,
+                },
+            );
+            let mut saw_question = false;
+            loop {
+                match device.receive().expect("the bridge closed during sync") {
+                    ToDevice::OpenItems { items, .. } => {
+                        saw_question |= items.iter().any(|item| item.id == "live-question");
+                    }
+                    ToDevice::Synced { .. } => return saw_question,
+                    _ => {}
+                }
+            }
+        };
+        let (mut device, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(!sync(&mut device));
+
+        let hub = Arc::clone(&bridge.hub);
+        let publishing = std::thread::spawn(move || {
+            let origin = questions::Origin {
+                agent: "lab/main",
+                connection: "test-plugin",
+            };
+            hub.question_connected(None, origin, &[Capability::Questions]);
+            hub.question_ask(
+                &hub.store().unwrap(),
+                origin,
+                &ConversationId::new("owned").unwrap(),
+                &QuestionDefinition {
+                    id: QuestionId::new("live-question").unwrap(),
+                    text: "Continue the review?".into(),
+                    choices: vec!["Continue".into(), "Pause".into()],
+                    multiple: false,
+                    approval: None,
+                },
+                &MessageId::new("ask-live-question").unwrap(),
+            )
+        });
+        loop {
+            if let ToDevice::OpenItems { items, .. } = device
+                .receive_any_with_timeout_message(
+                    "no live open-items snapshot within the read timeout",
+                )
+                .expect("the connection ended before the live open-items snapshot")
+            {
+                assert!(items.iter().any(|item| item.id == "live-question"));
+                break;
+            }
+        }
+        publishing.join().unwrap().unwrap();
+
+        device.socket.close(None).unwrap();
+        let (mut reconnected, auth) = connect(&bridge, &phone);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        assert!(sync(&mut reconnected));
     }
 
     #[test]
@@ -4878,7 +5095,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             .add("after", "c-1", &From::Agent, "and then", "reply")
             .unwrap()
             .unwrap();
-        device.send("s-1", FromDevice::Sync { since: 0 });
+        device.send(
+            "s-1",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut texts = Vec::new();
         let synced = loop {
             match device.receive() {
@@ -4946,7 +5169,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
 
     /// The tasks a sync from 0 sends `device`, up to `synced`.
     fn synced_tasks(device: &mut PhoneLink) -> Vec<enclos_protocol::task::Task> {
-        device.send("sync-tasks", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-tasks",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut tasks = Vec::new();
         loop {
             match device.receive() {
@@ -5011,7 +5240,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
     /// Syncs `device` from `since`, as the app does once authenticated: the
     /// messages it is sent, up to `synced`, whose `seq` comes last.
     fn synced(device: &mut PhoneLink, since: i64) -> (Vec<ConversationMessage>, i64) {
-        device.send(&format!("sync-{since}"), FromDevice::Sync { since });
+        device.send(
+            &format!("sync-{since}"),
+            FromDevice::Sync {
+                since,
+                open_items: false,
+            },
+        );
         let mut messages = Vec::new();
         loop {
             match device.receive() {
@@ -5662,6 +5897,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         plugin_that(&bridge.socket, move |mut lines, mut out| {
             // What its outbox holds, sent after each hello.
             let said = FromPlugin::MessageOut {
+                suggested_replies: Vec::new(),
                 conversation: ConversationId::new("c-1").unwrap(),
                 text: "the answer".into(),
                 kind: OutKind::Reply,
@@ -6988,7 +7224,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         // keeps sending pings and receiving ordinary sync responses.
         for _ in 0..5 {
             device.socket.send(Message::Ping(vec![1].into())).unwrap();
-            device.send("sync-pending", FromDevice::Sync { since: 0 });
+            device.send(
+                "sync-pending",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: false,
+                },
+            );
             loop {
                 match device.receive() {
                     Some(ToDevice::Synced { .. }) => break,
@@ -7014,7 +7256,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             }
         }
         assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
-        device.send("sync-after-delete", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-after-delete",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         loop {
             match device.receive() {
                 Some(ToDevice::Synced { .. }) => break,
@@ -7097,7 +7345,13 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         }
         assert_eq!(deleted, ["c-gone", "home.gone.coder"]);
         // A device that was away hears of them at sync.
-        device.send("sync-after-forget", FromDevice::Sync { since: 0 });
+        device.send(
+            "sync-after-forget",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
         let mut synced = Vec::new();
         loop {
             match device.receive() {

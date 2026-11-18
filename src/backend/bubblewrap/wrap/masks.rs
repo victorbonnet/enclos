@@ -15,7 +15,7 @@ use crate::policy::paths::{is_within, real_path};
 /// sandbox home as written and as they really are, and each workspace.
 pub(super) struct Grants<'a> {
     pub(super) home: PathBuf,
-    real_home: PathBuf,
+    pub(super) real_home: PathBuf,
     sandbox_home: &'a Path,
     real_sandbox_home: PathBuf,
     /// Every workspace, as written.

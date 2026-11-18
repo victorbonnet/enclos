@@ -345,6 +345,7 @@ impl Hub {
                 }
                 if let Some(person) = self.known_host() {
                     self.deliver(&person, ToDevice::Approval(existing));
+                    self.publish_open_items(store, &person);
                 }
             }
             return Ok(());
@@ -450,6 +451,7 @@ impl Hub {
         }
         if let Some(person) = self.known_host() {
             self.deliver(&person, ToDevice::Approval(a));
+            self.publish_open_items(store, &person);
         }
         Ok(())
     }
@@ -481,6 +483,7 @@ impl Hub {
                 && let Some(person) = self.known_host()
             {
                 self.deliver(&person, ToDevice::Approval(closed));
+                self.publish_open_items(store, &person);
             }
         }
         Ok(())
@@ -589,6 +592,7 @@ impl Hub {
         if self.is_probe(&a, &mut HashMap::new()) {
             if let Some(marked) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
                 self.deliver(person, ToDevice::Approval(marked));
+                self.publish_open_items(store, person);
             }
             return Err(PROBE_NOT_CLOSED.into());
         }
@@ -611,6 +615,7 @@ impl Hub {
         }
         let state = a.state.clone();
         self.deliver(person, ToDevice::Approval(a));
+        self.publish_open_items(store, person);
         match state.as_str() {
             "closed" => Ok(()),
             "applying" => Err(
@@ -679,11 +684,13 @@ impl Hub {
         if self.is_probe(&a, &mut HashMap::new()) {
             if let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
                 self.deliver(person, ToDevice::Approval(closed));
+                self.publish_open_items(store, person);
             }
             return Err("This is an Enclos diagnostic probe; no approval is needed.".into());
         }
         if a.state != "pending" {
             self.deliver(person, ToDevice::Approval(a));
+            self.publish_open_items(store, person);
             return Ok(());
         }
         let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
@@ -694,6 +701,7 @@ impl Hub {
                     return Err("This request was decided on another device.".into());
                 }
                 self.deliver(person, ToDevice::Approval(a));
+                self.publish_open_items(store, person);
                 return Err("The policy changed or this scope cannot be approved. Review the request's current details.".into());
             }
         }
@@ -702,6 +710,7 @@ impl Hub {
         }
         a.state = "applying".into();
         self.deliver(person, ToDevice::Approval(a.clone()));
+        self.publish_open_items(store, person);
         let by = super::authority::device_actor(person, &device.id, Some(id));
         let name = a
             .sandbox
@@ -728,6 +737,7 @@ impl Hub {
         }
         store.put_approval(&a).map_err(|e| e.to_string())?;
         self.deliver(person, ToDevice::Approval(a.clone()));
+        self.publish_open_items(store, person);
         // Knowledge is the active policy, never a speculative grant from a button press.
         self.refresh_access_context(&a.sandbox);
         Ok(())

@@ -1,9 +1,6 @@
 # M5 OpenClaw verification
 
-This record distinguishes implemented contracts from live acceptance. The stack
-starts at [enclos #227](https://github.com/victorbonnet/enclos/pull/227) and
-[enclos-app #44](https://github.com/victorbonnet/enclos-app/pull/44).
-[Issue #218](https://github.com/victorbonnet/enclos/issues/218) remains open.
+This record distinguishes implemented contracts from live acceptance. [Issue #218](https://github.com/victorbonnet/enclos/issues/218) records the current base, stack heads and checks.
 Linux live acceptance stays last on the new host; no Pi run is required.
 
 ## Agreed capability boundary
@@ -21,9 +18,14 @@ by an unconditional scheduler mutation substitutes for native revision checks.
 
 Native approvals negotiate independent offered scopes and preserve OpenClaw's
 persistence description. Once/Always/Deny does not invent Session. Structured
-cards require the exact native request and current account/conversation/person;
-unsupported requests retain native fallback. Consent receipts record native
-resolution, not execution success.
+cards require the exact native request and current account, conversation and person.
+Following proposed ADR 0060, the channel reads the bridge's public key at startup.
+It verifies each decision against its own card, the answer request id and action.
+Decisions older than 60 seconds or more than five seconds ahead are refused.
+The channel logs and refuses invalid signatures with `not_allowed` and denies the
+pending native approval. The adapter tests cover this behavior. Live approvals
+and consent receipts are still part of acceptance. Unsupported requests retain
+native fallback.
 
 The original live observations and counts below were recorded before this rebase,
 using source commit `59941ad1`. They remain historical evidence. The stack now
@@ -32,9 +34,9 @@ explicitly adapter-selected, its listener selection retains namespace checks,
 and its provider facts remain runtime-decoded. Fresh rebase verification is
 recorded separately; previous green checks are not a claim about rewritten heads.
 
-## Rebase verification
+## Historical rebase verification (superseded)
 
-The requested bases are enclos #227 (`753fc700`) and enclos-app #44 (`4e53b966`).
+These counts describe a superseded stack. See issue #218 for current results.
 The complete rebased source passed **1,758 Rust tests**: 1,514 library, 78 CLI
 unit, 102 CLI integration, 20 documentation, 38 protocol and six shared fixtures.
 Clippy, formatting and dependency policy passed. One first-run fake-proxy
@@ -102,18 +104,21 @@ ENCLOS_OPENCLAW_PACKAGE=/path/to/openclaw \
 
 Without this variable, native-package tests explicitly skip. Standard transport,
 protocol, routing, files and authority tests still run. CI installs the tested
-2026.11.3 SDK package in a disposable prefix and runs the native tests too.
+2026.11.5 SDK package in a disposable prefix and runs the native tests too.
 Changing the tested runtime version requires updating and re-running the native
 contract probes; the runtime installer itself remains official/as served.
 
-## Final stack checks
+## Historical combined-stack checks (superseded)
 
-The combined source passed **1,564 Rust tests**: 1,331 library, 67 CLI-unit,
+These counts record an earlier version of the combined stack. The current
+PR heads and their GitHub Actions results are recorded in issue #218.
+
+That version passed **1,564 Rust tests**: 1,331 library, 67 CLI-unit,
 100 CLI-integration, 24 documentation, 36 protocol and six shared fixtures.
 Workspace Clippy, formatting and `cargo deny` passed. Destructive runner-only
 host-service/member probes were not enabled on this Mac.
 
-The final OpenClaw suite passed **67 tests with zero skips** against the installed
+The OpenClaw suite at that point passed **67 tests with zero skips** against the installed
 SDK; six launcher/owner-helper tests also passed. Hermes Python 3.13 verification
 ran 103 cases: **102 passed, one optional legacy-source skip**. This includes
 18 native routine, 14 native question and eight native approval checks, plus all

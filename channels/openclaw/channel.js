@@ -1,17 +1,26 @@
-// OpenClaw 2026.11.3 public channel contract. Native imports live in index.js.
+// OpenClaw public channel contract. Native imports live in index.js.
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
 import { RoutineInventory } from './routines.js';
 import { ModelSettings } from './model.js';
-import { inboundMedia, mediaFolder, stageMedia } from './media.js';
+import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
 
-export const TESTED_OPENCLAW = '2026.11.3';
+export const TESTED_OPENCLAW = '2026.11.5';
+const MINIMUM_OPENCLAW = '2026.11.5';
+const release = /^v?(\d+\.\d+\.\d+)([+-].+)?$/u;
+function supportsRelease(version) {
+  const parts = typeof version === 'string' && release.exec(version);
+  if (!parts) return false;
+  const order = parts[1].localeCompare(MINIMUM_OPENCLAW, 'en', { numeric: true });
+  return order > 0 || (order === 0 && !parts[2]?.startsWith('-'));
+}
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 
 export function resolveAccount(cfg, accountId) {
@@ -28,8 +37,8 @@ export function resolveAccount(cfg, accountId) {
   checkedId(value.home, 'home');
   return {
     accountId: id, agentId: value.agentId, socket: value.socket,
-    tokenFile: value.tokenFile, home: value.home,
-    stateDir: value.stateDir ?? path.join(path.dirname(value.socket), 'openclaw-state'),
+    tokenFile: value.tokenFile, home: value.home, bridgeKey: value.bridgeKey,
+    stateDir: value.stateDir ?? path.join(path.dirname(value.socket), 'openclaw-state', id),
     enabled: section?.enabled !== false && value.enabled !== false,
   };
 }
@@ -39,7 +48,7 @@ export function sessionPeer(conversation, person) {
   return createHash('sha256').update(JSON.stringify([conversation, person])).digest('hex');
 }
 
-function accountKey(account) { return JSON.stringify([account.accountId, account.agentId, account.socket, account.tokenFile, account.stateDir]); }
+function accountKey(account) { return JSON.stringify([account.accountId, account.agentId, account.socket, account.tokenFile, account.stateDir, account.bridgeKey]); }
 function target(raw, account) {
   const value = typeof raw === 'string' && raw.startsWith('enclos:') ? raw.slice(7) : raw;
   return checkedId(!value || value === 'home' ? account.home : value, 'conversation');
@@ -48,6 +57,7 @@ function target(raw, account) {
 export function createChannel(sdk = {}) {
   let runtime;
   const running = new Map();
+  const outboundCaller = new AsyncLocalStorage();
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   const models = new ModelSettings({ catalogue: sdk.models, runtime: () => runtime });
@@ -64,7 +74,7 @@ export function createChannel(sdk = {}) {
 
   function setRuntime(value) {
     // version is part of the installed public PluginRuntimeCore contract.
-    if (value?.version !== TESTED_OPENCLAW) throw new Error(`enclos channel is tested with OpenClaw ${TESTED_OPENCLAW}; install a matching enclos channel before enabling it with ${value?.version ?? 'an unknown version'}`);
+    if (!supportsRelease(value?.version)) throw new Error(`Update OpenClaw to ${MINIMUM_OPENCLAW} or newer before enabling the enclos channel.`);
     runtime = value;
   }
 
@@ -83,11 +93,17 @@ export function createChannel(sdk = {}) {
   }
 
   async function startAccount(ctx) {
-    if (!runtime || runtime.version !== TESTED_OPENCLAW) throw new Error(`enclos requires the tested OpenClaw ${TESTED_OPENCLAW} plugin runtime`);
+    if (!runtime) throw new Error('Load the OpenClaw plugin runtime before starting the enclos channel.');
     const channel = ctx.channelRuntime ?? runtime.channel;
-    if (!channel?.inbound?.ingress?.resolve || !channel.inbound.buildContext || !channel.inbound.dispatch || !channel.routing?.resolveAgentRoute || !channel.routing.buildAgentSessionKey) {
-      throw new Error('OpenClaw did not supply its public channel ingress/dispatch runtime; update the enclos channel compatibility pair');
-    }
+    const required = {
+      'inbound.ingress.resolve': channel?.inbound?.ingress?.resolve,
+      'inbound.buildContext': channel?.inbound?.buildContext,
+      'inbound.dispatch': channel?.inbound?.dispatch,
+      'routing.resolveAgentRoute': channel?.routing?.resolveAgentRoute,
+      'routing.buildAgentSessionKey': channel?.routing?.buildAgentSessionKey,
+    };
+    const missing = Object.keys(required).filter(name => typeof required[name] !== 'function');
+    if (missing.length) throw new Error(`OpenClaw is missing channel interfaces: ${missing.join(', ')}. Update the enclos channel or OpenClaw.`);
     const account = resolveAccount(ctx.cfg, ctx.accountId);
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
@@ -198,7 +214,8 @@ export function createChannel(sdk = {}) {
           transport.send(incoming.conversation, 'The agent could not respond. Check its runtime logs before trying again.', { replyTo: incoming.id });
           failureReported = true;
         };
-        try { await channel.inbound.dispatch({
+        const caller = { agentId: nativeRoute.agentId, live: true, assertAuthority };
+        try { await outboundCaller.run(caller, () => channel.inbound.dispatch({
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
@@ -214,17 +231,18 @@ export function createChannel(sdk = {}) {
             assertAuthority();
             const urls = [...new Set([...(payload.mediaUrl ? [payload.mediaUrl] : []), ...(payload.mediaUrls ?? [])])];
             if (urls.length && !hasMedia) throw new Error('enclos OpenClaw channel media is not enabled');
-            const attachments = urls.length ? await stageMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }) : [];
-            assertAuthority();
-            if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
-              { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            return withStagedMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }, attachments => {
+              assertAuthority();
+              if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
+                { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            });
           } },
-        }); } catch (error) {
+        })); } catch (error) {
           reportFailure();
           // Native dispatch may have started work before failing. Preserve the
           // uncertain receipt so reconnects cannot replay that work.
           throw error;
-        } finally { finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
+        } finally { caller.live = false; finishActivity(); typing(false); void titles?.refresh(incoming.conversation); }
         } finally { execution.finish(); }
       },
     });
@@ -242,7 +260,7 @@ export function createChannel(sdk = {}) {
     try {
       titles = createNativeTitles(runtime, account, transport, { currentConfig: () => currentConfig(ctx.cfg),
         assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
-      approvals = sdk.nativeApprovals?.attach(account, transport, { cfg: ctx.cfg, channelRuntime: channel, abortSignal: ctx.abortSignal,
+      approvals = sdk.nativeApprovals?.attach(account, transport, { cfg: ctx.cfg, channelRuntime: channel, abortSignal: ctx.abortSignal, sandbox: process.env.ENCLOS_SANDBOX, log: ctx.log,
         assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
       await transport.start();
       ctx.setStatus?.({ accountId: account.accountId, running: true, connected: true });
@@ -271,11 +289,13 @@ export function createChannel(sdk = {}) {
     if (!active) throw new Error('enclos account is not running');
     const assertAuthority = () => { ctx.signal?.throwIfAborted(); ctx.assertDirectAdapterHandoff?.(); assertCurrent(ctx.cfg, account, active.transport); };
     assertAuthority();
-    const attachments = await stageMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority });
-    await ctx.onPlatformSendDispatch?.(); assertAuthority();
-    const to = target(ctx.to, { ...account, home: active.transport.home });
-    const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
-    return { channel: 'enclos', to, messageId: id };
+    return withStagedMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority }, async attachments => {
+      await ctx.onPlatformSendDispatch?.();
+      assertAuthority();
+      const to = target(ctx.to, { ...account, home: active.transport.home });
+      const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
+      return { channel: 'enclos', to, messageId: id };
+    });
   }
 
   const plugin = {
@@ -302,9 +322,15 @@ export function createChannel(sdk = {}) {
       targetResolver: {
         hint: 'Use home or a known bridge conversation id for this account.',
         async resolveTarget(params) {
-          const account = resolveAccount(params.cfg, params.accountId);
+          // The current upstream target resolver has no agent field. A
+          // resolver invoked during native dispatch inherits that caller.
+          const caller = outboundCaller.getStore();
+          if (caller && (!caller.live || (params.agentId != null && params.agentId !== caller.agentId))) return undefined;
+          caller?.assertAuthority();
+          const agentId = params.agentId ?? caller?.agentId;
+          if (!agentId) return undefined;
           const route = await plugin.messaging.resolveOutboundSessionRoute({ ...params,
-            agentId: account.agentId, target: params.normalized });
+            agentId, target: params.normalized });
           return route ? { to: route.to, kind: 'user' } : undefined;
         },
       },
@@ -334,7 +360,7 @@ export function createChannel(sdk = {}) {
         'The person is using the enclos mobile app. Use CommonMark, fenced code and narrow tables.',
         hasMedia ? 'For a file, write it to a permitted local path and send MEDIA:/absolute/path/file. Images and files travel through the app channel, never a host URL.' : 'This channel currently sends text. Do not claim a file was delivered.',
         'For a static HTML artefact, use a self-contained UTF-8 .html file with inline CSS and data images/fonts. Scripts, remote assets, forms and automatic navigation are unavailable; deliberate HTTP(S) links open the browser.',
-        'If sandbox policy refuses access, request the exact scope with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
+        'If sandbox policy refuses access, request the exact access with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
         'Remote markdown images are links; HTML in text is literal. Home is the bridge-owned permanent destination for output without another conversation.',
         'Preserve complete native question prompts and follow the native tool result. Do not invent mobile question buttons or successful answer receipts. Secrets must use the native trusted Control UI, never chat.',
       ] }),

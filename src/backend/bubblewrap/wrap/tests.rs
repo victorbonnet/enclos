@@ -36,7 +36,7 @@ impl Home {
     }
 
     fn user(&self) -> PathBuf {
-        self.dir.path().join("alice")
+        real_path(self.dir.path()).join("alice")
     }
 
     fn at(&self, rest: &str) -> PathBuf {

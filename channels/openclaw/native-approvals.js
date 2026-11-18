@@ -1,6 +1,6 @@
 // Native exec approvals through OpenClaw's public channel approval capability.
 // No Gateway admin client, general method dispatch or native storage access.
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPublicKey, randomUUID, verify } from 'node:crypto';
 import { checkedId, message, ProtocolError } from './protocol.js';
 
 const PREFIX = 'oc-exec-';
@@ -16,6 +16,38 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const supports = hello => ['runtime_approvals', 'runtime_approval_scopes'].every(c => hello?.capabilities?.includes(c));
 const terminal = state => ['answered', 'resolved', 'expired', 'cancelled'].includes(state);
 const settledState = status => ['expired', 'cancelled'].includes(status) ? status : 'resolved';
+
+// ADR 0060. Match enclos_protocol::decision::Decision::statement and the Hermes verifier.
+function decisionKey(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{87}$/u.test(value)) return undefined;
+  const point = Buffer.from(value, 'base64url');
+  if (point.length !== 65 || point[0] !== 4 || point.toString('base64url') !== value) return undefined;
+  try {
+    return createPublicKey({ format: 'jwk', key: {
+      kty: 'EC', crv: 'P-256', x: point.subarray(1, 33).toString('base64url'), y: point.subarray(33).toString('base64url'),
+    } });
+  } catch { return undefined; }
+}
+
+function checkDecision(key, agent, record, control, now) {
+  if (control.conversation !== record.conversation) return 'the conversation changed';
+  const { at, sig } = control.signed ?? {};
+  if (!Number.isSafeInteger(at) || typeof sig !== 'string') return 'the decision is unsigned or unreadable';
+  if (at < now - 60 || at > now + 5) return 'the signature is not fresh';
+  if (!/^[A-Za-z0-9_-]{86}$/u.test(sig)) return 'the signature cannot be read';
+  const bytes = Buffer.from(sig, 'base64url');
+  if (bytes.length !== 64 || bytes.toString('base64url') !== sig) return 'the signature cannot be read';
+  const { command, reason, patterns = [] } = record.definition.approval;
+  const fields = ['enclos/runtime-approval/1', agent, record.conversation, record.id, control.id,
+    control.answer.action, command, reason, String(patterns.length), ...patterns, String(at)];
+  const statement = Buffer.concat(fields.flatMap(field => {
+    const data = Buffer.from(field, 'utf8');
+    const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+    return [length, data];
+  }));
+  if (!verify('sha256', statement, { key, dsaEncoding: 'ieee-p1363' }, bytes)) return 'the signature does not match this decision and key';
+}
+
 
 function text(value, name) {
   if (typeof value !== 'string' || !value.trim() || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(value)) throw new Error(`invalid native approval ${name}`);
@@ -75,7 +107,7 @@ function display(request, view, id) {
     ? `Use OpenClaw's native approval surface for request ${request.id}. Native instructions (these are not unbound shortcuts through enclos):\n` + nativeActions.map(a => `${text(a.label, 'action label')}: ${text(a.command, 'native answer command')}`).join('\n')
     : `Use OpenClaw's native approval surface for request ${request.id}. Offered actions: ${offered.join(', ')}.`;
   const description = offered.includes('always')
-    ? 'Allow once permits this pending OpenClaw operation. Always allow persists an OpenClaw command allowlist grant, whose executable and argument matching policy is owned by OpenClaw. Deny refuses this request.'
+    ? 'Allow once permits this pending OpenClaw operation. Always allow saves an eligible command in this agent’s OpenClaw exec allowlist. OpenClaw matches the resolved executable, exact arguments and working directory. A policy that asks every time still prompts. Deny refuses this request.'
     : 'Allow once, when offered, permits only this pending OpenClaw operation. Deny refuses this request. No persistent grant is offered.';
   return { id, text: text(view.title || 'OpenClaw command approval', 'heading'), choices: [], multiple: false,
     approval: { command, reason: details.join('\n') || 'OpenClaw requires consent before this operation continues.',
@@ -132,6 +164,12 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
   function attach(account, transport, context) {
     if (controllers.has(account.accountId)) throw new Error('native approvals already attached to this account');
     if (typeof context?.assertCurrent !== 'function' || typeof context?.sessionKeyFor !== 'function') throw new Error('native approvals require current account and session attribution');
+    const key = decisionKey(account.bridgeKey);
+    const agent = context.sandbox && `${context.sandbox}/${account.agentId}`;
+    const warn = text => (context.log?.warn ?? console.warn)(text);
+    const signedControls = Boolean(key && agent);
+    if (!signedControls) warn('enclos runtime approvals need the bridge public key and sandbox name. Run enclos runtime configure --channel app again.');
+    const negotiated = hello => signedControls && supports(hello);
     const generation = randomUUID(), live = new Map(), attempts = new Map();
     const saved = transport.state.nativeApprovals ?? { v: 1, records: [], controls: [] };
     if (saved.v !== 1 || !Array.isArray(saved.records) || saved.records.length > MAX_RECORDS || !Array.isArray(saved.controls) || saved.controls.length > MAX_CONTROLS) throw new Error('invalid native approval state');
@@ -172,7 +210,7 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
       record.last = message('question.update', { question: record.id, state,
         ...(action ? { answer: { kind: 'approval', action } } : {}), ...(of ? { of } : {}) });
       persist(); retain(record.last);
-      if (!transport.closed && record.fallbackSent && !supports(transport.bridgeHello)) transport.send(record.conversation,
+      if (!transport.closed && record.fallbackSent && !negotiated(transport.bridgeHello)) transport.send(record.conversation,
         `OpenClaw approval ${state}. Consent is separate from execution.`, { kind: 'status' });
       return record.last;
     };
@@ -232,7 +270,7 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
         catch { fallback(record, 'The native approval exceeds the app\'s structured display contract. No lossy card or app answer was bound. Use OpenClaw\'s native approval surface.'); return { fallback: true, native: request.id }; }
         records.set(id, record); persist();
         try {
-          if (supports(transport.bridgeHello)) {
+          if (negotiated(transport.bridgeHello)) {
             record.ask = message('question.ask', { conversation: record.conversation, question: record.definition });
             persist(); retain(record.ask);
           } else fallback(record);
@@ -247,17 +285,17 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
         if (binding.inFlight) { binding.deferred = state; return; }
         update(binding.record, state); live.delete(entry.question);
       },
-      capabilities(hello) { return owner.isCurrent() && supports(hello) ? ['runtime_approvals', 'runtime_approval_scopes'] : []; },
+      capabilities(hello) { return owner.isCurrent() && negotiated(hello) ? ['runtime_approvals', 'runtime_approval_scopes'] : []; },
       canDeliver(envelope, hello) {
         const id = envelope.type === 'question.ask' ? envelope.question?.id : envelope.question;
-        return !['question.ask', 'question.update'].includes(envelope.type) || typeof id !== 'string' || !id.startsWith(PREFIX) || supports(hello);
+        return !['question.ask', 'question.update'].includes(envelope.type) || typeof id !== 'string' || !id.startsWith(PREFIX) || negotiated(hello);
       },
       onHello(hello) {
         if (!owner.isCurrent()) return;
         for (const record of records.values()) {
           if (terminal(record.state)) { if (record.last) retain(record.last); continue; }
           if (!live.has(record.id)) continue;
-          if (supports(hello)) {
+          if (negotiated(hello)) {
             record.ask ??= message('question.ask', { conversation: record.conversation, question: record.definition });
             persist(); retain(record.ask);
           } else fallback(record);
@@ -280,26 +318,38 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
         if (control.type !== 'question.answer' || typeof control.question !== 'string' || !control.question.startsWith(PREFIX)) return false;
         assertControlCurrent();
         checkedId(control.id); checkedId(control.question, 'question'); checkedId(control.conversation, 'conversation');
+        const record = records.get(control.question), binding = live.get(control.question);
+        if (!owner.isCurrent() || !negotiated(transport.bridgeHello)) throw new ProtocolError('unsupported', 'native approval scopes are not negotiated', control.id);
+        if (!record) throw new ProtocolError('conflict', 'this exact native approval is no longer pending', control.id);
+        const answer = control.answer, requested = answer?.action;
+        if (answer?.kind !== 'approval' || Object.keys(answer).sort().join(',') !== 'action,kind' || typeof requested !== 'string') throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
+        const signatureFailure = checkDecision(key, agent, record, control, Math.floor(now() / 1000));
+        const refused = () => new ProtocolError('not_allowed', 'The bridge signature for this runtime approval is missing or invalid.', control.id);
+        if (signatureFailure) {
+          warn(`enclos refused a runtime approval decision for ${record.id}: ${signatureFailure}`);
+          if (!binding || record.state !== 'pending' || record.attempted || !owner.target(binding.native)) throw refused();
+        }
+        if (!signatureFailure && !record.definition.approval.actions.includes(requested)) {
+          throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
+        }
+        const action = signatureFailure ? 'deny' : requested;
         const hash = digest([control.question, control.conversation, control.answer]);
-        const old = controls.get(control.id);
+        const old = signatureFailure ? undefined : controls.get(control.id);
         if (old) {
           if (old.hash !== hash) throw new ProtocolError('conflict', 'approval control id was reused', control.id);
           if (old.response) { if (old.response.type === 'error') transport.write(old.response); else retain(old.response); return true; }
           throw new ProtocolError('agent_unavailable', 'this native decision is uncertain and will not be retried', control.id);
         }
-        const binding = live.get(control.question), record = binding?.record;
-        if (!owner.isCurrent() || !supports(transport.bridgeHello)) throw new ProtocolError('unsupported', 'native approval scopes are not negotiated', control.id);
-        if (!binding || record.state !== 'pending' || record.conversation !== control.conversation || !owner.target(binding.native)) throw new ProtocolError('conflict', 'this exact native approval is no longer pending', control.id);
-        const answer = control.answer, action = answer?.action;
-        if (answer?.kind !== 'approval' || Object.keys(answer).sort().join(',') !== 'action,kind' || !record.definition.approval.actions.includes(action)) throw new ProtocolError('bad_message', 'choose an offered native approval action', control.id);
+        if (!binding || record.state !== 'pending' || !owner.target(binding.native)) throw new ProtocolError('conflict', 'this exact native approval is no longer pending', control.id);
         if (record.attempted) throw new ProtocolError('agent_unavailable', 'a prior native decision is uncertain; use the native surface', control.id);
-        if (controls.size >= MAX_CONTROLS) {
+        if (!signatureFailure && controls.size >= MAX_CONTROLS) {
           fallback(record, 'The enclos native decision receipt registry is full (256 retained receipts). No decision was sent. Use OpenClaw\'s native approval surface.');
           update(record, 'expired'); live.delete(record.id);
           throw new ProtocolError('agent_unavailable', 'native control receipt registry is full; no decision was sent', control.id);
         }
         const receipt = { id: control.id, question: record.id, hash };
-        controls.set(control.id, receipt); record.attempted = true; persist();
+        if (!signatureFailure) controls.set(control.id, receipt);
+        record.attempted = true; persist();
         binding.inFlight = control.id; binding.assertControlCurrent = assertControlCurrent; attempts.set(binding.native.id, binding);
         let timer;
         try {
@@ -322,7 +372,9 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
           persist();
           assertControlCurrent();
           if (!owner.isCurrent()) throw new Error('native channel stopped while the decision was in flight');
-          if (outcome.applied && canonical.decision === decisions.get(action) && canonical.status === (action === 'deny' ? 'denied' : 'allowed')) {
+          if (signatureFailure) {
+            update(record, settledState(canonical.status));
+          } else if (outcome.applied && canonical.decision === decisions.get(action) && canonical.status === (action === 'deny' ? 'denied' : 'allowed')) {
             receipt.response = update(record, 'answered', { action, of: control.id });
           } else {
             update(record, settledState(canonical.status));
@@ -336,8 +388,9 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
             ? 'OpenClaw settled this request, but its originating bridge lost receipt authority. Refresh the canonical state; this decision will not be retried.'
             : 'The native decision was not confirmed. Its outcome may be unknown; it will not be retried.' });
           persist();
-          try { assertControlCurrent(); transport.write(receipt.response); } catch { /* Only canonical terminal state may reach a successor peer. */ }
+          try { assertControlCurrent(); if (!signatureFailure) transport.write(receipt.response); } catch { /* Only canonical terminal state may reach a successor peer. */ }
         } finally { clearTimeout(timer); attempts.delete(binding.native.id); binding.inFlight = null; binding.assertControlCurrent = undefined; }
+        if (signatureFailure) throw refused();
         return true;
       },
       close() {

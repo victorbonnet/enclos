@@ -14,8 +14,8 @@ use crate::backend::bubblewrap::compile::CompiledSandbox;
 const NOT_A_FOLDER: &str = "/dev/null";
 
 /// bubblewrap's arguments for one launch, from [`read_host`]'s `host`, in the
-/// order the compiled file names (design §5): the `/` bind, the masks of the
-/// home and outside it, the home's listening sockets, the compiled mounts, each staged file in `reads`
+/// order the compiled file names (design §5): the rebuilt root and home, masks
+/// outside the home, the home's listening sockets, the compiled mounts, each staged file in `reads`
 /// read-only at its own path, the unmovable folders, the masks inside the
 /// grants, each folder made here and each the compiled file seals, read-only,
 /// then the options, whose place does not matter.
@@ -34,10 +34,10 @@ pub(super) fn arguments(
         hide(Path::new("/"), host, &mut args, &mut made);
     } else {
         args.extend(bubblewrap.root.iter().map(OsString::from));
-    }
-    let home = PathBuf::from(&bubblewrap.root_masks.home);
-    if host.entries.contains_key(&home) {
-        hide(&home, host, &mut args, &mut made);
+        let home = PathBuf::from(&bubblewrap.root_masks.home);
+        if host.entries.contains_key(&home) {
+            hide(&home, host, &mut args, &mut made);
+        }
     }
     for (path, kind) in &host.elsewhere {
         match kind {
