@@ -11,6 +11,7 @@ const OPEN: &str = "/task-board/open";
 const VIEW: &str = "/task-board/view/";
 const TICKET_LIFE: Duration = Duration::from_secs(60);
 const SESSION_LIFE: Duration = Duration::from_secs(15 * 60);
+const READ_PEER_LIFE: Duration = Duration::from_secs(10);
 const START_WAIT: Duration = Duration::from_secs(24);
 const MAX_TICKETS: usize = 32;
 const MAX_SESSIONS: usize = 8;
@@ -19,6 +20,8 @@ const MAX_HEAD: u64 = 16 * 1024;
 const MAX_BODY: usize = 256 * 1024;
 const COOKIE: &str = "enclos_board";
 const BOOT: &str = include_str!("task_board_open.html");
+const ACCESS_DENIED: &str =
+    "Open the board again from Enclos while connected to the host's network.";
 
 fn token() -> io::Result<String> {
     random_bytes(32).map(|bytes| BASE64_URL_SAFE_NO_PAD.encode(bytes))
@@ -53,9 +56,13 @@ struct Grant {
 }
 
 impl Grant {
-    fn still_paired(&self, hub: &Hub, store: &Store, caller: &Caller) -> bool {
+    fn matches_peer(&self, caller: &Caller) -> bool {
         self.device.node.as_deref() == Some(caller.node_id.as_str())
             && self.device.person == caller.login
+    }
+
+    fn still_paired(&self, hub: &Hub, store: &Store, caller: &Caller) -> bool {
+        self.matches_peer(caller)
             && hub
                 .host_authority(store, &self.device, &caller.login)
                 .is_ok()
@@ -68,6 +75,23 @@ struct Ticket {
     until: Instant,
 }
 
+struct BrowserPeer {
+    address: String,
+    caller: Caller,
+    until: Instant,
+}
+
+impl BrowserPeer {
+    fn lookup(hub: &Hub, login: &str, address: &str) -> Option<Self> {
+        let caller = (hub.whois)(address).ok()?;
+        (caller.login == login).then(|| Self {
+            address: address.to_owned(),
+            caller,
+            until: Instant::now() + READ_PEER_LIFE,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct BrowserSession {
     grant: Grant,
@@ -75,6 +99,27 @@ struct BrowserSession {
     origin: String,
     cookie: String,
     dashboard: Arc<Dashboard>,
+    read_peer: Arc<Mutex<BrowserPeer>>,
+}
+
+impl BrowserSession {
+    fn read_caller(&self, hub: &Hub, login: &str, address: &str) -> Option<Caller> {
+        // One lookup per session at a time, even when a page requests assets
+        // in parallel. Only the bound node is allowed to refresh the cache.
+        let mut cached = self.read_peer.lock().expect("not poisoned");
+        if cached.until > Instant::now()
+            && cached.address == address
+            && cached.caller.login == login
+        {
+            return Some(cached.caller.clone());
+        }
+        let peer = BrowserPeer::lookup(hub, login, address)?;
+        if !self.grant.matches_peer(&peer.caller) {
+            return None;
+        }
+        *cached = peer;
+        Some(cached.caller.clone())
+    }
 }
 
 #[derive(Default)]
@@ -142,7 +187,13 @@ impl TaskBoards {
         Some(records.tickets.remove(key)?.grant)
     }
 
-    fn open(&self, hub: &Hub, grant: Grant, origin: String) -> Option<(String, BrowserSession)> {
+    fn open(
+        &self,
+        hub: &Hub,
+        grant: Grant,
+        origin: String,
+        peer: BrowserPeer,
+    ) -> Option<(String, BrowserSession)> {
         let id = token().ok()?;
         let cookie = token().ok()?;
         let mut records = self.records.lock().expect("not poisoned");
@@ -174,6 +225,7 @@ impl TaskBoards {
             origin,
             cookie,
             dashboard,
+            read_peer: Arc::new(Mutex::new(peer)),
         };
         records.sessions.insert(id.clone(), session.clone());
         Some((id, session))
@@ -218,12 +270,13 @@ impl Dashboard {
         let state = Arc::downgrade(&dashboard);
         std::thread::spawn(move || {
             let engine = Engine::open(layout, crate::state::Wait::Background);
-            let result = engine.task_board_until(&actor, &sandbox, &stop, &mut |upstream| {
-                if let Some(state) = state.upgrade() {
-                    *state.startup.lock().expect("not poisoned") = Startup::Ready(upstream);
-                    state.changed.notify_all();
-                }
-            });
+            let result =
+                engine.task_board_until(&actor, &sandbox, &stop, SESSION_LIFE, &mut |upstream| {
+                    if let Some(state) = state.upgrade() {
+                        *state.startup.lock().expect("not poisoned") = Startup::Ready(upstream);
+                        state.changed.notify_all();
+                    }
+                });
             if let Some(state) = state.upgrade() {
                 *state.startup.lock().expect("not poisoned") = Startup::Ended;
                 state.changed.notify_all();
@@ -383,13 +436,7 @@ impl Hub {
         request: BrowserRequest,
     ) -> io::Result<()> {
         let deny = |client: &mut TcpStream| {
-            write_response(
-                client,
-                "403 Forbidden",
-                "text/plain",
-                "Open the board again from Enclos while connected to the host's network.",
-                "",
-            )
+            write_response(client, "403 Forbidden", "text/plain", ACCESS_DENIED, "")
         };
         if request.method == "GET" && request.target == OPEN {
             return write_response(
@@ -409,7 +456,7 @@ impl Hub {
         {
             return deny(client);
         }
-        let Some(caller) = self.browser_caller(&request) else {
+        let Some((login, address)) = self.browser_identity(&request) else {
             return deny(client);
         };
         let Ok(store) = self.store() else {
@@ -422,15 +469,18 @@ impl Hub {
             if !valid_token(ticket) {
                 return deny(client);
             }
-            let Some(grant) = self.task_boards.redeem(ticket, |g| {
-                g.device.person == caller.login
-                    && g.device.node.as_deref() == Some(caller.node_id.as_str())
-            }) else {
+            let Some(peer) = BrowserPeer::lookup(self, login, &address) else {
                 return deny(client);
             };
-            if !grant.still_paired(self, &store, &caller)
+            let Some(grant) = self
+                .task_boards
+                .redeem(ticket, |g| g.matches_peer(&peer.caller))
+            else {
+                return deny(client);
+            };
+            if !grant.still_paired(self, &store, &peer.caller)
                 || self
-                    .held_task_authority(&store, &grant.device, &caller.login, &grant.request)
+                    .held_task_authority(&store, &grant.device, login, &grant.request)
                     .is_err()
             {
                 return deny(client);
@@ -444,7 +494,8 @@ impl Hub {
                     "",
                 )
             };
-            let Some((id, session)) = self.task_boards.open(self, grant, origin) else {
+            let caller = peer.caller.clone();
+            let Some((id, session)) = self.task_boards.open(self, grant, origin, peer) else {
                 return unavailable(client);
             };
             if session.dashboard.upstream(START_WAIT).is_none() {
@@ -491,9 +542,13 @@ impl Hub {
         let Some(session) = self.task_boards.session(id) else {
             return deny(client);
         };
-        if origin != session.origin
-            || !request.has_session_cookie(&session.cookie)
-            || !session.grant.still_paired(self, &store, &caller)
+        if origin != session.origin || !request.has_session_cookie(&session.cookie) {
+            return deny(client);
+        }
+        if request.method == "GET"
+            && session
+                .read_caller(self, login, &address)
+                .is_none_or(|caller| !session.grant.still_paired(self, &store, &caller))
         {
             return deny(client);
         }
@@ -529,16 +584,59 @@ impl Hub {
             &format!("{VIEW}{id}/"),
             &session.grant.board,
             native_task,
+            |route| {
+                let peer = BrowserPeer::lookup(self, login, &address)
+                    .filter(|peer| session.grant.still_paired(self, &store, &peer.caller))
+                    .ok_or(("403 Forbidden", ACCESS_DENIED))?;
+                authorize_board_write(&store, &session.grant, &peer.caller, &request.method, route)
+            },
         )
     }
 
-    fn browser_caller(&self, request: &BrowserRequest) -> Option<Caller> {
+    fn browser_identity<'a>(&self, request: &'a BrowserRequest) -> Option<(&'a str, String)> {
         let login = std::str::from_utf8(request.header(self.transport.login_header())?).ok()?;
         let addresses =
             std::str::from_utf8(request.header(self.transport.address_header())?).ok()?;
-        let caller = (self.whois)(&caller_address(addresses)?).ok()?;
-        (caller.login == login).then_some(caller)
+        Some((login, caller_address(addresses)?))
     }
+}
+
+fn authorize_board_write(
+    store: &Store,
+    grant: &Grant,
+    caller: &Caller,
+    method: &str,
+    route: &str,
+) -> Result<(), (&'static str, &'static str)> {
+    const UNAVAILABLE: (&str, &str) = (
+        "503 Service Unavailable",
+        "The bridge could not check or record the task change. Try again later.",
+    );
+    held_tasks::current_held_task(store, &caller.login, &grant.request).map_err(|(code, _)| {
+        if code == ErrorCode::Internal {
+            UNAVAILABLE
+        } else {
+            (
+                "409 Conflict",
+                "This task is no longer held. Refresh the board to see its current state.",
+            )
+        }
+    })?;
+    let reason = format!(
+        "{} {} {method} {route}",
+        grant.request.agent, grant.request.task
+    );
+    store
+        .log(
+            Some(&grant.device.id),
+            Some(&caller.login),
+            "held_task.board.write",
+            Some(&reason),
+        )
+        .map_err(|e| {
+            eprintln!("enclos app: cannot audit a task board change: {e}");
+            UNAVAILABLE
+        })
 }
 
 struct RequestSlot<'a>(&'a AtomicUsize);
@@ -842,19 +940,24 @@ mod tests {
     }
 
     #[test]
-    fn paired_browser_can_exchange_once_and_loses_access_when_unpaired() {
+    fn paired_browser_reads_with_cached_identity_and_must_authorize_each_change() {
         use enclos_protocol::held_task::HeldTask;
         use std::os::unix::net::UnixListener;
 
         let folder = tempfile::tempdir().unwrap();
         let mut grant = grant();
         grant.endpoint.socket = folder.path().join("plugin.sock");
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let trusted = Arc::new(AtomicBool::new(true));
+        let whois_count = Arc::clone(&lookups);
+        let node_unchanged = Arc::clone(&trusted);
         let hub = Hub::new(
             Transport::Tailscale,
-            Arc::new(|addr| {
+            Arc::new(move |addr| {
+                whois_count.fetch_add(1, Ordering::Relaxed);
                 Ok(Caller {
                     login: "owner@example.com".into(),
-                    node_id: if addr == "100.64.0.1" {
+                    node_id: if addr == "100.64.0.1" && node_unchanged.load(Ordering::Relaxed) {
                         "node-1"
                     } else {
                         "node-2"
@@ -876,13 +979,13 @@ mod tests {
         store
             .conversation("held-board", "lab", "main", &grant.device.person)
             .unwrap();
-        let task: HeldTask = serde_json::from_value(serde_json::json!({
+        let mut task: HeldTask = serde_json::from_value(serde_json::json!({
             "task":"review/t1", "title":"Review", "reason":"Decide",
             "since":1, "revision":"e:1", "resume":"Use the board", "resumable":false
         }))
         .unwrap();
         store
-            .report_held_tasks("lab/main", "held-board", &[task])
+            .report_held_tasks("lab/main", "held-board", std::slice::from_ref(&task))
             .unwrap();
         grant.request.revision = store
             .held_task("lab/main", "review/t1")
@@ -905,29 +1008,44 @@ mod tests {
             .dashboards
             .insert("lab".into(), Arc::downgrade(&dashboard));
         let upstream = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = BufReader::new(&stream);
-            let mut text = String::new();
-            request.read_line(&mut text).unwrap();
-            assert_eq!(text, "GET /kanban HTTP/1.1\r\n");
-            // Read the full request before replying and closing the socket.
-            loop {
-                text.clear();
-                assert_ne!(request.read_line(&mut text).unwrap(), 0);
-                if text == "\r\n" {
-                    break;
+            for (start, body) in [
+                (
+                    "GET /kanban HTTP/1.0\r\n",
+                    "<html><head></head><body>test board</body></html>",
+                ),
+                (
+                    "PATCH /api/plugins/kanban/tasks/t1?board=review HTTP/1.0\r\n",
+                    "{}",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = BufReader::new(&stream);
+                let mut text = String::new();
+                request.read_line(&mut text).unwrap();
+                assert_eq!(text, start);
+                // Read the full request before replying and closing the socket.
+                loop {
+                    text.clear();
+                    assert_ne!(request.read_line(&mut text).unwrap(), 0);
+                    if text == "\r\n" {
+                        break;
+                    }
                 }
+                if start.starts_with("PATCH") {
+                    let mut patch = [0; 2];
+                    request.read_exact(&mut patch).unwrap();
+                    assert_eq!(&patch, b"{}");
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
             }
-            let body = "<html><head></head><body>test board</body></html>";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
         });
 
         let browser = |method: &str,
@@ -977,8 +1095,69 @@ mod tests {
             )
         };
         assert!(get("").starts_with("HTTP/1.1 403"));
+        let before = lookups.load(Ordering::Relaxed);
         assert!(get(cookie).contains("test board"));
+        assert_eq!(lookups.load(Ordering::Relaxed), before);
+        assert!(
+            browser(
+                "GET",
+                target,
+                "100.64.0.2",
+                "https://enclos.test",
+                cookie,
+                ""
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+
+        let write = |task: &str| {
+            let path = target.strip_suffix("kanban").unwrap();
+            browser(
+                "PATCH",
+                &format!("{path}api/plugins/kanban/tasks/{task}?board=other"),
+                "100.64.0.1",
+                "https://enclos.test",
+                cookie,
+                "{}",
+            )
+        };
+        trusted.store(false, Ordering::Relaxed);
+        assert!(write("t1").starts_with("HTTP/1.1 403"));
+        trusted.store(true, Ordering::Relaxed);
+        assert!(write("t2").starts_with("HTTP/1.1 404"));
+
+        let audit_db = rusqlite::Connection::open(folder.path().join("app.db")).unwrap();
+        audit_db.execute_batch(
+            "CREATE TRIGGER reject_board_audit BEFORE INSERT ON log WHEN NEW.event='held_task.board.write' BEGIN SELECT RAISE(ABORT, 'test audit failure'); END;",
+        ).unwrap();
+        assert!(write("t1").starts_with("HTTP/1.1 503"));
+        audit_db
+            .execute_batch("DROP TRIGGER reject_board_audit")
+            .unwrap();
+
+        task.title = "Still held at a new revision".into();
+        store
+            .report_held_tasks("lab/main", "held-board", &[task])
+            .unwrap();
+        assert!(write("t1").starts_with("HTTP/1.1 200"));
         upstream.join().unwrap();
+        store
+            .report_held_tasks("lab/main", "held-board", &[])
+            .unwrap();
+        assert!(write("t1").starts_with("HTTP/1.1 409"));
+        let writes: Vec<_> = store
+            .log_lines(20)
+            .unwrap()
+            .into_iter()
+            .filter(|line| line.event == "held_task.board.write")
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].device.as_deref(), Some("phone"));
+        assert_eq!(writes[0].person.as_deref(), Some("owner@example.com"));
+        assert_eq!(
+            writes[0].reason.as_deref(),
+            Some("lab/main review/t1 PATCH /api/plugins/kanban/tasks/t1")
+        );
         store.remove_device("phone").unwrap();
         assert!(get(cookie).starts_with("HTTP/1.1 403"));
     }

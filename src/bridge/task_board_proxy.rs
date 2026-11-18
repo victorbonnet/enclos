@@ -3,6 +3,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crate::engine::TaskBoardUpstream;
@@ -141,12 +142,14 @@ fn response_start(reader: &mut impl BufRead) -> io::Result<(u16, Vec<(String, St
     let mut remaining = reader.take(MAX_HEADER as u64);
     let mut line = String::new();
     remaining.read_line(&mut line)?;
-    let mut words = line.split_ascii_whitespace();
-    if words.next() != Some("HTTP/1.1") {
+    let text = line.strip_suffix("\r\n").ok_or_else(invalid)?;
+    let mut words = text.split(' ');
+    if !matches!(words.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
         return Err(invalid());
     }
     let status = words
         .next()
+        .filter(|word| word.len() == 3 && word.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|word| word.parse::<u16>().ok())
         .filter(|status| (100..600).contains(status))
         .ok_or_else(invalid)?;
@@ -163,7 +166,12 @@ fn response_start(reader: &mut impl BufRead) -> io::Result<(u16, Vec<(String, St
             .strip_suffix("\r\n")
             .and_then(|line| line.split_once(':'))
             .ok_or_else(invalid)?;
-        if !safe_header(value.as_bytes()) {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&b))
+            || !safe_header(value.as_bytes())
+        {
             return Err(invalid());
         }
         headers.push((name.to_ascii_lowercase(), value.trim().into()));
@@ -179,7 +187,11 @@ fn body_size(headers: &[(String, String)]) -> io::Result<Option<u64>> {
     for (name, value) in headers {
         match name.as_str() {
             "transfer-encoding" => return Err(invalid()),
-            "content-length" if length.is_none() => {
+            "content-length"
+                if length.is_none()
+                    && !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
                 length = Some(
                     value
                         .parse()
@@ -200,6 +212,14 @@ fn refuse(client: &mut TcpStream, status: &str, message: &str) -> io::Result<()>
         client,
         "HTTP/1.1 {status}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{message}",
         message.len()
+    )
+}
+
+fn bad_dashboard(client: &mut TcpStream) -> io::Result<()> {
+    refuse(
+        client,
+        "502 Bad Gateway",
+        "The private dashboard sent an invalid or unsupported response. Try again from Needs you.\n",
     )
 }
 
@@ -239,6 +259,7 @@ pub(super) fn forward(
     prefix: &str,
     board: &str,
     task: &str,
+    authorize_write: impl FnOnce(&str) -> Result<(), (&'static str, &'static str)>,
 ) -> io::Result<()> {
     client.set_write_timeout(Some(IO_WAIT))?;
     let path = target.split('?').next().unwrap_or_default();
@@ -261,32 +282,24 @@ pub(super) fn forward(
             "This task board resource is unavailable.\n",
         );
     }
-    let mut socket = upstream.connect()?;
-    socket.set_write_timeout(Some(IO_WAIT))?;
-    socket.set_read_timeout(Some(IO_WAIT))?;
-    write!(
-        socket,
-        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Forwarded-Prefix: {}\r\nAccept-Encoding: identity\r\n",
-        prefix.trim_end_matches('/')
-    )?;
-    for (name, value) in headers {
-        let name = name.to_ascii_lowercase();
-        let allowed = matches!(
-            name.as_str(),
-            "accept" | "accept-language" | "content-type" | "range" | "x-hermes-session-token"
-        );
-        if allowed && safe_header(value) {
-            header(&mut socket, &name, value)?;
-        }
+    if method != "GET"
+        && let Err((status, message)) = authorize_write(path)
+    {
+        return refuse(client, status, message);
     }
-    write!(
-        socket,
-        "Connection: close\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )?;
-    socket.write_all(body)?;
-    let mut response = BufReader::new(socket);
-    let (status, headers) = response_start(&mut response)?;
+    let mut response = match request(upstream, method, &target, headers, body, prefix) {
+        Ok(response) => response,
+        Err(_) => {
+            return refuse(
+                client,
+                "502 Bad Gateway",
+                "The private dashboard could not be reached. Try again from Needs you.\n",
+            );
+        }
+    };
+    let Ok((status, headers)) = response_start(&mut response) else {
+        return bad_dashboard(client);
+    };
     if status < 200 || (300..400).contains(&status) {
         return refuse(
             client,
@@ -296,7 +309,9 @@ pub(super) fn forward(
     }
     let rewrite =
         status == 200 && matches!(route, Route::Document | Route::Plugins | Route::Boards);
-    let length = body_size(&headers)?;
+    let Ok(length) = body_size(&headers) else {
+        return bad_dashboard(client);
+    };
     let mut output = Vec::new();
     if rewrite {
         if headers.iter().any(|(name, _)| name == "content-encoding") {
@@ -313,14 +328,20 @@ pub(super) fn forward(
                 "The dashboard document is too large.\n",
             );
         }
-        response
+        let read = response
             .by_ref()
             .take(length.unwrap_or(MAX_DOCUMENT as u64 + 1))
-            .read_to_end(&mut output)?;
-        if output.len() > MAX_DOCUMENT || length.is_some_and(|n| n != output.len() as u64) {
-            return Err(invalid());
+            .read_to_end(&mut output);
+        if read.is_err()
+            || output.len() > MAX_DOCUMENT
+            || length.is_some_and(|n| n != output.len() as u64)
+        {
+            return bad_dashboard(client);
         }
-        output = rewrite_body(route, &output, board)?;
+        let Ok(rewritten) = rewrite_body(route, &output, board) else {
+            return bad_dashboard(client);
+        };
+        output = rewritten;
     }
     write!(
         client,
@@ -353,9 +374,169 @@ pub(super) fn forward(
     }
 }
 
+fn request(
+    upstream: &TaskBoardUpstream,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &[u8])],
+    body: &[u8],
+    prefix: &str,
+) -> io::Result<BufReader<UnixStream>> {
+    let mut socket = upstream.connect()?;
+    socket.set_write_timeout(Some(IO_WAIT))?;
+    socket.set_read_timeout(Some(IO_WAIT))?;
+    // Uvicorn close-delimits streams without a content length for HTTP/1.0.
+    write!(
+        socket,
+        "{method} {target} HTTP/1.0\r\nHost: 127.0.0.1\r\nX-Forwarded-Prefix: {}\r\nAccept-Encoding: identity\r\n",
+        prefix.trim_end_matches('/')
+    )?;
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        let allowed = matches!(
+            name.as_str(),
+            "accept" | "accept-language" | "content-type" | "range" | "x-hermes-session-token"
+        );
+        if allowed && safe_header(value) {
+            header(&mut socket, &name, value)?;
+        }
+    }
+    write!(
+        socket,
+        "Connection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )?;
+    socket.write_all(body)?;
+    Ok(BufReader::new(socket))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::os::unix::net::UnixListener;
+
+    fn relay(
+        method: &str,
+        target: &str,
+        headers: &[(&str, &[u8])],
+        upstream_response: Option<&'static [u8]>,
+        authorize_write: impl FnOnce(&str) -> Result<(), (&'static str, &'static str)>,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dashboard.sock");
+        let runtime = upstream_response.map(|response| {
+            let listener = UnixListener::bind(&path).unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(IO_WAIT)).unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let mut line = String::new();
+                request.read_line(&mut line).unwrap();
+                assert!(line.ends_with(" HTTP/1.0\r\n"), "{line:?}");
+                let mut close = false;
+                loop {
+                    line.clear();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    close |= line == "Connection: close\r\n";
+                }
+                assert!(close);
+                stream.write_all(response).unwrap();
+            })
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut browser = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut client, _) = listener.accept().unwrap();
+        forward(
+            &mut client,
+            &TaskBoardUpstream::test_socket(path),
+            method,
+            target,
+            headers,
+            b"",
+            "/task-board/view/session/",
+            "reviews",
+            "t1",
+            authorize_write,
+        )
+        .unwrap();
+        drop(client);
+        let mut response = String::new();
+        browser.read_to_string(&mut response).unwrap();
+        if let Some(runtime) = runtime {
+            runtime.join().unwrap();
+        }
+        response
+    }
+
+    #[test]
+    fn the_relay_preserves_a_close_delimited_stream_without_authorizing_a_read() {
+        let result = relay(
+            "GET",
+            "/api/plugins/kanban/tasks/t1/log",
+            &[],
+            Some(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nprogress\n"),
+            |_| panic!("write check for a read"),
+        );
+        assert!(result.starts_with("HTTP/1.1 200 "), "{result}");
+        assert!(result.ends_with("\r\n\r\nprogress\n"), "{result}");
+    }
+
+    #[test]
+    fn invalid_upstream_responses_have_a_complete_gateway_error() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\ntruncated",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnull",
+        ] {
+            let result = relay(
+                "GET",
+                "/api/dashboard/plugins",
+                &[],
+                Some(response),
+                |_| unreachable!(),
+            );
+            assert!(result.starts_with("HTTP/1.1 502 "), "{result}");
+            assert!(result.ends_with("Try again from Needs you.\n"), "{result}");
+        }
+    }
+
+    #[test]
+    fn a_write_is_authorized_only_after_validation_and_before_connecting() {
+        for (target, headers, expected_status) in [
+            ("/api/plugins/kanban/tasks/t2", [].as_slice(), "404"),
+            ("/api/plugins/kanban/tasks/t1?board", [].as_slice(), "400"),
+            (
+                "/api/plugins/kanban/tasks/t1",
+                [("Upgrade", b"websocket".as_slice())].as_slice(),
+                "400",
+            ),
+        ] {
+            let result = relay("PATCH", target, headers, None, |_| {
+                panic!("write check for a refused request")
+            });
+            assert!(result.starts_with(&format!("HTTP/1.1 {expected_status} ")));
+        }
+        let result = relay(
+            "PATCH",
+            "/api/plugins/kanban/tasks/t1?board=other",
+            &[],
+            None,
+            |path| {
+                assert_eq!(path, "/api/plugins/kanban/tasks/t1");
+                Err((
+                    "403 Forbidden",
+                    "This task board write is no longer available.\n",
+                ))
+            },
+        );
+        assert!(result.starts_with("HTTP/1.1 403 "), "{result}");
+    }
 
     #[test]
     fn only_task_board_routes_and_assets_are_forwarded() {

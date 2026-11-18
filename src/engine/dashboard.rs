@@ -99,7 +99,10 @@ enum DashboardTarget {
 
 enum OpenFor<'a> {
     Host(&'a mut dyn FnMut(&DashboardOpen)),
-    TaskBoard(&'a mut dyn FnMut(TaskBoardUpstream)),
+    TaskBoard {
+        session_life: Duration,
+        opened: &'a mut dyn FnMut(TaskBoardUpstream),
+    },
 }
 
 struct UpstreamLifetime(Arc<AtomicBool>);
@@ -143,9 +146,18 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         ended: &AtomicBool,
+        session_life: Duration,
         opened: &mut dyn FnMut(TaskBoardUpstream),
     ) -> Result<DashboardEnd> {
-        self.dashboard_session(by, name, ended, OpenFor::TaskBoard(opened))
+        self.dashboard_session(
+            by,
+            name,
+            ended,
+            OpenFor::TaskBoard {
+                session_life,
+                opened,
+            },
+        )
     }
 
     fn dashboard_session(
@@ -157,7 +169,11 @@ impl Engine {
     ) -> Result<DashboardEnd> {
         let record = self.record(name)?;
         let runtime = adapter(self.runtime_of(name)?);
-        let task_board = matches!(open_for, OpenFor::TaskBoard(_));
+        let task_board_session_minutes = match &open_for {
+            OpenFor::Host(_) => None,
+            OpenFor::TaskBoard { session_life, .. } => Some(session_life.as_secs().div_ceil(60)),
+        };
+        let task_board = task_board_session_minutes.is_some();
         if task_board && runtime.kind() != RuntimeKind::Hermes {
             return Err(Error::Dashboard {
                 what: format!("the runtime of sandbox {name} has no supported task board"),
@@ -179,6 +195,7 @@ impl Engine {
             pid: std::process::id(),
             session: None,
             since: now(),
+            task_board_session_minutes,
         };
         let normal_lock = self.layout.dashboard_lock(name.as_str());
         // Linux's host dashboard uses its namespace relay and can coexist
@@ -303,7 +320,7 @@ impl Engine {
                 }
             };
             let serving = target.and_then(|target| match &mut open_for {
-                OpenFor::TaskBoard(opened) => {
+                OpenFor::TaskBoard { opened, .. } => {
                     let DashboardTarget::Local(socket) = target else {
                         unreachable!("a task board uses the private socket");
                     };

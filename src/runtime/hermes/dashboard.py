@@ -1,7 +1,9 @@
 """Run Hermes's dashboard on a Unix listener already bound by enclos.
 
-The bridge task board serves only on this descriptor. The regular macOS
-dashboard also uses it behind the local owner-checked host listener.
+The adapter serves only on this descriptor. On macOS, Seatbelt refuses
+TCP binds so a changed Hermes/Uvicorn startup fails closed instead of
+publishing the browser token on TCP. On Linux, Bubblewrap's network
+namespace keeps a stray TCP bind away from the host.
 """
 
 import os

@@ -121,6 +121,33 @@ fn answer_of(answer: &ToDevice) -> Option<MessageId> {
     }
 }
 
+/// The current card owned by this person, regardless of changes to its revision.
+pub(super) fn current_held_task(
+    store: &Store,
+    person: &str,
+    request: &ResumeRequest,
+) -> Result<StoredHeldTask, (ErrorCode, String)> {
+    let card = store
+        .held_task(&request.agent, request.task.as_str())
+        .map_err(|e| {
+            eprintln!(
+                "enclos app: cannot read a held task of {}: {e}",
+                request.agent
+            );
+            (ErrorCode::Internal, NOT_READ.to_owned())
+        })?
+        // Another person's and an unknown card read the same.
+        .filter(|card| card.owner == person)
+        .ok_or_else(|| (ErrorCode::NotFound, "No such held task.".to_owned()))?;
+    if card.info.state != HeldTaskState::Held {
+        return Err((
+            ErrorCode::Conflict,
+            "The task changed since its card was shown. Refresh before deciding again.".into(),
+        ));
+    }
+    Ok(card)
+}
+
 impl Hub {
     /// An agent's channel connected on `connection`. One without
     /// `held_tasks` can neither report nor resume: its held cards expire,
@@ -325,19 +352,8 @@ impl Hub {
         request: &ResumeRequest,
     ) -> Result<StoredHeldTask, (ErrorCode, String)> {
         self.host_authority(store, device, person)?;
-        let card = store
-            .held_task(&request.agent, request.task.as_str())
-            .map_err(|e| {
-                eprintln!(
-                    "enclos app: cannot read a held task of {}: {e}",
-                    request.agent
-                );
-                (ErrorCode::Internal, NOT_READ.to_owned())
-            })?
-            // Another person's and an unknown card read the same.
-            .filter(|card| card.owner == person)
-            .ok_or_else(|| (ErrorCode::NotFound, "No such held task.".to_owned()))?;
-        if card.info.state != HeldTaskState::Held || card.info.revision != request.revision {
+        let card = current_held_task(store, person, request)?;
+        if card.info.revision != request.revision {
             return Err((
                 ErrorCode::Conflict,
                 "The task changed since its card was shown. Refresh before deciding again.".into(),
