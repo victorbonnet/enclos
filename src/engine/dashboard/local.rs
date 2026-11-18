@@ -31,20 +31,29 @@ impl Local {
         engine: &Engine,
         name: &SandboxName,
         runtime: RuntimeSocketDashboard,
+        listen_on_host: bool,
     ) -> Result<Self> {
         let prepare = || -> io::Result<Self> {
             // A host can configure its ephemeral range to overlap enclos's.
             // Keep rejected listeners held until selection ends, so the
             // kernel cannot keep handing back the same reserved port.
             let mut rejected = Vec::new();
-            let front = loop {
-                let candidate = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-                if !(PORT_FIRST..=PORT_LAST).contains(&candidate.local_addr()?.port()) {
-                    break candidate;
-                }
-                rejected.push(candidate);
+            let front = if listen_on_host {
+                Some(loop {
+                    let candidate = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+                    if !(PORT_FIRST..=PORT_LAST).contains(&candidate.local_addr()?.port()) {
+                        break candidate;
+                    }
+                    rejected.push(candidate);
+                })
+            } else {
+                None
             };
-            let port = front.local_addr()?.port();
+            let port = front
+                .as_ref()
+                .map(TcpListener::local_addr)
+                .transpose()?
+                .map_or(0, |a| a.port());
             let mut random = [0u8; 32];
             getrandom::fill(&mut random).map_err(io::Error::other)?;
             let capability: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -71,7 +80,7 @@ impl Local {
             let command = SandboxCommand::new(words).reading(vec![script.clone()]);
             Ok(Self {
                 listener,
-                front: Some(front),
+                front,
                 socket,
                 script,
                 command,

@@ -34,7 +34,7 @@ use crate::lifecycle::process::{PsError, reference_of_child};
 use crate::lifecycle::slice::SliceLimits;
 use crate::model::limits::CpuShare;
 use crate::model::now;
-use crate::model::sandbox::{SandboxName, SandboxState};
+use crate::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
@@ -385,6 +385,21 @@ impl Engine {
         }
         let marker = self.new_marker(name)?;
         let extra = match starting {
+            Starting::Dashboard {
+                listener: Some(listener),
+                ..
+            } if record.backend == BackendKind::Bubblewrap => {
+                // Bubblewrap closes descriptors above stderr. Deliver the
+                // inherited listener on stdin, which the adapter detaches.
+                let fd = listener
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|error| Error::Session {
+                        what: format!("cannot pass the private dashboard listener: {error}"),
+                    })?;
+                wrapped.stdin(Stdio::from(fd));
+                None
+            }
             Starting::Dashboard {
                 listener: Some(listener),
                 ..

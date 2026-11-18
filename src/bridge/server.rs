@@ -48,6 +48,10 @@ mod questions;
 mod routines;
 #[path = "served.rs"]
 mod served;
+#[path = "task_board_proxy.rs"]
+mod task_board_proxy;
+#[path = "task_boards.rs"]
+mod task_boards;
 #[path = "task_details.rs"]
 mod task_details;
 #[path = "tasks.rs"]
@@ -206,6 +210,7 @@ struct Hub {
     open_item_devices: Mutex<HashSet<String>>,
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
+    task_boards: task_boards::TaskBoards,
     /// Task details asked of plugins for devices.
     task_details: Mutex<task_details::TaskDetailRequests>,
     /// One lock per agent, held while its plugin connection opens, never
@@ -473,6 +478,7 @@ impl Hub {
             open_items: Mutex::new(HashMap::new()),
             open_item_devices: Mutex::new(HashSet::new()),
             held_tasks: Mutex::new(Default::default()),
+            task_boards: task_boards::TaskBoards::default(),
             task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
@@ -1797,6 +1803,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(retry);
+            retrying.task_boards.sweep();
             let Ok(store) = retrying.store() else {
                 continue;
             };
@@ -1903,6 +1910,10 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
             }
             if super::page::requested(&stream) {
                 let _ = super::page::serve(stream);
+                return;
+            }
+            if task_boards::requested(&stream) {
+                hub.serve_task_board(stream, waiting, first_message_due);
                 return;
             }
             match connection(&hub, stream, waiting, deadline, first_message_due) {
@@ -2804,6 +2815,19 @@ fn run_session(
                 ) {
                     link.send(ToDevice::Error(error))?;
                 }
+            }
+            FromDevice::HeldTaskBoard {
+                agent,
+                task,
+                revision,
+            } => {
+                let request = held_tasks::ResumeRequest {
+                    agent,
+                    task,
+                    revision,
+                };
+                let answer = hub.task_board_link(store, device, person, message.id, request);
+                link.send(answer.unwrap_or_else(ToDevice::Error))?;
             }
             FromDevice::TaskGet { agent, task } => {
                 if let Err(error) = hub.task_get(store, device, person, message.id, agent, task) {
@@ -4488,6 +4512,68 @@ mod connection_end_tests {
             }
         });
         got
+    }
+
+    #[test]
+    fn only_the_host_person_can_open_a_board_for_the_current_held_task() {
+        use enclos_protocol::HeldTaskId;
+        use enclos_protocol::held_task::HeldTask;
+
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.set_host(PERSON).unwrap();
+        store
+            .conversation("owned-board", "lab", "main", PERSON)
+            .unwrap();
+        let task: HeldTask = serde_json::from_value(serde_json::json!({
+            "task": "review/t_one", "title": "Review", "reason": "Decide",
+            "since": 1, "revision": "e:1", "resume": "Open the board", "resumable": false
+        }))
+        .unwrap();
+        store
+            .report_held_tasks("lab/main", "owned-board", std::slice::from_ref(&task))
+            .unwrap();
+        let revision = store
+            .held_task("lab/main", "review/t_one")
+            .unwrap()
+            .unwrap()
+            .info
+            .revision;
+        let request = |revision| FromDevice::HeldTaskBoard {
+            agent: "lab/main".into(),
+            task: HeldTaskId::new("review/t_one").unwrap(),
+            revision,
+        };
+
+        let phone = paired(&bridge, "n-pixel");
+        let (mut device, auth) = connect(&bridge, &phone);
+        assert!(
+            matches!(auth, Some(ToDevice::Authenticated { capabilities, .. }) if capabilities.iter().any(|c| c == enclos_protocol::device::HELD_TASK_BOARD))
+        );
+        device.send("board-stale", request(revision + 1));
+        assert_eq!(
+            error_of(device.receive()),
+            (ErrorCode::Conflict, Some("board-stale".into()))
+        );
+        device.send("board-current", request(revision));
+        assert!(
+            matches!(device.receive(), Some(ToDevice::HeldTaskBoardLink { of, path })
+            if of.as_str() == "board-current" && path.starts_with("/task-board/open#"))
+        );
+
+        let other = "guest@example.com";
+        *bridge.whois_login.lock().unwrap() = other.into();
+        let guest = paired_as(&bridge, "n-pixel", other);
+        let (mut guest, auth) = connect_as(&bridge, &guest, other);
+        assert!(
+            matches!(auth, Some(ToDevice::Authenticated { capabilities, .. }) if !capabilities.iter().any(|c| c == enclos_protocol::device::HELD_TASK_BOARD))
+        );
+        guest.send("board-guest", request(revision));
+        assert_eq!(
+            error_of(guest.receive()),
+            (ErrorCode::NotAllowed, Some("board-guest".into()))
+        );
     }
 
     #[test]

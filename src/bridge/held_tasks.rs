@@ -316,9 +316,8 @@ impl Hub {
         }
     }
 
-    /// The card a resume names, if `person` may resume it at `revision`;
-    /// otherwise the code to answer, with nothing sent to the plugin.
-    fn resume_authority(
+    /// The current held card, if this device may act on it at its reviewed revision.
+    pub(super) fn held_task_authority(
         &self,
         store: &Store,
         device: &Device,
@@ -371,7 +370,7 @@ impl Hub {
             }
         }
         let card = self
-            .resume_authority(store, device, person, &request)
+            .held_task_authority(store, device, person, &request)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         // Said only to whoever may resume the card as it is, and before the
         // channel is opened: the runtime is not asked.
@@ -459,7 +458,7 @@ impl Hub {
         // lock that reports hold through their store write, and retain it through
         // admission/audit and the actual send: no accepted revocation can slip in.
         let card = self
-            .resume_authority(store, device, person, &request)
+            .held_task_authority(store, device, person, &request)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         if !card.info.resumable {
             return Err(failure(
