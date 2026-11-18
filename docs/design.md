@@ -563,7 +563,7 @@ pub trait RuntimeAdapter {
     fn services(&self) -> Vec<RuntimeService>;
     fn listener(&self) -> Option<RuntimeListener>;
     fn dashboard(&self) -> Option<RuntimeDashboard>;
-    fn secrets_folder_var(&self) -> Option<&'static str>;
+    fn secret_files(&self) -> Option<SecretFiles>;
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath>;
     fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath>;
     fn reads_agent_secrets(&self, _text: &str, _secrets_file: &Path) -> bool;
@@ -586,6 +586,17 @@ pub trait RuntimeAdapter {
         _channel: Channel,
         _agent: &RuntimeAgentName,
     ) -> Option<(HomePath, &'static str)>;
+    fn channel_token_is_plain(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+        _text: &str,
+        _field: &str,
+    ) -> Result<bool, String>;
+    fn inspect_settings(
+        &self,
+        _files: &[settings::SettingsFile],
+    ) -> Result<Vec<settings::SettingsFinding>, String>;
     fn agent_secrets_source(
         &self,
         _agent: &RuntimeAgentName,

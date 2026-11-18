@@ -31,6 +31,8 @@ The engine supplies bounded, link-safe reads from the sandbox home and the adapt
 
 Plain settings are independent of optional secret delivery. The adapter describes native secret references, account-to-agent routing and consumer format; the engine retains atomic protected-file writes, permissions, cleanup and redaction. Hermes's dotenv readers and `${VAR}` references cannot be the universal format. The source-backed OpenClaw candidate is a protected JSON/single-value file read through native SecretRefs, still to probe under Seatbelt. Runtime-owned OAuth remains inside the sandbox.
 
+M5-04 implements explicit `SecretFiles`/`SecretFileFormat` plans, JSON protected-file serialization, and runtime-owned `inspect_settings`/`channel_token_is_plain` decoding. A plan with no folder variable still writes protected files and returns no secret startup values. Legacy filenames remain stable; their contents follow the declared consumer format. Plain configuration does not require an agent-secret source when that agent has no grants. Hermes keeps its existing reader formats and diagnostics.
+
 Per-agent secrets provide routing within a sandbox, not isolation between its agents. Configure allowed people and account bindings before enabling a bot. Refuse unsupported secret values or consumer formats before mutation; never fall back to service startup environment secrets on macOS. Detect plaintext native tokens using the runtime's actual settings format.
 
 ### Services, listeners and dashboard
