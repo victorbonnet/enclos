@@ -505,6 +505,10 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/protocol.js"),
                 ),
                 (
+                    plugin.child("activity.js")?,
+                    include_str!("../../channels/openclaw/activity.js"),
+                ),
+                (
                     plugin.child("features.js")?,
                     include_str!("../../channels/openclaw/features.js"),
                 ),
