@@ -316,6 +316,7 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             adapter._write = AsyncMock(return_value=True)
             adapter._questions = types.SimpleNamespace(refused=AsyncMock())
             adapter._answers = {}
+            adapter._interrupts = types.SimpleNamespace(admit=lambda event: None, complete=lambda event: None)
             adapter._held = Mock()
             adapter._reporter = types.SimpleNamespace(refused=Mock())
             adapter.name = "enclos"

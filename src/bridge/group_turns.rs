@@ -312,7 +312,7 @@ impl Hub {
     }
 
     /// The person stopped group `id`'s discussion: what is queued is
-    /// cancelled, and the running member is sent `/stop`.
+    /// cancelled, and the running member's exact ingress is asked to abort.
     pub(super) fn group_stop(self: &Arc<Hub>, store: &Store, id: &str) {
         let Ok(Some((sandbox, _))) = group_of(store, id) else {
             return;
@@ -322,26 +322,42 @@ impl Hub {
             .lock()
             .expect("not poisoned")
             .get_mut(id)
+            .filter(|discussion| discussion.state != "stopped")
             .and_then(Discussion::stop);
         if let Some(run) = running {
             let _ = store.turn_status(&run.turn, "cancelled", None);
-            let owner = store.owner(id).ok().flatten().unwrap_or_default();
-            if let Ok(sent) = new_id()
-                .map_err(|e| e.to_string())
-                .and_then(|i| MessageId::new(i).map_err(|e| e.to_string()))
-            {
-                // Known before it is sent, so the runtime's answer is.
-                self.stops
+            // The running member's exact ingress is asked to abort, when its
+            // plugin advertises `abort`; an older one is sent no runtime
+            // text command. Written through the plugin's own lock.
+            let name = format!("{sandbox}/{}", run.member);
+            let out = if self.plugin(&name).is_ok() {
+                self.plugins
                     .lock()
                     .expect("not poisoned")
-                    .insert(sent.as_str().to_owned());
-                let agent = format!("{sandbox}/{}", run.member);
-                if self.send_to(&agent, id, &owner, &sent, "/stop").is_err() {
-                    self.stops
-                        .lock()
-                        .expect("not poisoned")
-                        .remove(sent.as_str());
-                }
+                    .get(&name)
+                    .filter(|plugin| plugin.capabilities.contains(&Capability::Abort))
+                    .map(|plugin| Arc::clone(&plugin.out))
+            } else {
+                None
+            };
+            let sent = out.is_some_and(|out| {
+                let (Ok(conversation), Ok(of)) =
+                    (ConversationId::new(id), MessageId::new(&run.sent))
+                else {
+                    return false;
+                };
+                out.lock()
+                    .expect("not poisoned")
+                    .writer
+                    .send(FromBridge::TurnAbort { conversation, of })
+                    .is_ok()
+            });
+            if !sent
+                && let Some(discussion) = self.groups.lock().expect("not poisoned").get_mut(id)
+                && discussion.state == "stopped"
+            {
+                discussion.reason =
+                    Some("The run continues in the runtime. Its reply will be dropped.".to_owned());
             }
         }
         self.deliver_group_state(store, id);
