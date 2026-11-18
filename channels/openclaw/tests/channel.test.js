@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { message } from '../protocol.js';
+import { mediaFolder } from '../media.js';
 import { accountFixture, bridge, waitFor } from './helpers.js';
 
 function nativeHarness(cfg) {
@@ -132,4 +134,100 @@ test('channel accounts sharing a socket folder get separate state folders by def
   const account = id => ({ agentId: id, socket: `/sandbox/sockets/${id}.sock`, tokenFile: '/sandbox/token.json', home: `home.lab.${id}` });
   const cfg = { channels: { enclos: { accounts: { first: account('first'), second: account('second') } } } };
   assert.notEqual(resolveAccount(cfg, 'first').stateDir, resolveAccount(cfg, 'second').stateDir);
+});
+
+test('typing, exact tool events, native commands and policy requests keep their separate contracts', async t => {
+  const account = accountFixture(t); const cfg = configured(account);
+  const channel = createChannel({ commands: () => [{ name: 'help', description: 'Native help\non one line', acceptsArgs: false }, { name: 'sethome', description: 'excluded' }] });
+  const native = nativeHarness(cfg), hooks = new Map(); let toolFactory;
+  channel.setRuntime(native.api);
+  channel.registerFull({ on(name, callback) { hooks.set(name, callback); }, registerTool(factory) { toolFactory = factory; } });
+  const dispatch = native.api.channel.inbound.dispatch;
+  native.api.channel.inbound.dispatch = async params => {
+    await params.dispatcherOptions.onReplyStart();
+    const ctx = { sessionKey: params.route.sessionKey, agentId: 'main', toolCallId: 'native-call' };
+    assert.equal(hooks.get('before_tool_call')({ toolName: 'read', params: { path: '/do-not-infer-policy', secret: 'do-not-show' } }, ctx), undefined);
+    const result = await dispatch(params);
+    hooks.get('after_tool_call')({ toolName: 'read', durationMs: 5 }, ctx);
+    await params.dispatcherOptions.onIdle();
+    return result;
+  };
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  const hello = await owner.hello();
+  assert.deepEqual(hello.capabilities, ['typing', 'commands', 'tools', 'approval']);
+  assert.deepEqual((await owner.next('commands')).commands, [{ name: 'help', description: 'Native help on one line' }]);
+  const policy = message('policy.context', { text: 'Sandbox access: read the permitted workspace only.' });
+  owner.send(policy); await owner.next('ack', policy.id);
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.equal((await owner.next('typing')).on, true);
+  const began = await owner.next('tool'), ended = await owner.next('tool');
+  assert.equal(began.call, 'native-call'); assert.equal(began.phase, 'start'); assert.equal(began.label, 'read');
+  assert.equal(JSON.stringify(began).includes('do-not-show'), false);
+  assert.equal(ended.call, began.call); assert.equal(ended.phase, 'end'); assert.equal(ended.ok, true); assert.equal(ended.duration_ms, 5);
+  const ctx = { sessionKey: native.calls.dispatch[0].route.sessionKey, agentId: 'main' };
+  assert.deepEqual(hooks.get('before_prompt_build')({}, ctx), { prependContext: policy.text });
+  assert.equal(hooks.get('before_prompt_build')({}, { ...ctx, agentId: 'scout' }), undefined);
+  hooks.get('after_tool_call')({ toolName: 'read', toolCallId: 'denied-call', params: { path: '/tmp/denied' }, error: 'EPERM: operation not permitted' }, ctx);
+  const observed = await owner.next('approval.request');
+  assert.deepEqual(observed.access, { kind: 'read', target: '/tmp/denied', private: false });
+  let live = true;
+  const tool = toolFactory.create({ ...ctx, messageChannel: 'enclos', assertInvocationCurrent() { if (!live) throw new Error('retired invocation'); } });
+  assert.equal(toolFactory.create({ sessionKey: 'unrelated', assertInvocationCurrent() {} }), null);
+  assert.match(tool.description, /policy request/);
+  assert.doesNotMatch(tool.description, /scope/);
+  const result = await tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read the requested file' });
+  const request = await owner.next('approval.request');
+  assert.equal(request.id, result.details.request); assert.equal(result.details.status, 'requested');
+  assert.deepEqual(request.access, { kind: 'read', target: '/tmp/requested', private: false });
+  assert.equal(channel.running.get('main').transport.state.policyContext, policy.text);
+  live = false;
+  await assert.rejects(tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read it again' }), /retired invocation/);
+});
+
+test('files enter the native context and an HTML artefact leaves through ordinary media', async t => {
+  const account = accountFixture(t), cfg = configured(account), folder = path.dirname(account.socket);
+  const sdk = { mediaRoots: () => [folder], async loadMedia(url, options) {
+    assert.deepEqual(options.localRoots, [folder]);
+    return { buffer: readFileSync(url), fileName: path.basename(url), contentType: 'text/html' };
+  } };
+  const channel = createChannel(sdk), native = nativeHarness(cfg);
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('attachments'));
+  writeFileSync(path.join(mediaFolder(account), 'input.txt'), 'hello file', { mode: 0o600 });
+  const input = message('message.in', { conversation: 'files', person: 'alice', text: '', attachments: [{ file: 'input.txt', name: 'input.txt', mime: 'text/plain', size: 10 }] });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.deepEqual(native.calls.contexts[0].media, [{ path: path.join(mediaFolder(account), 'input.txt'), contentType: 'text/plain', messageId: input.id }]);
+  const html = path.join(folder, 'answer.html'); writeFileSync(html, '<!doctype html><p>Static answer</p>');
+  await owner.next('message.out');
+  await channel.plugin.outbound.sendMedia({ cfg, accountId: 'main', to: 'files', text: 'Open the page', mediaUrl: html });
+  const outgoing = await owner.next('message.out');
+  assert.equal(outgoing.text, 'Open the page'); assert.equal(outgoing.attachments[0].mime, 'text/html');
+  assert.equal(outgoing.attachments[0].name, 'answer.html');
+  assert.equal(readFileSync(path.join(mediaFolder(account), outgoing.attachments[0].file), 'utf8'), '<!doctype html><p>Static answer</p>');
+});
+
+test('failed native and direct sends remove staged files', async t => {
+  const account = accountFixture(t), cfg = configured(account), folder = mediaFolder(account);
+  const sdk = {
+    mediaRoots: () => [path.dirname(account.socket)],
+    loadMedia: async () => ({ buffer: Buffer.from('test'), fileName: 'file.txt', contentType: 'text/plain' }),
+  };
+  const channel = createChannel(sdk), native = nativeHarness(cfg);
+  channel.setRuntime(native.api);
+  native.api.channel.inbound.dispatch = params => params.delivery.deliver({ mediaUrl: '/fixture.txt' });
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const ctx = { cfg, accountId: 'main', to: 'files', mediaUrl: '/fixture.txt' };
+  const fail = () => { assert.equal(readdirSync(folder).length, 1); throw new Error('send refused'); };
+  await assert.rejects(channel.plugin.outbound.sendMedia({ ...ctx, onPlatformSendDispatch: fail }), /send refused/);
+  assert.deepEqual(readdirSync(folder), []);
+  const active = channel.running.get('main');
+  active.transport.send = fail;
+  const input = message('message.in', { conversation: 'files', person: 'alice', text: 'hello' });
+  owner.send(input);
+  assert.equal((await owner.next('error', input.id)).code, 'agent_unavailable');
+  assert.deepEqual(readdirSync(folder), []);
 });

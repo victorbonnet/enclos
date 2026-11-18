@@ -4,6 +4,7 @@
   "description": "Token-authenticated conversations through the host's enclos bridge.",
   "channels": ["enclos"],
   "activation": { "onStartup": true },
+  "contracts": { "tools": ["enclos_request_access"] },
   "configSchema": { "type": "object", "additionalProperties": false, "properties": {} },
   "channelConfigs": {
     "enclos": {
