@@ -21,7 +21,11 @@ pub(crate) fn write_script(path: &Path, body: &str) {
         .unwrap()
         .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
         .unwrap();
-    assert!(sh.wait().unwrap().success(), "{}", path.display());
+    let status = sh.wait().unwrap();
+    assert!(
+        status.success(),
+        "could not write the test script ({status})"
+    );
 }
 
 /// Copies the program at `from` to `to`, executable, through a program of
