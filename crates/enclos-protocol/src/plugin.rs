@@ -357,6 +357,7 @@ pub enum Capability {
     Stream,
     Attachments,
     Approval,
+    /// Accepts `turn.abort` for an exact original incoming message id.
     Abort,
     /// It names conversations (`conversation.title`).
     Titles,
@@ -367,6 +368,9 @@ pub enum Capability {
     Routines,
     Questions,
     RuntimeApprovals,
+    /// Independent native approval scopes plus their persistence/fallback
+    /// descriptions; extends, rather than replaces, RuntimeApprovals.
+    RuntimeApprovalScopes,
     /// It permanently deletes a conversation's native session history.
     ConversationDelete,
     /// It reports its runtime's held tasks and resumes one (`held_tasks`,

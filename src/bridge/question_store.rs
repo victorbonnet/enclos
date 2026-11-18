@@ -1197,6 +1197,7 @@ mod runtime_approval_tests {
                 actions: vec![Action::Once, Action::Session, Action::Always, Action::Deny],
                 smart_denied: false,
                 patterns: vec!["package install scripts".into()],
+                scopes: None,
             }),
         }
     }

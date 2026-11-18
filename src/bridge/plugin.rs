@@ -110,6 +110,8 @@ fn connect_within(
         capabilities: vec![
             Capability::Questions,
             Capability::RuntimeApprovals,
+            Capability::RuntimeApprovalScopes,
+            Capability::Abort,
             Capability::Activity,
             Capability::Tasks,
             Capability::HeldTaskDetails,
@@ -156,6 +158,14 @@ fn connect_within(
 }
 
 impl PluginWriter {
+    #[cfg(test)]
+    pub(super) fn for_test(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
     /// Another writer on the same connection, for another thread.
     pub fn try_clone(&self) -> std::io::Result<PluginWriter> {
         Ok(PluginWriter {
@@ -484,10 +494,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         ours.set_write_timeout(Some(Duration::from_millis(200)))
             .unwrap();
-        let mut writer = PluginWriter {
-            stream: ours,
-            lock: Arc::new(Mutex::new(())),
-        };
+        let mut writer = PluginWriter::for_test(ours);
         // The plugin reads nothing: a line far larger than the socket's
         // buffer times out after part of it was written.
         let conversation = ConversationId::new("c-1").unwrap();
