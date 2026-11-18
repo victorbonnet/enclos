@@ -11,7 +11,8 @@ use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::runtime::{
-    HomeFile, Installer, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable,
+    AgentFacts, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter, RuntimeAgentName,
+    RuntimeFacts, SandboxCommand, Unreadable, ValueAt,
 };
 
 /// A runtime adapter that implements none of the `status` methods.
@@ -54,6 +55,187 @@ impl RuntimeAdapter for Bare {
     fn agents_in(&self, _: &Path) -> std::result::Result<Vec<RuntimeAgentName>, Unreadable> {
         Ok(Vec::new())
     }
+}
+
+/// A second native representation: shared JSON with JSON-pointer selectors
+/// and a configured removable default, without an immutable built-in agent.
+struct JsonRuntime;
+
+fn json_file() -> HomePath {
+    HomePath::new("runtime.json").unwrap()
+}
+
+impl RuntimeAdapter for JsonRuntime {
+    fn kind(&self) -> RuntimeKind {
+        Bare.kind()
+    }
+    fn version(&self) -> &'static str {
+        "0"
+    }
+    fn endpoints(&self) -> &'static str {
+        ""
+    }
+    fn installer(&self) -> Installer {
+        Bare.installer()
+    }
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        Bare.home_files(backend)
+    }
+    fn login(&self) -> String {
+        String::new()
+    }
+    fn create_agent(&self, name: &AgentName) -> SandboxCommand {
+        Bare.create_agent(name)
+    }
+    fn agent_files(&self, _: &AgentName) -> String {
+        String::new()
+    }
+    fn talk(&self, _: &AgentName) -> String {
+        String::new()
+    }
+    fn services(&self) -> Vec<crate::runtime::RuntimeService> {
+        Vec::new()
+    }
+    fn agents_in(&self, home: &Path) -> std::result::Result<Vec<RuntimeAgentName>, Unreadable> {
+        Ok(self.default_agent(home)?.into_iter().collect())
+    }
+    fn default_agent(
+        &self,
+        home: &Path,
+    ) -> std::result::Result<Option<RuntimeAgentName>, Unreadable> {
+        let Some(text) = crate::runtime::home::read_text(home, &json_file(), 256 * 1024)? else {
+            return Ok(None);
+        };
+        let at = ValueAt {
+            file: json_file(),
+            keys: vec!["/selected".into()],
+        };
+        let invalid = || Unreadable {
+            path: json_file().to_string(),
+            why: NotRead::Io("invalid runtime selection".into()),
+        };
+        self.fact_value(&at, &text)
+            .map_err(|_| invalid())?
+            .map(|name| RuntimeAgentName::new(&name).ok_or_else(invalid))
+            .transpose()
+    }
+    fn fact_value(&self, at: &ValueAt, text: &str) -> std::result::Result<Option<String>, String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| "invalid runtime JSON".to_owned())?;
+        for key in &at.keys {
+            if let Some(value) = doc.pointer(key) {
+                return value
+                    .as_str()
+                    .map(|s| Some(s.to_owned()))
+                    .ok_or_else(|| "runtime fact is not text".into());
+            }
+        }
+        Ok(None)
+    }
+    fn runtime_facts(&self) -> RuntimeFacts {
+        RuntimeFacts {
+            version: Some(ValueAt {
+                file: json_file(),
+                keys: vec!["/version".into()],
+            }),
+            ..RuntimeFacts::default()
+        }
+    }
+    fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts {
+        AgentFacts {
+            model: Some(ValueAt {
+                file: json_file(),
+                keys: vec![format!("/models/{agent}")],
+            }),
+            ..AgentFacts::default()
+        }
+    }
+}
+
+#[test]
+fn shared_json_facts_and_removable_defaults_cross_the_same_runtime_interface() {
+    let (_dir, engine, name) = with_runtime();
+    let home = engine.sandbox_home(&name);
+    let file = home.join("runtime.json");
+    let status = || {
+        let record = engine.state.get(&name).unwrap().unwrap();
+        let created = record.created_at;
+        engine
+            .sandbox_status(record, Some(&JsonRuntime), created)
+            .unwrap()
+    };
+    assert_eq!(JsonRuntime.builtin_agent(), None);
+    assert_eq!(JsonRuntime.default_agent(&home).unwrap(), None);
+    assert_eq!(Bare.default_agent(&home).unwrap(), None);
+    assert_eq!(status().runtime.unwrap().version, Fact::Absent);
+    assert_eq!(status().agents.unwrap().agents, Vec::new());
+
+    std::fs::write(
+        &file,
+        r#"{"selected":"main","version":"1","models":{"main":"model\u001b[2J"}}"#,
+    )
+    .unwrap();
+    let view = status();
+    let runtime = view.runtime.unwrap();
+    assert_eq!(runtime.version, Fact::Known("1".into()));
+    assert_eq!(runtime.logged_in, Fact::NotProvided);
+    let agents = view.agents.unwrap().agents;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].name.as_str(), "main");
+    assert_eq!(agents[0].kind, AgentKind::Untracked);
+    assert_eq!(agents[0].model, Fact::Known("model\\u{1b}[2J".into()));
+
+    // A different configured default replaces main, which is not invented
+    // again as a built-in agent. A missing fact remains absent.
+    std::fs::write(&file, r#"{"selected":"scout","version":"2"}"#).unwrap();
+    assert_eq!(
+        JsonRuntime.default_agent(&home).unwrap().unwrap().as_str(),
+        "scout"
+    );
+    let view = status();
+    let agents = view.agents.unwrap().agents;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].name.as_str(), "scout");
+    assert_eq!(agents[0].model, Fact::Absent);
+
+    std::fs::write(&file, "{broken").unwrap();
+    assert_eq!(
+        status().runtime.unwrap().version,
+        Fact::CannotTell("~/runtime.json: invalid runtime JSON".into())
+    );
+    assert!(JsonRuntime.default_agent(&home).is_err());
+
+    std::fs::remove_file(&file).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("runtime.json"),
+        r#"{"selected":"host"}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path().join("runtime.json"), &file).unwrap();
+    assert_eq!(
+        status().runtime.unwrap().version,
+        Fact::CannotTell("~/runtime.json is a link".into())
+    );
+    assert!(JsonRuntime.default_agent(&home).is_err());
+}
+
+#[test]
+fn an_omitted_agent_uses_the_installed_runtime_target() {
+    let (_dir, engine, name) = with_runtime();
+    assert_eq!(
+        engine.default_agent(&name).unwrap().unwrap().as_str(),
+        "default"
+    );
+    let missing = "missing".parse().unwrap();
+    assert!(engine.default_agent(&missing).is_err());
+    let (_dir, bare, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    assert!(
+        bare.default_agent(&name)
+            .unwrap_err()
+            .to_string()
+            .contains("no runtime")
+    );
 }
 
 fn with_runtime() -> (TempDir, Engine, SandboxName) {
@@ -102,7 +284,8 @@ fn a_runtime_that_names_nothing_gets_sizes_no_agents_and_suggestions() {
         status.agents,
         Some(AgentList {
             agents: Vec::new(),
-            unreadable: None
+            unreadable: None,
+            activity_unreadable: None,
         })
     );
     let rt = status.runtime.as_ref().unwrap();
@@ -639,9 +822,11 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                     model: Fact::NotProvided,
                     provider: Fact::NotProvided,
                     choose_provider: None,
+                    working: Vec::new(),
                 })
                 .collect(),
             unreadable: None,
+            activity_unreadable: None,
         }),
         ..base.clone()
     };
@@ -748,9 +933,8 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(default["model"], "absent");
     assert!(s["disk"]["total"].is_u64());
     assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
-    // The gateway is not running, and nothing in the sandbox listens.
-    assert_eq!(s["dashboard"], "absent");
-    // The host reaches a Seatbelt sandbox's listeners: no command to name.
+    // No gateway URL is published; a created sandbox has no dashboard hint.
+    assert!(s.get("dashboard").is_none());
     assert_eq!(s["dashboard_command"], serde_json::Value::Null);
     assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
     assert_eq!(json["complete"], true);
@@ -766,4 +950,46 @@ fn the_json_view_names_each_state_and_fact() {
             "command": "enclos connect home -- hermes -p default setup"
         })
     );
+}
+
+#[test]
+fn an_agent_the_bridge_heard_working_is_said_to_be_working_while_it_runs() {
+    let (_dir, engine, name) = with_runtime();
+    let agents = |engine: &Engine| {
+        engine.status(None).unwrap().sandboxes[0]
+            .agents
+            .clone()
+            .unwrap()
+    };
+    // No bridge database: nobody is said to be working
+    assert!(agents(&engine).agents[0].working.is_empty());
+    let path = engine.layout.app_store();
+    let store = crate::bridge::store::Store::open(&path).unwrap();
+    store
+        .set_activity(
+            &format!("{name}/default"),
+            &enclos_protocol::task::Activity {
+                doing: vec![enclos_protocol::task::Doing::Task { task: "t1".into() }],
+                since: 1,
+            },
+        )
+        .unwrap();
+    // What a bridge that stopped recorded says nothing now
+    let stopped = agents(&engine);
+    assert!(stopped.agents[0].working.is_empty());
+    assert_eq!(stopped.activity_unreadable, None);
+    // A bridge that runs holds its lock
+    let live = crate::bridge::store::hold_live(&path).unwrap();
+    let list = agents(&engine);
+    assert_eq!(
+        (list.agents[0].name.as_str(), list.agents[0].working.clone()),
+        ("default", vec!["task"])
+    );
+    // A database that cannot be read is said, not taken for idle
+    std::fs::write(&path, "not a database").unwrap();
+    let unreadable = agents(&engine);
+    assert!(unreadable.agents[0].working.is_empty());
+    assert!(unreadable.activity_unreadable.is_some());
+    drop(live);
+    assert_eq!(agents(&engine).activity_unreadable, None);
 }

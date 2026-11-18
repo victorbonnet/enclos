@@ -10,7 +10,8 @@ use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::runtime::RuntimeKind;
 use crate::runtime::RuntimeAgentName;
 use crate::runtime::{
-    HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable, hermes::Hermes,
+    AgentDeleteMode, HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable,
+    hermes::Hermes,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,7 @@ fn agents_need_a_runtime_first() {
 pub(super) struct TestRuntime {
     url: String,
     pub(super) sha256: String,
+    delete_mode: AgentDeleteMode,
 }
 
 impl TestRuntime {
@@ -114,6 +116,7 @@ impl TestRuntime {
         TestRuntime {
             url: format!("file://{}", installer.display()),
             sha256,
+            delete_mode: AgentDeleteMode::PauseRuntime,
         }
     }
 }
@@ -142,6 +145,15 @@ impl RuntimeAdapter for TestRuntime {
     }
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
         Hermes.create_agent(name)
+    }
+    fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
+        Hermes.delete_agent(name)
+    }
+    fn agent_delete_mode(&self) -> AgentDeleteMode {
+        self.delete_mode
+    }
+    fn agent_facts(&self, agent: &RuntimeAgentName) -> crate::runtime::AgentFacts {
+        Hermes.agent_facts(agent)
     }
     fn agent_files(&self, name: &AgentName) -> String {
         Hermes.agent_files(name)
@@ -223,8 +235,23 @@ fn answered<T>(mut ask: impl FnMut() -> Option<T>) -> Option<T> {
     }
 }
 
-/// A sandbox whose proxy is a listener this test stands in (`nc`), so
-/// that sessions can run through the fake backend; stopped when dropped,
+/// The proxy a [`Lab`] runs: it listens on the port it is given and closes
+/// every connection, until its parent, the test process, is gone. A test
+/// stopped from outside never drops its lab, and a proxy left listening in
+/// the proxy range would take the port of the next sandbox of every later
+/// run. Unlike `nc -lk`, it holds its port without a gap, where the
+/// engine's check for a free port would take the port for free.
+const FAKE_PROXY: &str = "use Socket; my $parent = getppid(); \
+    socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"socket: $!\\n\"; \
+    setsockopt($s, SOL_SOCKET, SO_REUSEADDR, 1) or die \"setsockopt: $!\\n\"; \
+    bind($s, sockaddr_in($ARGV[0], INADDR_LOOPBACK)) or die \"bind: $!\\n\"; \
+    listen($s, 16) or die \"listen: $!\\n\"; \
+    my $wait = \"\"; vec($wait, fileno($s), 1) = 1; \
+    while (getppid() == $parent) { \
+    if (select(my $ready = $wait, undef, undef, 1) > 0) { accept(my $c, $s) and close $c; } }";
+
+/// A sandbox whose proxy is a listener this test stands in ([`FAKE_PROXY`]),
+/// so that sessions can run through the fake backend; stopped when dropped,
 /// so the listener never outlives the test.
 struct Lab {
     _dir: TempDir,
@@ -240,26 +267,33 @@ impl Lab {
 
     /// A lab whose engine installs services through `services`.
     fn with_services(services: Option<Box<dyn crate::service::ServiceManager>>) -> Lab {
-        Lab::build(services, None, None)
+        Lab::build(services, None, None, &super::Root::usual())
     }
 
     /// A lab whose `launch` stops a session's members with `stop` once
     /// told to end.
     fn stopping_with(stop: crate::engine::StopMembers) -> Lab {
-        Lab::build(None, Some(stop), None)
+        Lab::build(None, Some(stop), None, &super::Root::usual())
     }
 
     /// A lab whose engine keeps secrets in `secrets`.
     fn with_secrets(secrets: Box<dyn crate::secrets::Stores>) -> Lab {
-        Lab::build(None, None, Some(secrets))
+        Lab::build(None, None, Some(secrets), &super::Root::usual())
+    }
+
+    /// [`Lab::with_secrets`], enclos's folder at `root`.
+    fn with_secrets_under(secrets: Box<dyn crate::secrets::Stores>, root: &super::Root) -> Lab {
+        Lab::build(None, None, Some(secrets), root)
     }
 
     fn build(
         services: Option<Box<dyn crate::service::ServiceManager>>,
         stop: Option<crate::engine::StopMembers>,
         secrets: Option<Box<dyn crate::secrets::Stores>>,
+        root: &super::Root,
     ) -> Lab {
-        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let (dir, engine, name) =
+            super::policy::with_sandbox_under(FakeBackend::available(BackendKind::Seatbelt), root);
         let engine = match services {
             Some(services) => engine.with_services(services),
             None => engine,
@@ -275,7 +309,9 @@ impl Lab {
         let proxy = dir.path().join("proxy.sh");
         crate::test_scripts::write_script(
             &proxy,
-            "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"",
+            &format!(
+                "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/perl -e '{FAKE_PROXY}' \"$5\""
+            ),
         );
         let home = engine.layout.sandbox_home("home");
         Lab {
@@ -352,7 +388,7 @@ fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
     // Listening is what the adapter brings, like its destinations: named,
     // and not an "also" change that would ask first (ADR 0028).
     assert!(
-        plan.contains("let sandbox home listen on TCP for hermes"),
+        plan.contains("let sandbox home listen for hermes (ADR 0028), on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"),
         "{plan}"
     );
     assert!(!plan.contains("also "), "{plan}");
@@ -389,7 +425,7 @@ fn an_install_says_when_policy_toml_keeps_listening_off() {
         plan.contains("keep sandbox home from listening, as its policy.toml sets `listen = false`: hermes's service cannot start"),
         "{plan}"
     );
-    assert!(!plan.contains("listen on TCP for hermes"), "{plan}");
+    assert!(!plan.contains("listen for hermes"), "{plan}");
     done(lab.install(INSTALLS, Confirm::Yes).unwrap());
     assert!(
         !lab.engine
@@ -497,6 +533,84 @@ fn an_installer_that_fails_leaves_the_sandbox_as_before() {
     );
     // The home file was put in place from inside the sandbox before.
     assert!(lab.home.join("bin/mktemp").is_file());
+}
+
+/// An installer that ignores TERM and starts a process in a process group
+/// of its own, which ignores TERM too, as a stuck `curl | bash` child can:
+/// both pids go to `installer-pids` in the home.
+const HANGS: &str = "#!/bin/sh
+trap '' TERM
+/usr/bin/perl -e 'setpgrp(0, 0); exec \"/bin/sleep\", \"600\"' &
+printf '%s\\n%s\\n' $! $$ > \"$HOME/installer-pids.part\"
+mv \"$HOME/installer-pids.part\" \"$HOME/installer-pids\"
+exec /bin/sleep 600
+";
+
+/// The mobile app's bridge asks for an install nobody watches: past its
+/// limit, every process of the installer is stopped, whatever its process
+/// group, its session's end is recorded, and the install is undone.
+#[test]
+fn an_installer_past_its_time_limit_is_stopped_with_all_it_started_and_undone() {
+    use crate::model::session::SessionKind;
+    use std::time::{Duration, Instant};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    // KILL half a second after TERM, rather than `STOP_GRACE`.
+    let lab = Lab::stopping_with(|cgroups, session, _| {
+        crate::lifecycle::stop::stop(cgroups, session, Duration::from_millis(500))
+    });
+    let runtime = TestRuntime::new(lab._dir.path(), HANGS);
+    let started = Instant::now();
+    let limit = Duration::from_secs(3);
+    let end = done(
+        lab.engine
+            .install_runtime_limited(&alice(), &lab.name, &runtime, Confirm::Yes, Some(limit))
+            .unwrap(),
+    );
+    assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!end.installed, "{end:?}");
+    assert_eq!(end.stopped_after, Some(limit));
+    assert_eq!(
+        end.ended(),
+        "did not finish within 3 seconds and was stopped"
+    );
+    // It ignored TERM, so KILL ended it.
+    assert_eq!(end.end.signal, Some(9), "{end:?}");
+    assert_eq!(end.end.left, Left::Nothing, "{end:?}");
+    // The process in a group of its own is gone too.
+    assert_gone(&pids_in(&lab.home.join("installer-pids")));
+    let open: Vec<_> = lab
+        .engine
+        .state
+        .sessions(&lab.name, true)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.kind != SessionKind::Proxy)
+        .collect();
+    assert!(open.is_empty(), "{open:?}");
+    // Undone, as after an installer that fails.
+    assert_eq!(end.recorded, None);
+    assert_eq!(lab.runtime(), None);
+    assert!(!lab.allows("chatgpt.com"));
+    assert_eq!(
+        lab.summary("runtime install failed"),
+        format!(
+            "the installer did not finish within 3 seconds and was stopped; policy v{} without hermes's destinations",
+            end.policy
+        )
+    );
+    assert!(
+        lab.summary("session end")
+            .contains("stopped at its time limit"),
+        "{}",
+        lab.audit()
+    );
+    assert!(lab.engine.verify_audit().unwrap().intact());
 }
 
 #[test]
@@ -810,6 +924,58 @@ fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
 }
 
 #[test]
+fn removing_an_agent_removes_it_from_the_app_inventory() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for keep_data in [false, true] {
+        check_removed_agent_app_inventory(keep_data);
+    }
+}
+
+fn check_removed_agent_app_inventory(keep_data: bool) {
+    let lab = Lab::with_secrets(Box::new(crate::secrets::InMemory::default()));
+    lab_with_profiles(&lab, &["main"]);
+    grant_app_token(&lab, Confirm::Yes);
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.main]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+        .unwrap();
+    let names = || {
+        lab.engine
+            .app_agents()
+            .unwrap()
+            .agents
+            .into_iter()
+            .map(|agent| agent.agent)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(), ["default", "main"]);
+    assert!(lab.engine.app_endpoint(&lab.name, "main").is_ok());
+    done(
+        lab.engine
+            .remove_agent(
+                &alice(),
+                &lab.name,
+                &"main".parse().unwrap(),
+                keep_data,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(lab.home.join(".hermes/profiles/main").exists(), keep_data);
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+    assert_eq!(
+        names(),
+        ["default"],
+        "a deleted agent must leave the Agents tab"
+    );
+    assert!(lab.engine.app_endpoint(&lab.name, "main").is_err());
+    assert!(lab.engine.app_endpoint(&lab.name, "default").is_ok());
+}
+
+#[test]
 fn an_agent_added_before_the_login_chose_a_provider_is_said_to_have_none() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
@@ -981,6 +1147,216 @@ fn a_delete_runs_with_the_gateway_stopped_and_a_half_deleted_agent_is_deleted_ag
     );
     assert!(!profile("other").exists());
     assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+}
+
+#[test]
+fn an_agent_added_while_the_gateway_runs_restarts_it_once_the_agent_exists() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    // The stub's create makes the agent's folder from the built-in one's
+    // settings.
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(lab.home.join(".hermes/config.yaml"), "").unwrap();
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let plan = |a: &str| {
+        let Planned::DryRun(plan) = lab
+            .engine
+            .add_agent(&alice(), &lab.name, agent(a), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run added");
+        };
+        plan.changes
+    };
+    // Each start of the gateway, with the agents whose folder it found:
+    // Hermes's gateway serves only those.
+    let starts: Rc<RefCell<Vec<Vec<String>>>> = Rc::default();
+    let seen = Rc::clone(&starts);
+    let profiles = lab.home.join(".hermes/profiles");
+    *fake.on_start.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            let mut found: Vec<String> = std::fs::read_dir(&profiles)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            found.sort();
+            seen.borrow_mut().push(found);
+        }
+    }));
+
+    // A stopped sandbox: nothing to restart, nothing to confirm.
+    assert_eq!(
+        plan("early"),
+        [
+            "run `hermes profile create early --clone-from default` in sandbox home under policy v2",
+            "run `hermes -p early config set secrets.command.enabled false` in sandbox home under policy v2",
+            "record agent home/early",
+        ]
+    );
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("early"), Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(fake.stopped.borrow().is_empty() && starts.borrow().is_empty());
+
+    // Started, as `sandbox start` leaves it: the plan and the confirmation
+    // say the gateway restarts, and asking runs nothing.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    assert_eq!(
+        plan("scout"),
+        [
+            "run `hermes profile create scout --clone-from default` in sandbox home under policy v2".to_owned(),
+            "run `hermes -p scout config set secrets.command.enabled false` in sandbox home under policy v2".to_owned(),
+            "record agent home/scout".to_owned(),
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/scout"),
+        ]
+    );
+    let before = calls();
+    let err = lab
+        .engine
+        .add_agent(&alice(), &lab.name, agent("scout"), Confirm::Ask)
+        .unwrap_err();
+    assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+    assert!(
+        err.to_string().starts_with(
+            "adding agent home/scout, which restarts the sandbox's service gateway and so ends a chat in progress, needs confirmation"
+        ),
+        "{err}"
+    );
+    assert_eq!(calls(), before);
+    assert!(fake.stopped.borrow().is_empty());
+
+    // Confirmed: Hermes creates the agent, then the gateway stops and
+    // starts again, finding it.
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("scout"), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(*fake.stopped.borrow(), std::slice::from_ref(&gateway));
+    assert_eq!(*starts.borrow(), [vec!["early", "scout"]]);
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
+    assert!(
+        lab.audit().contains("for agent add home/scout"),
+        "{}",
+        lab.audit()
+    );
+
+    // An agent made inside the sandbox while the gateway ran is adopted,
+    // and the gateway restarted for it too.
+    std::fs::create_dir_all(lab.home.join(".hermes/profiles/inside")).unwrap();
+    std::fs::write(lab.home.join(".hermes/profiles/inside/config.yaml"), "").unwrap();
+    assert_eq!(
+        plan("inside"),
+        [
+            "record agent home/inside, which Hermes already has in the sandbox".to_owned(),
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/inside"),
+        ]
+    );
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("inside"), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(starts.borrow().len(), 2);
+
+    // A gateway that cannot start again: the agent stays added, and enclos
+    // says how to start it.
+    *fake.refuse.borrow_mut() = Some("gateway".to_owned());
+    let err = lab
+        .engine
+        .add_agent(&alice(), &lab.name, agent("late"), Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::FailedAfter { .. }), "{err}");
+    let err = err.to_string();
+    assert!(
+        err.contains("its gateway could not start again")
+            && err.contains("`enclos sandbox start home` starts its services again")
+            && err.contains("after adding agent home/late"),
+        "{err}"
+    );
+    assert!(
+        lab.engine
+            .agents(&lab.name)
+            .unwrap()
+            .iter()
+            .any(|a| a.name == agent("late"))
+    );
+    // Stopped now: the next add restarts nothing.
+    assert_eq!(plan("after").len(), 3);
+}
+
+#[test]
+fn an_agent_imported_while_the_gateway_runs_restarts_it() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let archive = lab._dir.path().join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let import = |confirm| {
+        lab.engine
+            .import_agent(&alice(), &lab.name, agent("main"), &archive, confirm)
+    };
+
+    let Planned::DryRun(plan) = import(Confirm::DryRun).unwrap() else {
+        panic!("a dry run imported");
+    };
+    assert_eq!(
+        plan.changes[3..],
+        [
+            format!("stop service {gateway}, which ends a chat in progress"),
+            format!("install service {gateway} again, so that it serves agent home/main"),
+        ]
+    );
+    let err = import(Confirm::Ask).unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "importing agent home/main, which restarts the sandbox's service gateway and so ends a chat in progress, needs confirmation"
+        ),
+        "{err}"
+    );
+    assert!(!lab.home.join("hermes-calls").exists());
+    done(import(Confirm::Yes).unwrap());
+    assert!(
+        std::fs::read_to_string(lab.home.join("hermes-calls"))
+            .unwrap()
+            .contains("profile import")
+    );
+    assert_eq!(*fake.stopped.borrow(), std::slice::from_ref(&gateway));
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
 }
 
 #[test]
@@ -1935,6 +2311,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
         .ask_restart(
             &alice(),
             &service_session,
+            crate::engine::restart::ProgramAt::Root,
             crate::runtime::Signal::Usr1,
             &env,
         )
@@ -1951,6 +2328,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
@@ -2011,6 +2389,7 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
             .ask_restart(
                 &alice(),
                 &service_session,
+                crate::engine::restart::ProgramAt::Root,
                 crate::runtime::Signal::Usr1,
                 &env,
             )
@@ -2874,12 +3253,20 @@ fn configure_channel(
         match engine.configure_agent(by, name, agent, Some(request), &[], confirm)? {
             Planned::DryRun(plan) => Planned::DryRun(plan),
             Planned::Done(done) => {
-                let bot = done.channel.expect("a channel was asked for");
+                let Some(crate::engine::ChannelSet::Bot {
+                    token,
+                    answers,
+                    reachable,
+                    ..
+                }) = done.channel
+                else {
+                    panic!("a bot was asked for: {:?}", done.channel);
+                };
                 Planned::Done(Bot {
                     agent: done.agent,
-                    token: bot.token,
-                    answers: bot.answers,
-                    reachable: bot.reachable,
+                    token,
+                    answers,
+                    reachable,
                 })
             }
         },
@@ -3122,6 +3509,42 @@ fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
     assert!(done(configure(&users, Confirm::Yes).unwrap()).reachable);
 }
 
+/// The app channel gives the plugin the public key the bridge signs
+/// runtime-approval decisions with (ADR 0060): made by the first run that
+/// needs it, the user's alone, kept after, and named, not made, by a dry
+/// run. (A whole `runtime configure --channel app` here would need a socket
+/// path shorter than a test's folder gives on macOS.)
+#[test]
+fn the_app_channel_gives_the_plugin_the_bridges_approval_key() {
+    let (_dir, engine) = super::engine_with(Vec::new());
+    let key = engine.app_approval_key_path();
+    let named = engine.app_approval_public_key(Confirm::DryRun).unwrap();
+    assert!(named.contains("made when this runs"), "{named}");
+    assert!(!key.exists());
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    let public = engine.app_approval_public_key(Confirm::Yes).unwrap();
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        public,
+        crate::bridge::keys::approval_key(&key)
+            .unwrap()
+            .public_text()
+    );
+    // Again, and in a dry run: the same key, never a new one the plugins
+    // would not know.
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::Yes).unwrap(),
+        public
+    );
+    assert_eq!(
+        engine.app_approval_public_key(Confirm::DryRun).unwrap(),
+        public
+    );
+}
+
 /// A token granted only by the pending policy waits for it: nothing
 /// runs before `policy apply`.
 #[test]
@@ -3257,6 +3680,302 @@ fn an_agent_is_given_a_bot_of_its_own() {
     );
     assert!(!calls.contains("-p default config set"), "{calls}");
     assert!(!calls.contains("123:main"), "{calls}");
+}
+
+/// `runtime configure --channel app`, with `--allow-user` and
+/// `--token-env` given as `answers` and `token`.
+fn configure_app(
+    lab: &Lab,
+    answers: &[crate::model::channel::ChannelUser],
+    token: Option<&str>,
+    confirm: Confirm,
+) -> crate::error::Result<Planned<crate::engine::Configured>> {
+    let request = crate::engine::ChannelRequest {
+        channel: crate::model::channel::Channel::App,
+        token: token.map(str::to_owned),
+        answers: answers.to_vec(),
+    };
+    lab.engine
+        .configure_agent(&alice(), &lab.name, None, Some(request), &[], confirm)
+}
+
+/// The app channel's files enclos staged in `installers/` and left there.
+fn staged_app_files(lab: &Lab) -> Vec<String> {
+    let dir = lab.engine.layout.sandbox_installers("home");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("app-"))
+        .collect()
+}
+
+/// Grants the built-in agent `MOBILE_APP_TOKEN` in the policy, from a
+/// secret stored for it, with `confirm` (`Ask` leaves it pending while a
+/// session runs under the old rules).
+fn grant_app_token(lab: &Lab, confirm: Confirm) {
+    use crate::model::secret::{SecretRef, SecretValue};
+    let token: SecretRef = "home/app".parse().unwrap();
+    let value = SecretValue::new("0123abcd".into()).unwrap();
+    done(
+        lab.engine
+            .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.default]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, confirm)
+        .unwrap();
+}
+
+/// The app channel (ADR 0042, proposed): refused, with nothing run or
+/// staged, while its token is not the agent's own or when asked for
+/// people or a token variable the bridge decides instead; a dry run
+/// stages nothing; set up, the plugin is in the agent's home, turned on,
+/// told its socket, and nothing staged is left behind.
+#[test]
+fn the_app_channel_is_set_up_once_the_agent_alone_holds_its_token() {
+    use crate::model::channel::ChannelUser;
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    // In /tmp: the socket's path must fit in 103 bytes, which macOS's own
+    // temporary folder, deep as it is, leaves no room for.
+    let root = super::Root {
+        parent: "/tmp".into(),
+        leaf: "e".to_owned(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let nothing_ran = |lab: &Lab| {
+        assert!(!calls().contains("plugins enable"), "{}", calls());
+        assert!(!calls().contains("MOBILE_APP"), "{}", calls());
+        assert!(
+            staged_app_files(lab).is_empty(),
+            "{:?}",
+            staged_app_files(lab)
+        );
+    };
+
+    // People to answer, or another token variable: the bridge decides
+    // both, so each is refused rather than ignored.
+    let users: Vec<ChannelUser> = vec!["111".parse().unwrap()];
+    let err = configure_app(&lab, &users, None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string().contains("`--allow-user` does not apply"),
+        "{err}"
+    );
+    let err = configure_app(&lab, &[], Some("MY_TOKEN"), Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string().contains("`--token-env` does not apply")
+            && err.to_string().contains("$MOBILE_APP_TOKEN"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    // No token granted: refused, saying how to make and grant one.
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("gives agent default no $MOBILE_APP_TOKEN")
+            && err
+                .to_string()
+                .contains("enclos secret set home/default-app")
+            && err.to_string().contains("[secrets.agents.default]"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    // Granted to the whole sandbox, every agent would hold it: the
+    // policy itself is refused, so one token is one agent's.
+    let shared: SecretRef = "home/shared-app".parse().unwrap();
+    let value = SecretValue::new("0123abcd".into()).unwrap();
+    done(
+        lab.engine
+            .secret_set(&alice(), &shared, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let sandbox_wide =
+        format!("{before}\n[secrets]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/shared-app\" }}\n");
+    let err = lab
+        .engine
+        .policy_edit(&alice(), &lab.name, &before, &sandbox_wide, Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Policy(e) if e.is_refused())
+            && err.to_string().contains("secrets.env.MOBILE_APP_TOKEN"),
+        "{err}"
+    );
+    nothing_ran(&lab);
+
+    grant_app_token(&lab, Confirm::Yes);
+    // A dry run names the copy and runs nothing, and stages nothing.
+    let Planned::DryRun(plan) = configure_app(&lab, &[], None, Confirm::DryRun).unwrap() else {
+        panic!("a dry run set the app channel up");
+    };
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.contains("run `cp '~/.hermes/plugins/enclos/plugin.yaml'")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.contains("plugins enable enclos")),
+        "{plan:?}"
+    );
+    nothing_ran(&lab);
+    // Nor makes the bridge's key for runtime approvals (ADR 0060): it names it.
+    assert!(!lab.engine.app_approval_key_path().exists());
+
+    let Planned::Done(configured) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
+        panic!("not a dry run");
+    };
+    let socket = lab.engine.layout.agent_app_socket("home", "default");
+    assert_eq!(
+        configured.channel,
+        Some(crate::engine::ChannelSet::App {
+            token: "MOBILE_APP_TOKEN".to_owned(),
+            socket: socket.clone(),
+        })
+    );
+    assert_eq!(
+        configured.settings,
+        [
+            "MOBILE_APP_SOCKET",
+            "MOBILE_APP_ALLOW_ALL",
+            "MOBILE_APP_HOME_CHANNEL",
+            "agent.clarify_timeout",
+            "MOBILE_APP_BRIDGE_KEY"
+        ]
+    );
+    // The public key of the bridge's key for runtime approvals, made now.
+    let public = crate::bridge::keys::approval_key(&lab.engine.app_approval_key_path())
+        .unwrap()
+        .public_text();
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/plugins/enclos/plugin.yaml")).unwrap(),
+        include_str!("../../../channels/hermes/enclos/plugin.yaml")
+    );
+    assert!(
+        calls().ends_with(&format!(
+            "-p default plugins enable enclos\n-p default config set MOBILE_APP_SOCKET {}\n-p default config set MOBILE_APP_ALLOW_ALL true\n-p default config set MOBILE_APP_HOME_CHANNEL home.home.default\n-p default config set agent.clarify_timeout 3600\n-p default config set MOBILE_APP_BRIDGE_KEY {public}\n",
+            socket.display()
+        )),
+        "{}",
+        calls()
+    );
+    assert!(!calls().contains("0123abcd"), "{}", calls());
+    assert!(
+        staged_app_files(&lab).is_empty(),
+        "{:?}",
+        staged_app_files(&lab)
+    );
+}
+
+/// An agent forgotten in the app and set up again gets a Home id never
+/// used (ADR 0067, proposed): `runtime configure` claims it in the
+/// bridge's database and gives it to the runtime; a dry run claims none.
+#[test]
+fn an_agent_forgotten_in_the_app_is_set_up_with_a_new_home() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let root = super::Root {
+        parent: "/tmp".into(),
+        leaf: "f".to_owned(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    grant_app_token(&lab, Confirm::Yes);
+    let bridge = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    bridge.claim_host("alice").unwrap();
+    bridge.ensure_home("home/default", "alice", true).unwrap();
+    let (forgotten, _) = bridge
+        .forget_agent("home/default", "alice", "phone")
+        .unwrap();
+    assert_eq!(forgotten, ["home.home.default"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let Planned::DryRun(_) = configure_app(&lab, &[], None, Confirm::DryRun).unwrap() else {
+        panic!("a dry run set the app channel up");
+    };
+    assert_eq!(bridge.home_of("home/default").unwrap(), None);
+    let Planned::Done(_) = configure_app(&lab, &[], None, Confirm::Yes).unwrap() else {
+        panic!("not a dry run");
+    };
+    assert!(
+        calls().contains("-p default config set MOBILE_APP_HOME_CHANNEL home.home.default.2\n"),
+        "{}",
+        calls()
+    );
+    assert_eq!(
+        bridge.home_of("home/default").unwrap().as_deref(),
+        Some("home.home.default.2")
+    );
+}
+
+/// The app channel's token granted only by the pending policy waits for
+/// it: nothing runs, and nothing is staged, before `policy apply`.
+#[test]
+fn an_app_channel_whose_token_is_only_pending_is_refused() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    // A session under rules the grant changes keeps it pending.
+    let sleeping = super::sandbox::Sleeping::new();
+    let mut session = super::sandbox::session_of(&lab.engine, &lab.name, sleeping.process());
+    session.compiled = Some("/compiled/at-launch.sb".into());
+    super::sandbox::put(&lab.engine, &session);
+    grant_app_token(&lab, Confirm::Ask);
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("pending policy of sandbox home gives agent default $MOBILE_APP_TOKEN")
+            && err.to_string().contains("enclos policy apply home"),
+        "{err}"
+    );
+    let calls = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    assert!(!calls.contains("plugins enable"), "{calls}");
+    assert!(staged_app_files(&lab).is_empty());
+    drop(sleeping);
+}
+
+/// A socket path longer than a Unix socket's may be is refused before
+/// anything runs or is staged, saying to move ENCLOS_HOME.
+#[test]
+fn an_app_channel_whose_socket_path_is_too_long_is_refused() {
+    use crate::secrets::InMemory;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let root = super::Root {
+        leaf: "e".repeat(80),
+        ..super::Root::usual()
+    };
+    let lab = Lab::with_secrets_under(Box::new(std::rc::Rc::clone(&store)), &root);
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    grant_app_token(&lab, Confirm::Yes);
+    let socket = lab.engine.layout.agent_app_socket("home", "default");
+    assert!(socket.as_os_str().len() > 103, "{}", socket.display());
+    let err = configure_app(&lab, &[], None, Confirm::Yes).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("longer than a Unix socket's path may be")
+            && err.to_string().contains("ENCLOS_HOME"),
+        "{err}"
+    );
+    let calls = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    assert!(!calls.contains("plugins enable"), "{calls}");
+    assert!(staged_app_files(&lab).is_empty());
 }
 
 /// A session is given the port its gateway listens on, and says why when
@@ -4021,4 +4740,882 @@ fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
     );
     other.kill().unwrap();
     other.wait().unwrap();
+}
+
+fn portable_installer() -> String {
+    INSTALLS.replace("exit 0\nSTUB", "if [ \"$1 $2\" = \"profile export\" ]; then cat \"$HOME/runtime-export-source\" > \"$5\"; fi\nexit 0\nSTUB")
+}
+
+fn portable_photo() -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 2)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+#[test]
+fn portable_export_materializes_file_credentials_while_stopped_and_cleans_them_on_failure() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::with_secrets(Box::new(crate::secrets::InMemory::default()));
+    done(lab.install(&portable_installer(), Confirm::Yes).unwrap());
+    let agent: AgentName = "source".parse().unwrap();
+    std::fs::create_dir_all(lab.home.join(".hermes/profiles/source")).unwrap();
+    std::fs::write(
+        lab.home.join(".hermes/profiles/source/config.yaml"),
+        "model: source",
+    )
+    .unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"home/source-api".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("private-fixture".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.source]\nenv = {{ API_KEY = \"secret:home/source-api\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+        .unwrap();
+    let python = lab.home.join(".hermes/hermes-agent/.hermes/bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    let wrapper = r#"python3 - "$6" <<'PY'
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+source = home.parent / 'secrets/source.env'
+files = json.loads(sys.argv[1])['credential_files']
+staged = pathlib.Path(files[str(source)])
+assert staged.is_file() and 'API_KEY' in staged.read_text()
+(home / 'export-credentials-observed').write_text(str(staged))
+PY
+if [ -f "$HOME/retain-service-delivery" ]; then
+  mkdir -p "$HOME/../secrets"
+  printf 'live-service-delivery' > "$HOME/../secrets/source.env"
+fi
+if [ -f "$HOME/fail-export" ]; then exit 92; fi
+exec python3 "$@"
+"#;
+    crate::test_scripts::write_script(&python, wrapper);
+    let secrets = lab.engine.layout.sandbox_secrets_dir("home");
+    assert!(!secrets.exists());
+    let archive = lab._dir.path().join("file-credentials.enclos");
+    done(
+        lab.engine
+            .export_agent(&alice(), &lab.name, &agent, &archive, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(lab.home.join("export-credentials-observed").is_file());
+    assert!(
+        !secrets.exists(),
+        "temporary delivery must not outlive export"
+    );
+    let staged = std::fs::read_to_string(lab.home.join("export-credentials-observed")).unwrap();
+    assert!(!Path::new(&staged).exists());
+    std::fs::write(lab.home.join("fail-export"), "").unwrap();
+    std::fs::write(lab.home.join("retain-service-delivery"), "").unwrap();
+    assert!(
+        lab.engine
+            .export_agent(
+                &alice(),
+                &lab.name,
+                &agent,
+                &lab._dir.path().join("failed-export.enclos"),
+                Confirm::Yes
+            )
+            .is_err()
+    );
+    let staged = std::fs::read_to_string(lab.home.join("export-credentials-observed")).unwrap();
+    assert!(
+        !Path::new(&staged).exists(),
+        "failed export must clean its own delivery"
+    );
+    assert_eq!(
+        std::fs::read_to_string(secrets.join("source.env")).unwrap(),
+        "live-service-delivery"
+    );
+}
+
+#[test]
+fn portable_agent_moves_between_sandboxes_on_one_host_with_name_and_image() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let root = super::Root {
+        parent: PathBuf::from("/tmp"),
+        leaf: "e".into(),
+    };
+    let lab = Lab::with_secrets_under(Box::new(crate::secrets::InMemory::default()), &root);
+    let installer = portable_installer();
+    done(lab.install(&installer, Confirm::Yes).unwrap());
+    let source_agent: AgentName = "source".parse().unwrap();
+    let profile = lab.home.join(".hermes/profiles/source");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "model: source").unwrap();
+    let bytes = b"runtime data is opaque, including ../../pretend/path";
+    std::fs::write(profile.join("memory.md"), bytes).unwrap();
+    let photo = portable_photo();
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    store
+        .import_presentation("home/source", Some("Gégé Commit"), Some(&photo))
+        .unwrap();
+    store.set_host("owner").unwrap();
+    store.ensure_home("home/source", "owner", true).unwrap();
+    let source_home = crate::bridge::store::home_id("home/source");
+    store
+        .add(
+            "original-message",
+            &source_home,
+            &crate::bridge::store::From::Agent,
+            "history survives",
+            "reply",
+        )
+        .unwrap();
+    let secret = "home/source-api".parse().unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &secret,
+            Some(
+                &crate::model::secret::SecretValue::new("credential-survives-privately".into())
+                    .unwrap(),
+            ),
+            Confirm::Yes,
+        )
+        .unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"home/source-app".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("old-bridge-token".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.source]\nenv = {{ API_TOKEN = \"secret:home/source-api\", MOBILE_APP_TOKEN = \"secret:home/source-app\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+        .unwrap();
+    let archive = lab._dir.path().join("gege.enclos");
+    let exported = done(
+        lab.engine
+            .export_agent(&alice(), &lab.name, &source_agent, &archive, Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(exported.path, archive.canonicalize().unwrap());
+    assert_eq!(
+        store
+            .agent_name("home/source")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert!(profile.is_dir(), "export must leave the source in place");
+
+    let other: SandboxName = "other".parse().unwrap();
+    done(
+        lab.engine
+            .create_sandbox(
+                &alice(),
+                SandboxSpec {
+                    name: other.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "minimal".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    struct Stop<'a>(&'a Engine, SandboxName);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.stop_sandbox(&alice(), &self.1, Confirm::Yes);
+        }
+    }
+    let _stop = Stop(&lab.engine, other.clone());
+    let runtime = TestRuntime::new(lab._dir.path(), &installer);
+    done(
+        lab.engine
+            .install_runtime_with(&alice(), &other, &runtime, Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.layout.read_policy(other.as_str()).unwrap();
+    lab.engine
+        .secret_set(
+            &alice(),
+            &"other/target-api".parse().unwrap(),
+            Some(&crate::model::secret::SecretValue::new("destination-key".into()).unwrap()),
+            Confirm::Yes,
+        )
+        .unwrap();
+    let mut conflicting = before.parse::<toml_edit::DocumentMut>().unwrap();
+    conflicting["secrets"]["env"]["API_TOKEN"] = toml_edit::value("secret:other/target-api");
+    let conflicting = conflicting.to_string();
+    lab.engine
+        .policy_edit(&alice(), &other, &before, &conflicting, Confirm::Yes)
+        .unwrap();
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &other,
+            "comptoir-dev".parse().unwrap(),
+            &archive,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("API_TOKEN"));
+    assert!(
+        !lab.engine
+            .sandbox_home(&other)
+            .join(".hermes/profiles/comptoir-dev")
+            .exists(),
+        "a credential policy conflict must refuse before importing runtime data"
+    );
+    assert_eq!(
+        lab.engine.layout.read_policy(other.as_str()).unwrap(),
+        conflicting
+    );
+    lab.engine
+        .policy_edit(&alice(), &other, &conflicting, &before, Confirm::Yes)
+        .unwrap();
+    let policy_before = lab.engine.policy(&other).unwrap().snapshot.policy;
+    // An agent of the destination's name was forgotten in the app: the
+    // import claims a new Home for it (ADR 0067, proposed).
+    let host = store.host_person().unwrap().unwrap();
+    store
+        .forget_agent("other/comptoir-dev", &host, "phone")
+        .unwrap();
+    let manifest = done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &other,
+                "comptoir-dev".parse().unwrap(),
+                &archive,
+                false,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(manifest.manifest.source_agent, "home/source");
+    assert_eq!(
+        std::fs::read(
+            lab.engine
+                .sandbox_home(&other)
+                .join(".hermes/profiles/comptoir-dev/memory.md")
+        )
+        .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        store
+            .agent_name("other/comptoir-dev")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert_eq!(
+        store.avatar("other/comptoir-dev").unwrap().image.as_deref(),
+        Some(
+            crate::bridge::server::normalize_photo(&photo)
+                .unwrap()
+                .as_slice()
+        )
+    );
+    let policy_after = lab.engine.policy(&other).unwrap().snapshot.policy;
+    assert_eq!(policy_after.fs, policy_before.fs);
+    assert_eq!(policy_after.net, policy_before.net);
+    assert!(policy_after.secrets.is_empty());
+    let grants = &policy_after.agent_secrets["comptoir-dev"];
+    assert_eq!(
+        lab.engine.granted_values(grants).unwrap()[0].1.expose(),
+        "credential-survives-privately"
+    );
+    assert_ne!(grants["API_TOKEN"].0, secret);
+    let app = lab.engine.app_endpoint(&other, "comptoir-dev").unwrap();
+    assert_ne!(app.token.expose(), "old-bridge-token");
+    assert!(app.socket.to_string_lossy().contains("comptoir-dev"));
+    let target_home = "home.other.comptoir-dev.2";
+    assert_eq!(
+        store.home_of("other/comptoir-dev").unwrap().as_deref(),
+        Some(target_home)
+    );
+    assert_eq!(
+        store.messages_after(target_home, 0).unwrap()[0].text,
+        "history survives"
+    );
+    assert_eq!(
+        store.messages_after(&source_home, 0).unwrap()[0].id,
+        "original-message"
+    );
+    assert_eq!(
+        std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!lab.audit().contains("credential-survives-privately"));
+    assert!(profile.is_dir());
+    assert!(
+        !lab.engine.layout.data().join("agent-transfers").exists(),
+        "the whole export must not be copied to another temporary file"
+    );
+    assert!(
+        !std::fs::read_dir(lab.engine.layout.sandbox_installers(other.as_str()))
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|s| s == "runtime"))
+    );
+    assert_eq!(manifest.archive.sha256, exported.sha256);
+    assert!(matches!(
+        manifest.added.as_ref().map(|a| &a.how),
+        Some(Added::Imported {
+            copy_left: None,
+            ..
+        })
+    ));
+    assert!(lab.audit().contains("agent export"));
+    assert!(lab.audit().contains("agent import presentation"));
+    assert!(lab.audit().contains("without another copy"));
+}
+
+#[test]
+fn portable_metadata_only_and_dry_run_do_not_import_runtime_or_modify_policy() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let profile = lab.home.join(".hermes/profiles/main");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "model: existing").unwrap();
+    let path = lab._dir.path().join("presentation.enclos");
+    let mut file = std::fs::File::create(&path).unwrap();
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"opaque"),
+        &mut file,
+        RuntimeKind::Hermes,
+        "old/comptoir-dev".into(),
+        crate::agent_export::Presentation {
+            display_name: Some("Gégé Commit".into()),
+            photo: None,
+        },
+    )
+    .unwrap();
+    let policy = lab.engine.policy(&lab.name).unwrap().version.version;
+    let before = lab.engine.audit(None).unwrap().len();
+    assert!(matches!(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::DryRun
+            )
+            .unwrap(),
+        Planned::DryRun(_)
+    ));
+    assert_eq!(lab.engine.audit(None).unwrap().len(), before);
+    assert!(!lab.engine.app_store_path().exists());
+    done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    assert_eq!(
+        store
+            .agent_name("home/main")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Gégé Commit")
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile.join("config.yaml")).unwrap(),
+        "model: existing"
+    );
+    assert_eq!(
+        lab.engine.policy(&lab.name).unwrap().version.version,
+        policy
+    );
+    assert!(!lab.home.join("hermes-calls").exists());
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                "main".parse().unwrap(),
+                &path,
+                true,
+                Confirm::Yes
+            )
+            .is_err()
+    );
+    assert_eq!(store.agent_name("home/main").unwrap().revision, 1);
+}
+
+fn review_export_file(lab: &Lab) -> PathBuf {
+    let path = lab._dir.path().join("review.enclos");
+    let mut file = std::fs::File::create(&path).unwrap();
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"runtime export"),
+        &mut file,
+        RuntimeKind::Hermes,
+        "old/main".into(),
+        crate::agent_export::Presentation::default(),
+    )
+    .unwrap();
+    path
+}
+#[test]
+fn review_dry_run_refuses_conflicts_and_describes_service_pause_and_resume() {
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = review_export_file(&lab);
+    for name in ["tracked", "untracked"] {
+        let profile = lab.home.join(".hermes/profiles").join(name);
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("config.yaml"), "model: fixture").unwrap();
+    }
+    done(
+        lab.engine
+            .add_agent(&alice(), &lab.name, agent("tracked"), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = lab.engine.audit(None).unwrap().len();
+    for name in ["default", "tracked", "untracked", "hermes"] {
+        assert!(
+            lab.engine
+                .import_agent_export(
+                    &alice(),
+                    &lab.name,
+                    agent(name),
+                    &path,
+                    false,
+                    Confirm::DryRun
+                )
+                .is_err(),
+            "{name}"
+        );
+    }
+    let gateway = lab
+        .engine
+        .label(
+            &lab.name,
+            Unit::Runtime(crate::runtime::ServiceName::new("gateway")),
+        )
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let Planned::DryRun(plan) = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::DryRun,
+        )
+        .unwrap()
+    else {
+        panic!("not a plan")
+    };
+    assert!(
+        plan.changes.iter().any(|s| s.contains("stop service")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.changes.iter().any(|s| s.contains("install service")),
+        "{plan:?}"
+    );
+    assert_eq!(lab.engine.audit(None).unwrap().len(), before);
+}
+#[test]
+fn review_partial_runtime_import_keeps_the_presentation_recovery_hint() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = review_export_file(&lab);
+    std::fs::write(lab.home.join("hermes-after-fails"), "").unwrap();
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("--metadata-only"), "{error}");
+}
+
+#[test]
+fn review_portable_import_preserves_a_staged_copy_cleanup_warning_in_its_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    let installer=INSTALLS.replace("exit 0\nSTUB","if [ \"$1 $2\" = \"profile import\" ]; then chmod 500 \"$HOME/../installers\"; fi\nexit 0\nSTUB");
+    done(lab.install(&installer, Confirm::Yes).unwrap());
+    let directory = lab.engine.layout.sandbox_installers(lab.name.as_str());
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = Writable(directory.clone());
+    let path = review_export_file(&lab);
+    let imported = done(
+        lab.engine
+            .import_agent_export(
+                &alice(),
+                &lab.name,
+                agent("fresh"),
+                &path,
+                false,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let Added::Imported {
+        end,
+        copy_left: Some(left),
+        ..
+    } = &imported.added.unwrap().how
+    else {
+        panic!("cleanup warning was discarded")
+    };
+    assert_eq!(end.exit, 0);
+    assert!(left.to_string().contains("remove it yourself"));
+    assert_eq!(std::fs::read(&left.path).unwrap(), b"runtime export");
+}
+#[test]
+fn review_resume_failure_reports_that_presentation_was_already_restored() {
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let path = lab._dir.path().join("resume.enclos");
+    crate::agent_export::write(
+        &mut std::io::Cursor::new(b"runtime export"),
+        &mut std::fs::File::create(&path).unwrap(),
+        RuntimeKind::Hermes,
+        "old/main".into(),
+        crate::agent_export::Presentation {
+            display_name: Some("Recovered name".into()),
+            photo: None,
+        },
+    )
+    .unwrap();
+    let gateway = lab
+        .engine
+        .label(
+            &lab.name,
+            Unit::Runtime(crate::runtime::ServiceName::new("gateway")),
+        )
+        .unwrap();
+    fake.seed(gateway.as_str());
+    *fake.refuse.borrow_mut() = Some("gateway".into());
+    let error = lab
+        .engine
+        .import_agent_export(
+            &alice(),
+            &lab.name,
+            agent("fresh"),
+            &path,
+            false,
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("restoring complete data and presentation"),
+        "{error}"
+    );
+    let store = crate::bridge::store::Store::open(&lab.engine.app_store_path()).unwrap();
+    assert_eq!(
+        store
+            .agent_name("home/fresh")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Recovered name")
+    );
+}
+
+#[test]
+fn usage_reads_each_agents_records_inside_the_sandbox_and_removes_its_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // `scout` is listed, and was never used: no `state.db` of its own.
+    let scout = lab.home.join(".hermes/profiles/scout");
+    std::fs::create_dir_all(&scout).unwrap();
+    std::fs::write(scout.join("config.yaml"), "").unwrap();
+    // Hermes's table, without `cache_write_tokens`: an older Hermes's.
+    let db = rusqlite::Connection::open(lab.home.join(".hermes/state.db")).unwrap();
+    db.execute_batch(
+        "create table sessions(id text, source text, model text, title text, started_at real,
+             last_activity_at real, api_call_count integer, input_tokens integer,
+             output_tokens integer, cache_read_tokens integer, cost_status text,
+             estimated_cost_usd real);
+         insert into sessions values
+             ('s1', 'enclos', 'gpt', 'Weather', 4102444800, 4102444800, 26, 83087, 6084,
+              762752, 'included', 0.0),
+             ('old', 'cli', 'gpt', 'Old', 1, 1, 1, 9, 9, 9, 'included', 0.0);",
+    )
+    .unwrap();
+    drop(db);
+
+    let since = crate::model::Timestamp::from_second(1_000_000).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert_eq!(sandbox.runtime, Some("Hermes"));
+    let Fact::Known(agents) = &sandbox.agents else {
+        panic!("{sandbox:?}")
+    };
+    let by_name = |n: &str| &agents.iter().find(|a| a.agent == n).unwrap().usage;
+    let Fact::Known(records) = by_name("default") else {
+        panic!("{agents:?}")
+    };
+    let [model] = records.models.as_slice() else {
+        panic!("{records:?}")
+    };
+    // The old chat is outside the window, and a count the table does not
+    // keep is not provided, never 0.
+    assert_eq!(model.chats, 1);
+    assert_eq!(model.calls, Some(26));
+    assert_eq!(model.tokens.input, Some(83087));
+    assert_eq!(model.tokens.cache_read, Some(762752));
+    assert_eq!(model.tokens.cache_write, None);
+    assert_eq!(model.cost.kind, crate::engine::CostKind::Included);
+    assert_eq!(records.top[0].title.as_deref(), Some("Weather"));
+    assert_eq!(by_name("scout"), &Fact::Absent);
+    let left = std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        });
+    assert!(!left, "the report stayed in the home");
+    assert!(lab.audit().contains("usage session"), "{}", lab.audit());
+}
+
+/// A stand-in for Hermes's own Python, where the usage reader looks for
+/// it: `body` runs with the reader's words (`-I -c <script> <report> ...`),
+/// the report's path in `$4`.
+fn usage_python(lab: &Lab, body: &str) {
+    let bin = lab.home.join(".hermes/tools/python-stub/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::test_scripts::write_script(&bin.join("python3"), body);
+}
+
+fn usage_of(lab: &Lab) -> Fact<Vec<crate::engine::AgentUsage>> {
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), Some(&lab.name), since).unwrap();
+    view.sandboxes.into_iter().next().unwrap().agents
+}
+
+fn report_left(lab: &Lab) -> bool {
+    std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-usage-")
+        })
+}
+
+#[test]
+fn a_usage_reader_that_fails_says_how_and_leaves_no_report() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    // It exits non-zero without a word: how it ended.
+    usage_python(&lab, "exit 3");
+    assert_eq!(
+        usage_of(&lab),
+        Fact::CannotTell("Hermes's usage reader exited with 3".into())
+    );
+    // It wrote a report, then failed: the report goes all the same.
+    usage_python(&lab, "printf '{}' > \"$4\"; exit 1");
+    assert!(matches!(usage_of(&lab), Fact::CannotTell(why) if why.contains("exited with 1")));
+    assert!(!report_left(&lab));
+    // It wrote what is not a report.
+    usage_python(&lab, "printf 'not json' > \"$4\"");
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert!(why.starts_with("the usage report is not valid"), "{why}");
+    assert!(!report_left(&lab));
+    // It could not read at all, and said why, escaped.
+    usage_python(
+        &lab,
+        "printf '{\"format\":1,\"agents\":[],\"error\":\"OSError: \\\\u001b[2J gone\"}' > \"$4\"",
+    );
+    let Fact::CannotTell(why) = usage_of(&lab) else {
+        panic!("read")
+    };
+    assert_eq!(
+        why,
+        "Hermes's usage reader could not read: OSError: \\u{1b}[2J gone"
+    );
+    // Nothing it prints reaches enclos's output: it goes nowhere.
+    usage_python(
+        &lab,
+        "echo printed; echo said >&2; printf '{\"format\":1,\"agents\":[]}' > \"$4\"",
+    );
+    assert!(matches!(usage_of(&lab), Fact::Known(_)));
+}
+
+#[test]
+fn usage_of_every_sandbox_leaves_one_not_running_unread_and_runs_nothing_in_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let sessions_before = lab.audit().matches("usage session").count();
+    lab.engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = lab.engine.state.get(&lab.name)?.unwrap();
+                record.state = crate::model::sandbox::SandboxState::Stopped;
+                lab.engine.state.put(lock, &record)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    let since = crate::model::Timestamp::from_second(0).unwrap();
+    let view = lab.engine.usage(&alice(), None, since).unwrap();
+    let [sandbox] = view.sandboxes.as_slice() else {
+        panic!("{view:?}")
+    };
+    assert!(
+        matches!(&sandbox.agents, Fact::CannotTell(why) if why.starts_with("not running; `enclos usage home`")),
+        "{sandbox:?}"
+    );
+    assert_eq!(
+        lab.audit().matches("usage session").count(),
+        sessions_before
+    );
+}
+
+#[test]
+fn a_native_delete_keeps_the_service_it_calls_and_refuses_without_it() {
+    use crate::runtime::ServiceName;
+    use crate::service::{ServiceManager, fake::FakeServices};
+    use std::io::BufRead;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    lab_with_profiles(&lab, &["writer", "reader"]);
+
+    // A real listener owned by the fake service manager: pausing the
+    // service kills it, and the native command then fails its connection.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let listener = format!(
+        "{}$|=1; my $s=listener(INADDR_LOOPBACK); print((sockaddr_in(getsockname($s)))[0], qq(\\n)); while(accept(my $c,$s)){{close $c;}}",
+        crate::test_ports::perl_listener()
+    );
+    let mut server = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", &listener])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
+    let stdout = server.stdout.take();
+    // Register before fallible setup so Lab also reaps the listener if
+    // reading/parsing its port or writing the fixture fails.
+    fake.jobs.borrow_mut().push((gateway.clone(), server));
+    let mut port = String::new();
+    std::io::BufReader::new(stdout.unwrap())
+        .read_line(&mut port)
+        .unwrap();
+    let port: u16 = port.trim().parse().unwrap();
+    assert!(
+        !(crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST).contains(&port)
+    );
+    std::fs::write(lab.home.join("gateway-port"), port.to_string()).unwrap();
+
+    let executable = lab.home.join(".local/bin/hermes");
+    let script = std::fs::read_to_string(&executable).unwrap().replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1 $2\" = \"profile delete\" ]; then\n  /usr/bin/nc -z 127.0.0.1 \"$(cat \"$HOME/gateway-port\")\" || exit 12\nfi\n",
+        1,
+    );
+    std::fs::write(executable, script).unwrap();
+    let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+    runtime.delete_mode = AgentDeleteMode::RuntimeService;
+    assert_eq!(Hermes.agent_delete_mode(), AgentDeleteMode::PauseRuntime);
+    let rm = |who: &str, confirm| {
+        lab.engine
+            .remove_agent_with(&alice(), &lab.name, &agent(who), false, confirm, &runtime)
+    };
+
+    let Planned::DryRun(plan) = rm("writer", Confirm::DryRun).unwrap() else {
+        panic!("a dry run removed the agent");
+    };
+    assert_eq!(
+        plan.changes,
+        ["delete agent home/writer and its files, with Hermes's own command"]
+    );
+    assert_eq!(
+        done(rm("writer", Confirm::Yes).unwrap()),
+        AgentRemoved::Deleted {
+            kind: RuntimeKind::Hermes
+        }
+    );
+    assert!(!lab.home.join(".hermes/profiles/writer").exists());
+    assert!(fake.stopped.borrow().is_empty());
+    assert_eq!(fake.started.borrow().len(), 1);
+    assert!(fake.jobs.borrow_mut()[0].1.try_wait().unwrap().is_none());
+    assert!(!lab.audit().contains("services remove"));
+    assert!(!lab.audit().contains("services start"));
+
+    // Unavailability is a native failure, with the record and files kept;
+    // removal never starts the service or substitutes an offline command.
+    fake.stop(&gateway).unwrap();
+    let error = rm("reader", Confirm::Yes).unwrap_err().to_string();
+    assert!(error.contains("exited with 12"), "{error}");
+    assert!(lab.home.join(".hermes/profiles/reader").exists());
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+    assert!(fake.started.borrow().is_empty());
 }

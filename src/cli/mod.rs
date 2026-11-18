@@ -2,6 +2,7 @@
 //! the one engine call each verb makes, and how its result prints.
 
 pub mod agent;
+pub mod app;
 pub mod connect;
 pub mod dashboard;
 pub mod doctor;
@@ -12,9 +13,12 @@ pub mod net;
 pub mod output;
 pub mod policy;
 pub mod proxy;
+#[cfg(test)]
+mod reference;
 pub mod relay;
 pub mod runtime;
 pub mod sandbox;
 pub mod secret;
 pub mod state;
 pub mod status;
+pub mod usage;

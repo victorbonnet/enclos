@@ -20,6 +20,7 @@ READY: no probe got out of sandbox lab: all 3 shown closed (1 by Seatbelt itself
     "writing the pasteboard",
     "typing into the terminal (TIOCSTI)"
   ],
+  "open_by_policy": [],
   "probes": [
     {
       "closed_by": null,
@@ -77,6 +78,7 @@ READY: no probe got out of sandbox lab: 3 of 4 shown closed (1 by Seatbelt itsel
     "writing the pasteboard",
     "typing into the terminal (TIOCSTI)"
   ],
+  "open_by_policy": [],
   "probes": [
     {
       "closed_by": null,
@@ -139,6 +141,7 @@ NOT READY: sandbox lab: 1 of 6 probes got out (OPEN above); 1 could not run or b
     "writing the pasteboard",
     "typing into the terminal (TIOCSTI)"
   ],
+  "open_by_policy": [],
   "probes": [
     {
       "closed_by": null,
@@ -209,6 +212,7 @@ NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by S
     "writing the pasteboard",
     "typing into the terminal (TIOCSTI)"
   ],
+  "open_by_policy": [],
   "probes": [
     {
       "closed_by": "seatbelt",

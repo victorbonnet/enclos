@@ -61,7 +61,7 @@ enum End {
 ///
 /// Everything else is shown as it is, blank-looking characters such as
 /// U+3000 and U+2800 too.
-pub(super) fn printable(text: &str) -> String {
+pub(in crate::engine) fn printable(text: &str) -> String {
     escaped(text, MAX_FACT_TEXT)
 }
 

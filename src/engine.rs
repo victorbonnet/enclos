@@ -7,6 +7,8 @@
 
 mod agent_rm;
 mod agents;
+mod app;
+mod approvals;
 mod compile;
 mod configure;
 mod dashboard;
@@ -18,10 +20,13 @@ mod launch;
 mod listener;
 mod loopback;
 mod markers;
+mod mobile_policy;
 mod net;
 mod pause;
 mod pending;
 mod policy;
+mod portable;
+mod portable_state;
 mod probe;
 mod proxy;
 mod restart;
@@ -36,12 +41,17 @@ mod start;
 mod state_check;
 mod status;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod unenforced;
+mod usage;
 
+pub use crate::runtime::settings::{Held, SettingsFinding};
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
+pub use app::{AppAgent, AppAgents, AppEndpoint};
+pub use approvals::{AccessPlan, normalized};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
+pub(crate) use dashboard::TaskBoardUpstream;
 pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
@@ -52,13 +62,13 @@ pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
+pub use portable::{AgentImportOptions, ImportedAgentExport};
 pub use probe::TestReport;
-pub use runtime::InstallEnd;
+pub use runtime::{INSTALL_STOP_TIME, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, SandboxStarted, Unit};
 pub use session::{Left, SessionEnd};
-pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use staging::home_files_script;
 use staging::{Curl, Downloader};
@@ -67,6 +77,10 @@ pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
     RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted,
     human_bytes, printable_line,
+};
+pub use usage::{
+    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, REPORT_FORMAT, SandboxUsage,
+    Tokens, UsageView,
 };
 
 use std::path::PathBuf;
@@ -88,7 +102,7 @@ use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::session::SessionRecord;
 use crate::state::sqlite::SqliteStateStore;
-use crate::state::{Migration, StateLock, StateStore};
+use crate::state::{Migration, StateLock, StateStore, Wait};
 
 pub struct Engine {
     layout: Layout,
@@ -115,6 +129,16 @@ pub struct Engine {
     /// does not enforce them (`--accept-unenforced`, ADR 0038).
     accepting: Vec<crate::model::unenforced::UnenforcedField>,
 }
+
+/// This system's own backend.
+const SYSTEM_BACKEND: BackendKind = if cfg!(target_os = "macos") {
+    BackendKind::Seatbelt
+} else {
+    BackendKind::Bubblewrap
+};
+
+/// How often [`Engine::write_in_background`] tries the state lock again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Stops a session's members within a grace period, reading its cgroup in
 /// the hierarchy given, as `lifecycle::stop::stop` does.
@@ -182,9 +206,11 @@ impl InitReport {
 }
 
 impl Engine {
-    /// The engine with the real implementations, listed here explicitly.
-    pub fn open(layout: Layout) -> Engine {
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    /// The engine with the real implementations, listed here explicitly,
+    /// whose writes to the state database wait for another's as `wait`
+    /// says: whether a person waits on this program.
+    pub fn open(layout: Layout, wait: Wait) -> Engine {
+        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock(), wait);
         let audit = JsonlAuditLog::new(layout.audit_log());
         let services = crate::service::host(&layout);
         let secrets: Box<dyn crate::secrets::Stores> = match layout.install_id() {
@@ -385,6 +411,30 @@ impl Engine {
         }
     }
 
+    /// The backend a sandbox is made with when `sandbox create` names none:
+    /// the default backend `config.toml` names, which `enclos init` wrote
+    /// for this host; where it names none, or is not there, the first
+    /// available here, as init picks it, else this system's own (Seatbelt
+    /// on macOS, bubblewrap elsewhere), whose probe then says why it
+    /// cannot run.
+    pub fn default_backend(&self) -> Result<BackendKind> {
+        let path = self.layout.config_file();
+        let named = match std::fs::read_to_string(&path) {
+            Ok(text) => config::default_backend(&text)
+                .map_err(|reason| Error::DefaultBackend { path, reason })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(Error::DefaultBackend {
+                    path,
+                    reason: e.to_string(),
+                });
+            }
+        };
+        Ok(named
+            .or_else(|| self.probe_backends().0)
+            .unwrap_or(SYSTEM_BACKEND))
+    }
+
     /// The first backend available here, and why each unavailable one is
     /// not.
     fn probe_backends(&self) -> (Option<BackendKind>, Vec<Unavailable>) {
@@ -453,6 +503,60 @@ impl Engine {
         work: impl FnOnce(&StateLock) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
+        self.write_holding(lock, by, command, target, outcome, work)
+    }
+
+    /// As [`Engine::write`], for a program the service manager runs, which
+    /// no person waits on: it waits for the state lock as long as its writes
+    /// wait for `state.db` (`Wait::Background`, design §11), rather than the
+    /// 10 seconds a command waits, and returns `None`, having written
+    /// nothing, once `ended` is set. `sandbox start` holds the lock while it
+    /// installs the sandbox's services, and the service manager runs each as
+    /// it is installed, the proxy first, which records itself under the
+    /// lock: on a loaded host, installing the others took longer than 10
+    /// seconds, and the proxy gave up.
+    fn write_in_background<T>(
+        &self,
+        ended: &std::sync::atomic::AtomicBool,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        summary: impl FnOnce(&T) -> String,
+        work: impl FnOnce(&StateLock) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let waited = std::time::Instant::now();
+        let lock = loop {
+            if ended.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
+            match self.state.try_lock()? {
+                Some(lock) => break lock,
+                None if waited.elapsed() < Wait::Background.limit() => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                None => {
+                    return Err(crate::state::StateError::Locked {
+                        path: self.layout.state_lock(),
+                    }
+                    .into());
+                }
+            }
+        };
+        let outcome = |v: &T| Outcome::ok(summary(v));
+        self.write_holding(lock, by, command, target, outcome, work)
+            .map(Some)
+    }
+
+    /// The rest of [`Engine::write_with_outcome`], once `lock` is taken.
+    fn write_holding<T>(
+        &self,
+        lock: StateLock,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        outcome: impl FnOnce(&T) -> Outcome,
+        work: impl FnOnce(&StateLock) -> Result<T>,
+    ) -> Result<T> {
         let intent = Intent {
             by: by.clone(),
             command: command.to_owned(),

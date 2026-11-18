@@ -14,6 +14,7 @@ use enclos::error::{Result, exit};
 use enclos::layout::Layout;
 use enclos::model::audit::{Actor, AuditEntry, AuditResult, Since, VerifyReport};
 use enclos::model::plan::{Confirm, Plan, Planned};
+use enclos::state::Wait;
 
 /// Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log.
 #[derive(Parser)]
@@ -59,15 +60,17 @@ enum Command {
     State(cli::state::StateArgs),
     /// Install a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot.
     Runtime(cli::runtime::RuntimeArgs),
-    /// Add, list or remove the runtime's agents.
+    /// Add, list, remove, export or import the runtime's agents.
     Agent(cli::agent::AgentArgs),
+    /// The enclos mobile app's side of this host: serve the bridge, pair, list devices, unpair, status, log, push, or chat with an agent through its app channel.
+    App(cli::app::AppArgs),
     /// Show, widen, edit, apply, discard, refresh, diff, roll back or test a sandbox's policy, or list its history.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
-    /// Open the runtime's dashboard of a sandbox the host cannot reach, as on Linux, to you alone, until Ctrl-C.
+    /// Open the runtime's protected dashboard to you alone, until Ctrl-C.
     Dashboard(cli::dashboard::DashboardArgs),
     /// What is on this host, what it costs on disk, and what you could do.
     ///
@@ -75,6 +78,13 @@ enum Command {
     /// from a sandbox is `{"known": …}`, `"absent"`, `{"cannot_tell": why}`
     /// or `"not_provided"`.
     Status(cli::status::StatusArgs),
+    /// What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them.
+    ///
+    /// Reads the runtime's records inside the sandbox, as an exec session.
+    /// In JSON, each count the runtime does not keep is `null`, and each
+    /// read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or
+    /// `"not_provided"`.
+    Usage(cli::usage::UsageArgs),
     /// Run one of a sandbox's runtime services; started by the service manager.
     #[command(hide = true)]
     Launch(cli::launch::LaunchArgs),
@@ -281,7 +291,8 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::accepted_unenforced(args),
         _ => Vec::new(),
     };
-    let engine = Engine::open(Layout::from_env()?).accepting_unenforced(accepted);
+    let engine =
+        Engine::open(Layout::from_env()?, writes_wait(&command)).accepting_unenforced(accepted);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
     match command {
         Command::Init => {
@@ -334,6 +345,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Secret(args) => cli::secret::run(&engine, &current_actor(), confirm, args),
         Command::State(args) => cli::state::run(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
+        Command::App(args) => cli::app::run(&engine, &current_actor(), args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
@@ -345,6 +357,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Dashboard(args) => cli::dashboard::run(&engine, &current_actor(), args),
         Command::Status(args) => cli::status::run(&engine, args),
+        Command::Usage(args) => cli::usage::run(&engine, &current_actor(), args),
     }
 }
 
@@ -382,13 +395,47 @@ fn ends_on_closed_output(command: &Command) -> bool {
         Command::Connect(_)
         | Command::Exec(_)
         | Command::Runtime(_)
+        | Command::App(_)
         | Command::Proxy(_)
         | Command::Relay(_)
         | Command::Inside(_)
         | Command::Holder(_)
         | Command::Launch(_)
         | Command::Dashboard(_)
+        | Command::Usage(_)
         | Command::Logs(_) => false,
+    }
+}
+
+/// How long `command`'s writes to the state database wait for another's
+/// (design §11): those of the programs the service manager runs, which no
+/// person waits on, wait longer than a command's, which the user can run
+/// again. No arm takes the rest, so a new command is placed here to build.
+fn writes_wait(command: &Command) -> Wait {
+    match command {
+        Command::Launch(_) | Command::Proxy(_) | Command::Holder(_) | Command::Relay(_) => {
+            Wait::Background
+        }
+        // The long-running bridge, whose writes no person waits on
+        Command::App(args) if args.is_service() => Wait::Background,
+        Command::Init
+        | Command::Doctor
+        | Command::Audit(_)
+        | Command::Sandbox(_)
+        | Command::Policy(_)
+        | Command::Secret(_)
+        | Command::State(_)
+        | Command::Net(_)
+        | Command::Status(_)
+        | Command::Agent(_)
+        | Command::Connect(_)
+        | Command::Exec(_)
+        | Command::Runtime(_)
+        | Command::Inside(_)
+        | Command::Dashboard(_)
+        | Command::Usage(_)
+        | Command::Logs(_)
+        | Command::App(_) => Wait::Command,
     }
 }
 
@@ -454,13 +501,7 @@ fn verify_json(report: &VerifyReport) -> serde_json::Value {
 
 /// The user and host recorded in audit entries.
 fn current_actor() -> Actor {
-    let or_unknown = |value: std::result::Result<String, _>| {
-        value.unwrap_or_else(|_: whoami::Error| "unknown".to_owned())
-    };
-    Actor {
-        user: or_unknown(whoami::username()),
-        host: or_unknown(whoami::hostname()),
-    }
+    Actor::on_this_host(whoami::username().unwrap_or_else(|_| "unknown".to_owned()))
 }
 
 fn print_init(planned: Planned<InitReport>) {

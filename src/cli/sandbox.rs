@@ -11,6 +11,7 @@ use enclos::engine::{
 };
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
+use enclos::model::count;
 use enclos::model::plan::{Confirm, Plan, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
@@ -29,13 +30,17 @@ enum SandboxVerb {
     /// Create a sandbox with its own home, policy and proxy port.
     Create {
         name: SandboxName,
-        /// The isolation technology.
-        #[arg(long, default_value = "seatbelt")]
-        backend: BackendKind,
+        /// The isolation technology: seatbelt (macOS) or bubblewrap
+        /// (Linux). Without it, the default backend `enclos init` wrote to
+        /// config.toml for this host.
+        #[arg(long)]
+        backend: Option<BackendKind>,
         /// The policy it starts from, required so the widest is never
         /// picked by leaving it out: minimal (only what is listed; from
-        /// `runtime install` on, the runtime's hosts) or assistant (the
-        /// public web) (design §7).
+        /// `runtime install` on, the runtime's hosts), assistant (the
+        /// public web) or autonomous (Seatbelt only, proposed: writes
+        /// everywhere but keys, enclos's files and program and the shell's
+        /// startup files, any port; higher risk) (design §7, ADR 0058).
         #[arg(long)]
         template: TemplateName,
     },
@@ -91,6 +96,14 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             backend,
             template,
         } => {
+            let backend = match backend {
+                Some(kind) => kind,
+                None => engine.default_backend()?,
+            };
+            let autonomous = template.to_string() == "autonomous";
+            if autonomous {
+                eprintln!("{AUTONOMOUS_WARNING}");
+            }
             let planned = engine.create_sandbox(
                 by,
                 SandboxSpec {
@@ -321,8 +334,14 @@ fn show_json(v: &SandboxView) -> Value {
     })
 }
 
+/// What `sandbox create --template autonomous` says first (ADR 0058), on
+/// standard error so that it reaches a person whatever the output format.
+const AUTONOMOUS_WARNING: &str = "warning: the autonomous template lets the sandbox write wherever you can, your own files included: nothing stops it changing or removing them, and commands are not filtered, so keep backups. Anything the host later runs from a file it wrote, such as a program on your PATH, a Git hook or an app, runs outside the sandbox. It reaches any public address on any port. It still cannot read or write the sensitive paths (keys, credentials, browsers, password managers), enclos's own files or program, change your shell's startup files, or use host services. Only the Seatbelt backend builds it. Narrow it in the sandbox's policy.toml.";
+
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {
+        // `autonomous` left out on purpose: the hint should not lead a new
+        // user to the template that may change their files (ADR 0058).
         println!(
             "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|assistant`."
         );
@@ -349,8 +368,11 @@ fn print_list(views: &[SandboxView]) {
         let gone = v.sessions.len() - running;
         let sessions = match (running, gone) {
             (0, 0) => String::new(),
-            (n, 0) => format!(" ({n} sessions)"),
-            (n, g) => format!(" ({n} sessions, {g} gone, not recorded)"),
+            (n, 0) => format!(" ({})", count(n, "session", "sessions")),
+            (n, g) => format!(
+                " ({}, {g} gone, not recorded)",
+                count(n, "session", "sessions")
+            ),
         };
         println!(
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
@@ -578,6 +600,24 @@ fn not_restarted(name: &SandboxName, code: u8, stopped: Value) -> Value {
     )
 }
 
+/// The line a stop that ended everything prints, and what a stop that left
+/// processes running says it ended, each count agreeing with its noun.
+fn stop_lines(name: &SandboxName, report: &StopReport) -> (String, String) {
+    let gone = match report.gone.len() {
+        0 => String::new(),
+        n => format!(", {n} found gone and recorded"),
+    };
+    let ended = format!(
+        "{} ended{gone}",
+        count(report.stopped.len(), "session", "sessions")
+    );
+    let stopped = format!(
+        "Stopped sandbox {name}: {} removed, {ended}.",
+        count(report.services.len(), "service", "services")
+    );
+    (stopped, ended)
+}
+
 /// Says how a stop went, in text; returns its code and, for JSON, its
 /// report.
 pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value) {
@@ -606,27 +646,20 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
     );
     let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
     let value = output::with_error(value, code, || {
-        format!("sandbox {name} is marked failed: {survivors} processes survived stop. {what_now}")
+        format!(
+            "sandbox {name} is marked failed: {} survived stop. {what_now}",
+            count(survivors, "process", "processes")
+        )
     });
     if output::json() {
         return (code, value);
     }
-    let gone = match report.gone.len() {
-        0 => String::new(),
-        n => format!(", {n} found gone and recorded"),
-    };
+    let (stopped, ended) = stop_lines(name, report);
     if report.survivors.is_empty() {
-        println!(
-            "Stopped sandbox {name}: {} services removed, {} sessions ended{gone}.",
-            report.services.len(),
-            report.stopped.len()
-        );
+        println!("{stopped}");
         return (code, value);
     }
-    eprintln!(
-        "error: sandbox {name} is marked failed: some processes survived stop ({} sessions ended{gone}):",
-        report.stopped.len()
-    );
+    eprintln!("error: sandbox {name} is marked failed: some processes survived stop ({ended}):");
     for (session, survivors) in &report.survivors {
         for s in survivors {
             eprintln!(
@@ -840,8 +873,48 @@ mod tests {
             value["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("1 processes survived stop"),
+                .contains("1 process survived stop"),
             "{value}"
+        );
+    }
+
+    /// A stop's line says "1 session", "1 service", not "1 sessions".
+    #[test]
+    fn a_stops_counts_agree_with_their_nouns() {
+        use enclos::model::session::SessionId;
+        let name: SandboxName = "home".parse().unwrap();
+        let label = |s: &str| ServiceLabel::parse(s).unwrap();
+        let one = StopReport {
+            services: vec![label("enclos.home.proxy")],
+            stopped: vec![SessionId(3)],
+            gone: vec![SessionId(4)],
+            survivors: Vec::new(),
+        };
+        let (stopped, ended) = stop_lines(&name, &one);
+        assert_eq!(
+            stopped,
+            "Stopped sandbox home: 1 service removed, 1 session ended, 1 found gone and recorded."
+        );
+        assert_eq!(ended, "1 session ended, 1 found gone and recorded");
+        let none = StopReport {
+            services: Vec::new(),
+            stopped: Vec::new(),
+            gone: Vec::new(),
+            survivors: Vec::new(),
+        };
+        assert_eq!(
+            stop_lines(&name, &none).0,
+            "Stopped sandbox home: 0 services removed, 0 sessions ended."
+        );
+        let two = StopReport {
+            services: vec![label("enclos.home.proxy"), label("enclos.home.gateway")],
+            stopped: vec![SessionId(3), SessionId(5)],
+            gone: Vec::new(),
+            survivors: Vec::new(),
+        };
+        assert_eq!(
+            stop_lines(&name, &two).0,
+            "Stopped sandbox home: 2 services removed, 2 sessions ended."
         );
     }
 

@@ -1,0 +1,238 @@
+# OpenClaw enclos channel
+
+One channel package runs inside a sandbox's OpenClaw gateway. Each configured
+account belongs to an agent and listens on that agent's Unix socket. The host's
+bridge dials in and presents the agent's token; the sandbox gains no outbound
+route to the host. Text and unsolicited output are baseline. Typing, native
+command discovery, files, exact tool events and sandbox policy requests are negotiated
+only when their native adapters/hooks have been registered.
+
+The package is tested against **OpenClaw 2026.11.5**. The channel requires
+that release or newer and checks the native interfaces at account startup. The
+SDK is experimental. This does not change enclos's installer-as-served policy.
+There are no runtime dependencies besides Node's standard library and the host's
+public `openclaw/plugin-sdk` entry points.
+
+## Configuration
+
+enclos writes the package and native settings, then enables the channel last:
+
+```json
+{
+  "plugins": {
+    "load": { "paths": ["/sandbox/home/.enclos-openclaw"] },
+    "entries": { "enclos": { "enabled": true } }
+  },
+  "channels": {
+    "enclos": {
+      "enabled": true,
+      "accounts": {
+        "main": {
+          "enabled": true,
+          "agentId": "main",
+          "socket": "/sandbox/home/.enclos-app/main/channel.sock",
+          "tokenFile": "/protected/sandbox/secrets/main.env",
+          "home": "home.lab.main"
+        }
+      }
+    }
+  },
+  "bindings": [{ "agentId": "main", "match": { "channel": "enclos", "accountId": "main" } }]
+}
+```
+
+Use the actual paths enclos supplies. The token file is the host-owned protected
+**JSON** secret file, despite the legacy `.env` filename. It contains
+`MOBILE_APP_TOKEN`; no value is copied into channel settings, argv or persistent
+channel state. Reads require a private single-link regular file and reject a
+symlink. Token rotation closes a connection using the old value at its next
+message. Multiple accounts require explicit account selection; they do not
+silently choose an agent.
+
+`stateDir` optionally selects a sandbox-local folder; otherwise it is
+`openclaw-state/` beside the socket. The socket and its folder are private.
+An occupied socket is probed before stale-socket removal; a live listener or
+non-socket is refused. Shutdown removes only the socket created by that account.
+
+## Native dispatch and delivery
+
+The public account lifecycle supplies `channelRuntime`. Inbound uses that exact
+runtime's ingress resolver, context builder and dispatcher. An explicit native
+account binding must select the configured agent. A stable digest of person and
+conversation becomes the peer under `per-account-channel-peer`; distinct direct
+conversations and bridge group members never collapse into the native main
+session. Home has its own deterministic account/agent/conversation route even
+before a person first speaks there. Its first authenticated inbound message binds
+the owner without replacing that native session or inventing a human identity
+for earlier output. The exact ingress result is passed to the native context builder.
+Bridge groups remain direct per-member contexts; OpenClaw's broadcast coordinator
+is not enabled for them. Account authority is rechecked after asynchronous
+preparation and before dispatch/delivery.
+
+Outbound messages are atomically persisted and synced before a native send
+returns. They keep their ids and ordering across reconnect/restart until bridge
+acknowledgement. Native scheduled/proactive sends use the same outbound adapter;
+`home` selects the bridge-owned Home. The bridge still owns conversation history,
+names, photos, read state and archives.
+
+Ingress ids are persisted before native dispatch. Repeated ids with the same
+content share active work or acknowledge a completed delivery; reuse with other
+content is refused. A crash or error after dispatch begins leaves an uncertain
+receipt. It is **not replayed automatically**: the bridge receives
+`agent_unavailable`, and the person must refresh before intentionally sending a
+new message. The plugin does not claim an atomic transaction with OpenClaw's
+native execution. Its acknowledgement follows native dispatcher settlement.
+State is bounded: 1,000 unacknowledged replies, 10,000 ingress receipts, 4,096
+conversation routes and 16 MiB total. A full registry refuses new work rather
+than deleting deduplication evidence. A corrupted state file refuses startup.
+
+Typing follows the native dispatcher and is cleared on settlement/error. The
+command catalog comes from the installed public native registry. Tool events
+retain native call ids and session attribution and disclose no raw tool arguments;
+observation never changes a native guard or result. Absolute `read`/`write`/`edit`
+permission failures may request that exact path, while `enclos_request_access`
+requests an explicit typed scope through a V2 invocation guard. No shell text is
+parsed. Requests grant nothing. Bounded, persisted `policy.context` is added to
+matching future native prompts; the bridge retains approval authority.
+
+The native scoped media loader reads permitted local files, preserving native
+local-root/reader policy. Remote output URLs are not fetched automatically. Files
+are copied into the existing media folder with opaque names before a reply is
+queued; HTML is an ordinary `text/html` attachment whose bytes are preserved.
+Inbound metadata names only a bounded regular file of that same media folder,
+never a path or symlink. There are at most ten files and 25 MiB total per message.
+The prompt explains markdown, files and the app's static HTML behavior. The app
+continues to own rendering and blocking scripts/network assets in artefacts.
+
+Native question presentations retain the complete public text fallback, including
+batches and multiple selections. Credential requests retain their native trusted
+Control UI guidance. No structured question capability is advertised; see
+[the tested native question boundary](NATIVE_QUESTIONS.md) for the supported
+subset and the public APIs needed for richer controls.
+
+Native titles come from the public session metadata getter and keyed native
+session invalidations. Human rename/clear uses the public prepared metadata patch
+with an exact account/route authority fence and preserves native activity time.
+It changes the native display title, whose values may repeat; native addressable
+labels keep their separate meaning and validation. Renaming a conversation before
+it has a native session keeps the name in the bridge without creating a session.
+
+Routines use the public Gateway service's lifecycle-scoped `getCron()` facade.
+Only explicitly agent-owned jobs enter its bounded inventory; supported full
+definitions are read-only. `options.operations=["get"]` hides creation and
+mutation controls. Native unknown fields and external destinations are never
+rewritten. Unsupported native schedules or incomplete definitions report
+`unsupported`. The public facade does not provide atomic definition
+preconditions for changes/removal/manual runs or complete agent-targeted
+creation, so all writes are refused before scheduler access. See the
+[source evidence](../../docs/research/openclaw-routines.md).
+Read-only inventory/details are M5's agreed scope; mutation parity is tracked
+in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
+
+Typed `turn.abort` targets the original incoming message id. Each ingress owns
+the public native run abort signal; a queued target, a repeated stop, and a stale
+stop never select another run by its session. Account stop also aborts its owned
+signals. The acknowledgement accepts cancellation without claiming cleanup has
+drained. [Native cancellation evidence](NATIVE_CANCELLATION.md) records the exact
+public dispatch test and Hermes compatibility boundary.
+
+Structured questions remain separate work.
+Unsupported controls return `unsupported`.
+Structured native
+control modules can gate live sends and durable replay with `canDeliver`; the
+retained bridge hello excludes its token.
+
+## Native exec approvals
+
+`native-approvals.js` registers the public channel approval capability and the
+account's `approval.native` runtime context. OpenClaw owns pending discovery,
+native replay, expiration and resolution. The module never reads native approval
+storage, opens an administrator client, dispatches general gateway methods or
+executes commands. Channel integration supplies the current account guard and
+the native session key derived from the persisted conversation route.
+
+A structured card requires an exact local `gateway` or `sandbox` exec request:
+agent, account, source channel, conversation, person and native session must
+match. Remote `node` requests, unknown Home owners, thread routes and other
+approval kinds stay on OpenClaw's native approval surface. The native view's
+complete display command, warnings, metadata and offered actions are preserved.
+OpenClaw normally offers Once/Always/Deny; its `ask: always` policy offers
+Once/Deny. Session is never fabricated. Always describes OpenClaw's native
+executable/argument allowlist policy, rather than an exact-command or session
+grant invented by enclos.
+
+The bridge must negotiate both `runtime_approvals` and
+`runtime_approval_scopes`; the host separately checks the app's opt-in. Live
+structured sends and durable replay are gated. Older bridges get bounded literal
+text with the complete command, all actions and native instructions. Oversized
+or unrepresentable views receive the same complete fallback without an app
+answer binding. Native instructions refer to OpenClaw's approval surface; an
+unbound `/approve` message through enclos is not authorized by this module.
+
+An app answer records its control id and content hash before requesting the
+public canonical resolver. Native reviewer authorization is restricted to that
+live exact attempt. Only `applied: true` with the same request id, creation and
+expiration, complete display command, chosen decision and terminal status emits
+`answered` with that control id. Consent does not mean execution succeeded.
+External decisions emit neutral `resolved`, without an action or receipt.
+The exact requesting bridge peer and token are checked again by the native
+commit authorizer and after resolution. Revocation before commit denies the
+decision. If the native decision was already confirmed when receipt authority
+is lost, private evidence is retained and reconciliation shows only its neutral
+terminal state; the successor connection does not receive an answer receipt.
+Timeouts and ambiguous failures expire the app's control lease and retain the
+uncertain receipt; they never retry a native decision. Reconnect reuses current
+bindings. Restart expires old cards; only a fresh native pending callback creates
+a new binding with a new app id, so old buttons cannot acquire new authority.
+
+The private shared channel state retains at most 128 cards and 256 decision
+receipts. It preserves conflict hashes, including pending/uncertain evidence.
+At capacity, new structured work is refused with complete native fallback and
+an explicit reason; generating that fallback grants nothing. There is no
+automatic retention migration or evidence deletion. Use OpenClaw's native
+approval surface until a future safe retirement policy is implemented. Corrupt
+approval state refuses activation rather than discarding receipts.
+
+## Validation
+
+```sh
+node channels/openclaw/scripts/build.mjs --check
+node --test channels/openclaw/tests/*.test.js
+ENCLOS_OPENCLAW_PACKAGE=/path/to/installed/openclaw node --test channels/openclaw/tests/native-sdk.test.js channels/openclaw/tests/native-approvals.test.js
+```
+
+The build uses Node's type stripper to emit `index.js` from `index.ts`; the emitted
+JavaScript ships with enclos. No TypeScript compiler or upstream development
+dependencies are installed. The transport tests use disposable Unix sockets and
+fake secrets, and read the Rust/Hermes wire fixtures. Native SDK registration and
+session-key checks are optional when the exact installed package is unavailable.
+The approval source harness uses public SDK lifecycle calls and an in-memory
+canonical resolver transport: it verifies native action sets, exact reviewer
+parameters and receipts without starting a gateway client or executing a command.
+Live gateway/plugin loading, Seatbelt socket reachability and real model/scheduled
+output are recorded separately in `prototype/m5/`; source/fixture tests alone do
+not establish those behaviors.
+
+The channel keeps the latest 10,000 inbound receipts per account and preserves
+in-flight receipts until dispatch finishes. It retains up to 4,096 conversation
+routes, keeping Home and routes with pending delivery. A new inbound message
+reestablishes an evicted route with the same native chat for that person.
+
+## Answering activity
+
+The channel advertises `activity` and publishes `agent.activity` only when the
+bridge also negotiated it. It reports authenticated enclos ingresses while
+awaiting native dispatch and delivery settlement. Concurrent ingresses are
+tracked separately, including ones in the same conversation; a typing idle
+callback or cancellation acknowledgement does not claim native cleanup ended.
+Each message is the current bounded snapshot (at most 16 conversations), sent
+again after every hello. Idle has an empty list and `since: 0`. These transient
+frames never enter the durable outbox, and account shutdown revokes reporting.
+
+This covers answering through this channel. It does not report CLI work,
+scheduled runs or native background tasks, and native deferred ingress is not
+a complete Gateway run inventory. `tasks` and `held_tasks` remain unavailable.
+
+Native message targets require the calling agent's identity. OpenClaw's target
+resolver can inherit that identity during an enclos dispatch. A target lookup
+with no authenticated dispatch or caller identity returns no enclos route.

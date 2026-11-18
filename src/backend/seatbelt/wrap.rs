@@ -117,6 +117,9 @@ pub(super) fn wrap_in(
     terminal: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(SANDBOX_EXEC);
+    if launch.dashboard_socket {
+        command.arg("-D").arg("ENCLOS_DASHBOARD=1");
+    }
     if let Some(terminal) = terminal {
         let mut param = OsString::from(format!("{TERMINAL_PARAM}="));
         param.push(terminal);
@@ -186,6 +189,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -215,6 +219,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: Some(61374),
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -246,6 +251,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -301,6 +307,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };

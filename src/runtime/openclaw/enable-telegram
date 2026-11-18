@@ -1,0 +1,7 @@
+#!/bin/sh
+# Access settings and the protected token reference have already been saved.
+set -eu
+agent=$1
+"$HOME/bin/openclaw" agents bind --agent "$agent" --bind "telegram:$agent" --json
+"$HOME/bin/openclaw" config set "channels.telegram.accounts.$agent.enabled" true
+exec "$HOME/bin/openclaw" config set channels.telegram.enabled true

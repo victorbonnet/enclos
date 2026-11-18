@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 
 use super::policy::with_sandbox;
 use super::*;
+use crate::engine::loopback::reached_another;
 use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::net::{Reason, Verdict};
 
@@ -33,7 +34,11 @@ fn runs_a_proxy_when_asked() {
     let port = std::env::var(PROXY_PORT).unwrap().parse().unwrap();
     let records = std::env::var_os(PROXY_RECORDS).is_some();
     let layout = Layout::at(std::path::PathBuf::from(folder));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     let err = engine
@@ -48,10 +53,12 @@ fn runs_a_proxy_when_asked() {
 /// would keep its port, which the next sandbox of another test is given,
 /// for every test after. Killed when dropped; [`ProxyChild::end`]
 /// also checks the port is free again. Take the [`HOST_PORTS`] turn first
-/// and keep it until then.
+/// and keep it until then. What the child writes is kept, for a test to
+/// say why the proxy stopped ([`ProxyChild::said`]).
 struct ProxyChild {
     child: Child,
     port: u16,
+    output: std::path::PathBuf,
 }
 
 impl ProxyChild {
@@ -59,6 +66,18 @@ impl ProxyChild {
         let port = engine.state.get(name).unwrap().unwrap().proxy_port;
         // `Layout::at` keeps everything in one folder, the state's.
         let folder = engine.layout.state_db().parent().unwrap().to_owned();
+        ProxyChild::start_at(&folder, name, port, records)
+    }
+
+    /// [`ProxyChild::start`], for the engine whose folder is `folder`.
+    fn start_at(
+        folder: &std::path::Path,
+        name: &SandboxName,
+        port: u16,
+        records: bool,
+    ) -> ProxyChild {
+        let output = folder.join(format!("proxy-child-{port}.out"));
+        let file = std::fs::File::create(&output).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -69,15 +88,22 @@ impl ProxyChild {
             .env(PROXY_FOLDER, folder)
             .env(PROXY_SANDBOX, name.as_str())
             .env(PROXY_PORT, port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file));
         if records {
             command.env(PROXY_RECORDS, "1");
         }
         ProxyChild {
             child: spawn_unmarked(&mut command).unwrap(),
             port,
+            output,
         }
+    }
+
+    /// What the child wrote: libtest's report, with the proxy's error once
+    /// it stopped.
+    fn said(&self) -> String {
+        std::fs::read_to_string(&self.output).unwrap_or_else(|e| format!("nothing to read: {e}"))
     }
 
     fn exited(&mut self) -> bool {
@@ -90,7 +116,9 @@ impl ProxyChild {
         loop {
             match UnixStream::connect(path) {
                 Ok(conn) => return conn,
-                Err(e) if started.elapsed().as_secs() > 30 || self.exited() => panic!("{e}"),
+                Err(e) if started.elapsed().as_secs() > 30 || self.exited() => {
+                    panic!("{e}; the proxy wrote:\n{}", self.said())
+                }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
@@ -101,11 +129,39 @@ impl ProxyChild {
     fn end(mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
-        let refused = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port)).unwrap_err();
-        assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
-        // `[::1]` may not be configured: any error says nothing answers.
-        assert!(TcpStream::connect((Ipv6Addr::LOCALHOST, self.port)).is_err());
+        assert_nothing_listens(self.port);
     }
+}
+
+/// Asserts that nothing listens on `port`, on either loopback: a connection
+/// to 127.0.0.1 is refused or reaches itself, and one to `[::1]`, which may
+/// not be configured, fails or reaches itself. Linux can give a connection the port
+/// it connects to as its own, since its ephemeral range holds the proxy
+/// range; with nothing listening, the connection then reaches itself. It is
+/// reset as it closes, so that it leaves the port free for the next proxy
+/// (see `loopback`).
+fn assert_nothing_listens(port: u16) {
+    match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+        Err(refused) => assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}"),
+        Ok(conn) => assert!(
+            !reached_another(conn),
+            "something listens on 127.0.0.1:{port}"
+        ),
+    }
+    // `[::1]` may not be configured: any error says nothing answers.
+    if let Ok(conn) = TcpStream::connect((Ipv6Addr::LOCALHOST, port)) {
+        assert!(!reached_another(conn), "something listens on [::1]:{port}");
+    }
+}
+
+/// The control for [`assert_nothing_listens`]: a listener on the port fails
+/// it. The listener's port is outside the proxy range, so no proxy test
+/// shares it.
+#[test]
+#[should_panic(expected = "something listens on 127.0.0.1:")]
+fn a_listener_on_the_port_fails_the_check_that_nothing_listens() {
+    let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+    assert_nothing_listens(listener.local_addr().unwrap().port());
 }
 
 impl Drop for ProxyChild {
@@ -144,7 +200,11 @@ fn a_running_proxy_decides_and_logs_on_its_socket() {
 fn engine_with_a_long_path() -> (tempfile::TempDir, Engine) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path().join("e".repeat(120)));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
     (dir, engine)
@@ -240,7 +300,11 @@ fn run_proxy_of(
     let name = name.clone();
     let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
     std::thread::spawn(move || {
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         let engine = Engine::new(layout, Box::new(state), Box::new(audit), Vec::new());
         engine.run_proxy(&name, port, Some(&alice()))
@@ -284,15 +348,14 @@ fn a_proxy_goes_by_its_sandboxs_backend_when_its_socket_cannot_be_opened() {
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
     assert!(!engine.proxy_runs(&name).unwrap());
     // Nothing holds its port.
-    let refused = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap_err();
-    assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
+    assert_nothing_listens(port);
 
     let (_dir, engine, name) = on_backend(BackendKind::Seatbelt);
     block_the_socket(&engine, &name);
     let mut running = ProxyChild::start(&engine, &name, true);
     let started = std::time::Instant::now();
     while !engine.proxy_runs(&name).unwrap() {
-        assert!(!running.exited(), "the proxy stopped");
+        assert!(!running.exited(), "the proxy stopped:\n{}", running.said());
         assert!(started.elapsed().as_secs() < 30, "the proxy never recorded");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -321,16 +384,11 @@ fn a_proxy_whose_sessions_reach_it_over_its_socket_leaves_its_port_free() {
         let mut proxy = ProxyChild::start(&engine, &name, false);
         // The socket opens last, so every listener is up once it answers.
         proxy.connect(&engine.layout.proxy_socket(name.as_str()));
-        let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port));
         match backend.reaches_proxy_over_socket() {
-            true => {
-                let refused = tcp.unwrap_err();
-                assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
-                // `[::1]` may not be configured: any error says nothing answers.
-                assert!(TcpStream::connect((Ipv6Addr::LOCALHOST, proxy.port)).is_err());
-            }
+            true => assert_nothing_listens(proxy.port),
             false => {
-                tcp.unwrap();
+                let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port)).unwrap();
+                assert!(reached_another(tcp), "the proxy does not listen");
             }
         }
         proxy.end();
@@ -350,7 +408,7 @@ fn a_second_proxy_leaves_the_running_one_its_socket_when_neither_holds_a_port() 
         "{err}"
     );
     UnixStream::connect(&path).unwrap();
-    assert!(!running.exited());
+    assert!(!running.exited(), "the proxy stopped:\n{}", running.said());
     running.end();
 }
 
@@ -398,4 +456,44 @@ fn a_started_proxy_is_waited_for_where_its_sessions_reach_it() {
         assert!(engine.proxy_runs(&name).unwrap(), "{backend}");
         proxy.end();
     }
+}
+
+/// `sandbox start` holds the state lock while it installs the sandbox's
+/// services, the proxy first, and the service manager runs the proxy at
+/// once, which records itself under that lock. On a Raspberry Pi under load
+/// (2026-11-11), installing the services after it took longer than the 10
+/// seconds a command waits for the lock: the proxy gave up, and `sandbox
+/// start` said it had not started. It waits as long as a write no person
+/// waits on (design §11), then records itself.
+#[test]
+fn a_proxy_service_records_itself_after_a_long_sandbox_start() {
+    use crate::engine::service::{PROXY_WAIT, Unit};
+    use crate::model::runtime::RuntimeKind;
+    use crate::service::ServiceLabel;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, engine, fake, name) =
+        super::services::sandbox_with_services(Some(RuntimeKind::Hermes));
+    let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    let folder = engine.layout.state_db().parent().unwrap().to_owned();
+    let proxy = engine.label(&name, Unit::Proxy).unwrap();
+    let running = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let started = std::rc::Rc::clone(&running);
+    let sandbox = name.clone();
+    *fake.on_start.borrow_mut() = Some(Box::new(move |label: &ServiceLabel| {
+        if *label == proxy {
+            *started.borrow_mut() = Some(ProxyChild::start_at(&folder, &sandbox, port, true));
+        } else {
+            // The gateway's install takes longer than a command waits for
+            // the lock, as systemd's did on the Pi.
+            std::thread::sleep(std::time::Duration::from_secs(11));
+        }
+    }));
+    engine.start_sandbox(&alice(), &name).unwrap();
+    let mut proxy = running.borrow_mut().take().unwrap();
+    // As `sandbox start` waits for it once the services are installed.
+    let recorded = engine.proxy_started(&name, PROXY_WAIT).unwrap();
+    assert!(!proxy.exited(), "the proxy exited:\n{}", proxy.said());
+    assert!(recorded, "the proxy did not record itself");
+    proxy.end();
 }

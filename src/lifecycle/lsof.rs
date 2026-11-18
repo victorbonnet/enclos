@@ -28,6 +28,94 @@ pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersEr
     lsof(&[&format!("-iTCP@127.0.0.1:{port}"), "-sTCP:LISTEN"])
 }
 
+pub fn all_tcp_listeners() -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    lsof(&["-iTCP", "-sTCP:LISTEN"])
+}
+
+/// The uid of the connected client socket. The reverse (accepted) socket
+/// belongs to enclos and must never be mistaken for the caller. Missing,
+/// unreadable, malformed or conflicting ownership fails closed.
+pub fn tcp_client_owner(client: SocketAddr, server: SocketAddr) -> std::io::Result<Option<u32>> {
+    let output = super::bounded::output_within(
+        Command::new("/usr/sbin/lsof").env("LC_ALL", "C").args([
+            "-nP",
+            "-a",
+            &format!("-iTCP@{}:{}", client.ip(), client.port()),
+            "-sTCP:ESTABLISHED",
+            "-Fpun",
+        ]),
+        super::bounded::LIMIT,
+    )?;
+    if !output.status.success() && !(output.status.code() == Some(1) && output.stdout.is_empty()) {
+        return Err(std::io::Error::other(
+            "lsof could not identify the dashboard client",
+        ));
+    }
+    Ok(client_owner(
+        &String::from_utf8_lossy(&output.stdout),
+        client,
+        server,
+    ))
+}
+
+fn client_owner(text: &str, client: SocketAddr, server: SocketAddr) -> Option<u32> {
+    let wanted = format!("{client}->{server}");
+    let mut uid = None;
+    let mut owners = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if line.starts_with('p') {
+            uid = None;
+        } else if let Some(value) = line.strip_prefix('u') {
+            uid = value.parse::<u32>().ok();
+        } else if line.strip_prefix('n') == Some(wanted.as_str()) {
+            owners.insert(uid?);
+        }
+    }
+    if owners.len() == 1 {
+        owners.into_iter().next()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod dashboard_owner_tests {
+    use super::*;
+
+    #[test]
+    fn client_uid_is_not_the_accepted_sockets_uid_and_ambiguous_owners_are_refused() {
+        let client = "127.0.0.1:59001".parse().unwrap();
+        let server = "127.0.0.1:41002".parse().unwrap();
+        let caller = "p10\nu1001\nn127.0.0.1:59001->127.0.0.1:41002\n";
+        let accepted = "p11\nu1000\nn127.0.0.1:41002->127.0.0.1:59001\n";
+        assert_eq!(
+            client_owner(&format!("{accepted}{caller}"), client, server),
+            Some(1001)
+        );
+        for text in [
+            accepted.to_owned(),
+            caller.replace("u1001", "ux"),
+            caller.replace("u1001\n", ""),
+            format!("{caller}{}", caller.replace("u1001", "u1002")),
+        ] {
+            assert_eq!(client_owner(&text, client, server), None, "{text}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_kernel_names_the_real_loopback_client() {
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let server = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(server).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        assert_eq!(
+            tcp_client_owner(client.local_addr().unwrap(), server).unwrap(),
+            Some(rustix::process::getuid().as_raw())
+        );
+    }
+}
+
 /// The first and last port the system picks from for a bind on port 0.
 pub fn ephemeral_ports() -> Result<(u16, u16), String> {
     Ok((

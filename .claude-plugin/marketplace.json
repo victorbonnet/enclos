@@ -1,0 +1,17 @@
+{
+  "name": "enclos",
+  "owner": {
+    "name": "Victor Bonnet",
+    "url": "https://github.com/victorbonnet"
+  },
+  "metadata": {
+    "description": "The enclos plugin for Claude Code and Codex"
+  },
+  "plugins": [
+    {
+      "name": "enclos",
+      "source": "./plugins/enclos",
+      "description": "Teaches a host assistant what enclos is and every command it has, so that it can set up and run sandboxed agents on this host through the enclos CLI"
+    }
+  ]
+}

@@ -5,7 +5,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{Backend, Launch, SandboxContext};
 use super::Baseline;
@@ -14,7 +14,7 @@ use super::probes::SeatbeltProbes;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::policy::file::PolicyFile;
-use crate::policy::paths::{FsPaths, PathContext};
+use crate::policy::paths::{FsPaths, Kept, PathContext};
 use crate::probes::{Outcome, ProbeInputs, Proof, Run, outcome, probes, sandboxed_script};
 
 /// `text`, a policy compiled on `(deny default)`, as it compiles on
@@ -38,6 +38,7 @@ fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
         env: vec![],
         in_terminal: false,
         service_port: None,
+        dashboard_socket: false,
         limits: Default::default(),
         reads: Vec::new(),
     };
@@ -93,6 +94,26 @@ fn world() -> World {
     std::fs::write(user.join("work/project/private/key"), "secret").unwrap();
     std::fs::write(home.join("private/key"), "secret").unwrap();
     std::fs::write(data.join("state.db"), "state").unwrap();
+    // The bridge's: its database (ADR 0042) and its write-ahead log, its
+    // Noise key and a file the key is written to first, its key for
+    // signed runtime-approval decisions (ADR 0060), its push key and a file
+    // a new one is written to first (ADR 0065), and a message's file; and
+    // the diagnostic provenance beside `state.db` (ADR 0059).
+    std::fs::create_dir_all(data.join("app-media")).unwrap();
+    for file in [
+        "app.db",
+        "app.db-wal",
+        "app-bridge.key",
+        "app-bridge.key.0123.new",
+        "app-approvals.key",
+        "app-push-key.json",
+        "app-push-key.json.0123.new",
+        "app-media/0123",
+        "probe-sources.db",
+        "probe-sources.db-journal",
+    ] {
+        std::fs::write(data.join(file), "the bridge's").unwrap();
+    }
     std::fs::write(data.join("sandboxes/other/policy.toml"), "theirs").unwrap();
     std::fs::write(user.join("readable.txt"), "fine").unwrap();
     // A workspace the user reaches through a link of their own.
@@ -136,7 +157,7 @@ fn world() -> World {
         user_home: ctx.user_home.clone(),
         sandbox_home: ctx.home.clone(),
     };
-    let fs = FsPaths::of(&policy.fs, &paths).unwrap();
+    let fs = FsPaths::of(&policy.fs, &paths, Kept::NONE).unwrap();
     World {
         _dir: dir,
         base,
@@ -145,6 +166,102 @@ fn world() -> World {
         fs,
         allowed,
         other,
+    }
+}
+
+/// The actual kernel boundary: the dashboard can accept on the one
+/// inherited private socket, cannot open that path, and cannot bind TCP.
+#[test]
+fn a_private_dashboard_inherits_its_listener_and_cannot_bind_or_dial_its_path() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let layout = Layout::at(dir.path().join("e"));
+    let name = "home".parse().unwrap();
+    let ctx = SandboxContext::new(&layout, &name, 41000);
+    std::fs::create_dir_all(&ctx.home).unwrap();
+    layout.create_sandbox_run_dir("home").unwrap();
+    let socket = layout.dashboard_socket("home");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut policy = Policy::default();
+    policy.fs.write = vec!["{home}".into()];
+    policy.net.listen = true;
+    let compiled = dir.path().join("policy.sb");
+    let text = Seatbelt::default().compile(&policy, &ctx).unwrap().text;
+    let code = r#"import os, socket
+s = socket.socket(fileno=int(os.environ['ENCLOS_DASHBOARD_FD']))
+assert s.family == socket.AF_UNIX
+ipc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ipc_path = os.path.join(os.environ['HOME'], 'dashboard-ipc.sock')
+ipc.bind(ipc_path)
+ipc.listen()
+ipc.close()
+os.unlink(ipc_path)
+for family, address in [(socket.AF_INET, ('127.0.0.1', 0)), (socket.AF_INET6, ('::', 0))]:
+    raw = socket.socket(family, socket.SOCK_STREAM)
+    try: raw.bind(address)
+    except PermissionError: pass
+    else: raise AssertionError('dashboard bound a new listener')
+    raw.close()
+try:
+    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).connect(s.getsockname())
+except PermissionError: pass
+else: raise AssertionError('dashboard dialed its private listener by path')
+client, _ = s.accept()
+client.sendall(b'private token')
+client.close()
+"#;
+    let launch = Launch {
+        program: "/usr/bin/python3".into(),
+        args: vec!["-I".into(), "-c".into(), code.into()],
+        env: vec![],
+        in_terminal: false,
+        service_port: None,
+        dashboard_socket: true,
+        limits: Default::default(),
+        reads: vec![],
+    };
+    for (baseline, text) in [
+        ("deny default", text.clone()),
+        ("allow default", on_allow_default(&text)),
+    ] {
+        std::fs::write(&compiled, text).unwrap();
+        let mut command = Seatbelt::default().wrap(&compiled, &ctx, &launch).unwrap();
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let marker_dir = layout.sandbox_dir("home").join("members");
+        let started = Instant::now();
+        let (child, _marker) = crate::lifecycle::marker::Marker::new(&marker_dir)
+            .unwrap()
+            .spawn_with(
+                &mut command,
+                Some((listener.as_fd(), "ENCLOS_DASHBOARD_FD")),
+            )
+            .unwrap();
+        let mut client = UnixStream::connect(&socket).unwrap();
+        // Only a guard against a dashboard that never answers (the test holds
+        // the listener, so the read would wait forever). A cold Python under
+        // sandbox-exec on a CI runner has taken over 5 s to answer.
+        client
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut answer = String::new();
+        let read = client.read_to_string(&mut answer);
+        // Straight to the job's log, which keeps no output of a test that
+        // passes: a start slowing towards the guard shows there.
+        let _ = writeln!(
+            std::io::stderr(),
+            "private dashboard on {baseline}: answered after {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        read.unwrap();
+        assert_eq!(answer, "private token");
     }
 }
 
@@ -162,6 +279,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -181,6 +299,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -223,6 +342,35 @@ fn an_installer_can_create_folders_in_its_home_with_mkdir_p() {
 }
 
 #[test]
+fn openclaw_host_state_is_hidden_while_sandbox_local_state_is_writable() {
+    let w = world();
+    let policy = crate::policy::resolve(
+        "extends = \"assistant\"\n[filesystem]\nread_deny_add = [\"~/.openclaw-work\"]\n",
+        None,
+    )
+    .unwrap()
+    .policy;
+    w.enforce(&policy);
+    // These are harmless fixtures in a temporary home, never the host's
+    // actual OpenClaw state. Reading outside is each denial's control.
+    for root in [".openclaw", ".openclaw-dev", ".openclaw-work"] {
+        let folder = w.ctx.user_home.join(root);
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("openclaw.json");
+        std::fs::write(&file, "fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fixture");
+        assert!(w.refused(&format!("/bin/cat '{}'", file.display())));
+    }
+    assert!(w.sh(
+        "/bin/mkdir -p \"$HOME/.openclaw\" && printf local > \"$HOME/.openclaw/openclaw.json\""
+    ));
+    assert_eq!(
+        w.out("/bin/cat \"$HOME/.openclaw/openclaw.json\""),
+        (true, "local".into())
+    );
+}
+
+#[test]
 fn the_sandbox_writes_only_in_its_home() {
     let w = world();
     assert!(w.sh("echo ok > \"$HOME/written\""));
@@ -231,12 +379,254 @@ fn the_sandbox_writes_only_in_its_home() {
     assert!(!Path::new(&w.path("alice/outside")).exists());
 }
 
+/// A grant of the whole filesystem (ADR 0058): the sandbox writes the
+/// user's files anywhere, and still cannot change a read-only path, the
+/// deny list, enclos's own files or enclos's program, nor move a folder
+/// that holds one of them.
+#[test]
+fn a_grant_of_the_whole_filesystem_keeps_read_only_denied_and_enclos_paths() {
+    let mut w = world();
+    let program_dir = w.base.join("bin");
+    std::fs::create_dir_all(&program_dir).unwrap();
+    let program = program_dir.join("enclos");
+    std::fs::write(&program, "the program").unwrap();
+    w.ctx.program = Some(vec![program.clone()]);
+    std::fs::write(w.path("alice/.zshrc"), "export A=1\n").unwrap();
+    std::fs::create_dir_all(w.path("alice/.config/fish")).unwrap();
+    std::fs::create_dir_all(w.path("alice/Movies/new")).unwrap();
+    let mut p = Policy::default();
+    p.fs.write = vec!["/".into()];
+    p.fs.read_deny = vec!["~/.ssh".into()];
+    p.fs.read_only = vec![
+        "~/.zshrc".into(),
+        "~/.zlogin".into(),
+        "~/.config/fish".into(),
+    ];
+    w.enforce(&p);
+
+    // The user's own files, wherever they are.
+    assert!(w.sh(&format!("echo ok > '{}'", w.path("alice/outside"))));
+    assert!(w.sh(&format!("echo ok > '{}'", w.path("elsewhere"))));
+    assert!(w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/Movies/new"),
+        w.path("alice/Movies/sorted")
+    )));
+    assert!(w.sh("echo ok > \"$HOME/written\""));
+    assert!(w.sh("echo ok > /dev/null"));
+
+    // Read-only paths: read, never changed, removed, renamed or made.
+    let zshrc = w.path("alice/.zshrc");
+    assert!(w.sh(&format!("cat '{zshrc}'")));
+    assert!(!w.sh(&format!("echo x >> '{zshrc}'")));
+    assert!(!w.sh(&format!("rm '{zshrc}'")));
+    assert!(!w.sh(&format!("mv '{zshrc}' '{zshrc}.old'")));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.zlogin"))));
+    assert!(!w.sh(&format!(
+        "echo x > '{}'",
+        w.path("alice/.config/fish/config.fish")
+    )));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/.config"),
+        w.path("alice/config")
+    )));
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "export A=1\n");
+    assert!(!Path::new(&w.path("alice/.zlogin")).exists());
+
+    // The deny list and enclos's own files.
+    assert!(!w.sh(&format!("cat '{}'", w.path("alice/.ssh/id_ed25519"))));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.ssh/new"))));
+    assert!(!w.sh(&format!("cat '{}'", w.path("alice/.enclos/state.db"))));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.enclos/new"))));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/.enclos"),
+        w.path("alice/moved")
+    )));
+    assert!(!w.sh(&format!("mv '{}' '{}'", w.path("alice"), w.path("bob"))));
+
+    // A hard link elsewhere would name the same file by a path no rule
+    // names: making one is refused for each of them, while one to the
+    // user's own file is made.
+    assert!(w.sh(&format!(
+        "ln '{}' '{}'",
+        w.path("alice/outside"),
+        w.path("alice/link-ok")
+    )));
+    for (i, target) in [
+        zshrc.clone(),
+        w.path("alice/.ssh/id_ed25519"),
+        w.path("alice/.enclos/state.db"),
+        program.display().to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let link = w.path(&format!("alice/link-{i}"));
+        assert!(!w.sh(&format!("ln '{target}' '{link}'")), "{target}");
+        assert!(!Path::new(&link).exists(), "{target}");
+    }
+
+    // enclos's program and the folder holding it.
+    let shown = program.display();
+    assert!(!w.sh(&format!("echo x > '{shown}'")));
+    assert!(!w.sh(&format!("rm '{shown}'")));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        program_dir.display(),
+        w.path("bin2")
+    )));
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), "the program");
+
+    // Replacing a read-only file by renaming another over it, as an
+    // atomic save does, is refused too.
+    assert!(w.sh(&format!("echo evil > '{}'", w.path("alice/new-rc"))));
+    assert!(!w.sh(&format!("mv '{}' '{zshrc}'", w.path("alice/new-rc"))));
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "export A=1\n");
+
+    // `/dev` keeps the device rules: a device the user may open for
+    // appending outside the sandbox is refused inside it, while the
+    // runtime's own devices still open. Appending nothing writes nothing.
+    let device = ["/dev/console", "/dev/autofs_nowait"]
+        .into_iter()
+        .find(|d| std::fs::OpenOptions::new().append(true).open(d).is_ok());
+    if let Some(device) = device {
+        assert!(!w.sh(&format!(": >> {device}")), "{device}");
+    }
+    assert!(w.sh(": >> /dev/null && : >> /dev/zero"));
+}
+
+/// Under a grant of the whole filesystem, a kept path behind a symlink is
+/// kept by every name that leads to it (ADR 0058): the link itself, a link
+/// on the way, and the file it leads to; and a folder on the way to a kept
+/// path that is not made yet cannot be made as a symlink, nor moved there
+/// as one, so the names inside it cannot be sent elsewhere.
+#[test]
+fn a_grant_of_the_whole_filesystem_keeps_paths_behind_links_and_missing_folders() {
+    let mut w = world();
+    for d in [
+        "alice/dotfiles/config/fish",
+        "alice/sync/ssh",
+        "bin",
+        "cellar",
+    ] {
+        std::fs::create_dir_all(w.path(d)).unwrap();
+    }
+    let link = |target: &str, at: &str| {
+        std::os::unix::fs::symlink(w.path(target), w.path(at)).unwrap();
+    };
+    std::fs::write(w.path("alice/dotfiles/zshrc"), "ok\n").unwrap();
+    link("alice/dotfiles/zshrc", "alice/.zshrc");
+    link("alice/dotfiles/config", "alice/.config");
+    std::fs::write(w.path("alice/sync/ssh/id_ed25519"), "secret").unwrap();
+    std::fs::remove_dir_all(w.path("alice/.ssh")).unwrap();
+    link("alice/sync/ssh", "alice/.ssh");
+    std::fs::write(w.path("cellar/enclos"), "the program").unwrap();
+    link("cellar/enclos", "bin/enclos");
+    w.ctx.program = Some(vec![w.base.join("bin/enclos")]);
+    let mut p = Policy::default();
+    p.fs.write = vec!["/".into()];
+    p.fs.read_deny = vec!["~/.ssh".into(), "~/.cache/hf/token".into()];
+    p.fs.read_only = vec!["~/.zshrc".into(), "~/.config/fish".into()];
+    w.enforce(&p);
+
+    // A symlinked read-only file: neither the link nor its target changes.
+    let zshrc = w.path("alice/.zshrc");
+    assert!(w.sh(&format!("cat '{zshrc}'")));
+    assert!(!w.sh(&format!("rm '{zshrc}'")));
+    assert!(!w.sh(&format!("mv '{zshrc}' '{zshrc}.old'")));
+    assert!(!w.sh(&format!("ln -sfh /tmp '{zshrc}'")));
+    assert!(!w.sh(&format!("echo x >> '{zshrc}'")));
+    assert!(!w.sh(&format!("echo x >> '{}'", w.path("alice/dotfiles/zshrc"))));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/dotfiles"),
+        w.path("alice/df")
+    )));
+    assert_eq!(
+        std::fs::read_link(&zshrc).unwrap(),
+        w.base.join("alice/dotfiles/zshrc")
+    );
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "ok\n");
+
+    // A link on the way to a read-only folder.
+    let config = w.path("alice/.config");
+    assert!(!w.sh(&format!("rm '{config}'")));
+    assert!(!w.sh(&format!("mv '{config}' '{config}.old'")));
+    assert!(!w.sh(&format!("echo x > '{config}/fish/config.fish'")));
+    assert!(std::fs::symlink_metadata(&config).unwrap().is_symlink());
+
+    // A symlinked deny-list folder: unreadable, and the link stays.
+    let ssh = w.path("alice/.ssh");
+    assert!(!w.sh(&format!("cat '{ssh}/id_ed25519'")));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/sync/ssh/new"))));
+    assert!(!w.sh(&format!("rm '{ssh}'")));
+    assert!(!w.sh(&format!("mv '{ssh}' '{ssh}.old'")));
+    assert!(std::fs::symlink_metadata(&ssh).unwrap().is_symlink());
+
+    // A missing folder on the way to a denied path: made as a folder, never
+    // as a link, whether made there or moved there.
+    let cache = w.path("alice/.cache");
+    assert!(!w.sh(&format!("ln -s /tmp '{cache}'")));
+    assert!(w.sh(&format!("ln -s /tmp '{}'", w.path("alice/elsewhere"))));
+    assert!(!w.sh(&format!("mv '{}' '{cache}'", w.path("alice/elsewhere"))));
+    assert!(!Path::new(&cache).exists());
+    assert!(w.sh(&format!("mkdir '{cache}'")));
+    assert!(!w.sh(&format!("ln -s /tmp '{cache}/hf'")));
+    assert!(w.sh(&format!("mkdir '{cache}/hf'")));
+    assert!(!w.sh(&format!("ln -s /tmp/x '{cache}/hf/token'")));
+
+    // enclos's program behind a link: the link, the file and both folders.
+    let program = w.path("bin/enclos");
+    assert!(!w.sh(&format!("rm '{program}'")));
+    assert!(!w.sh(&format!("ln -sfh /tmp/x '{program}'")));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("cellar/enclos"))));
+    assert!(!w.sh(&format!("mv '{}' '{}'", w.path("bin"), w.path("old-bin"))));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("cellar"),
+        w.path("old-cellar")
+    )));
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), "the program");
+
+    // Controls: the user's own links and folders still change.
+    assert!(w.sh(&format!("ln -s /tmp '{}'", w.path("alice/mine"))));
+    assert!(w.sh(&format!("rm '{}'", w.path("alice/mine"))));
+    // The folder holding the denied target cannot move either.
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/sync"),
+        w.path("alice/sync2")
+    )));
+}
+
 #[test]
 fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
     let w = world();
     assert!(w.sh(&format!("cat '{}'", w.path("alice/readable.txt"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.ssh/id_ed25519"))));
     assert!(!w.sh(&format!("cat '{}'", w.path("alice/.enclos/state.db"))));
+    for file in [
+        "app.db",
+        "app.db-wal",
+        "app-bridge.key",
+        "app-bridge.key.0123.new",
+        "app-approvals.key",
+        "app-push-key.json",
+        "app-push-key.json.0123.new",
+        "app-media/0123",
+        "probe-sources.db",
+        "probe-sources.db-journal",
+    ] {
+        assert!(
+            !w.sh(&format!(
+                "cat '{}'",
+                w.path(&format!("alice/.enclos/{file}"))
+            )),
+            "{file}"
+        );
+    }
     assert!(!w.sh(&format!(
         "cat '{}'",
         w.path("alice/.enclos/sandboxes/other/policy.toml")
@@ -363,6 +753,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     env: vec![],
                     in_terminal: false,
                     service_port: None,
+                    dashboard_socket: false,
                     limits: Default::default(),
                     reads: Vec::new(),
                 };
@@ -672,6 +1063,9 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         other_terminal: None,
         target: None,
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: Default::default(),
     };
     let output = |mut command: Command| {
@@ -689,6 +1083,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 env: vec![],
                 in_terminal: false,
                 service_port: None,
+                dashboard_socket: false,
                 limits: Default::default(),
                 reads: Vec::new(),
             };
@@ -832,6 +1227,9 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         other_terminal: None,
         target: None,
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: Default::default(),
     };
     let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
@@ -1113,6 +1511,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };
@@ -1167,6 +1566,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };

@@ -24,12 +24,63 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::model::unenforced::NotEnforced;
-use crate::policy::paths::{FsPaths, PathContext};
+use crate::policy::paths::{FsPaths, Kept, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
     TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, set_aside_notices,
     with_real_paths,
 };
+
+struct ProbeRun<'a> {
+    store: &'a dyn crate::state::NetLogStore,
+    tag: String,
+}
+impl<'a> ProbeRun<'a> {
+    /// Registers a run's tag with the host. A side database that cannot be
+    /// written only means the probes' refusals are not told apart from the
+    /// agents' (ADR 0059): no run, the probes go untagged and may reach the
+    /// approval inbox, and `policy test` goes on.
+    fn begin(
+        store: &'a dyn crate::state::NetLogStore,
+        name: &SandboxName,
+        tag: &str,
+    ) -> Option<Self> {
+        match store.begin_probe(name, tag) {
+            Ok(()) => Some(ProbeRun {
+                store,
+                tag: tag.to_owned(),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "enclos: diagnostic run metadata cannot be written, so the probes' refusals may reach the approval inbox: {e}"
+                );
+                None
+            }
+        }
+    }
+}
+impl Drop for ProbeRun<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.store.end_probe(&self.tag) {
+            eprintln!("enclos: could not close diagnostic run metadata: {e}");
+        }
+    }
+}
+fn tag_probe(probe: &mut Probe, tag: &str) {
+    let mark = |script: &str| {
+        script.replace(
+            "/usr/bin/curl ",
+            &format!("/usr/bin/curl --proxy-header 'X-Enclos-Probe: {tag}' "),
+        )
+    };
+    probe.script = mark(&probe.script);
+    match &mut probe.proof {
+        Proof::Control { control, .. } | Proof::OnlyTheProxy { control } => {
+            *control = crate::probes::HostScript::new(mark(control.as_str()))
+        }
+        Proof::ProxyRefuses => (),
+    }
+}
 
 /// What `enclos policy test` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +93,9 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
+    /// What else the policy opens, so the probes leave it out, each as the
+    /// report's sentence (ADR 0058).
+    pub open_by_policy: Vec<&'static str>,
     /// What the report says of the backend's probes, the baseline they ran
     /// on included.
     pub notes: ReportNotes,
@@ -272,7 +326,18 @@ impl Engine {
             }
             let mut results = Vec::new();
             let mut notices: Vec<String> = Vec::new();
-            for probe in list {
+            let tag: String = crate::bridge::ids::random_bytes(32)
+                .map_err(|e| Error::Session {
+                    what: e.to_string(),
+                })?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let run = ProbeRun::begin(self.state.as_ref(), name, &tag);
+            for mut probe in list {
+                if run.is_some() {
+                    tag_probe(&mut probe, &tag);
+                }
                 let run_in_sandbox = |script: String| {
                     let launch = Launch {
                         program: "/bin/sh".into(),
@@ -282,6 +347,7 @@ impl Engine {
                         // more than a service does.
                         in_terminal: false,
                         service_port: None,
+                        dashboard_socket: false,
                         limits: limits.clone(),
                         reads: Vec::new(),
                     };
@@ -307,6 +373,7 @@ impl Engine {
                 host_services,
                 not_here: not_here(&inputs, own.as_ref()),
                 listens: inputs.listen,
+                open_by_policy: crate::probes::open_by_policy(&inputs),
                 notes: own.notes(),
                 notices,
                 not_enforced,
@@ -334,8 +401,13 @@ impl Engine {
         };
         // Every stored policy was validated, so each entry expands; one that
         // does not is an error, never a path silently left out. The compiler
-        // starts from the same paths, so the probes check what it denies.
-        let fs = FsPaths::of(&policy.fs, &paths).map_err(|reason| Error::Session {
+        // starts from the same paths, with the same protected folders and
+        // program, so the probes check what it denies.
+        let kept = Kept {
+            protected: &ctx.protected,
+            program: ctx.program.as_deref().unwrap_or(&[]),
+        };
+        let fs = FsPaths::of(&policy.fs, &paths, kept).map_err(|reason| Error::Session {
             what: format!("the policy of sandbox {name} has a path enclos cannot expand: {reason}"),
         })?;
         let unmovable = fs.unmovable();
@@ -351,7 +423,10 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
+        // Every hidden folder gets a read probe too; `run/` has its own.
+        let run = self.layout.run_dir();
         let mut hidden_files = self.layout.hidden_files();
+        hidden_files.extend(self.layout.hidden_dirs().into_iter().filter(|d| *d != run));
         if record.backend.binds_the_hosts_root() {
             hidden_files = with_real_paths(&hidden_files, &self.layout.run_dir());
         }
@@ -370,6 +445,9 @@ impl Engine {
                 .map(|r| self.layout.sandbox_dir(r.name.as_str()))
                 .collect(),
             read_deny: fs.read_deny,
+            read_only: fs.read_only,
+            program: fs.program,
+            every_port: policy.net.public_reach() == Some(crate::model::policy::PublicPorts::Any),
             home,
             workspaces,
             unmovable,
@@ -680,6 +758,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            open_by_policy: Vec::new(),
             notes: notes_on(Baseline::DenyDefault),
             notices: Vec::new(),
             not_enforced: Vec::new(),
@@ -787,6 +866,9 @@ mod tests {
             target: Some(target),
             other_terminal: None,
             tag: 7,
+            read_only: Vec::new(),
+            program: Vec::new(),
+            every_port: false,
             limits: Default::default(),
         }
     }
@@ -878,5 +960,71 @@ mod tests {
             run_probe(&signal, refused, &mut target.0),
             Outcome::NotRun(why) if why.contains("ended before")
         ));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_source_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_provenance_tags_the_sandbox_attempt_and_its_host_control() {
+        // The probes' own command: tagging rewrites it, so a change to it
+        // shows here rather than as probes in the inbox.
+        let script = crate::probes::curl_through_proxy("https://10.0.0.1/");
+        let mut probe = Probe {
+            route: "network",
+            name: "private address".into(),
+            script: script.clone(),
+            proof: Proof::OnlyTheProxy {
+                control: crate::probes::HostScript::new(script),
+            },
+            host: None,
+            closed_by: None,
+        };
+        let tag = "a".repeat(64);
+        tag_probe(&mut probe, &tag);
+        assert!(
+            probe
+                .script
+                .contains(&format!("--proxy-header 'X-Enclos-Probe: {tag}'"))
+        );
+        let Proof::OnlyTheProxy { control } = probe.proof else {
+            panic!("wrong proof")
+        };
+        assert!(control.as_str().contains(&tag));
+    }
+
+    #[test]
+    fn diagnostic_provenance_that_cannot_be_written_leaves_the_probes_untagged() {
+        use crate::model::net::{DeniedDestination, NetEvent};
+        use crate::state::{NetLogStore, StateError};
+        use jiff::Timestamp;
+        struct Unwritable;
+        impl NetLogStore for Unwritable {
+            fn record(&self, _: &NetEvent) -> crate::state::Result<i64> {
+                Ok(0)
+            }
+            fn finish(&self, _: i64, _: &NetEvent) -> crate::state::Result<()> {
+                Ok(())
+            }
+            fn events(
+                &self,
+                _: &SandboxName,
+                _: Option<Timestamp>,
+            ) -> crate::state::Result<Vec<NetEvent>> {
+                Ok(Vec::new())
+            }
+            fn denied(&self, _: &SandboxName) -> crate::state::Result<Vec<DeniedDestination>> {
+                Ok(Vec::new())
+            }
+            fn begin_probe(&self, _: &SandboxName, _: &str) -> crate::state::Result<()> {
+                Err(StateError::Io {
+                    path: "probe-sources.db".into(),
+                    source: std::io::Error::other("read-only"),
+                })
+            }
+        }
+        let name: SandboxName = "home".parse().unwrap();
+        assert!(ProbeRun::begin(&Unwritable, &name, &"a".repeat(64)).is_none());
     }
 }

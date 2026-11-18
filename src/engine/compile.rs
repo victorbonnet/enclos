@@ -55,7 +55,9 @@ impl Engine {
 
     /// What the backend needs to know about the sandbox.
     pub(crate) fn sandbox_context(&self, name: &SandboxName, proxy_port: u16) -> SandboxContext {
-        SandboxContext::new(&self.layout, name, proxy_port)
+        let mut ctx = SandboxContext::new(&self.layout, name, proxy_port);
+        ctx.program = self.exe.clone().map(|exe| vec![exe]);
+        ctx
     }
 
     /// Compiles the sandbox's active policy for its backend, with the proxy

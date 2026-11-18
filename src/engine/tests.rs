@@ -22,13 +22,43 @@ fn alice() -> Actor {
 }
 
 fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
-    let dir = tempfile::tempdir().unwrap();
-    let layout = Layout::at(dir.path().join("enclos"));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    engine_under(backends, &Root::usual())
+}
+
+/// Where a test's enclos folder goes: `leaf`, in a new folder made in
+/// `parent`; the lengths of the paths in it follow.
+pub(super) struct Root {
+    pub(super) parent: std::path::PathBuf,
+    pub(super) leaf: String,
+}
+
+impl Root {
+    /// `enclos`, in the system's temporary folder.
+    pub(super) fn usual() -> Root {
+        Root {
+            parent: std::env::temp_dir(),
+            leaf: "enclos".to_owned(),
+        }
+    }
+}
+
+/// [`engine_with`], enclos's folder at `root`.
+fn engine_under(backends: Vec<Box<dyn Backend>>, root: &Root) -> (TempDir, Engine) {
+    let dir = tempfile::tempdir_in(&root.parent).unwrap();
+    let layout = Layout::at(dir.path().join(&root.leaf));
+    (dir, engine_on(backends, layout))
+}
+
+/// An engine on `layout`, wherever it puts enclos's folder and `~`.
+fn engine_on(backends: Vec<Box<dyn Backend>>, layout: Layout) -> Engine {
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
-    let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
-        .with_downloader(Box::new(LocalFiles));
-    (dir, engine)
+    Engine::new(layout, Box::new(state), Box::new(audit), backends)
+        .with_downloader(Box::new(LocalFiles))
 }
 
 /// Copies a test's `file://` installer, which curl refuses, and leaves any
@@ -134,6 +164,46 @@ fn init_records_the_first_available_backend() {
     );
 }
 
+/// The backend `sandbox create` takes when it names none: the one
+/// `config.toml` names, whether this host runs it or not; where it names
+/// none or is not there, the first available here; with none available,
+/// this system's own, whose probe then refuses the create.
+#[test]
+fn the_default_backend_is_config_tomls_else_the_first_available_else_the_systems() {
+    let (_dir, mut engine) = engine_with(vec![
+        Box::new(FakeBackend::unavailable(BackendKind::Seatbelt, "not here")),
+        Box::new(FakeBackend::available(BackendKind::Bubblewrap)),
+    ]);
+    // Not initialized: no config.toml.
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+
+    let named = crate::config::initial(Some(BackendKind::Seatbelt));
+    std::fs::write(engine.layout.config_file(), named).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Seatbelt);
+
+    std::fs::write(engine.layout.config_file(), crate::config::initial(None)).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    engine.backends = vec![Box::new(FakeBackend::unavailable(
+        BackendKind::Bubblewrap,
+        "not here",
+    ))];
+    let system = match cfg!(target_os = "macos") {
+        true => BackendKind::Seatbelt,
+        false => BackendKind::Bubblewrap,
+    };
+    assert_eq!(engine.default_backend().unwrap(), system);
+
+    std::fs::write(engine.layout.config_file(), "not = [toml").unwrap();
+    let err = engine.default_backend().unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::DefaultBackend { .. }),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), crate::error::exit::ERROR);
+}
+
 /// A `config.toml` written while no backend was available gets the one
 /// available now, in place of init's own line for that; one changed by
 /// hand is said to name none and left; one that does not parse is said, and
@@ -222,6 +292,74 @@ fn audit_since_keeps_recent_entries() {
     assert_eq!(recent.len(), 1);
 }
 
+#[test]
+fn a_change_to_the_apps_devices_is_audited_or_not_made() {
+    let (_dir, engine) = engine();
+    // No audit log yet: the work does not run
+    let mut ran = false;
+    let refused = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-1".into(),
+        |_| String::new(),
+        || {
+            ran = true;
+            Ok(())
+        },
+    );
+    assert!(refused.is_err());
+    assert!(!ran);
+    done(engine.init(&alice(), Confirm::Ask).unwrap());
+    engine
+        .app_access(
+            &alice(),
+            "app pair",
+            "Pixel".into(),
+            |id: &String| format!("paired as {id}"),
+            || Ok("d-1".to_owned()),
+        )
+        .unwrap();
+    let failed = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-2".into(),
+        |_| String::new(),
+        || {
+            Err::<(), _>(Error::Session {
+                what: "no paired device d-2".into(),
+            })
+        },
+    );
+    assert!(failed.is_err());
+    let entries = engine.audit(None).unwrap();
+    let app: Vec<_> = entries
+        .iter()
+        .filter(|e| e.intent.command.starts_with("app "))
+        .map(|e| {
+            let outcome = &e.finished.as_ref().unwrap().outcome;
+            (
+                e.intent.command.as_str(),
+                e.intent.target.as_deref(),
+                outcome.result,
+                outcome.message.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        app,
+        [
+            ("app pair", Some("Pixel"), AuditResult::Ok, "paired as d-1"),
+            (
+                "app unpair",
+                Some("d-2"),
+                AuditResult::Failed,
+                "no paired device d-2"
+            ),
+        ]
+    );
+}
+
+mod approvals;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 mod compile;
@@ -232,8 +370,9 @@ mod history;
 /// The runtime's own service, whose port the sandbox's sessions reach (ADR
 /// 0028). The stand-in gateways are `perl`.
 mod listener;
+mod mobile_policy;
 mod pending;
-mod policy;
+pub(crate) mod policy;
 mod proxy_socket;
 mod runtime;
 mod sandbox;

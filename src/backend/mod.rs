@@ -85,9 +85,18 @@ pub struct SandboxContext {
     /// The socket of the namespace holder's relay from the host to a port in
     /// the sandbox's network namespace (ADR 0040).
     pub inward_socket: PathBuf,
+    /// The private listener the macOS dashboard inherits from the host.
+    pub dashboard_socket: PathBuf,
     /// What enclos stages for an install or an import, which the sandbox
     /// reads and never writes.
     pub installers: PathBuf,
+    /// enclos's own program, as it was started: the services run it
+    /// outside every sandbox, so a policy whose grants cover it, by any
+    /// path that leads to it, must still keep it unchanged (ADR 0058).
+    /// `None` when enclos cannot tell where its program is, and then a
+    /// grant that could hold it is refused; [`SandboxContext::new`] knows
+    /// of none, which the engine replaces with its own.
+    pub program: Option<Vec<PathBuf>>,
 }
 
 impl SandboxContext {
@@ -108,7 +117,9 @@ impl SandboxContext {
             proxy_socket: layout.proxy_socket(name.as_str()),
             holder_socket: layout.holder_socket(name.as_str()),
             inward_socket: layout.inward_socket(name.as_str()),
+            dashboard_socket: layout.dashboard_socket(name.as_str()),
             installers: layout.sandbox_installers(name.as_str()),
+            program: Some(Vec::new()),
         }
     }
 }
@@ -141,6 +152,9 @@ pub struct Launch {
     /// listens; none for the service itself, a probe, a sandbox whose
     /// runtime has no such service, or one whose service does not listen.
     pub service_port: Option<u16>,
+    /// The dashboard inherits a host-bound Unix listener instead of
+    /// binding TCP. Seatbelt permits accepting there and refuses TCP binds.
+    pub dashboard_socket: bool,
     /// The limits each of its processes runs under (design §7).
     pub limits: LaunchLimits,
     /// The files enclos staged in the sandbox's `installers/` folder that

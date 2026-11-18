@@ -56,6 +56,7 @@ fn writer_of(store: &SqliteStateStore) -> Arc<NetLogWriter> {
     Arc::new(NetLogWriter::start(SqliteStateStore::new(
         &store.db,
         &store.lock_file,
+        crate::state::Wait::Command,
     )))
 }
 

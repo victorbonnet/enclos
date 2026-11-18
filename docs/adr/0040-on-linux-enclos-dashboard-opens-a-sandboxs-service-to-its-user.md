@@ -4,6 +4,8 @@ status: accepted
 
 # On Linux, `enclos dashboard` opens a sandbox's dashboard to the user running it
 
+Proposed amendment: [0063](0063-a-dashboard-on-macos-uses-a-private-inherited-socket.md) supersedes this decision's macOS exception. It implements `enclos dashboard` there through a private inherited socket; this decision's Linux namespace relay remains in force.
+
 Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for the bubblewrap backend.
 
 0028's consequences say that the host can reach a runtime's listener: Hermes's dashboard works in the host's browser, and a listener bound to every address serves the host's network. On Linux a sandbox has its own network namespace ([0004](0004-linux-bubblewrap-and-landlock.md), [0039](0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md)), so the host cannot reach a listener there, on 127.0.0.1 or on every address (ECONNREFUSED; `prototype/m3/README.md`). The gateway's own port does not help: through a path to it the page loads, but Hermes withholds the session token there, so `/api/auth/me` gets 401 and `/api/ws` 403. `hermes dashboard` publishes the token in its page, to anyone who connects, and has no auth on loopback, which every user of the host shares.
@@ -18,7 +20,7 @@ Decision, on the bubblewrap backend:
 - **`status` names the command, with no URL.** It says to run `enclos dashboard <sandbox>`, and over ssh with `-L` on a remote host. On macOS it shows the dashboard as before.
 - **Listening.** `policy show` and `policy test` say that the sandbox may listen, and that its listeners are reachable from its own sessions and, through `enclos dashboard`, by the user running it. No rule needs to keep the sandbox off enclos's proxy ports: those ports are on the host's loopback, which a sandbox's namespace does not share. `status` naming listeners beyond loopback stays as 0028 has it, since none of them serve the host's network on Linux.
 
-Reason: the network namespace that keeps the sandbox off the host's loopback and network (0004) also keeps the host off the sandbox's listeners, and on this path nothing else looks at who connects, so the check on the owner is what keeps the token from another local user. Milestone 4.1's host-service forward is a different thing, which gives a sandbox a port of the host. On GitHub's runners the path was measured with Hermes's real dashboard (`prototype/m3/README.md`): the page, its assets and WebSockets served to this user, also through `ssh -L`, and a second user refused with no byte and no token, itself and through its own tunnel.
+Reason: the network namespace that keeps the sandbox off the host's loopback and network (0004) also keeps the host off the sandbox's listeners, and on this path nothing else looks at who connects, so the check on the owner is what keeps the token from another local user. Milestone 5.1's host-service forward is a different thing, which gives a sandbox a port of the host. On GitHub's runners the path was measured with Hermes's real dashboard (`prototype/m3/README.md`): the page, its assets and WebSockets served to this user, also through `ssh -L`, and a second user refused with no byte and no token, itself and through its own tunnel.
 
 ## Considered options
 

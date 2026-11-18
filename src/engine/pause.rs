@@ -1,7 +1,9 @@
 //! A runtime's services stopped around one of the runtime's own commands
 //! that a running service would get in the way of, then installed again:
 //! Hermes's gateway serves every agent and holds its files, so its delete
-//! of one runs while the gateway is stopped (design §10).
+//! of one runs while the gateway is stopped (design §10). It also serves
+//! only the agents that existed when it started, so `agent add` restarts it
+//! once the agent exists (design §9).
 
 use super::Engine;
 use super::service::{IfUnrecorded, Unit};
@@ -135,5 +137,81 @@ impl Engine {
             ),
             error: Box::new(error),
         })
+    }
+}
+
+/// The runtime services `agent add` restarts once the agent exists, read
+/// when it plans: Hermes's gateway serves only the agents that existed when
+/// it started (design §9).
+pub(super) struct Restart {
+    installed: Vec<(Unit, ServiceLabel)>,
+}
+
+impl Restart {
+    /// What the restart adds to the plan of adding `agent`: nothing when
+    /// no runtime service is installed.
+    pub(super) fn plan(&self, agent: &str) -> Vec<String> {
+        let stop = self
+            .installed
+            .iter()
+            .map(|(_, l)| format!("stop service {l}, which ends a chat in progress"));
+        let start = self
+            .installed
+            .iter()
+            .map(|(_, l)| format!("install service {l} again, so that it serves agent {agent}"));
+        stop.chain(start).collect()
+    }
+
+    /// The confirmation `agent add` asks for while it would restart a
+    /// service, `adding` naming what it does; `Ok` when it restarts none.
+    pub(super) fn confirm(&self, adding: &str) -> Result<()> {
+        if self.installed.is_empty() {
+            return Ok(());
+        }
+        Err(Error::NeedsConfirmation {
+            what: format!(
+                "{adding}, which restarts the sandbox's service {} and so ends a chat in progress,",
+                self.installed
+                    .iter()
+                    .map(|(u, _)| u.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        })
+    }
+}
+
+impl Engine {
+    /// The runtime services installed now, which `agent add` restarts once
+    /// the agent exists; none while the sandbox is stopped.
+    pub(super) fn plan_restart(&self, name: &SandboxName) -> Result<Restart> {
+        Ok(Restart {
+            installed: self.installed_runtime_services(name)?,
+        })
+    }
+
+    /// Stops the runtime services `restart` names, and installs them again,
+    /// as `sandbox start` does, so that they start after what `why` made;
+    /// unless `sandbox stop` stopped the sandbox meanwhile. An error says
+    /// how to start them.
+    pub(super) fn restart_runtime(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        restart: Restart,
+        why: &str,
+    ) -> Result<()> {
+        if restart.installed.is_empty() {
+            return Ok(());
+        }
+        let paused = self
+            .pause_runtime(by, name, why)
+            .map_err(|error| Error::WithContext {
+                what: format!(
+                    "its services could not be stopped to start again: {error}. `enclos sandbox start {name}` starts them again"
+                ),
+                error: Box::new(error),
+            })?;
+        self.resume_runtime(by, name, paused)
     }
 }

@@ -28,6 +28,9 @@ mod mount_race;
 #[path = "bubblewrap/status.rs"]
 mod status;
 
+#[path = "bubblewrap/restart.rs"]
+mod restart;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};
@@ -77,15 +80,13 @@ impl Lab {
             _turn: turn,
         };
         lab.ok(&["init"]);
-        lab.ok(&[
-            "sandbox",
-            "create",
-            "lab",
-            "--backend",
-            "bubblewrap",
-            "--template",
-            "assistant",
-        ]);
+        // No `--backend`: bubblewrap is this host's default backend, which
+        // `init` wrote to config.toml.
+        lab.ok(&["sandbox", "create", "lab", "--template", "assistant"]);
+        assert_eq!(
+            lab.record("lab").backend,
+            enclos::model::sandbox::BackendKind::Bubblewrap
+        );
         lab
     }
 
@@ -131,8 +132,11 @@ impl Lab {
     fn record(&self, sandbox: &str) -> enclos::model::sandbox::SandboxRecord {
         use enclos::state::StateStore;
         let layout = self.layout();
-        let state =
-            enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = enclos::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            enclos::state::Wait::Command,
+        );
         state.get(&sandbox.parse().unwrap()).unwrap().unwrap()
     }
 
@@ -145,12 +149,18 @@ impl Lab {
     /// 127.0.0.1:0, as Hermes's does, and writes its port and a token of
     /// its own to `~/gateway.port`; it answers each connection with that
     /// token, and exits 1, for the service manager to start it again, when
-    /// a connection says `exit`.
+    /// a connection says `exit`. On `USR1`, Hermes's graceful restart, it
+    /// adds its token to `~/gateway.usr1` and exits 75, as Hermes does once
+    /// drained: it runs no work, so a test shows where the signal went, not
+    /// a drain.
     fn with_stand_in_hermes(&self) {
         use enclos::state::StateStore;
         let layout = self.layout();
-        let state =
-            enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = enclos::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            enclos::state::Wait::Command,
+        );
         let lock = state.lock().unwrap();
         let mut record = self.record("lab");
         record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);
@@ -189,11 +199,16 @@ impl Lab {
 
 /// The stand-in gateway, in Python, between single quotes.
 const STAND_IN_GATEWAY: &str = r#"
-import os, socket
+import os, signal, socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
 s.listen()
 token = os.urandom(4).hex()
+def restart(*_):
+    with open(os.path.join(os.environ["HOME"], "gateway.usr1"), "a") as f:
+        f.write(token + "\n")
+    raise SystemExit(75)
+signal.signal(signal.SIGUSR1, restart)
 port = os.path.join(os.environ["HOME"], "gateway.port")
 with open(port + ".tmp", "w") as f:
     f.write("%d %s" % (s.getsockname()[1], token))
@@ -308,6 +323,46 @@ fn on_a_runner_a_bubblewrap_sandbox_is_created_and_runs_a_session() {
     // Recorded, and ended with its program.
     let list = text(&lab.ok(&["sandbox", "show", "lab"]).stdout);
     assert!(list.contains("bubblewrap"), "{list}");
+}
+
+/// Native Codex requires a visible process group when inspecting its Gateway.
+/// A group inherited from outside this PID namespace is reported as zero.
+#[test]
+fn on_a_runner_the_openclaw_gateway_has_a_visible_process_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let home = lab.sandbox_home();
+    let native = home.join(".local/share/openclaw/bin/openclaw");
+    std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+    std::fs::write(
+        &native,
+        "#!/usr/bin/python3\nimport json, os, sys\nprint(json.dumps({'pgid': os.getpgrp(), 'sid': os.getsid(0), 'args': sys.argv[1:]}))\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let wrapper = home.join("openclaw-command");
+    std::fs::write(&wrapper, include_str!("../src/runtime/openclaw/command")).unwrap();
+    let out = lab.connect("/bin/sh \"$HOME/openclaw-command\" gateway run --fixture 'two words'");
+    assert!(out.status.success(), "{out:?}");
+    let identity: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(identity["pgid"].as_u64().unwrap() > 0, "{identity}");
+    assert!(identity["sid"].as_u64().unwrap() > 0, "{identity}");
+    assert_eq!(
+        identity["args"],
+        serde_json::json!([
+            "gateway",
+            "run",
+            "--bind",
+            "loopback",
+            "--port",
+            (lab.proxy_port("lab") + 2000).to_string(),
+            "--fixture",
+            "two words"
+        ])
+    );
 }
 
 #[test]
@@ -654,6 +709,7 @@ ls \"$(dirname \"$1\")\" 2>/dev/null";
             env: Vec::new(),
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads,
         };

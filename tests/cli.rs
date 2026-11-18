@@ -78,7 +78,7 @@ impl Home {
                 out.stderr()
             )
         });
-        assert_eq!(doc["schema_version"], 1, "{args:?}: {doc}");
+        assert_eq!(doc["schema_version"], 2, "{args:?}: {doc}");
         let code = out.code();
         assert_eq!(
             code == 0,
@@ -1160,20 +1160,134 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     assert_eq!(out.code(), 1);
 }
 
+/// Off macOS, a sandbox named with no `--backend` is made on bubblewrap,
+/// the default backend: created where this host runs it (CI's `bubblewrap`
+/// job shows that), else refused naming bubblewrap, never Seatbelt. Named
+/// with `--backend seatbelt`, it is refused.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn a_seatbelt_sandbox_is_refused_off_macos() {
+fn off_macos_a_sandbox_is_made_on_bubblewrap_unless_another_is_named() {
     let home = Home::new();
     home.init(1);
     let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    match out.code() {
+        0 => assert!(
+            out.stdout().contains("Created sandbox home (bubblewrap,"),
+            "{}",
+            out.stdout()
+        ),
+        _ => {
+            assert_eq!(out.code(), 2, "{}", out.stderr());
+            assert!(
+                out.stderr().contains("uses the bubblewrap backend"),
+                "{}",
+                out.stderr()
+            );
+        }
+    }
+    assert!(!out.stderr().contains("seatbelt"), "{}", out.stderr());
+
+    let out = home.run(&[
+        "sandbox",
+        "create",
+        "lab",
+        "--backend",
+        "seatbelt",
+        "--template",
+        "assistant",
+    ]);
     assert_eq!(out.code(), 2, "{}", out.stderr());
-    assert!(out.stderr().contains("cannot run"), "{}", out.stderr());
     assert!(
-        home.run(&["sandbox", "list"])
+        out.stderr()
+            .contains("uses the seatbelt backend, which this host cannot run"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.run(&["sandbox", "list"]).ok().stdout().contains("lab"));
+}
+
+/// Off macOS, `sandbox create --template autonomous` takes bubblewrap, which
+/// does not build the template yet: the create is refused, by the policy's
+/// grant of the whole filesystem, or by the backend's probe where bubblewrap
+/// cannot run here, and no sandbox is made (ADR 0058).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_autonomous_sandbox_is_refused() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("is not built on the bubblewrap backend yet")
+            || out.stderr().contains("uses the bubblewrap backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        !home
+            .run(&["sandbox", "list"])
             .ok()
             .stdout()
-            .contains("No sandboxes yet")
+            .contains("keeper")
     );
+}
+
+/// The backend this system does not run.
+#[cfg(target_os = "macos")]
+const OTHER_BACKEND: &str = "bubblewrap";
+#[cfg(not(target_os = "macos"))]
+const OTHER_BACKEND: &str = "seatbelt";
+
+/// With no `--backend`, `sandbox create` takes the default backend
+/// `config.toml` names, as `init` wrote it or as the user changed it; one
+/// it cannot read is named, with nothing made.
+#[test]
+fn a_sandbox_is_made_on_the_default_backend_config_toml_names() {
+    let home = Home::new();
+    home.init(1);
+    let config = home.root.join("config.toml");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains("default_backend"), "{written}");
+
+    std::fs::write(
+        &config,
+        format!("schema_version = 1\ndefault_backend = \"{OTHER_BACKEND}\"\n"),
+    )
+    .unwrap();
+    for args in [
+        &["sandbox", "create", "home", "--template", "assistant"][..],
+        &[
+            "--dry-run",
+            "sandbox",
+            "create",
+            "home",
+            "--template",
+            "assistant",
+        ],
+    ] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 2, "{args:?}: {}", out.stderr());
+        assert!(
+            out.stderr()
+                .contains(&format!("uses the {OTHER_BACKEND} backend")),
+            "{args:?}: {}",
+            out.stderr()
+        );
+    }
+
+    std::fs::write(&config, "schema_version = 1\ndefault_backend = \"jail\"\n").unwrap();
+    let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("config.toml names no default backend")
+            && out.stderr().contains("unknown backend `jail`")
+            && out.stderr().contains("--backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.root.join("sandboxes/home").exists());
 }
 
 /// Where each column of a table line starts: after two spaces or more.
@@ -1714,7 +1828,7 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
     assert_eq!(out.code(), 0, "{}", out.stderr());
     assert!(
-        out.stderr().contains("left 1 processes running"),
+        out.stderr().contains("left 1 process running"),
         "{}",
         out.stderr()
     );
@@ -2630,8 +2744,11 @@ fn the_rarer_commands_print_one_document_piped() {
 fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
     use enclos::state::StateStore;
     let layout = enclos::layout::Layout::at(&home.root);
-    let state =
-        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = enclos::state::sqlite::SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        enclos::state::Wait::Command,
+    );
     let lock = state.lock().unwrap();
     let mut record = state.get(&name.parse().unwrap()).unwrap().unwrap();
     record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);
@@ -2641,6 +2758,28 @@ fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
         std::fs::create_dir_all(profiles.join(agent)).unwrap();
         std::fs::write(profiles.join(agent).join("config.yaml"), "").unwrap();
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn app_chat_without_an_agent_resolves_the_runtime_default_target() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let make = record_hermes(&home, "home");
+    make("scout");
+
+    let omitted = home.run(&["app", "chat", "home"]);
+    let explicit = home.run(&["app", "chat", "home/default"]);
+    assert_ne!(omitted.code(), 0);
+    assert_eq!(omitted.code(), explicit.code());
+    assert_eq!(omitted.stderr(), explicit.stderr());
+    assert!(
+        omitted
+            .stderr()
+            .contains("agent home/default has no app channel")
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -2828,6 +2967,178 @@ fn connect_reports_untracked_agents_on_stderr_without_the_untrackable_names() {
 }
 
 #[test]
+fn app_devices_status_and_log_print_a_document_when_piped() {
+    let home = Home::new();
+    home.init(1);
+    for (args, key) in [
+        (&["app", "devices"][..], "devices"),
+        (&["app", "status"][..], "devices"),
+        (&["app", "log"][..], "log"),
+    ] {
+        let (code, json) = home.json(args);
+        assert_eq!(code, 0, "{args:?}");
+        assert_eq!(json[key], serde_json::json!([]), "{args:?}");
+    }
+    let out = home.run(&["app", "devices"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "No paired device: pair one with `enclos app pair`.\n"
+    );
+    let out = home.run(&["app", "unpair", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no paired device nope"),
+        "{}",
+        out.stderr()
+    );
+    // No device paired: no host's person, and none can be named.
+    let out = home.run(&["app", "host"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Nobody yet: the first device paired with `enclos app pair` names the host's person.\n"
+    );
+    let out = home.run(&["app", "host", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["host_person"], serde_json::Value::Null);
+    let out = home.run(&["app", "host", "bob@example.com"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr()
+            .contains("bob@example.com has no paired device"),
+        "{}",
+        out.stderr()
+    );
+}
+
+/// A service-account key file for project `enclos-test`, its RSA key made
+/// by `openssl` for the test: no private key is kept in the repository.
+fn service_account_key(at: &Path) {
+    let made = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+        ])
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let json = serde_json::json!({
+        "type": "service_account",
+        "project_id": "enclos-test",
+        "private_key": String::from_utf8(made.stdout).unwrap(),
+        "client_email": "push@enclos-test.iam.gserviceaccount.com",
+    });
+    std::fs::write(at, json.to_string()).unwrap();
+}
+
+#[test]
+fn app_push_key_keeps_a_copy_for_the_user_alone_audited_and_push_off_removes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new();
+    home.init(1);
+    let kept = home.root.join("app-push-key.json");
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push: off. Give the bridge a key"),
+        "{}",
+        out.stdout()
+    );
+
+    // Not a key: refused before anything is written or audited.
+    let audited = home.audit_lines().len();
+    let wrong = home.root.join("not-a-key.json");
+    std::fs::write(&wrong, r#"{"type":"authorized_user"}"#).unwrap();
+    let out = home.run(&["app", "push", "key", wrong.to_str().unwrap()]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("not `service_account`"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!kept.exists());
+    assert_eq!(home.audit_lines().len(), audited);
+
+    let given = home.root.join("downloaded.json");
+    service_account_key(&given);
+    let out = home.run(&["app", "push", "key", given.to_str().unwrap()]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push on: the bridge sends through FCM as push@enclos-test.iam.gserviceaccount.com, for project enclos-test"),
+        "{}",
+        out.stdout()
+    );
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        std::fs::read(&given).unwrap()
+    );
+    assert_eq!(
+        std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let audit = home.audit_lines().join("\n");
+    assert!(audit.contains("\"command\":\"app push key\""), "{audit}");
+    assert!(audit.contains("\"target\":\"enclos-test\""), "{audit}");
+    // The key itself never reaches the audit log.
+    assert!(!audit.contains("PRIVATE KEY"), "{audit}");
+
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .starts_with("Push: on, through FCM for project enclos-test."),
+        "{}",
+        out.stdout()
+    );
+    let (_, json) = home.json(&["app", "status"]);
+    assert_eq!(
+        json["push"],
+        serde_json::json!({"on": true, "project": "enclos-test"})
+    );
+    // `app devices` says nothing of push.
+    let (_, json) = home.json(&["app", "devices"]);
+    assert!(json.get("push").is_none(), "{json}");
+
+    let out = home.run(&["app", "push", "off"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Push off: the bridge sends no push from now on.\n"
+    );
+    assert!(!kept.exists());
+    assert!(
+        home.audit_lines()
+            .join("\n")
+            .contains("\"command\":\"app push off\"")
+    );
+    let out = home.run(&["app", "push", "off"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "Push was off already: the bridge has no push key.\n"
+    );
+    // A key file that cannot be used: push is off, and status says why.
+    std::fs::write(&kept, "{}").unwrap();
+    let out = home.run(&["app", "status"]);
+    assert!(
+        out.ok().stdout().starts_with("Push: off: "),
+        "{}",
+        out.stdout()
+    );
+    let (_, json) = home.json(&["app", "status"]);
+    assert_eq!(json["push"]["on"], false);
+    assert!(
+        json["push"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not `service_account`"),
+        "{json}"
+    );
+}
+
+#[test]
 fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() {
     let home = Home::new();
     home.init(1);
@@ -2857,6 +3168,40 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
         "{}",
         out.stderr()
     );
+}
+
+#[test]
+fn usage_without_sandboxes_says_so_and_refuses_a_bad_window() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["usage"]);
+    assert_eq!(out.ok().stdout(), "No sandboxes yet.\n");
+    let out = home.run(&["usage", "--since", "soon"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("not a duration"), "{}", out.stderr());
+    let out = home.run(&["usage", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
+    );
+}
+
+// Making a sandbox needs its backend, which only macOS has on every runner.
+#[cfg(target_os = "macos")]
+#[test]
+fn usage_of_a_sandbox_without_a_runtime_runs_nothing_in_it() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "lab", "--template", "minimal"])
+        .ok();
+    let out = home.run(&["usage", "lab", "--json", "--since", "30d"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["sandboxes"][0]["name"], "lab");
+    assert_eq!(json["sandboxes"][0]["agents"], "absent");
+    assert_eq!(json["sandboxes"][0]["runtime"], serde_json::Value::Null);
+    assert!(!home.run(&["audit"]).ok().stdout().contains("usage session"));
 }
 
 #[cfg(target_os = "macos")]
@@ -3416,6 +3761,39 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
     assert!(!home.root.join("sandboxes/lab").exists());
 }
 
+/// `sandbox create --template autonomous` says, on standard error, that
+/// the sandbox may change or remove the user's own files (ADR 0058),
+/// and `policy show` names the whole filesystem, the read-only paths and
+/// every port.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_autonomous_sandbox_is_created_with_a_warning_and_shows_what_it_may_do() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    out.ok();
+    assert!(
+        out.stderr()
+            .contains("warning: the autonomous template lets the sandbox write wherever you can"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        out.stdout().contains("template autonomous"),
+        "{}",
+        out.stdout()
+    );
+    let shown = home.run(&["policy", "show", "keeper"]).ok().stdout();
+    assert!(shown.contains("writable:   /"), "{shown}");
+    assert!(shown.contains("read-only:"), "{shown}");
+    assert!(shown.contains("~/.zshrc"), "{shown}");
+    assert!(shown.contains("any public address on any port"), "{shown}");
+    // Another template says nothing of it.
+    let out = home.run(&["sandbox", "create", "lab", "--template", "assistant"]);
+    out.ok();
+    assert!(!out.stderr().contains("autonomous"), "{}", out.stderr());
+}
+
 /// `state check` finds nothing in a new sandbox, names what differs once a
 /// file is gone, and `state repair` puts it back.
 #[cfg(target_os = "macos")]
@@ -3832,7 +4210,7 @@ fn exec_output_stays_its_commands_when_piped() {
     // schema version.
     assert!(
         out.stderr().lines().all(|l| {
-            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|l| l["schema_version"] == 1)
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|l| l["schema_version"] == 2)
         }),
         "{}",
         out.stderr()
@@ -3914,6 +4292,30 @@ fn what_a_program_enclos_starts_prints_stays_out_of_the_document() {
     assert_eq!(doc["outcome"]["in_force"], true, "{doc}");
     assert!(!out.stdout().contains("editor-noise"), "{}", out.stdout());
     assert!(out.stderr().contains("editor-noise"), "{}", out.stderr());
+}
+
+/// The same document stdout reservation used by runtime install must survive
+/// more child output than the bridge retains for its JSON result.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_json_document_survives_more_than_64_kib_of_child_output() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "minimal"])
+        .ok();
+    let mut command = home.piped(&["--json", "policy", "edit", "home"]);
+    command.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "awk 'BEGIN { for (i = 0; i < 8192; i++) print \"installer-progress\" }'",
+        ),
+    );
+    let out = Run(command.output().unwrap());
+    let document: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert!(document.get("error").is_none());
+    assert!(out.stderr().len() > 65_536);
+    assert!(!out.stdout().contains("installer-progress"));
 }
 
 /// A document nobody reads fails the command, and says what the command
@@ -4075,17 +4477,25 @@ fn a_change_while_a_session_runs_waits_and_apply_restarts_into_it() {
     home.run(&["sandbox", "create", "home", "--template", "assistant"])
         .ok();
     let _stop = StopOnDrop(&home, "home");
+    // What the session and its proxy say, for a failure to say why.
+    let said = home._dir.path().join("exec.err");
     let mut session = home
         .command(&["exec", "home", "--", "/bin/sleep", "30"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(File::create(&said).unwrap())
         .spawn()
         .unwrap();
-    assert!(eventually(|| {
-        home.run(&["sandbox", "show", "home"])
-            .stdout()
-            .contains("/bin/sleep")
-    }));
+    assert!(
+        eventually(|| {
+            home.run(&["sandbox", "show", "home"])
+                .stdout()
+                .contains("/bin/sleep")
+        }),
+        "the session never ran: {}\nthe proxy's log: {}",
+        std::fs::read_to_string(&said).unwrap_or_default(),
+        std::fs::read_to_string(home.root.join("sandboxes/home/logs/proxy.log"))
+            .unwrap_or_default()
+    );
     let file = home.root.join("sandboxes/home/policy.toml");
     let text = std::fs::read_to_string(&file).unwrap();
     let work = home._dir.path().join("work");
@@ -4284,7 +4694,7 @@ fn logs_in_json_are_json_lines() {
             .is_some_and(|n| n.contains("no service logs yet")),
         "{note}"
     );
-    assert_eq!(note["schema_version"], 1, "{note}");
+    assert_eq!(note["schema_version"], 2, "{note}");
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     // A C1 control and a bidirectional one, which JSON leaves alone: the
@@ -4298,7 +4708,7 @@ fn logs_in_json_are_json_lines() {
         .lines()
         .map(|l| {
             let doc: serde_json::Value = serde_json::from_str(l).unwrap();
-            assert_eq!(doc["schema_version"], 1, "{doc}");
+            assert_eq!(doc["schema_version"], 2, "{doc}");
             doc["line"].as_str().unwrap().to_owned()
         })
         .collect();

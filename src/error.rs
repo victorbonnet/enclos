@@ -30,6 +30,12 @@ pub enum Error {
         "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
     )]
     SandboxHasServices { name: String },
+    /// A start ran while `sandbox stop` removed the services, and installed
+    /// them again: the stop changed nothing more.
+    #[error(
+        "sandbox `{name}` was not stopped: a start or restart that ran meanwhile installed its services again. Run `enclos sandbox stop {name}` again to stop it"
+    )]
+    StartedWhileStopping { name: String },
     /// A sandbox marked failed, by a stop that left members running or by
     /// a command that failed, still has sessions running; `rm` waits until
     /// they are gone.
@@ -100,6 +106,13 @@ pub enum Error {
         backend: String,
         template: String,
     },
+    /// A `config.toml` whose default backend cannot be read, asked for by a
+    /// `sandbox create` that names no `--backend`.
+    #[error(
+        "{} names no default backend enclos can read: {reason}. Fix the file, or name the backend with `--backend`",
+        path.display()
+    )]
+    DefaultBackend { path: PathBuf, reason: String },
     /// A backend this host cannot run; never overridden (ADR 0009).
     #[error("sandbox `{sandbox}` uses the {backend} backend, which this host cannot run: {reason}")]
     BackendUnavailable {
@@ -402,6 +415,7 @@ impl Error {
             | Error::Audit(_)
             | Error::Policy(_)
             | Error::NoSuchSandbox { .. }
+            | Error::DefaultBackend { .. }
             | Error::NoPolicy { .. }
             | Error::ProxyPortTaken { .. }
             | Error::ProxyRuns { .. }
@@ -416,6 +430,7 @@ impl Error {
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
             | Error::SandboxHasServices { .. }
+            | Error::StartedWhileStopping { .. }
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }

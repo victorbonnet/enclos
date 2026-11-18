@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+# A pull request's new push cancels its previous run. A run on `main` is
+# never cancelled nor queued behind another: a release needs this workflow
+# to have passed on its very commit (release.yml), so each has a group of
+# its own.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -26,7 +30,7 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     strategy:
@@ -53,12 +57,16 @@ jobs:
       # Installs the toolchain and components pinned in rust-toolchain.toml
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test --locked --all-features
+      - run: cargo test --locked --workspace --all-features
       # A release build refuses the comparison baseline (ADR 0006): checked
-      # on every change, not only when a tag is pushed.
+      # on every change, not only when a tag is pushed. A test renamed away
+      # would leave the filter matching nothing, so the count is checked too.
       - name: A release refuses the comparison baseline
         if: runner.os == 'macOS'
-        run: cargo test --release --locked --test cli init_takes_allow_default_only_in_a_debug_build
+        shell: bash
+        run: |
+          cargo test --release --locked --test cli init_takes_allow_default_only_in_a_debug_build | tee baseline.log
+          grep -q 'test result: ok\. 1 passed' baseline.log
 
   systemd-units:
     strategy:
@@ -146,7 +154,13 @@ jobs:
           uname -r
           python3 -c "import ctypes; print('Landlock ABI', ctypes.CDLL(None).syscall(444, None, 0, 1))"
           if [ -e /proc/sys/dev/tty/legacy_tiocsti ]; then echo "legacy_tiocsti $(cat /proc/sys/dev/tty/legacy_tiocsti)"; fi
-      - run: cargo test --locked --all-features --test inside on_a_runner
+      # A test renamed away would leave the filter matching nothing, so the
+      # count is checked too.
+      - name: Landlock and seccomp
+        shell: bash
+        run: |
+          cargo test --locked --all-features --test inside on_a_runner | tee inside.log
+          grep -q 'test result: ok\. 11 passed' inside.log
       # A /proc that refuses other users' processes: mounted with hidepid=1
       # as root in a mount namespace of its own, a new instance that leaves
       # the runner's /proc as it is, then read as the runner's user. A test
@@ -226,7 +240,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 23 passed' bubblewrap.log
+          grep -q 'test result: ok\. 26 passed' bubblewrap.log
       - name: The escape probes' report
         if: always()
         run: |
@@ -402,9 +416,131 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  # enclos-protocol also builds into the Android app (victorbonnet/enclos-app):
+  # catch a dependency that does not build for Android here, first
+  protocol-android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --locked -p enclos-protocol --target aarch64-linux-android
+
+  # The Hermes channel plugin's protocol and outbox, against the crate's
+  # fixtures; standard library only, no Hermes needed. The checks of the
+  # bridge's signed decisions need `cryptography`, which Hermes ships: they
+  # skip here and run in hermes-latest.
+  hermes-plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          python3 -I -m unittest discover -s channels/hermes/tests
+          python3 -I -m unittest discover -s src/runtime/hermes/tests -v
+
+  # The same tests against the latest Hermes, its default branch, never
+  # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`,
+  # and `ENCLOS_HERMES_APPROVAL_SOURCE` for the native runtime approvals),
+  # and one that skips fails the job, so a Hermes change the plugin relies on
+  # shows here rather than in a gateway. It is in `ci-ok` on purpose: an
+  # upstream change that breaks the plugin blocks every PR until enclos is
+  # changed to fit it, since enclos follows the latest Hermes rather than
+  # pinning one. It runs Hermes's code, so no checkout keeps the token.
+  hermes-latest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+          persist-credentials: false
+      # The one fixed revision, and on purpose: the last Hermes without the
+      # exact approval API (`resolve_gateway_approval_card`, added by the
+      # commit after it), for the test that an older runtime's approvals go
+      # as text (`ENCLOS_HERMES_LEGACY_SOURCE`). Only its source is read, with
+      # the latest Hermes's packages.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: c10474fbb6300d2634f063139dcb06c3c96fb6ef
+          path: hermes-legacy
+          persist-credentials: false
+      - run: git -C hermes-agent log -1 --format='Hermes %H, %cI'
+      # Hermes installs with uv, as Hermes itself does: from its own lock and
+      # the overrides in its `[tool.uv]` (pip cannot resolve its pins without
+      # them), with the Python its `.python-version` names.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --frozen --no-dev --project hermes-agent
+      # `shell: bash` adds pipefail: without it the step took tee's status,
+      # and passed while tests failed. No test may skip here: the summary
+      # unittest writes after `Ran N tests` must be a bare `OK`, not
+      # `OK (skipped=N)`. It is read there, since a test's own output could
+      # be a line reading `OK`; the per-test `skipped` lines are only listed,
+      # since a test writing to stderr splits its line.
+      - name: Run every test, the real-Hermes ones included
+        shell: bash
+        env:
+          ENCLOS_HERMES_SOURCE: ${{ github.workspace }}/hermes-agent
+          ENCLOS_HERMES_APPROVAL_SOURCE: ${{ github.workspace }}/hermes-agent
+          ENCLOS_HERMES_LEGACY_SOURCE: ${{ github.workspace }}/hermes-legacy
+        run: |
+          hermes-agent/.venv/bin/python -I -m unittest discover -s channels/hermes/tests -v 2>&1 | tee unittest.log
+          if ! grep -A2 '^Ran [0-9]* tests* in ' unittest.log | grep -qx 'OK'; then
+            grep -n ' \.\.\. skipped ' unittest.log || true
+            grep -A2 '^Ran [0-9]* tests* in ' unittest.log || true
+            echo "::error::the run is not a bare OK: a test skipped although Hermes is installed, or failed as expected"
+            exit 1
+          fi
+
+  openclaw-launchers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: node --test src/runtime/openclaw/*.test.mjs
+      - name: OpenClaw transfer tests
+        run: python3 -I -m unittest discover -s src/runtime/openclaw/tests
+
+  # The exact native SDK is the channel's tested contract. Install it only in
+  # a disposable prefix; no package lifecycle scripts or onboarding run.
+  openclaw-channel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          check-latest: true
+      - name: Check generated channel JavaScript
+        run: node channels/openclaw/scripts/build.mjs --check
+      - name: Install the supported public SDK without running package scripts
+        shell: bash
+        run: |
+          sdk_prefix="$RUNNER_TEMP/enclos-openclaw-sdk"
+          npm install --prefix "$sdk_prefix" --cache "$RUNNER_TEMP/enclos-openclaw-npm-cache" \
+            --registry=https://registry.npmjs.org --ignore-scripts --omit=dev \
+            --no-audit --no-fund --package-lock=false openclaw@2026.11.5
+          echo "ENCLOS_OPENCLAW_PACKAGE=$sdk_prefix/node_modules/openclaw" >>"$GITHUB_ENV"
+      - name: Channel tests including installed SDK probes
+        run: node --test channels/openclaw/tests/*.test.js
+
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, hermes-latest, openclaw-launchers, openclaw-channel]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

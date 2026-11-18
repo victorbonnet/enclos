@@ -1,0 +1,1 @@
+{"v":1,"id":"6a1f3c2e-8b4d-4e5f-9a7c-1d2e3f4a5b61","type":"commands","commands":[{"name":"new","description":"Start a new session (fresh session ID + history)","args":"[name]"},{"name":"model","description":"Switch model for this session","args":"[model] [--provider name] [--global]"},{"name":"stop","description":"Kill all running background processes"}]}

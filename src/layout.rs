@@ -16,6 +16,14 @@ pub const HOME_VAR: &str = "ENCLOS_HOME";
 /// What follows an agent's name in its secrets file's name (ADR 0036).
 pub const AGENT_SECRETS_SUFFIX: &str = ".env";
 
+/// The bridge's folder of message files, beside its database
+/// ([`Layout::app_media`]).
+pub const APP_MEDIA_DIR: &str = "app-media";
+
+/// The side database of diagnostic provenance (ADR 0059), beside
+/// `state.db` ([`Layout::probe_sources`]).
+pub const PROBE_SOURCES_FILE: &str = "probe-sources.db";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     MacOs,
@@ -226,6 +234,14 @@ impl Layout {
             .join(format!("{agent}{AGENT_SECRETS_SUFFIX}"))
     }
 
+    /// The socket an agent's app channel plugin listens on, in the sandbox
+    /// home, and enclos's bridge connects to (ADR 0042, proposed).
+    pub fn agent_app_socket(&self, name: &str, agent: &str) -> PathBuf {
+        self.sandbox_home(name)
+            .join(".enclos-app")
+            .join(format!("{agent}.sock"))
+    }
+
     /// What enclos stages for an install or an import, beside the home:
     /// the host writes it, and the sandbox reads it and never writes it.
     pub fn sandbox_installers(&self, name: &str) -> PathBuf {
@@ -263,6 +279,44 @@ impl Layout {
     /// The file store's one file (design §12): for the host alone.
     pub fn secrets_file(&self) -> PathBuf {
         self.data.join("secrets.json")
+    }
+
+    /// The bridge's database: its conversations, their messages, and the
+    /// paired devices (ADR 0042, proposed). For the host alone.
+    pub fn app_store(&self) -> PathBuf {
+        self.data.join("app.db")
+    }
+
+    /// The bridge's static key pair, which every paired device pins. For
+    /// the host alone.
+    pub fn app_bridge_key(&self) -> PathBuf {
+        self.data.join("app-bridge.key")
+    }
+
+    /// The key the bridge signs runtime-approval decisions with (ADR 0060,
+    /// proposed): no sandbox may read it, or an agent could sign its own.
+    pub fn app_approval_key(&self) -> PathBuf {
+        self.data.join("app-approvals.key")
+    }
+
+    /// The service-account key the bridge pushes through FCM with (ADR
+    /// 0065, proposed), which `enclos app push key` gives it: no sandbox may
+    /// read it, or an agent could send to every device of the app.
+    pub fn app_push_key(&self) -> PathBuf {
+        self.data.join("app-push-key.json")
+    }
+
+    /// The files agents sent with their messages (and those an import
+    /// restores), one per attachment id. For the host alone: a sandbox that
+    /// read it would read other sandboxes' files.
+    pub fn app_media(&self) -> PathBuf {
+        self.data.join(APP_MEDIA_DIR)
+    }
+
+    /// Which runs of `policy test` are under way and which network log
+    /// entries they made (ADR 0059). For the host alone.
+    pub fn probe_sources(&self) -> PathBuf {
+        self.data.join(PROBE_SOURCES_FILE)
     }
 
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
@@ -307,6 +361,12 @@ impl Layout {
         self.sandbox_run_dir(name).join("dashboard.lock")
     }
 
+    /// Host-bound, in the host-only run folder; the dashboard inherits
+    /// its listener without gaining access to this path.
+    pub fn dashboard_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("dashboard.sock")
+    }
+
     /// Creates the sandbox's folder of what runs, this user's alone.
     pub fn create_sandbox_run_dir(&self, name: &str) -> std::io::Result<()> {
         users_alone(&self.sandbox_run_dir(name))
@@ -330,6 +390,21 @@ impl Layout {
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
+            // The bridge's (ADR 0042), which Seatbelt, reading the host
+            // broadly, would otherwise let a sandbox read.
+            self.app_store(),
+            // The bridge's Noise key: a sandbox that read it could pass
+            // for the bridge to every paired device.
+            self.app_bridge_key(),
+            // The key the bridge signs runtime-approval decisions with: a
+            // sandbox that read it could sign its own (ADR 0060).
+            self.app_approval_key(),
+            // The key the bridge pushes with: a sandbox that read it could
+            // wake every device of the app's Firebase project (ADR 0065).
+            self.app_push_key(),
+            // Which `policy test` runs are under way and their run tags
+            // (ADR 0059): every sandbox's, which no sandbox may read.
+            self.probe_sources(),
         ];
         // Only Linux has the file store, as `secrets::host` picks the
         // stores: the two change together.
@@ -341,7 +416,7 @@ impl Layout {
 
     /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
     pub fn hidden_dirs(&self) -> Vec<PathBuf> {
-        vec![self.run_dir()]
+        vec![self.run_dir(), self.app_media()]
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -534,10 +609,54 @@ mod tests {
                 layout.state_db(),
                 layout.state_lock(),
                 layout.audit_log(),
-                layout.config_file()
+                layout.config_file(),
+                layout.app_store(),
+                layout.app_bridge_key(),
+                layout.app_approval_key(),
+                layout.app_push_key(),
+                layout.probe_sources(),
             ]
         );
         assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
+    }
+
+    /// The bridge's database and keys are hidden on every system: the
+    /// approval key above all, which would let an agent sign its own
+    /// decisions (ADR 0060), and the push key, which would let it send to
+    /// every device of the app (ADR 0065).
+    #[test]
+    fn the_bridges_files_are_on_the_hidden_files() {
+        let layout = Layout::at("/data/enclos");
+        for os in [Os::Linux, Os::MacOs] {
+            let hidden = layout.hidden_files_on(os);
+            for file in [
+                layout.app_store(),
+                layout.app_bridge_key(),
+                layout.app_approval_key(),
+                layout.app_push_key(),
+                layout.probe_sources(),
+            ] {
+                assert!(file.starts_with(layout.data()));
+                assert!(hidden.contains(&file), "{os:?}: {}", file.display());
+            }
+        }
+        // The message files are a folder: hidden whole.
+        assert!(layout.hidden_dirs().contains(&layout.app_media()));
+    }
+
+    /// The bridge and the state store find these beside their databases,
+    /// under the names the layout hides.
+    #[test]
+    fn the_side_files_are_beside_their_databases() {
+        let layout = Layout::at("/data/enclos");
+        assert_eq!(
+            layout.state_db().with_file_name(PROBE_SOURCES_FILE),
+            layout.probe_sources()
+        );
+        assert_eq!(
+            layout.app_store().with_file_name(APP_MEDIA_DIR),
+            layout.app_media()
+        );
     }
 
     #[test]

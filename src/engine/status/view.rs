@@ -119,16 +119,8 @@ pub struct SandboxStatus {
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,
-    /// The address of the page the runtime's service serves on the host,
-    /// such as Hermes's dashboard (ADR 0028), at the port sessions are
-    /// given: absent while no session of the service runs, "cannot tell"
-    /// while it holds no such port or one that cannot be trusted, not
-    /// provided for a runtime with no such page.
-    pub dashboard: Fact<String>,
-    /// The command that opens the runtime's dashboard to the user who runs
-    /// it, for a sandbox whose listeners the host cannot reach, where
-    /// `dashboard` gives no address (ADR 0040); none elsewhere, and for a
-    /// runtime with no dashboard.
+    /// The explicit, audited command that opens a protected dashboard;
+    /// absent until the runtime's files and running service are present.
     pub dashboard_command: Option<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback
@@ -221,6 +213,11 @@ pub struct AgentList {
     /// the built-in agent and enclos's records are known, and none of them
     /// can be said present or gone.
     pub unreadable: Option<String>,
+    /// Why what the app bridge heard the agents are doing could not be
+    /// read (its database, or the lock that says it runs): `working` is
+    /// then empty, which says nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_unreadable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,6 +235,12 @@ pub struct AgentStatus {
     /// and may find none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choose_provider: Option<String>,
+    /// What the agent is doing, as the running app bridge last heard from
+    /// its plugin (`answering`, `routine`, `task`): empty when idle, when no
+    /// bridge runs, or when that cannot be read (see
+    /// [`AgentList::activity_unreadable`]) (ADR 0068, proposed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub working: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

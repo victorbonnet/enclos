@@ -36,7 +36,7 @@ impl Home {
     }
 
     fn user(&self) -> PathBuf {
-        self.dir.path().join("alice")
+        real_path(self.dir.path()).join("alice")
     }
 
     fn at(&self, rest: &str) -> PathBuf {
@@ -156,6 +156,7 @@ fn launch(env: Vec<(String, SecretValue)>) -> Launch {
         env,
         in_terminal: false,
         service_port: None,
+        dashboard_socket: false,
         limits: LaunchLimits::default(),
         reads: Vec::new(),
     }

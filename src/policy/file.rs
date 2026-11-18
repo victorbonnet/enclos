@@ -1,13 +1,14 @@
 //! One layer of policy as written in TOML: the built-in defaults, a template,
 //! an adapter's endpoints, or a sandbox's `policy.toml` (design §7).
 //!
-//! A list written `name = [...]` replaces what the layers below set, and
-//! `name_add = [...]` extends it.
+//! A list written `name = [...]` replaces what the layers below set,
+//! `name_remove = [...]` takes entries out of it, and `name_add = [...]`
+//! extends it, in that order.
 
 use serde::Deserialize;
 
 use super::PolicyError;
-use crate::model::policy::{ByteSize, NetLog, NetMode, Policy, TemplateName};
+use crate::model::policy::{ByteSize, NetLog, NetMode, Policy, PublicPorts, TemplateName};
 use crate::model::secret::SecretGrant;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -74,8 +75,12 @@ pub struct AgentSecretsLayer {
 pub struct FsLayer {
     pub write: Option<Vec<String>>,
     pub write_add: Vec<String>,
+    pub write_remove: Vec<String>,
     pub read_deny: Option<Vec<String>>,
     pub read_deny_add: Vec<String>,
+    pub read_deny_remove: Vec<String>,
+    pub read_only: Option<Vec<String>>,
+    pub read_only_add: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -84,10 +89,13 @@ pub struct NetLayer {
     pub mode: Option<NetMode>,
     pub allow: Option<Vec<String>>,
     pub allow_add: Vec<String>,
+    pub allow_remove: Vec<String>,
     pub private: Option<Vec<String>>,
     pub private_add: Vec<String>,
+    pub private_remove: Vec<String>,
     pub log: Option<NetLog>,
     pub listen: Option<bool>,
+    pub public_ports: Option<PublicPorts>,
 }
 
 impl PolicyFile {
@@ -105,14 +113,20 @@ impl PolicyFile {
         if self.network.mode.is_some() {
             found.push("network.mode");
         }
-        if self.network.allow.is_some() {
+        if self.network.allow.is_some() || !self.network.allow_remove.is_empty() {
             found.push("network.allow");
         }
-        if self.network.private.is_some() || !self.network.private_add.is_empty() {
+        if self.network.private.is_some()
+            || !self.network.private_add.is_empty()
+            || !self.network.private_remove.is_empty()
+        {
             found.push("network.private");
         }
         if self.network.log.is_some() {
             found.push("network.log");
+        }
+        if self.network.public_ports.is_some() {
+            found.push("network.public_ports");
         }
         if self.resources != ResourcesLayer::default() {
             found.push("resources");
@@ -137,21 +151,31 @@ impl PolicyFile {
         layer(
             &mut policy.fs.write,
             &self.filesystem.write,
+            &self.filesystem.write_remove,
             &self.filesystem.write_add,
         );
         layer(
             &mut policy.fs.read_deny,
             &self.filesystem.read_deny,
+            &self.filesystem.read_deny_remove,
             &self.filesystem.read_deny_add,
+        );
+        layer(
+            &mut policy.fs.read_only,
+            &self.filesystem.read_only,
+            &[],
+            &self.filesystem.read_only_add,
         );
         layer(
             &mut policy.net.allow,
             &self.network.allow,
+            &self.network.allow_remove,
             &self.network.allow_add,
         );
         layer(
             &mut policy.net.private,
             &self.network.private,
+            &self.network.private_remove,
             &self.network.private_add,
         );
         if let Some(mode) = self.network.mode {
@@ -162,6 +186,9 @@ impl PolicyFile {
         }
         if let Some(listen) = self.network.listen {
             policy.net.listen = listen;
+        }
+        if let Some(ports) = self.network.public_ports {
+            policy.net.public_ports = ports;
         }
         if let Some(env) = &self.secrets.env {
             policy.secrets.clone_from(env);
@@ -211,10 +238,11 @@ impl PolicyFile {
     }
 }
 
-fn layer(list: &mut Vec<String>, replace: &Option<Vec<String>>, add: &[String]) {
+fn layer(list: &mut Vec<String>, replace: &Option<Vec<String>>, remove: &[String], add: &[String]) {
     if let Some(replace) = replace {
         list.clone_from(replace);
     }
+    list.retain(|entry| !remove.contains(entry));
     list.extend(add.iter().cloned());
 }
 
@@ -251,6 +279,41 @@ mod tests {
             .unwrap()
             .apply(&mut policy);
         assert_eq!(policy.net.allow, ["d.com"]);
+    }
+
+    /// A remove list takes entries out of what the layers below set and
+    /// leaves the rest inherited, so a later change below still arrives.
+    #[test]
+    fn a_remove_list_takes_out_only_its_entries() {
+        let mut policy = Policy::default();
+        PolicyFile::parse("a", "[network]\nallow = [\"a.com\", \"b.com\"]")
+            .unwrap()
+            .apply(&mut policy);
+        PolicyFile::parse(
+            "b",
+            "[network]\nallow_remove = [\"a.com\", \"absent.com\"]\nallow_add = [\"c.com\"]\n[filesystem]\nwrite_remove = [\"~/x\"]",
+        )
+        .unwrap()
+        .apply(&mut policy);
+        assert_eq!(policy.net.allow, ["b.com", "c.com"]);
+    }
+
+    /// An adapter's layer only adds destinations: it removes none.
+    #[test]
+    fn an_adapter_layer_removes_nothing() {
+        for text in [
+            "[network]\nallow_remove = [\"a.com\"]",
+            "[network]\nprivate_remove = [\"a.lan\"]",
+            "[filesystem]\nwrite_remove = [\"~/x\"]",
+        ] {
+            assert!(
+                !PolicyFile::parse("adapter", text)
+                    .unwrap()
+                    .beyond_destinations()
+                    .is_empty(),
+                "{text}"
+            );
+        }
     }
 
     #[test]

@@ -438,8 +438,8 @@ fn masks_in_a_writable_folder_come_after_the_arguments_that_bind_it() {
         &design(),
         "**The order `wrap` keeps:**",
         &[
-            "the host's files, read-only",
-            "the masks over them",
+            "the root view and home masks",
+            "the masks outside the home",
             "the writable binds",
             "each bound on itself",
             "the masks inside the writable binds",

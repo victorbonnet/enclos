@@ -127,12 +127,15 @@ impl Engine {
         // The sandbox's own proxy, not whatever listens on its port: a proxy
         // records itself only once it holds the port, so a recorded proxy
         // session whose process still runs is the proof (`proxy run --record`).
+        // Waited for before the state lock is taken, which the proxy needs
+        // to record itself.
+        let told_to_end = || Error::Session {
+            what: format!("told to end before the {service} service of {name} started"),
+        };
         let start = Instant::now();
         while !self.proxy_runs(name)? {
             if ended.load(Ordering::Relaxed) {
-                return Err(Error::Session {
-                    what: format!("told to end before the {service} service of {name} started"),
-                });
+                return Err(told_to_end());
             }
             if start.elapsed() > PROXY_WAIT {
                 return Err(Error::Session {
@@ -149,6 +152,12 @@ impl Engine {
         // services a version of enclos without it installed, is installed.
         self.ensure_holder(&record)?;
         let mut watch = self.settings_watch(name, kind, service);
+        // A backend with a namespace holder runs each session in a PID
+        // namespace of its own, below `enclos holder join` (design §5).
+        let program_at = match self.holder_of(record.backend) {
+            Some(_) => super::restart::ProgramAt::PidNamespace,
+            None => super::restart::ProgramAt::Root,
+        };
         let summary = |(started, replaced): &(Started<()>, Vec<SessionId>)| {
             let session = started.session.id;
             match replaced_earlier(service, replaced) {
@@ -156,8 +165,8 @@ impl Engine {
                 None => format!("session {session}"),
             }
         };
-        let (Started { session, mut child, .. }, _) =
-            self.write(by, "launch", Some(name.to_string()), summary, |lock| {
+        let launched =
+            self.write_in_background(ended, by, "launch", Some(name.to_string()), summary, |lock| {
                 // Sessions stopped and ended before a failure are named in
                 // the failed entry too.
                 let mut replaced = Vec::new();
@@ -174,9 +183,7 @@ impl Engine {
                         &mut replaced,
                     )?;
                     if ended.load(Ordering::Relaxed) {
-                        return Err(Error::Session {
-                            what: format!("told to end before the {service} service of {name} started"),
-                        });
+                        return Err(told_to_end());
                     }
                     // A service session whose `launch` was killed before it
                     // recorded its end, at logout or by the service manager's
@@ -195,6 +202,12 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
+        let (
+            Started {
+                session, mut child, ..
+            },
+            _,
+        ) = launched.ok_or_else(told_to_end)?;
         // Asked to restart once its settings change (ADR 0031).
         let mut restarting = false;
         let mut look = |notes: &mut Vec<String>| {
@@ -206,7 +219,7 @@ impl Engine {
             };
             let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
             let files = files.join(", ");
-            let why = match self.ask_restart(by, &session, *signal, &changed) {
+            let why = match self.ask_restart(by, &session, program_at, *signal, &changed) {
                 Ok(None) => return,
                 Ok(Some(Ok(()))) => {
                     restarting = true;
@@ -275,7 +288,10 @@ impl Engine {
     /// a crash, a proxy service dies with its session open.
     pub(super) fn record_proxy(&self, by: &Actor, name: &SandboxName) -> Result<SessionId> {
         let me = std::process::id();
-        self.write(
+        // Ended only by a signal, which ends the process.
+        let never = AtomicBool::new(false);
+        let recorded = self.write_in_background(
+            &never,
             by,
             "proxy start",
             Some(name.to_string()),
@@ -304,7 +320,8 @@ impl Engine {
                 };
                 Ok(self.state.put_session(lock, &session)?)
             },
-        )
+        )?;
+        Ok(recorded.expect("`never` is never set"))
     }
 }
 

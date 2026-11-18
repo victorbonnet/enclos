@@ -1,0 +1,44 @@
+//! The enclos mobile app's protocol, as `docs/protocol.md` describes it.
+//!
+//! Types, their encoding and the device leg's crypto, with no I/O and no
+//! clock, so the bridge and the app (through `enclos-app`'s UniFFI glue)
+//! share it, and tests feed it bytes and read bytes back. Only new keys and
+//! nonces come from the system's random source.
+//!
+//! - [`plugin`]: the bridge and an agent's channel plugin.
+//! - [`device`], [`noise`], [`pairing`], [`preview`]: the bridge and a
+//!   paired device.
+//! - [`decision`]: the runtime-approval decisions the bridge signs for a
+//!   plugin.
+//! - [`held_task`]: a runtime's held tasks, on both legs.
+//! - [`task`]: tasks and agent activity, as a runtime reports them.
+//! - [`visible`]: text checked for hidden characters before a person
+//!   reads it.
+
+pub mod agent_name;
+pub mod approval;
+pub mod avatar;
+pub mod decision;
+pub mod device;
+mod envelope;
+pub mod held_task;
+mod ids;
+pub mod model;
+pub mod noise;
+pub mod open_items;
+pub mod pairing;
+pub mod plugin;
+pub mod policy;
+pub mod preview;
+pub mod question;
+pub mod routine;
+pub mod suggested_replies;
+pub mod task;
+pub mod task_detail;
+pub mod usage;
+pub mod visible;
+
+pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
+pub use ids::{
+    ConversationId, HeldTaskId, HeldTaskRevision, IdError, MessageId, Person, QuestionId,
+};

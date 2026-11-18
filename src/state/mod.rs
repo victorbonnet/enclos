@@ -8,6 +8,7 @@ pub mod sqlite;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
@@ -56,6 +57,29 @@ impl Migration {
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
+/// How long a write to the state database waits for another's to finish
+/// before it fails (design §11). A read never waits for a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// A write of a command the user waits on, who is told if it fails and
+    /// can run it again; also the proxy's network log, since a connection
+    /// waits for its row before it is forwarded.
+    Command,
+    /// A write no person waits on, which nobody would make again if it
+    /// failed: a session's record of its members, and what `enclos launch`
+    /// and `enclos proxy run` record.
+    Background,
+}
+
+impl Wait {
+    pub fn limit(self) -> Duration {
+        match self {
+            Wait::Command => Duration::from_secs(10),
+            Wait::Background => Duration::from_secs(60),
+        }
+    }
+}
+
 /// A sandbox record that does not read: the name stored in it, which may
 /// not be a sandbox's, and why.
 #[derive(Debug)]
@@ -67,6 +91,8 @@ pub struct UnreadableRecord {
 /// Sandbox records, each change made under the state lock, and the network
 /// log beside them.
 pub trait StateStore: NetLogStore {
+    /// The same store, whose writes wait for another's as `wait` says.
+    fn waiting(&self, wait: Wait) -> Box<dyn StateStore>;
     /// Takes the exclusive state lock, waiting a few seconds for another
     /// enclos command to finish.
     fn lock(&self) -> Result<StateLock>;
@@ -207,6 +233,20 @@ pub trait StateStore: NetLogStore {
 pub trait NetLogStore {
     /// Records a connection; returns its row, for `finish`.
     fn record(&self, event: &NetEvent) -> Result<i64>;
+    /// Record diagnostic provenance only for a host-registered run; otherwise record normally.
+    fn record_probe(&self, event: &NetEvent, _tag: Option<&str>) -> Result<i64> {
+        self.record(event)
+    }
+    fn begin_probe(&self, _sandbox: &SandboxName, _tag: &str) -> Result<()> {
+        Ok(())
+    }
+    fn end_probe(&self, _tag: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Denials eligible for the approval inbox, excluding host-attributed diagnostics.
+    fn denied_for_approval(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        self.denied(sandbox)
+    }
     /// Sets a recorded connection's bytes, duration and reason, once it
     /// closed.
     fn finish(&self, row: i64, event: &NetEvent) -> Result<()>;

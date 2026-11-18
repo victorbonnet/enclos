@@ -4,6 +4,7 @@ use crate::engine::listener::{Network, NoPort, outside_proxy_range, service_list
 use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::runtime::ListenerPorts;
 
 /// A stand-in gateway: `perl` running `script`, which prints each port
 /// it listens on, one a line, then waits.
@@ -139,15 +140,75 @@ fn the_service_port_is_the_one_its_own_process_holds() {
 }
 
 #[test]
+fn a_configured_service_port_does_not_have_to_be_ephemeral() {
+    let (_dir, engine, name) = with_sandbox();
+    let ephemeral = crate::lifecycle::listeners::ephemeral_ports().unwrap();
+    let candidates = if *ephemeral.start() > 1024 {
+        1024..=*ephemeral.start() - 1
+    } else if *ephemeral.end() < u16::MAX {
+        *ephemeral.end() + 1..=u16::MAX
+    } else {
+        // This host has no unprivileged non-ephemeral port to exercise.
+        // The pure selector test still covers both kinds of port.
+        return;
+    };
+    let script = format!(
+        "my $s; for my $port ({}..{}) {{ next if $port >= {} && $port <= {}; socket(my $candidate, PF_INET, SOCK_STREAM, 0) or die qq(socket: $!); next unless bind($candidate, sockaddr_in($port, INADDR_LOOPBACK)); listen($candidate, 1) or die qq(listen: $!); $s = $candidate; last; }} die qq(no configured port) unless $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30",
+        candidates.start(),
+        candidates.end(),
+        crate::model::sandbox::PORT_FIRST,
+        crate::model::sandbox::PORT_LAST,
+    );
+    let (child, ports) = perl(&script, 1);
+    record_gateway(
+        &engine,
+        &name,
+        crate::lifecycle::process::reference_of_child(&child).unwrap(),
+    );
+    let selected = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(ports[0]),
+    );
+    let unchanged = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    end(child);
+    assert!(!ephemeral.contains(&ports[0]));
+    assert_eq!(selected, Ok(ports[0]));
+    assert!(matches!(unchanged, Err(NoPort::NotYet(_))), "{unchanged:?}");
+}
+
+#[test]
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
-    let (child, _) = gateway(&engine, &name, 2);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let (child, port) = gateway(&engine, &name, 2);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(port),
+    );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
         "{got:?}"
     );
+    assert_eq!(configured, Ok(port));
 }
 
 #[test]
@@ -155,7 +216,13 @@ fn two_open_gateway_sessions_get_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (one, _) = gateway(&engine, &name, 1);
     let (two, _) = gateway(&engine, &name, 1);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
     end(one);
     end(two);
     assert!(
@@ -175,10 +242,27 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
         started: "Thu Jan  1 00:00:00 1970".to_owned(),
     };
     record_gateway(&engine, &name, root);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(12345),
+    );
     assert!(
         matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
         "{got:?}"
+    );
+    assert!(
+        matches!(configured, Err(NoPort::NotRunning(_))),
+        "{configured:?}"
     );
 }
 
@@ -192,11 +276,28 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&child).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(held[0]),
+    );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::NotYet(why)) if why.contains("no TCP listener at 127.0.0.1")),
         "{held:?}"
+    );
+    assert!(
+        matches!(configured, Err(NoPort::NotYet(_))),
+        "{configured:?}"
     );
 
     // Sharing 127.0.0.1 at its port with another process (SO_REUSEPORT):
@@ -223,13 +324,30 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&owner).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Loopback(port[0]),
+    );
     end(owner);
     end(other);
     let why = got.unwrap_err();
     assert!(
         matches!(&why, NoPort::Refused(why) if why.contains("also listens at 127.0.0.1")),
         "{why:?}"
+    );
+    assert!(
+        matches!(&configured, Err(NoPort::Refused(why)) if why.contains("also listens at 127.0.0.1")),
+        "{configured:?}"
     );
 }
 
@@ -238,45 +356,81 @@ fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatu
     view.sandboxes.remove(0)
 }
 
-/// Status shows the dashboard at the port sessions are given, nothing
-/// once the gateway is gone, and why when the port cannot be trusted.
+/// The gateway serves the SPA without its browser token, so its port is
+/// not a usable dashboard. Status directs the user to a dedicated server.
 #[test]
-fn status_shows_the_dashboard_at_the_gateways_port() {
+fn status_shows_a_dedicated_dashboard_command_instead_of_the_gateway_url() {
     use crate::engine::Fact;
+    fn ready(engine: &Engine, name: &SandboxName) {
+        std::fs::create_dir_all(engine.sandbox_home(name).join(".hermes/hermes-agent")).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.record(name)?;
+                    record.state = crate::model::sandbox::SandboxState::Running;
+                    Ok(engine.state.put(lock, &record)?)
+                },
+            )
+            .unwrap();
+    }
     let (_dir, engine, name) = with_sandbox();
-    let (child, port) = gateway(&engine, &name, 1);
+    let (child, _) = gateway(&engine, &name, 1);
+    ready(&engine, &name);
     let up = status_of(&engine, &name);
-    end(child);
-    assert_eq!(
-        up.dashboard,
-        Fact::Known(format!("http://127.0.0.1:{port}/"))
+    let command = Some(format!("enclos dashboard {name}"));
+    assert!(
+        serde_json::to_value(&up)
+            .unwrap()
+            .get("dashboard")
+            .is_none()
     );
+    assert_eq!(up.dashboard_command, command);
+    let mut unsupported = engine.record(&name).unwrap();
+    unsupported.backend = crate::model::sandbox::BackendKind::Bubblewrap;
+    let runtime = crate::runtime::adapter(unsupported.runtime.unwrap());
+    assert!(
+        engine
+            .dashboard_of(
+                &unsupported,
+                runtime.as_ref(),
+                &super::super::listener::HostServices::default()
+            )
+            .is_err()
+    );
+    assert!(
+        engine
+            .sandbox_status(unsupported, Some(runtime.as_ref()), crate::model::now())
+            .unwrap()
+            .dashboard_command
+            .is_none()
+    );
+    end(child);
     // On loopback alone: nothing the host's network reaches.
     assert_eq!(up.network_listeners, Fact::Known(Vec::new()));
-    assert_eq!(status_of(&engine, &name).dashboard, Fact::Absent);
+    let stopped = status_of(&engine, &name);
+    assert_eq!(stopped.dashboard_command, None);
 
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
+    ready(&engine, &name);
     let several = status_of(&engine, &name);
     end(child);
-    let Fact::CannotTell(why) = several.dashboard else {
-        panic!("{:?}", several.dashboard);
-    };
-    assert!(why.contains("listens on 2 ephemeral ports"), "{why}");
+    assert_eq!(several.dashboard_command, None);
 
-    // On every address: no dashboard, and the gateway is named as what
-    // the host's network reaches.
+    // The command does not depend on a gateway port, and listeners beyond
+    // loopback are still named as reachable from the host's network.
     let (_dir, engine, name) = with_sandbox();
     let (child, held) = perl(&listening(1, "0.0.0.0"), 1);
     let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
     record_gateway(&engine, &name, root);
+    ready(&engine, &name);
     let wide = status_of(&engine, &name);
     end(child);
-    assert!(
-        matches!(wide.dashboard, Fact::CannotTell(_)),
-        "{:?}",
-        wide.dashboard
-    );
+    assert_eq!(wide.dashboard_command, None);
     let Fact::Known(reached) = wide.network_listeners else {
         panic!("{:?}", wide.network_listeners);
     };
@@ -290,4 +444,42 @@ fn a_proxy_port_is_never_a_sessions_service_port() {
     assert!(outside_proxy_range(PORT_FIRST).is_err());
     assert!(outside_proxy_range(PORT_LAST).is_err());
     assert_eq!(outside_proxy_range(61374), Ok(61374));
+}
+
+#[test]
+fn a_second_sandbox_does_not_select_another_sandbox_declared_listener() {
+    let (_dir, engine, first) = with_sandbox();
+    let second = "other".parse::<SandboxName>().unwrap();
+    done(
+        engine
+            .create_sandbox(
+                &alice(),
+                crate::engine::SandboxSpec {
+                    name: second.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "assistant".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let (first_service, first_port) = gateway(&engine, &first, 1);
+    let (second_service, second_port) = gateway(&engine, &second, 1);
+    let select = |sandbox, port| {
+        service_listener(
+            engine.state.as_ref(),
+            sandbox,
+            "gateway",
+            &Network::Host,
+            ListenerPorts::Loopback(port),
+        )
+    };
+    let first_result = select(&first, first_port);
+    let second_result = select(&second, second_port);
+    let other_result = select(&second, first_port);
+    end(first_service);
+    end(second_service);
+    assert_eq!(first_result, Ok(first_port));
+    assert_eq!(second_result, Ok(second_port));
+    assert!(matches!(other_result, Err(NoPort::NotYet(_))));
 }

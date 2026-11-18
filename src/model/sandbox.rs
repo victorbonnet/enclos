@@ -90,6 +90,27 @@ impl BackendKind {
         }
     }
 
+    /// Where a sandbox of this kind listens once its policy lets it (ADR
+    /// 0028), and who reaches what listens there, as `policy show` and a
+    /// runtime install's plan say it. A Seatbelt sandbox shares the host's
+    /// network, and nothing holds its listeners to loopback. A bubblewrap
+    /// sandbox listens in its own network namespace, which the host's
+    /// network does not reach; `enclos dashboard` opens the runtime's
+    /// dashboard to the user running it alone (ADR 0039, ADR 0040).
+    /// OpenShell and a microVM are not built yet: a session of either has
+    /// a network of its own, as `reaches_proxy_over_socket` says.
+    pub const fn listening(self) -> &'static str {
+        match self {
+            BackendKind::Seatbelt => {
+                "on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
+            }
+            BackendKind::Bubblewrap => {
+                "on TCP, in the sandbox's own network namespace, which its sessions share and the host's network does not reach: `enclos dashboard` opens the runtime's dashboard to the user running it alone (ADR 0040)"
+            }
+            BackendKind::OpenShell | BackendKind::Libkrun => "on TCP, in the sandbox's own network",
+        }
+    }
+
     /// Whether the `mktemp` a sandbox of this kind runs ignores `TMPDIR`
     /// for a call with no template, `-d` or `-t`, as macOS's
     /// `/usr/bin/mktemp` does (design §5, "System temp"). GNU `mktemp`, a
@@ -126,6 +147,18 @@ impl BackendKind {
         match self {
             BackendKind::Bubblewrap => true,
             BackendKind::Seatbelt | BackendKind::OpenShell | BackendKind::Libkrun => false,
+        }
+    }
+
+    /// Whether the backend keeps a path unchanged inside a folder the
+    /// sandbox writes (ADR 0058): a read-only path, enclos's own program,
+    /// or anything a grant of the whole filesystem holds. Seatbelt denies
+    /// writes to it after the grant's allow; bubblewrap would need a
+    /// read-only bind inside a writable one, not built yet.
+    pub fn keeps_paths_under_a_grant(self) -> bool {
+        match self {
+            BackendKind::Seatbelt => true,
+            BackendKind::Bubblewrap | BackendKind::OpenShell | BackendKind::Libkrun => false,
         }
     }
 }
@@ -230,6 +263,28 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    /// Only a Seatbelt sandbox's listeners can serve the network: a
+    /// bubblewrap one's are in its own network namespace, and `enclos
+    /// dashboard` is the way in (ADR 0040).
+    #[test]
+    fn only_a_seatbelt_sandbox_listening_can_serve_the_network() {
+        for kind in BackendKind::ALL {
+            assert_eq!(
+                kind.listening().contains("can serve the network"),
+                kind == BackendKind::Seatbelt,
+                "{kind}"
+            );
+        }
+        let bubblewrap = BackendKind::Bubblewrap.listening();
+        assert!(bubblewrap.contains("own network namespace"), "{bubblewrap}");
+        assert!(
+            bubblewrap.contains("the host's network does not reach"),
+            "{bubblewrap}"
+        );
+        assert!(bubblewrap.contains("`enclos dashboard`"), "{bubblewrap}");
+        assert!(!bubblewrap.contains("every address"), "{bubblewrap}");
     }
 
     #[test]

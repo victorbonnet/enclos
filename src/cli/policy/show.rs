@@ -7,7 +7,7 @@ use super::super::output;
 use enclos::engine::{PolicyDiff, PolicyHistory, PolicyView};
 use enclos::error::{Error, Result};
 use enclos::model::policy::{NetMode, PendingPolicy, Policy, PolicyVersion};
-use enclos::model::sandbox::SandboxName;
+use enclos::model::sandbox::{BackendKind, SandboxName};
 
 fn version_json(v: &PolicyVersion) -> Value {
     json!({
@@ -94,7 +94,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
             version.version,
             view.sandbox,
         );
-        print_rules(&pending.policy);
+        print_rules(&pending.policy, view.backend);
         return Ok(());
     }
     println!(
@@ -107,7 +107,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
         version.by.host,
         version.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
     );
-    print_rules(&snap.policy);
+    print_rules(&snap.policy, view.backend);
     match &view.pending {
         Some((p, pending)) => {
             println!(
@@ -134,7 +134,7 @@ pub(super) fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_rules(policy: &Policy) {
+fn print_rules(policy: &Policy, backend: BackendKind) {
     println!("\nFiles (everything else is readable)");
     println!("  writable:   {}", policy.fs.write.join(", "));
     println!(
@@ -144,10 +144,26 @@ fn print_rules(policy: &Policy) {
     for path in &policy.fs.read_deny {
         println!("    {path}");
     }
+    if !policy.fs.read_only.is_empty() {
+        println!(
+            "  read-only:  {} paths, readable but never changed",
+            policy.fs.read_only.len()
+        );
+        for path in &policy.fs.read_only {
+            println!("    {path}");
+        }
+    } else if policy.fs.write.iter().any(|w| w == "/") {
+        // Under the whole filesystem, none is worth saying: the shell's
+        // startup files are writable then (ADR 0058).
+        println!("  read-only:  none, so the shell's startup files are writable too");
+    }
     match policy.net.mode {
         NetMode::Public => {
             println!("\nNetwork: public web (every connection is logged)");
-            println!("  mode:    public: any public address on ports 80 and 443");
+            println!(
+                "  mode:    public: any public address {}",
+                policy.net.public_ports.described()
+            );
             println!(
                 "           never loopback, link-local or metadata addresses, nor private ones unless listed below"
             );
@@ -169,9 +185,7 @@ fn print_rules(policy: &Policy) {
         );
     }
     if policy.net.listen {
-        println!(
-            "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
-        );
+        println!("  listening: allowed {}", backend.listening());
     }
     let r = &policy.resources;
     // Every field named, so one added is decided on here.

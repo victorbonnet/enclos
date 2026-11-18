@@ -5,12 +5,27 @@ use super::*;
 use crate::model::sandbox::SandboxName;
 
 /// An initialized engine with sandbox `home`, created as the CLI does.
-pub(super) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
+pub(crate) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
     with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt))
 }
 
 pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
-    let (dir, engine) = engine_with(vec![Box::new(backend)]);
+    with_sandbox_under(backend, &super::Root::usual())
+}
+
+/// [`with_sandbox_on`], enclos's folder at `root`.
+pub(super) fn with_sandbox_under(
+    backend: FakeBackend,
+    root: &super::Root,
+) -> (TempDir, Engine, SandboxName) {
+    let (dir, engine) = engine_under(vec![Box::new(backend)], root);
+    let name = home_sandbox(&engine);
+    (dir, engine, name)
+}
+
+/// Sets enclos up on `engine` and creates the `home` sandbox from the
+/// `assistant` template.
+pub(super) fn home_sandbox(engine: &Engine) -> SandboxName {
     done(engine.init(&alice(), Confirm::Yes).unwrap());
     let name: SandboxName = "home".parse().unwrap();
     let spec = crate::engine::SandboxSpec {
@@ -19,7 +34,7 @@ pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, Sandbox
         template: "assistant".parse().unwrap(),
     };
     done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
-    (dir, engine, name)
+    name
 }
 
 /// What a grant over the folder the user's manager reads units from would

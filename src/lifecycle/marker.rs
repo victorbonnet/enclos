@@ -91,12 +91,31 @@ impl Marker {
     /// through [`spawn_unmarked`]: the CLI starts nothing else meanwhile;
     /// tests running in parallel threads may.
     pub fn spawn(self, command: &mut Command) -> io::Result<(Child, Started)> {
+        self.spawn_with(command, None)
+    }
+
+    /// Passes one additional descriptor to this child alone, under the
+    /// same spawn lock as its marker. Its number goes in `variable`.
+    pub fn spawn_with(
+        self,
+        command: &mut Command,
+        extra: Option<(std::os::fd::BorrowedFd<'_>, &str)>,
+    ) -> io::Result<(Child, Started)> {
+        use std::os::fd::AsRawFd;
         let started = Started {
             path: Some(self.path),
         };
         let _turn = STARTS.write().unwrap_or_else(|e| e.into_inner());
         let inherited = rustix::io::dup(&self.file)?;
+        let extra = extra
+            .map(|(fd, variable)| {
+                let fd = rustix::io::dup(fd)?;
+                command.env(variable, fd.as_raw_fd().to_string());
+                Ok::<_, io::Error>(fd)
+            })
+            .transpose()?;
         let child = command.spawn();
+        drop(extra);
         drop(inherited);
         drop(self.file);
         Ok((child?, started))

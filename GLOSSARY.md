@@ -8,6 +8,10 @@ enclos creates sandboxes, installs agent runtimes in them and runs agents there,
 A machine where the enclos CLI runs and keeps its state. Each host is managed locally, by running enclos on it.
 _Avoid_: machine, node, server
 
+**Host assistant**:
+An AI assistant the user runs on the host, outside any sandbox, such as Claude Code or Codex. It operates enclos through the CLI, as the user would.
+_Avoid_: agent (an agent lives in a sandbox), operator agent
+
 **Sandbox**:
 A named, persistent isolated environment created by enclos, with its own backend, policy, home folder and lifecycle state. The sandbox is the permission boundary.
 _Avoid_: container, jail, environment, enclosure
@@ -23,6 +27,18 @@ _Avoid_: missing feature, fallback mode
 **Policy**:
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
 _Avoid_: rules, permissions, config
+
+**Policy request**:
+A proposed grant of access for a sandbox, such as one destination or one writable path, which the host's person may approve, deny or close without a new decision. Approving it changes the sandbox's policy for all of its agents; closing puts it aside without accepting or rejecting it.
+_Avoid_: tool approval or command approval (a runtime approval is a runtime's own decision), scope (a session's systemd unit)
+
+**Runtime approval**:
+A runtime's request for a person's decision before an operation continues, with the operation and the consents it allows, such as once, for the session or always, supplied by that runtime. It changes no sandbox policy.
+_Avoid_: policy request, question (a request for information), command approval
+
+**Signed decision**:
+A person's decision on a runtime approval as the bridge passes it to the agent's channel plugin, signed with a key no sandbox reads, which the plugin acts on alone.
+_Avoid_: approval token, typed approval
 
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
@@ -40,7 +56,7 @@ One immutable, fully resolved version of a sandbox's policy, identified by its c
 _Avoid_: revision, policy file
 
 **Network mode**:
-Which destinations a sandbox may reach: `public`, any public address on the web ports as well as what its policy lists, or `allowlist`, only what its policy lists.
+Which destinations a sandbox may reach: `public`, any public address on the web ports (or on every port, when its policy says so) as well as what its policy lists, or `allowlist`, only what its policy lists.
 _Avoid_: open mode, internet access
 
 **Active policy**:
@@ -52,7 +68,7 @@ A policy snapshot saved for a sandbox because the user declined the restart it n
 _Avoid_: draft, staged policy
 
 **Template**:
-A reusable policy that a sandbox's policy extends, such as `minimal` or `assistant`.
+A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant` or `autonomous`.
 _Avoid_: preset, base policy
 
 **Runtime**:
@@ -67,12 +83,28 @@ _Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
 _Avoid_: main agent, root profile, default profile
 
+**Runtime default target**:
+The agent a runtime selects when a person omits the agent name. The selection can name a built-in agent or an ordinary agent.
+_Avoid_: built-in agent (for the selection)
+
+**Removed agent**:
+An agent that enclos has confirmed is gone from its host, with no runtime identity or data left, as after its sandbox was removed with its folder. The person's conversations with it remain until they are deleted.
+_Avoid_: deleted agent, orphan agent
+
+**Agent display name**:
+The human-readable name shown for an agent, shared by the people who can reach it and independent of the identifier used to address it.
+_Avoid_: nickname, alias, profile name
+
 **Untracked agent**:
 An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. It becomes a tracked agent when added.
 _Avoid_: orphan, rogue agent, unknown agent
 
 **Export**:
-An archive of an agent made by its runtime's own command, such as `hermes profile export`. An agent comes into a sandbox from the host only by importing an export with the runtime's own import; enclos has no archive format of its own.
+A portable copy of an agent's runtime data, credentials, presentation and direct conversation history that can be imported on another host or in another sandbox, independent of the host's identities and sandbox policy.
+_Avoid_: backup, bundle, snapshot (a policy's word)
+
+**Runtime export**:
+A runtime-specific portable representation of an agent's data, including its runtime-held logins.
 _Avoid_: backup, bundle, snapshot (a policy's word)
 
 **Session**:
@@ -82,6 +114,22 @@ _Avoid_: run, job, instance
 **Gone session**:
 A session whose end is not recorded though none of its members runs any more, because nothing was left to record it, as after a crash or a restart of the Mac.
 _Avoid_: stale session, zombie session
+
+**Native chat**:
+The runtime's own record of one exchange with an agent, whatever started it: a conversation in the app, a talk in the sandbox, a routine's run. Hermes calls it a session.
+_Avoid_: session (a sandbox's word), thread
+
+**Usage**:
+What an agent's model calls consumed, as its runtime counts them: requests, input, output, cache-read, cache-write and reasoning tokens, and cost. A runtime counts it inside the sandbox, so it guides, and bills nothing.
+_Avoid_: consumption, spend, billing, quota (a provider's limit)
+
+**Model provider**:
+A service, such as OpenAI or OpenRouter, through which an agent's runtime calls a model, with the runtime's own login or a secret granted to the agent. An agent can use only the model providers set up for it.
+_Avoid_: provider alone (it also names other things), backend, vendor
+
+**Agent model**:
+The model provider and model an agent's runtime uses for all the agent's conversations, unless a conversation sets its own. The runtime keeps it.
+_Avoid_: default model (Hermes's key, also OpenClaw's shared default), engine, LLM
 
 **Secret**:
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
@@ -98,6 +146,95 @@ _Avoid_: platform, integration
 **Bot**:
 The account on a channel through which the sandbox's runtime answers people, such as a Telegram bot.
 _Avoid_: agent (an agent is the runtime's identity, not the account)
+
+**Bridge**:
+The part of an install that the mobile app reaches through its transport, and that talks to each agent's channel plugin inside its sandbox.
+_Avoid_: daemon, server, gateway (the runtime's word), relay (the proxy's)
+
+**Transport**:
+What puts the bridge, which listens on the host's loopback only, on a network the person's devices are on, and tells the bridge who each caller is. Tailscale is the only one for now.
+_Avoid_: tunnel (the proxy's word), front, VPN (one kind of transport)
+
+**Paired device**:
+A phone or other device that a bridge accepts, because the host's user paired it there and it holds the key it was paired with.
+_Avoid_: client, session (a sandbox's word)
+
+**Push**:
+A message the bridge sends a paired device through its platform's push service while none of its person's devices is connected, holding a preview of what came that only that device can open.
+_Avoid_: notification (what the phone shows), alert, wake-up
+
+**Person**:
+Someone the bridge knows by the login their transport gives (a tailnet login with Tailscale), who talks to agents from their paired devices. The host's user is one.
+_Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
+
+**Host's person**:
+The person each agent's Home conversation belongs to: the person of the first device paired at the host's terminal, until it is changed there.
+_Avoid_: owner (a conversation's word), admin
+
+**Share**:
+What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
+_Avoid_: grant (a secret's or policy's word), permission
+
+**Conversation**:
+One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
+_Avoid_: session (a sandbox's word), chat, thread
+
+**Archived conversation**:
+A conversation other than Home that its owner has set aside from the active list, with its identity and history kept until restored.
+_Avoid_: deleted conversation, closed conversation
+
+**Home conversation**:
+An agent's permanent conversation for messages that have no other destination, including scheduled output and the runtime's notices.
+
+**Group**:
+A conversation between one person and several agents of one sandbox, which the bridge keeps and whose turns it runs. Each agent answers in turn, when addressed by its handle (`@main`), by `@all`, or by another member.
+_Avoid_: room (Hermes's word), channel (a messaging account), team
+
+**Artefact**:
+A page an agent makes for a person to open in the app from its conversation.
+_Avoid_: artifact, app (for a generated page)
+
+**Agent photo**:
+The picture that stands for an agent in the app, the same for every person shown the agent. The host's person chooses it; without one, the agent shows its initial.
+_Avoid_: profile picture, icon, avatar (the protocol's word, in `agent.avatar` and its fields, and nowhere else)
+
+**Agent command**:
+A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
+_Avoid_: command alone (enclos's own), shortcut, action
+
+**Routine**:
+A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
+_Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
+
+**Task**:
+Work an agent does outside a conversation's answer, which its runtime tracks from the moment it is asked for until it ends. Another agent, or a person, asks for it.
+_Avoid_: job, ticket, card, kanban item (except when naming a runtime's own feature, such as a task on Hermes's kanban board)
+
+**Task detail**:
+What a task's runtime holds of it beyond where it stands: what it asks, the tasks it waits for and that wait for it, the comments on it, and its history.
+_Avoid_: task page, ticket
+
+**Task history**:
+What happened to a task, oldest first: when it was asked for, each attempt at it and how that ended, when it blocked and went on, and when it was done.
+_Avoid_: activity, timeline, log (activity is what an agent is doing now)
+
+**Agent activity**:
+What an agent is doing right now: answering in a conversation, running a routine or working on a task, several at once, or nothing (idle).
+_Avoid_: busy state, presence, status (enclos's own)
+
+**Question**:
+An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
+_Avoid_: runtime approval, policy request (different authority)
+
+**Open item**:
+A question, runtime approval, held task or policy request still waiting for a person on a host. An unanswered ordinary question can remain an open item after its native waiting call expires.
+
+**Suggested reply**:
+An agent's proposed literal response to an ordinary message, which a person can choose to send as their own message.
+
+**Held task**:
+Background work an agent's runtime started that has stopped and waits for a person before it runs again. The runtime keeps it; the app shows it and may resume it.
+_Avoid_: blocked task, stuck task, job, ticket (except when naming a runtime's own feature, such as a blocked task on Hermes's kanban board)
 
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
@@ -119,6 +256,7 @@ A file enclos gives a program as a session starts, which the program and everyth
 
 **Scope**:
 On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
+_Avoid_: scope for what a policy request asks (a grant) or a runtime approval allows (a consent), except the protocol's `scope` field and the titles of ADRs 0046 and 0053, which keep the earlier word
 
 **Slice**:
 On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
@@ -146,6 +284,10 @@ _Avoid_: reserved path, private mount
 **Protected path**:
 A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
 _Avoid_: system path, reserved path
+
+**Read-only path**:
+A path a sandbox may read but not change, although its write grants cover it, such as a shell's startup file.
+_Avoid_: write deny, protected path (enclos's own paths)
 
 **Escape probe**:
 A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call refused outside too, that it gets as far there as the sandbox refuses it, such as to the filesystem; for what the host cannot reach either, that it is there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.

@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 
 use crate::model::net::Reason;
-use crate::model::policy::{NetMode, Policy};
+use crate::model::policy::Policy;
 use crate::net::addr::AddrClass;
 use crate::net::host::{AllowEntry, normalize_host};
 
@@ -38,10 +38,14 @@ impl Destination {
 }
 
 /// Whether the policy lets the sandbox reach `dest`: in public mode any
-/// destination on a web port, and in either mode what the allowlist lists.
-/// Its addresses are checked after this, the same way in both modes.
+/// destination on a web port, or on any port when the policy opens them all
+/// (ADR 0058), and in either mode what the allowlist lists. Its addresses
+/// are checked after this, the same way in both modes.
 pub fn allowed(policy: &Policy, dest: &Destination) -> bool {
-    let public = policy.net.mode == NetMode::Public && NetMode::PUBLIC_PORTS.contains(&dest.port);
+    let public = policy
+        .net
+        .public_reach()
+        .is_some_and(|ports| ports.open(dest.port));
     public
         || policy
             .net
@@ -84,6 +88,7 @@ pub fn validated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::policy::NetMode;
     use crate::net::addr::classify;
 
     fn policy(allow: &[&str], private: &[&str]) -> Policy {
@@ -137,6 +142,37 @@ mod tests {
             validated(&p, &any, &ips(&["192.168.1.20"]), classify),
             Err(Reason::PrivateAddress)
         );
+    }
+
+    #[test]
+    fn public_mode_on_every_port_opens_any_port_and_still_checks_addresses() {
+        let mut p = policy(&[], &[]);
+        p.net.mode = NetMode::Public;
+        p.net.public_ports = crate::model::policy::PublicPorts::Any;
+        let dest = |h: &str, port| Destination::parse(h, port).unwrap();
+        assert!(allowed(&p, &dest("weather.example.com", 443)));
+        assert!(allowed(&p, &dest("git.example.com", 22)));
+        assert!(allowed(&p, &dest("files.example.org", 8443)));
+        let any = dest("rebind.example.com", 22);
+        assert_eq!(
+            validated(&p, &any, &ips(&["127.0.0.1", "169.254.169.254"]), classify),
+            Err(Reason::BlockedAddress)
+        );
+        assert_eq!(
+            validated(&p, &any, &ips(&["192.168.1.20"]), classify),
+            Err(Reason::PrivateAddress)
+        );
+        // An address literal too: what the IPv6 loopback probe asks for when
+        // every port is open, which the proxy still refuses.
+        let literal = dest("127.0.0.1", 8443);
+        assert!(allowed(&p, &literal));
+        assert_eq!(
+            validated(&p, &literal, &ips(&["127.0.0.1"]), classify),
+            Err(Reason::BlockedAddress)
+        );
+        // In allowlist mode the setting opens nothing.
+        p.net.mode = NetMode::Allowlist;
+        assert!(!allowed(&p, &dest("git.example.com", 22)));
     }
 
     #[test]

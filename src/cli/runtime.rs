@@ -3,12 +3,13 @@
 //! `enclos connect` (ADR 0024).
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde_json::json;
 
 use super::output;
-use enclos::engine::{ChannelRequest, Engine, Setting};
+use enclos::engine::{ChannelRequest, ChannelSet, Engine, Setting};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -30,6 +31,16 @@ enum RuntimeVerb {
         runtime: RuntimeKind,
         #[arg(long)]
         sandbox: SandboxName,
+        /// Stop the installer, and every process it started, once it has
+        /// run this many seconds, and fail the install: for the mobile
+        /// app's bridge, which runs this command with nobody watching.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        time_limit: Option<u64>,
+        /// Who asked for the install, as the audit log names them: the
+        /// mobile app's bridge, which runs this command for a paired
+        /// device, names its person and device.
+        #[arg(long, hide = true, value_name = "WHO")]
+        requested_by: Option<String>,
     },
     /// Set an agent up with the runtime's own commands: it reads the
     /// secrets the policy grants it under [secrets.agents.<agent>], then
@@ -45,8 +56,9 @@ enum RuntimeVerb {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<Setting>,
         /// A bot on this messaging channel, its token a secret the policy
-        /// grants the agent.
-        #[arg(long, requires = "allow_user")]
+        /// grants the agent; or `app`, the enclos mobile app's channel,
+        /// which enclos's bridge connects to.
+        #[arg(long)]
         channel: Option<Channel>,
         /// With --channel: the variable the policy grants the bot's token
         /// as; the channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
@@ -61,8 +73,18 @@ enum RuntimeVerb {
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
-    let (runtime, sandbox) = match args.verb {
-        RuntimeVerb::Install { runtime, sandbox } => (runtime, sandbox),
+    let (runtime, sandbox, limit, requested_by) = match args.verb {
+        RuntimeVerb::Install {
+            runtime,
+            sandbox,
+            time_limit,
+            requested_by,
+        } => (
+            runtime,
+            sandbox,
+            time_limit.map(Duration::from_secs),
+            requested_by,
+        ),
         RuntimeVerb::Configure {
             target,
             set,
@@ -78,7 +100,12 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             return configure(engine, by, confirm, target, channel, &set);
         }
     };
-    let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
+    let by = &requester(by, requested_by);
+    let installed = match limit {
+        None => engine.install_runtime(by, &sandbox, runtime, confirm)?,
+        Some(limit) => engine.install_runtime_within(by, &sandbox, runtime, confirm, limit)?,
+    };
+    let end = match installed {
         Planned::DryRun(plan) => {
             output::show_plan(&plan);
             return Ok(exit::OK);
@@ -88,10 +115,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     let shown = runtime.display_name();
     // How the installer ended, and what that leaves recorded: the same in
     // text and in JSON, since a policy left wider must be said.
-    let ended = match end.end.signal {
-        Some(signal) => format!("was ended by signal {signal}"),
-        None => format!("exited with {}", end.end.exit),
-    };
+    let ended = end.ended();
     let after = match end.recorded {
         Some(kept) => format!(
             "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
@@ -140,12 +164,24 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     Ok(exit::OK)
 }
 
+/// Who the audit log names for an install: the user running enclos, or
+/// the one `--requested-by` names, on this host.
+fn requester(by: &Actor, requested_by: Option<String>) -> Actor {
+    match requested_by {
+        Some(user) => Actor {
+            user,
+            host: by.host.clone(),
+        },
+        None => by.clone(),
+    }
+}
+
 /// What `runtime configure` sets up: the bot of the sandbox's built-in
 /// agent, or of the agent named (ADR 0036).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChannelTarget {
-    sandbox: SandboxName,
-    agent: Option<AgentName>,
+pub(super) struct ChannelTarget {
+    pub(super) sandbox: SandboxName,
+    pub(super) agent: Option<AgentName>,
 }
 
 impl FromStr for ChannelTarget {
@@ -189,13 +225,24 @@ fn configure(
             "sandbox": sandbox.to_string(),
             "agent": agent.to_string(),
             "settings": done.settings,
-            "channel": done.channel.as_ref().map(|bot| json!({
-                "channel": bot.channel.to_string(),
-                "token_variable": bot.token,
-                "answers": bot.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "reachable": bot.reachable,
-                "host": bot.channel.host(),
-            })),
+            "channel": done.channel.as_ref().map(|set| match set {
+                ChannelSet::Bot { channel, token, answers, reachable } => json!({
+                    "channel": channel.to_string(),
+                    "token_variable": token,
+                    "answers": answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "reachable": reachable,
+                    "host": channel.host(),
+                    "socket": null,
+                }),
+                ChannelSet::App { token, socket } => json!({
+                    "channel": Channel::App.to_string(),
+                    "token_variable": token,
+                    "answers": [],
+                    "reachable": true,
+                    "host": null,
+                    "socket": socket.display().to_string(),
+                }),
+            }),
         }));
         return Ok(exit::OK);
     }
@@ -205,18 +252,28 @@ fn configure(
     if !done.settings.is_empty() {
         println!("Set: {}.", done.settings.join(", "));
     }
-    if let Some(bot) = &done.channel {
-        println!(
-            "Its {} bot is set up: its token is read from ${}, and it answers {} user(s).",
-            bot.channel.display_name(),
-            bot.token,
-            bot.answers.len()
-        );
-        if !bot.reachable {
+    match &done.channel {
+        None => {}
+        Some(ChannelSet::App { token, socket }) => println!(
+            "Its app channel is set up: it listens at {}, for enclos's bridge, which presents ${token}. A running bridge serves it within seconds, with no restart.",
+            socket.display()
+        ),
+        Some(ChannelSet::Bot {
+            channel,
+            token,
+            answers,
+            reachable,
+        }) => {
             println!(
-                "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
-                host = bot.channel.host(),
+                "Its {} bot is set up: its token is read from ${token}, and it answers {} user(s).",
+                channel.display_name(),
+                answers.len()
             );
+            if let (false, Some(host)) = (*reachable, channel.host()) {
+                println!(
+                    "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`."
+                );
+            }
         }
     }
     println!(
@@ -228,6 +285,69 @@ fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_install_is_audited_as_who_asked_for_it_on_this_host() {
+        let by = Actor {
+            user: "victor".into(),
+            host: "mac".into(),
+        };
+        assert_eq!(requester(&by, None), by);
+        assert_eq!(
+            requester(&by, Some("alice@example.com (device d-1)".into())),
+            Actor {
+                user: "alice@example.com (device d-1)".into(),
+                host: "mac".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn who_asked_may_start_with_a_dash_when_given_with_an_equals_sign() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let parsed = Cli::try_parse_from([
+            "enclos",
+            "install",
+            "hermes",
+            "--sandbox",
+            "lab",
+            "--requested-by=-alice (device d-1)",
+        ])
+        .unwrap();
+        let RuntimeVerb::Install { requested_by, .. } = parsed.args.verb else {
+            panic!("not an install");
+        };
+        assert_eq!(requested_by.as_deref(), Some("-alice (device d-1)"));
+    }
+
+    #[test]
+    fn an_install_may_be_given_a_time_limit_in_seconds() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let limit = |args: &[&str]| {
+            let parsed = Cli::try_parse_from(
+                ["enclos", "install", "hermes", "--sandbox", "lab"]
+                    .iter()
+                    .chain(args),
+            )
+            .unwrap();
+            let RuntimeVerb::Install { time_limit, .. } = parsed.args.verb else {
+                panic!("not an install");
+            };
+            time_limit
+        };
+        assert_eq!(limit(&[]), None);
+        assert_eq!(limit(&["--time-limit=3600"]), Some(3600));
+    }
 
     #[test]
     fn a_target_is_a_sandbox_or_one_of_its_agents() {

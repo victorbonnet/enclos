@@ -315,6 +315,7 @@ mod tests {
             ],
             in_terminal: false,
             service_port: None,
+            dashboard_socket: false,
             limits: Default::default(),
             reads: Vec::new(),
         };

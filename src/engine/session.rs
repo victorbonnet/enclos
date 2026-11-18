@@ -24,11 +24,12 @@ use crate::lifecycle::process::{
 };
 use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
+use crate::model::count;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionRecord};
 use crate::runtime::SandboxCommand;
-use crate::state::{StateError, StateLock};
+use crate::state::{StateError, StateLock, StateStore, Wait};
 
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +129,9 @@ impl Engine {
             SandboxCommand::new(command),
             "exec",
             CommandKind::Exec,
+            None,
         )
-        .map(Planned::Done)
+        .map(|(end, _)| Planned::Done(end))
     }
 
     /// Runs `command` in the sandbox, in this terminal, as a recorded
@@ -141,12 +143,51 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
-        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Interactive)
+        self.run_in_sandbox_as(
+            by,
+            name,
+            command,
+            audit_name,
+            CommandKind::Interactive,
+            None,
+        )
+        .map(|(end, _)| end)
+    }
+
+    /// [`Engine::run_in_sandbox`] as an exec session, for a runtime's own
+    /// command that reads something for enclos: it does not hold back a
+    /// runtime's settings restart (ADR 0031), as `exec` does not.
+    pub(super) fn run_exec_in_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+    ) -> Result<SessionEnd> {
+        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Exec, None)
+            .map(|(end, _)| end)
+    }
+
+    /// [`Engine::run_in_sandbox`], told to end at `deadline`, as `launch`
+    /// is when its service stops: every member of the session is stopped,
+    /// TERM then KILL, whatever its process group, and so is what it left
+    /// running, before the end is recorded. Also says whether it was told
+    /// to end.
+    pub(super) fn run_in_sandbox_within(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        deadline: Instant,
+    ) -> Result<(SessionEnd, bool)> {
+        let kind = CommandKind::Interactive;
+        self.run_in_sandbox_as(by, name, command, audit_name, kind, Some(deadline))
     }
 
     /// Runs `command` in the sandbox as a recorded session of `kind`, with
     /// this process's input and output (design §8 steps 1-6), and returns
-    /// when it exits.
+    /// when it exits, ending it at `deadline`, and whether it did.
     fn run_in_sandbox_as(
         &self,
         by: &Actor,
@@ -154,7 +195,8 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
         kind: CommandKind,
-    ) -> Result<SessionEnd> {
+        deadline: Option<Instant>,
+    ) -> Result<(SessionEnd, bool)> {
         let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
         let me = std::process::id();
@@ -179,12 +221,18 @@ impl Engine {
             self.failed_on_error(lock, name, audit_name, started)
         })?;
 
+        // Past its deadline, it is told to end: each member, whatever its
+        // process group, is stopped, not only the group it leads.
+        let ended = AtomicBool::new(false);
         // In a group of its own, the program hears of a signal only when
         // this process passes it on, to the group it leads. In a terminal,
         // it hears the terminal's signals itself, but not a TERM sent to
         // this process alone, which is passed on to the program.
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                ended.store(true, Ordering::Relaxed);
+            }
             for signal in keep_waiting.received() {
                 let sent = match (group, signal) {
                     (Group::Own, _) => signal_group(&session.root, pgid, signal),
@@ -200,10 +248,28 @@ impl Engine {
                 note(notes, format!("could not pass {} on: {why}", signal.name()));
             }
         };
-        let waited = self.wait_session(&session, &mut child, None, &mut pass_on)?;
+        let waited =
+            self.wait_session(&session, &mut child, deadline.map(|_| &ended), &mut pass_on);
+        let timed_out = ended.load(Ordering::Relaxed);
+        let why = timed_out.then_some("stopped at its time limit");
+        let mut waited = match (waited, why) {
+            (Ok(waited), _) => waited,
+            // A member survived TERM and KILL: the session stays open.
+            (Err(error), Some(why)) => {
+                let error = Error::Session {
+                    what: format!("{why}, but {error}"),
+                };
+                return Err(self.record_unended(by, "session end", &session, error));
+            }
+            (Err(error), None) => return Err(error),
+        };
+        if timed_out {
+            // Nobody is there to end what it left running.
+            self.stop_left(&session, &mut waited);
+        }
         let exit = waited.status;
         let mut end = self
-            .finish_session(by, "session end", &session, waited)
+            .finish_session_saying(by, "session end", &session, waited, why)
             .map_err(|error| Error::WithContext {
                 what: format!("{error} (the command itself ended: {exit})"),
                 error: Box::new(error),
@@ -211,7 +277,7 @@ impl Engine {
         // Why the session could not reach its runtime's service (ADR 0028),
         // which explains a runtime's own "connection failed".
         end.notes.extend(unreachable);
-        Ok(end)
+        Ok((end, timed_out))
     }
 
     /// Saves `Failed { reason: "<what> failed: …" }` on the sandbox when
@@ -279,7 +345,10 @@ impl Engine {
         };
         let summary = |_: &()| match &waited.left {
             Ok(left) if left.is_empty() => format!("exit {exit}"),
-            Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
+            Ok(left) => format!(
+                "exit {exit}, {} still running",
+                count(left.len(), "process", "processes")
+            ),
             Err(_) => format!("exit {exit}, could not look at what it left running"),
         };
         self.write_session_end(by, audit_name, session, summary, |lock| {
@@ -444,11 +513,17 @@ impl Engine {
                     Err(e) => note(&mut notes, format!("could not look at its processes: {e}")),
                 }
                 // Recorded for `show`, `stop` and `rm`. This never waits for
-                // the lock: while another command holds it, a later look
-                // records them, and the program's exit is still seen at once.
+                // the state lock: while another command holds it, a later
+                // look records them, and the program's exit is still seen at
+                // once. It waits for state.db's write lock as long as a write
+                // no person waits on does (design §11), and sees the exit
+                // that much later.
                 if known != saved {
                     let tracked = self.state.try_lock().and_then(|lock| match lock {
-                        Some(lock) => self.state.track(&lock, session.id, &known).map(Some),
+                        Some(lock) => self
+                            .members_state()
+                            .track(&lock, session.id, &known)
+                            .map(Some),
                         None => Ok(None),
                     });
                     match tracked {
@@ -523,18 +598,26 @@ impl Engine {
         session: &SessionRecord,
         waited: &Waited,
     ) -> Result<()> {
+        let state = self.members_state();
         match &waited.left {
             Ok(left) if left.is_empty() => {
-                self.state.end_session(lock, session.id)?;
+                state.end_session(lock, session.id)?;
                 self.forget_marker(session);
             }
             Ok(left) => {
                 let sure: Vec<ProcessRef> = left.iter().filter_map(Found::sure_ref).collect();
-                self.state.track(lock, session.id, &sure)?;
+                state.track(lock, session.id, &sure)?;
             }
-            Err(_) => self.state.track(lock, session.id, &waited.known)?,
+            Err(_) => state.track(lock, session.id, &waited.known)?,
         }
         Ok(())
+    }
+
+    /// The state store for a session's record of its members, as it runs
+    /// and as its program ends: a write no person waits on, which would
+    /// otherwise be lost (design §11).
+    fn members_state(&self) -> Box<dyn StateStore> {
+        self.state.waiting(Wait::Background)
     }
 
     /// Stops the sandbox's open sessions that `which` selects, so that
@@ -667,6 +750,15 @@ pub(super) fn note(notes: &mut Vec<String>, note: String) {
 /// gets nothing from a terminal, so those signals are passed on to its
 /// group instead; a TERM sent to this process alone is passed on to the
 /// program either way ([`KeepWaiting::received`]).
+/// `limit` as a person reads it: in whole minutes, else in seconds.
+pub(super) fn spoken(limit: Duration) -> String {
+    match limit.as_secs() {
+        0 => count(limit.as_millis() as usize, "millisecond", "milliseconds"),
+        s if s % 60 == 0 => count((s / 60) as usize, "minute", "minutes"),
+        s => count(s as usize, "second", "seconds"),
+    }
+}
+
 struct KeepWaiting(Vec<(Signal, Arc<AtomicBool>, signal_hook::SigId)>);
 
 impl KeepWaiting {

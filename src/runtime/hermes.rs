@@ -4,6 +4,8 @@
 //! profile under `~/.hermes/profiles`, all sharing the sandbox's one Hermes
 //! login (`~/.hermes/auth.json`) (design §14: to verify in this build).
 
+mod facts;
+
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -11,9 +13,10 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
-    RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, ListenerPorts,
+    NotRead, ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts,
+    RuntimeListener, RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat,
+    SecretFiles, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -29,7 +32,41 @@ pub const INSTALLER_URL: &str = "https://hermes-agent.nousresearch.com/install.s
 
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
+
+// The mobile app's channel plugin (`channels/hermes/enclos/`), carried by
+// the binary so that nothing is downloaded to put it in a sandbox.
+const APP_PLUGIN_YAML: &str = include_str!("../../channels/hermes/enclos/plugin.yaml");
+const APP_PLUGIN_INIT: &str = include_str!("../../channels/hermes/enclos/__init__.py");
+const APP_PLUGIN_ADAPTER: &str = include_str!("../../channels/hermes/enclos/adapter.py");
+const APP_PLUGIN_CONVERSATIONS: &str =
+    include_str!("../../channels/hermes/enclos/conversations.py");
+const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/protocol.py");
+const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/approvals.py");
+const APP_PLUGIN_INTERRUPTS: &str = include_str!("../../channels/hermes/enclos/interrupts.py");
+const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
+const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
+const APP_PLUGIN_MODEL: &str = include_str!("../../channels/hermes/enclos/model.py");
+const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.py");
+const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
+const APP_PLUGIN_RUNTIME_APPROVALS: &str =
+    include_str!("../../channels/hermes/enclos/runtime_approvals.py");
+const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/decisions.py");
+const APP_PLUGIN_HELD_TASKS: &str = include_str!("../../channels/hermes/enclos/held_tasks.py");
+const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
+const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.py");
+const APP_PLUGIN_SUGGESTED_REPLIES: &str =
+    include_str!("../../channels/hermes/enclos/suggested_replies.py");
+const APP_PLUGIN_QUESTIONS_SKILL: &str =
+    include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+/// How long Hermes's `clarify` waits for the person's answer before the
+/// agent goes on without one. Hermes's own default (90 s on main of
+/// 2026-11-10, `tools/clarify_gateway.py`, `resolve_clarify_timeout`) frees
+/// a turn quickly at a desk; a question on a phone is often seen later, so
+/// the app's agents wait an hour, Hermes's earlier default. A reply typed
+/// instead still cancels the question at once. The bridge's own backstop
+/// for a channel that stays away is twice this (`bridge/questions.rs`).
+pub const CLARIFY_TIMEOUT_SECONDS: u32 = 3600;
 
 /// Hermes's built-in profile, the root of its home.
 const DEFAULT_PROFILE: BuiltinAgent = BuiltinAgent::new("default");
@@ -172,18 +209,18 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
-    fn channel_token_file(
+    fn channel_token_files(
         &self,
         channel: Channel,
         agent: &RuntimeAgentName,
-    ) -> Option<(HomePath, &'static str)> {
+    ) -> Vec<(HomePath, &'static str)> {
         // Hermes's setup writes a profile's bot token to its `.env`
         // (`save_env_value` in `hermes_cli/setup_platforms.py`).
         let file = match agent.as_str() == DEFAULT_PROFILE.as_str() {
             true => ".hermes/.env".to_owned(),
             false => format!(".hermes/profiles/{agent}/.env"),
         };
-        Some((at(&file), channel.token_variable()))
+        vec![(at(&file), channel.token_variable())]
     }
 
     fn agent_secrets_source(
@@ -195,10 +232,13 @@ impl RuntimeAdapter for Hermes {
         // sandbox's secrets file reaches them all alike; a profile's own
         // `secrets.command` gives what it prints to that profile alone
         // (`agent/secret_sources/command.py`, Hermes 0.22.5), read here from
-        // the file `enclos launch` writes its grants to (ADR 0036). Run by
-        // Hermes through `/bin/sh -c`; the path is enclos's, quoted whole
-        // (the engine refuses one holding a quote or a line break).
-        let read = format!("cat '{}'", secrets_file.display());
+        // the file `enclos launch` writes its grants to (ADR 0036). Hermes
+        // runs it through `/bin/sh -c`, so this adapter quotes the path.
+        let path = secrets_file.to_str()?;
+        if path.contains(['\n', '\r']) {
+            return None;
+        }
+        let read = format!("cat '{}'", path.replace('\'', "'\\''"));
         let set = |key: &str, value: &str| self.set_setting(agent, key, value);
         Some(vec![
             set("secrets.command.command", &read)?,
@@ -206,6 +246,23 @@ impl RuntimeAdapter for Hermes {
             set("secrets.command.override_existing", "true")?,
             set("secrets.command.enabled", "true")?,
         ])
+    }
+
+    fn channel_token_is_plain(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+        text: &str,
+        field: &str,
+    ) -> Result<bool, String> {
+        Ok(super::settings::holds_variable(text, field))
+    }
+
+    fn inspect_settings(
+        &self,
+        files: &[super::settings::SettingsFile],
+    ) -> Result<Vec<super::settings::SettingsFinding>, String> {
+        Ok(super::settings::dotenv_yaml_findings(files))
     }
 
     fn set_setting(
@@ -231,6 +288,7 @@ impl RuntimeAdapter for Hermes {
 
     fn channel_settings(
         &self,
+        _agent: &RuntimeAgentName,
         channel: Channel,
         token: &str,
         answers: &[ChannelUser],
@@ -247,7 +305,80 @@ impl RuntimeAdapter for Hermes {
                 ),
                 ("platforms.telegram.enabled".to_owned(), "true".to_owned()),
             ]),
+            // Set up by `app_channel`: no bot, no people to answer.
+            Channel::App => None,
         }
+    }
+
+    fn app_channel(
+        &self,
+        agent: &RuntimeAgentName,
+        socket: &Path,
+        _token_file: &Path,
+        home: &str,
+        bridge_key: &str,
+    ) -> Option<AppChannel> {
+        // A plugin Hermes loads from the agent's own home, `plugins/` under
+        // its `HERMES_HOME`, and only once `plugins enable` lists it in
+        // that agent's settings (read in Hermes's source, main of
+        // 2026-11-03: `plugins/plugin_loader.py`, `user_plugins_dir`, and
+        // `hermes_cli/plugins_discovery.py`, `gate_manifest`; to verify,
+        // design §14). It turns itself on for an agent whose secrets give
+        // it a socket and a token (`channels/hermes/enclos/adapter.py`).
+        let plugins = agent_folder(agent).child("plugins")?.child("enclos")?;
+        let file = |name: &str, contents: &'static str| Some((plugins.child(name)?, contents));
+        Some(AppChannel {
+            files: vec![
+                file("plugin.yaml", APP_PLUGIN_YAML)?,
+                file("__init__.py", APP_PLUGIN_INIT)?,
+                file("adapter.py", APP_PLUGIN_ADAPTER)?,
+                file("conversations.py", APP_PLUGIN_CONVERSATIONS)?,
+                file("interrupts.py", APP_PLUGIN_INTERRUPTS)?,
+                file("protocol.py", APP_PLUGIN_PROTOCOL)?,
+                file("outbox.py", APP_PLUGIN_OUTBOX)?,
+                file("approvals.py", APP_PLUGIN_APPROVALS)?,
+                file("routines.py", APP_PLUGIN_ROUTINES)?,
+                file("model.py", APP_PLUGIN_MODEL)?,
+                file("lines.py", APP_PLUGIN_LINES)?,
+                file("questions.py", APP_PLUGIN_QUESTIONS)?,
+                file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
+                file("decisions.py", APP_PLUGIN_DECISIONS)?,
+                file("held_tasks.py", APP_PLUGIN_HELD_TASKS)?,
+                file("visible.py", APP_PLUGIN_VISIBLE)?,
+                file("tasks.py", APP_PLUGIN_TASKS)?,
+                file("suggested_replies.py", APP_PLUGIN_SUGGESTED_REPLIES)?,
+                file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
+            ],
+            commands: vec![SandboxCommand::from_words(&[
+                HERMES,
+                "-p",
+                agent.as_str(),
+                "plugins",
+                "enable",
+                "enclos",
+            ])],
+            settings: vec![
+                // Not secrets: where to listen, and that the bridge, which
+                // holds the agent's token, decides who talks to the agent.
+                ("MOBILE_APP_SOCKET".to_owned(), socket.display().to_string()),
+                ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                // Hermes's home channel for the app is the agent's Home
+                // conversation (ADR 0044): what `/sethome` would set, from
+                // the start, so Hermes never asks for one. Overwrites what
+                // a `/sethome` left.
+                ("MOBILE_APP_HOME_CHANNEL".to_owned(), home.to_owned()),
+                // A question asked in the app waits for a phone, not a desk.
+                (
+                    "agent.clarify_timeout".to_owned(),
+                    CLARIFY_TIMEOUT_SECONDS.to_string(),
+                ),
+                // Public: what the plugin checks each runtime-approval
+                // decision against (ADR 0060). Given here rather than by
+                // the bridge's `hello`, which any program with the agent's
+                // token can send.
+                ("MOBILE_APP_BRIDGE_KEY".to_owned(), bridge_key.to_owned()),
+            ],
+        })
     }
 
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
@@ -277,6 +408,62 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn export_agent(
+        &self,
+        name: &AgentName,
+        prefix: &Path,
+        context: &str,
+    ) -> Option<super::RuntimeExport> {
+        let archive = prefix.with_extension("tar.gz");
+        Some(super::RuntimeExport {
+            format: "hermes-data-v1",
+            command: transfer("export", name, &archive, context),
+            archive,
+            package_plan: None,
+        })
+    }
+
+    fn import_export(
+        &self,
+        name: &AgentName,
+        archive: &Path,
+        format: &str,
+        context: &str,
+    ) -> Option<SandboxCommand> {
+        match format {
+            "native" => self.import_agent(name, archive),
+            "hermes-data-v1" => Some(transfer("import", name, archive, context)),
+            _ => None,
+        }
+    }
+
+    fn usage(
+        &self,
+        agents: &[RuntimeAgentName],
+        since: i64,
+        report: &Path,
+    ) -> Option<SandboxCommand> {
+        // Hermes keeps each agent's sessions, with their token counts and
+        // cost, in its own `state.db` (`hermes_state.py`); its own Python,
+        // which its installer puts in `~/.hermes/tools/python-<version>/`
+        // (seen with the install of 2026-11), reads them read-only inside
+        // the sandbox, else the sandbox's `python3`. Isolated (`-I`), so no
+        // file the agent planted in its site folders or here runs; and its
+        // output goes nowhere, so nothing it prints reaches the host's
+        // terminal or JSON unescaped: what it has to say is in the report.
+        let mut words: Vec<OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "python=python3; for candidate in \"$HOME\"/.hermes/tools/python-*/bin/python3; do if [ -x \"$candidate\" ]; then python=\"$candidate\"; fi; done; script=\"$1\"; shift; exec \"$python\" -I -c \"$script\" \"$@\" </dev/null >/dev/null 2>&1".into(),
+            "enclos-hermes-usage".into(),
+            include_str!("hermes/usage.py").into(),
+            report.as_os_str().to_owned(),
+            since.to_string().into(),
+        ];
+        words.extend(agents.iter().map(|a| OsString::from(a.as_str())));
+        Some(SandboxCommand::new(words))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
@@ -297,6 +484,10 @@ impl RuntimeAdapter for Hermes {
             .map(|p| (DiskPart::Runtime, at(p)));
         let caches = [".hermes/cache", ".npm", ".cache", "tmp"].map(|p| (DiskPart::Cache, at(p)));
         runtime.into_iter().chain(caches).collect()
+    }
+
+    fn fact_value(&self, at: &ValueAt, text: &str) -> Result<Option<String>, String> {
+        facts::value(at, text)
     }
 
     fn runtime_facts(&self) -> RuntimeFacts {
@@ -321,7 +512,7 @@ impl RuntimeAdapter for Hermes {
             model: Some(ValueAt {
                 file: file("config.yaml"),
                 // Hermes reads either key.
-                keys: &["model.default", "model.model"],
+                keys: vec!["model.default".into(), "model.model".into()],
             }),
             // Each profile keeps its own provider, which a new one copies
             // from `default` as it is then: `auto` before the sandbox's
@@ -334,7 +525,7 @@ impl RuntimeAdapter for Hermes {
             provider: Some(ProviderAt {
                 at: ValueAt {
                     file: file("config.yaml"),
-                    keys: &["model.provider"],
+                    keys: vec!["model.provider".into()],
                 },
                 unchosen: &["auto", ""],
                 choose: format!("{HERMES} -p {agent} model"),
@@ -398,12 +589,29 @@ impl RuntimeAdapter for Hermes {
             .to_vec()
     }
 
+    fn restart_relevant(&self, file: &HomePath, text: &str) -> String {
+        // By Hermes's source, its gateway loads `config.yaml` for each turn
+        // (`_load_gateway_config`; to verify on a host, design §14): a change
+        // of the `model` block alone restarts nothing (ADR 0069, proposed).
+        // YAML this reader does not follow is compared whole, as before; the
+        // channel's `model.py` follows the same rules for its `applies`.
+        let config = file.as_path().file_name() == Some(std::ffi::OsStr::new("config.yaml"));
+        match config
+            .then(|| facts::without_top_level(text, "model"))
+            .flatten()
+        {
+            Some(rest) => rest,
+            None => text.to_owned(),
+        }
+    }
+
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool {
         // `secrets.command` as `agent_secrets_source` sets it, read line by
         // line: a clone or an import keeps the command and turns it off
         // (`after_create_agent`), and a line outside it says nothing. YAML
         // may fold the command over two lines, both inside the block.
         let secrets_file = secrets_file.to_string_lossy();
+        let quoted_file = secrets_file.replace('\'', "'\\''");
         let (mut reads, mut on) = (false, false);
         let (mut in_secrets, mut block) = (false, None);
         for line in text.lines() {
@@ -420,7 +628,7 @@ impl RuntimeAdapter for Hermes {
             }
             match block {
                 Some(at) if indent > at => {
-                    reads |= content.contains(&*secrets_file);
+                    reads |= content.contains(&*secrets_file) || content.contains(&quoted_file);
                     on |= content == "enabled: true";
                 }
                 _ => block = (in_secrets && content == "command:").then_some(indent),
@@ -429,14 +637,18 @@ impl RuntimeAdapter for Hermes {
         reads && on
     }
 
-    fn secrets_folder_var(&self) -> Option<&'static str> {
+    fn secret_files(&self) -> Option<SecretFiles> {
         // Hermes loads `$HERMES_MANAGED_DIR/.env` into its own environment,
         // last and with override, when the folder exists
         // (`hermes_cli/managed_scope.py`, `env_loader._apply_managed_env`).
-        Some("HERMES_MANAGED_DIR")
+        Some(SecretFiles {
+            folder_variable: Some("HERMES_MANAGED_DIR"),
+            sandbox: SecretFileFormat::EscapedDotenv,
+            agent: SecretFileFormat::QuotedDotenv,
+        })
     }
 
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         // Hermes 0.22.3's chat (CLI, TUI, stream-json) cannot run without the
         // gateway: it finds it, gets a ticket for its own agent (a Hermes
         // profile) over
@@ -445,10 +657,7 @@ impl RuntimeAdapter for Hermes {
         // `hermes_cli/gateway_client.py`).
         Some(RuntimeListener {
             service: GATEWAY,
-            // Its web dashboard, on the same listener. Bound to loopback,
-            // Hermes asks no login for it, by its code
-            // (`listener_auth_required` in `gateway/run_api.py`).
-            page: Some("/"),
+            ports: ListenerPorts::Ephemeral,
         })
     }
 
@@ -469,6 +678,19 @@ impl RuntimeAdapter for Hermes {
                 "0",
             ]),
             page: "/",
+            socket: Some(RuntimeSocketDashboard {
+                source: include_str!("hermes/dashboard.py"),
+                // Hermes's isolated launcher only imports modules from its
+                // own dependency environment. Copy our staged adapter there
+                // from inside the sandbox, as other adapter files are copied;
+                // never load sandbox Python into the host's interpreter.
+                launcher: SandboxCommand::from_words(&[
+                    "/bin/sh",
+                    "-c",
+                    "set -eu\nadapter=\"$HOME/.hermes/hermes-agent/_enclos_dashboard.py\"\ntrap '/bin/rm -f \"$adapter\"' EXIT\ntrap 'exit 1' HUP INT TERM\n/bin/cp \"$1\" \"$adapter\"\nhermes --run-module _enclos_dashboard \"$2\"",
+                    "enclos-dashboard",
+                ]),
+            }),
         })
     }
 
@@ -549,9 +771,34 @@ impl RuntimeAdapter for Hermes {
     }
 }
 
+fn transfer(operation: &str, name: &AgentName, path: &Path, context: &str) -> SandboxCommand {
+    SandboxCommand::new(vec!["/bin/sh".into(), "-c".into(),
+        "python=\"$HOME/.hermes/hermes-agent/.hermes/bin/python\"; if [ ! -x \"$python\" ]; then python=python3; fi; exec \"$python\" -c \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"".into(),
+        "enclos-hermes-transfer".into(), include_str!("hermes/transfer.py").into(), operation.into(), name.as_str().into(), path.as_os_str().to_owned(), context.into()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_protected_source_path_with_a_quote_is_passed_literally_to_the_shell() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("one'quote.env");
+        std::fs::write(&file, "harmless fixture").unwrap();
+        let commands = Hermes
+            .agent_secrets_source(&RuntimeAgentName::new("main").unwrap(), &file)
+            .unwrap();
+        let words = commands[0].clone().into_words();
+        let read = words.last().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(read)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"harmless fixture");
+    }
     use crate::policy::file::{FsLayer, PolicyFile};
 
     #[test]
@@ -634,6 +881,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_change_of_an_agents_model_alone_does_not_restart_the_gateway() {
+        let config = at(".hermes/profiles/main/config.yaml");
+        let env = at(".hermes/profiles/main/.env");
+        let before =
+            "model:\n  default: model-1\n  provider: provider-a\nterminal:\n  backend: local\n";
+        let after =
+            "model:\n  default: model-2\n  provider: provider-b\nterminal:\n  backend: local\n";
+        let relevant = |file: &HomePath, text: &str| Hermes.restart_relevant(file, text);
+        assert_eq!(relevant(&config, before), relevant(&config, after));
+        let other = after.replace("local", "docker");
+        assert_ne!(relevant(&config, before), relevant(&config, &other));
+        // `.env` is compared whole: a key there needs a restart.
+        assert_ne!(relevant(&env, "model: 1\n"), relevant(&env, "model: 2\n"));
+        // YAML the reader does not follow is compared whole.
+        let tabbed = "model:\n\tdefault: model-1\n";
+        assert_eq!(relevant(&config, tabbed), tabbed);
+    }
+
     /// An agent reads its own secrets file through its own
     /// `secrets.command` (ADR 0036); a setting is Hermes's `config set`;
     /// a Telegram bot is the people it answers, its token by name, and the
@@ -668,7 +934,12 @@ mod tests {
         );
         assert_eq!(
             Hermes
-                .channel_settings(Channel::Telegram, "TELEGRAM_BOT_TOKEN_MAIN", &users)
+                .channel_settings(
+                    &RuntimeAgentName::new("main").unwrap(),
+                    Channel::Telegram,
+                    "TELEGRAM_BOT_TOKEN_MAIN",
+                    &users
+                )
                 .unwrap(),
             [
                 ("TELEGRAM_ALLOWED_USERS".to_owned(), "111,222".to_owned()),
@@ -683,17 +954,11 @@ mod tests {
         // another agent's in its own folder's.
         let default = RuntimeAgentName::new("default").unwrap();
         assert_eq!(
-            Hermes
-                .channel_token_file(Channel::Telegram, &default)
-                .unwrap()
-                .0,
+            Hermes.channel_token_files(Channel::Telegram, &default)[0].0,
             at(".hermes/.env")
         );
         assert_eq!(
-            Hermes
-                .channel_token_file(Channel::Telegram, &agent)
-                .unwrap()
-                .0,
+            Hermes.channel_token_files(Channel::Telegram, &agent)[0].0,
             at(".hermes/profiles/main/.env")
         );
     }
@@ -727,8 +992,9 @@ mod tests {
 
     #[test]
     fn the_listening_service_is_one_of_its_services() {
-        let listener = Hermes.listener().unwrap();
+        let listener = Hermes.listener(41000).unwrap();
         assert_eq!(listener.service.as_str(), "gateway");
+        assert_eq!(listener.ports, ListenerPorts::Ephemeral);
         assert!(Hermes.services().iter().any(|s| s.name == listener.service));
     }
 
@@ -740,6 +1006,62 @@ mod tests {
             "hermes dashboard --no-open --isolated --port 0"
         );
         assert_eq!(dashboard.page, "/");
+    }
+
+    #[test]
+    fn the_dashboard_launcher_cleans_up_after_term_in_sh_and_dash() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        for shell in ["/bin/sh", "/bin/dash"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let checkout = home.path().join(".hermes/hermes-agent");
+            std::fs::create_dir_all(&checkout).unwrap();
+            let bin = home.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::test_scripts::write_script(
+                &bin.join("hermes"),
+                "echo ready\nexec /bin/sleep 60",
+            );
+            let source = home.path().join("adapter.py");
+            std::fs::write(&source, "# staged adapter").unwrap();
+            let launcher = Hermes
+                .dashboard()
+                .unwrap()
+                .socket
+                .unwrap()
+                .launcher
+                .into_words();
+            let mut command = Command::new(shell);
+            command
+                .args(&launcher[1..])
+                .arg(&source)
+                .arg("50000")
+                .env("HOME", home.path())
+                .env("PATH", &bin)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0);
+            let mut child = crate::lifecycle::marker::spawn_unmarked(&mut command).unwrap();
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let adapter = checkout.join("_enclos_dashboard.py");
+            assert!(adapter.exists());
+            rustix::process::kill_process_group(
+                rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+                rustix::process::Signal::TERM,
+            )
+            .unwrap();
+            child.wait_with_output().unwrap();
+            assert!(!adapter.exists(), "{shell} left the adapter after TERM");
+        }
     }
 
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {
@@ -903,7 +1225,7 @@ mod tests {
             main_facts.model,
             Some(ValueAt {
                 file: at(".hermes/profiles/main/config.yaml"),
-                keys: &["model.default", "model.model"],
+                keys: vec!["model.default".into(), "model.model".into()],
             })
         );
         assert_eq!(
@@ -987,6 +1309,99 @@ mod tests {
                 "{backend:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_app_channel_goes_in_the_agents_own_home_and_is_enabled_there() {
+        let socket = Path::new("/h/.enclos-app/main.sock");
+        let main = RuntimeAgentName::new("main").unwrap();
+        let token_file = Path::new("/protected/secrets/main.env");
+        let app = Hermes
+            .app_channel(
+                &main,
+                socket,
+                token_file,
+                "home.lab.main",
+                "the-bridges-public-key",
+            )
+            .unwrap();
+        let places: Vec<String> = app
+            .files
+            .iter()
+            .map(|(place, _)| place.as_path().display().to_string())
+            .collect();
+        assert_eq!(
+            places,
+            [
+                ".hermes/profiles/main/plugins/enclos/plugin.yaml",
+                ".hermes/profiles/main/plugins/enclos/__init__.py",
+                ".hermes/profiles/main/plugins/enclos/adapter.py",
+                ".hermes/profiles/main/plugins/enclos/conversations.py",
+                ".hermes/profiles/main/plugins/enclos/interrupts.py",
+                ".hermes/profiles/main/plugins/enclos/protocol.py",
+                ".hermes/profiles/main/plugins/enclos/outbox.py",
+                ".hermes/profiles/main/plugins/enclos/approvals.py",
+                ".hermes/profiles/main/plugins/enclos/routines.py",
+                ".hermes/profiles/main/plugins/enclos/model.py",
+                ".hermes/profiles/main/plugins/enclos/lines.py",
+                ".hermes/profiles/main/plugins/enclos/questions.py",
+                ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
+                ".hermes/profiles/main/plugins/enclos/decisions.py",
+                ".hermes/profiles/main/plugins/enclos/held_tasks.py",
+                ".hermes/profiles/main/plugins/enclos/visible.py",
+                ".hermes/profiles/main/plugins/enclos/tasks.py",
+                ".hermes/profiles/main/plugins/enclos/suggested_replies.py",
+                ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
+            ]
+        );
+        // Every module of the plugin goes in: one left out fails the
+        // plugin's import, and the channel with it.
+        let modules =
+            std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("channels/hermes/enclos"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".py") || name.ends_with(".yaml"));
+        for module in modules {
+            assert!(
+                places.contains(&format!(".hermes/profiles/main/plugins/enclos/{module}")),
+                "{module} is not put in the sandbox"
+            );
+        }
+        assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));
+        assert_eq!(
+            app.commands
+                .iter()
+                .map(SandboxCommand::shown)
+                .collect::<Vec<_>>(),
+            ["hermes -p main plugins enable enclos"]
+        );
+        assert_eq!(
+            app.settings,
+            [
+                (
+                    "MOBILE_APP_SOCKET".to_owned(),
+                    "/h/.enclos-app/main.sock".to_owned()
+                ),
+                ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                (
+                    "MOBILE_APP_HOME_CHANNEL".to_owned(),
+                    "home.lab.main".to_owned()
+                ),
+                ("agent.clarify_timeout".to_owned(), "3600".to_owned()),
+                (
+                    "MOBILE_APP_BRIDGE_KEY".to_owned(),
+                    "the-bridges-public-key".to_owned()
+                ),
+            ]
+        );
+        let default = RuntimeAgentName::new("default").unwrap();
+        let app = Hermes
+            .app_channel(&default, socket, token_file, "home.lab.default", "key")
+            .unwrap();
+        assert_eq!(
+            app.files[0].0.as_path(),
+            Path::new(".hermes/plugins/enclos/plugin.yaml")
+        );
     }
 
     #[test]

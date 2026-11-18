@@ -12,6 +12,8 @@ Secrets are stored in the macOS Keychain, libsecret, or a `0600` file on a headl
 
 Per-agent grants would not provide isolation. The sandbox is the permission boundary and its agents share a home ([0003](0003-sandbox-is-the-permission-boundary.md)), so any agent can read what another saved. One gateway serves every agent of a sandbox ([0021](0021-one-runtime-service-per-sandbox.md)), so it would need every agent's secrets anyway, and messaging, the first use of secrets, runs in that gateway. Agents also already share the runtime's login: in the prototype, agents with no login of their own used the sandbox's.
 
+A complete agent export proposes an explicit, private-file exception to secret values staying in their store; see [proposed ADR 0061](0061-agent-exports-include-enclos-presentation.md). It does not grant a sandbox access to any host secret store.
+
 ## Consequences
 
 - Two agents that must not share a secret go in different sandboxes.

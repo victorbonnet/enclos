@@ -49,6 +49,11 @@ pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersEr
     host::tcp_listeners_at(port)
 }
 
+/// One host-wide listing, shared by status's dashboard prerequisite checks.
+pub fn all_tcp_listeners() -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    host::all_tcp_listeners()
+}
+
 /// The TCP addresses `pid` listens on in the network namespace of
 /// `namespace`, a process in it. From `/proc`: only Linux gives a sandbox a
 /// network namespace of its own (ADR 0039).
@@ -203,5 +208,7 @@ mod tests {
         // Another test's program between fork and exec may hold a copy.
         let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         assert!(holders.contains(&(std::process::id(), at)), "{holders:?}");
+        let all = all_tcp_listeners().unwrap();
+        assert!(all.contains(&(std::process::id(), at)), "{all:?}");
     }
 }

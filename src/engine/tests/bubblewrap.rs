@@ -90,7 +90,11 @@ exit 99"#,
         );
         let backend = Bubblewrap::at(&at("bwrap"), &at("systemd-run"), Some(at("enclos")));
         let layout = Layout::at(at("enclos-home"));
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         let socket = layout.proxy_socket("lab");
         // The proxy only tells its listener to listen: an interpreter starting
@@ -288,7 +292,8 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
             fds.to_str().unwrap()
         ]
     );
-    assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
+    assert_eq!(&args[..2], ["--tmpfs", "/"]);
+    assert!(args.windows(2).any(|words| words == ["--remount-ro", "/"]));
     // The session joined the namespace holder first, which became
     // bubblewrap.
     let join = stood.read("join");
@@ -415,6 +420,34 @@ fn status_looks_for_no_listener_of_a_bubblewrap_sandbox() {
     assert_eq!(
         view.sandboxes[0].network_listeners,
         crate::engine::Fact::NotProvided
+    );
+}
+
+#[test]
+fn a_stopped_namespace_sandbox_still_offers_its_dashboard() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let mut record = stood.engine.record(&stood.name).unwrap();
+    record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+    record.state = crate::model::sandbox::SandboxState::Stopped;
+    let runtime = crate::runtime::adapter(record.runtime.unwrap());
+    assert!(
+        stood
+            .engine
+            .dashboard_of(
+                &record,
+                runtime.as_ref(),
+                &super::super::listener::HostServices::default()
+            )
+            .is_ok()
+    );
+    let status = stood
+        .engine
+        .sandbox_status(record, Some(runtime.as_ref()), crate::model::now())
+        .unwrap();
+    assert_eq!(
+        status.dashboard_command,
+        Some(format!("enclos dashboard {}", stood.name))
     );
 }
 

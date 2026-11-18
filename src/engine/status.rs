@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
-use super::listener::{Network, NoPort, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -31,13 +30,12 @@ use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
-use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter};
-use crate::state::StateStore;
+use crate::runtime::{RuntimeAdapter, RuntimeAgentName, adapter};
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
 pub(super) use facts::read_provider;
 use facts::{exists, newest, read_value};
-use printable::printable;
+pub(super) use printable::printable;
 pub use printable::printable_line;
 use suggestion::REFUSED_DAYS;
 pub use suggestion::{IDLE_DAYS, Suggestion, suggest};
@@ -59,10 +57,11 @@ impl Engine {
         let now = now();
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
+        let dashboard_services = super::listener::HostServices::default();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
-            match self.sandbox_status(record, runtime.as_deref(), now) {
+            match self.sandbox_status_in(record, runtime.as_deref(), now, &dashboard_services) {
                 Ok(s) => sandboxes.push(s),
                 Err(e) => unlisted.push(Unlisted {
                     name,
@@ -83,11 +82,27 @@ impl Engine {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn sandbox_status(
         &self,
         record: SandboxRecord,
         runtime: Option<&dyn RuntimeAdapter>,
         now: Timestamp,
+    ) -> Result<SandboxStatus> {
+        self.sandbox_status_in(
+            record,
+            runtime,
+            now,
+            &super::listener::HostServices::default(),
+        )
+    }
+
+    fn sandbox_status_in(
+        &self,
+        record: SandboxRecord,
+        runtime: Option<&dyn RuntimeAdapter>,
+        now: Timestamp,
+        dashboard_services: &super::listener::HostServices,
     ) -> Result<SandboxStatus> {
         let name = record.name.clone();
         let dir = self.layout.sandbox_dir(name.as_str());
@@ -148,16 +163,11 @@ impl Engine {
             true => Fact::NotProvided,
             false => network_listeners(&look, &running),
         };
-        let dashboard = match runtime.and_then(|rt| rt.listener()) {
-            Some(_) if own_network => Fact::NotProvided,
-            Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
-            None => Fact::NotProvided,
-        };
-        // There, `enclos dashboard` opens it, with no address to give now.
-        let dashboard_command = runtime
-            .and_then(|rt| rt.dashboard())
-            .filter(|_| own_network)
-            .map(|_| format!("enclos dashboard {name}"));
+        let dashboard_command = runtime.and_then(|rt| {
+            self.dashboard_of(&record, rt, dashboard_services)
+                .ok()
+                .map(|_| format!("enclos dashboard {name}"))
+        });
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -177,7 +187,7 @@ impl Engine {
                         name: kind.display_name(),
                         version: facts
                             .version
-                            .map_or(Fact::NotProvided, |v| read_value(&home, &v)),
+                            .map_or(Fact::NotProvided, |v| read_value(&home, &v, rt)),
                         logged_in: facts.login.map_or(Fact::NotProvided, |f| exists(&home, &f)),
                         installed: facts
                             .install
@@ -205,7 +215,6 @@ impl Engine {
             policy_unreadable_refused,
             agents,
             disk,
-            dashboard,
             dashboard_command,
             network_listeners,
             name,
@@ -222,6 +231,10 @@ impl Engine {
     ) -> Result<AgentList> {
         let tracked = self.state.agents(name)?;
         let found = runtime.agents_in(home);
+        // What the running app bridge last heard each agent's plugin say it
+        // is doing: nothing without a bridge database or a bridge that runs,
+        // and said when either cannot be read.
+        let (activity, activity_unreadable) = bridge_activity(&self.layout.app_store());
         let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
         let mut names: Vec<RuntimeAgentName> = builtin.iter().cloned().collect();
         for n in tracked
@@ -256,15 +269,20 @@ impl Engine {
                     AgentKind::Untrackable
                 };
                 let facts = runtime.agent_facts(&agent);
-                let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
+                let (provider, choose_provider) =
+                    read_provider(home, facts.provider.as_ref(), runtime);
                 AgentStatus {
+                    working: activity
+                        .get(&format!("{name}/{}", agent.as_str()))
+                        .map(|a| a.kinds())
+                        .unwrap_or_default(),
                     provider,
                     choose_provider,
                     kind,
                     last_active: newest(home, &facts.activity),
                     model: facts
                         .model
-                        .map_or(Fact::NotProvided, |v| read_value(home, &v)),
+                        .map_or(Fact::NotProvided, |v| read_value(home, &v, runtime)),
                     // Filled in from the walk.
                     bytes: Fact::NotProvided,
                     name: agent,
@@ -274,7 +292,31 @@ impl Engine {
         Ok(AgentList {
             agents,
             unreadable: found.err().map(|why| why.to_string()),
+            activity_unreadable,
         })
+    }
+}
+
+/// What each agent (`<sandbox>/<agent>`) is doing, as the app bridge whose
+/// database is `store` recorded it, if that bridge runs; and why it could
+/// not be read, if it could not. A bridge that stopped or crashed left its
+/// last state behind, which says nothing now.
+fn bridge_activity(
+    store: &Path,
+) -> (
+    std::collections::HashMap<String, enclos_protocol::task::Activity>,
+    Option<String>,
+) {
+    if !store.exists() {
+        return Default::default();
+    }
+    let read = crate::bridge::store::bridge_runs(store).and_then(|runs| match runs {
+        true => crate::bridge::store::Store::read_activity(store).map_err(std::io::Error::other),
+        false => Ok(Default::default()),
+    });
+    match read {
+        Ok(activity) => (activity, None),
+        Err(e) => (Default::default(), Some(e.to_string())),
     }
 }
 
@@ -292,31 +334,6 @@ pub(super) fn last_used(
         .flatten()
         .chain(last_network)
         .fold(created, Timestamp::max)
-}
-
-/// The address of the page `listener`'s service serves on the host, at the
-/// port sessions are given (ADR 0028), found the same way.
-fn dashboard(
-    store: &dyn StateStore,
-    name: &SandboxName,
-    listener: &RuntimeListener,
-    running: &[SessionRecord],
-) -> Fact<String> {
-    let Some(page) = listener.page else {
-        return Fact::NotProvided;
-    };
-    let service = listener.service.as_str();
-    let runs = running
-        .iter()
-        .any(|s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service));
-    if !runs {
-        return Fact::Absent;
-    }
-    match service_listener(store, name, service, &Network::Host) {
-        Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
-        Err(NoPort::NotRunning(_)) => Fact::Absent,
-        Err(why) => Fact::CannotTell(why.to_string()),
-    }
 }
 
 /// Members of the `running` sessions that run in the sandbox (the proxy runs
