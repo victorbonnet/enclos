@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_name_says_it_holds_a_secret_by_its_last_word() {
-        for secret in [
+        for (index, name) in [
             "TELEGRAM_BOT_TOKEN",
             "OPENROUTER_API_KEY",
             "api_key",
@@ -313,8 +313,14 @@ mod tests {
             "storage.secretKey",
             "x.tokenValue",
             "x.passwordHash",
-        ] {
-            assert!(names_a_secret(secret), "{secret}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                names_a_secret(name),
+                "unexpected result for naming case {index}"
+            );
         }
         for not in [
             "TELEGRAM_ALLOWED_USERS",
