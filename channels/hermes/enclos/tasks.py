@@ -55,32 +55,24 @@ MAX_UNANSWERED = 1024
 # Hermes's hooks after a board write, taken as a cue to read it again.
 HOOKS = ("kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked", "on_kanban_task_updated")
 
-# What the agent is told, in each model call (a `pre_llm_call` context), about
-# the text it writes on the board: the app draws a task's body and comments as
-# markdown, as it draws what an agent says, and its title as one plain line
-# (docs/protocol.md, Task details). Hermes keeps the board's text as written,
-# so whoever writes it, a coordinator or a worker, formats it for the phone.
-# Short, as it is in every call; it changes when the app's list does.
+# What the agent is told in each turn (a `pre_llm_call` context, added to the
+# turn's user message) about the text it writes on the board: the app draws a
+# task's body and comments as markdown, as it draws what an agent says, and its
+# title and result as one plain line each (docs/protocol.md, Task details).
+# Hermes keeps the board's text as written, so whoever writes it, the agent
+# asking for a task or the one doing it, formats it for the phone. Short, as
+# it is in every turn; it changes when the app's list does.
 WRITING_HINT = (
-    "The person reads this agent's kanban tasks in the enclos mobile app. A task's body and its "
-    "comments render as Markdown: bold, italic, strikethrough, inline code, headings, lists, quotes, fenced code "
-    "blocks, narrow tables and links. Start a body with one plain sentence on what the task is for, "
-    "then short sections. A task's title shows as one plain line, without Markdown."
+    "The person reads the kanban tasks on this Hermes's boards in the enclos mobile app. A task's body and its "
+    f"comments render as Markdown: {protocol.MARKDOWN_ELEMENTS}. Keep tables narrow; only web and mailto links "
+    "open. Start a body with one plain sentence on what the task is for, then short sections. A task's title "
+    "and the result you leave when it ends each show as one plain line, without Markdown."
 )
 
 
 def writing_context(**_) -> dict[str, str]:
     """The `pre_llm_call` context telling the agent how the app draws the board's text."""
     return {"context": WRITING_HINT}
-
-
-def has_board() -> bool:
-    """Whether this Hermes has the kanban board the plugin reads."""
-    try:
-        from hermes_cli import kanban_db
-    except Exception:
-        return False
-    return callable(getattr(kanban_db, "list_tasks", None)) and callable(getattr(kanban_db, "list_boards", None))
 
 # What is read of a task: its row, when its state last changed (its newest
 # event, and its newest claim for a run), and the enclos conversation it was
@@ -437,9 +429,11 @@ def board_databases(kb) -> list[tuple[str, Path]]:
     return found
 
 
-def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
-    """The board of the Hermes this plugin runs in, for the profile whose home
-    is `home`; None when this Hermes has no board, which turns `tasks` off."""
+def _kanban(home: Optional[Path]):
+    """Hermes's kanban module and the profile whose home is `home`, when this
+    Hermes has the board's functions the plugin reads it with (`list_tasks`,
+    `list_boards`) and `home` is a profile's; None otherwise, saying why in the
+    log. Not whether any board or task exists yet."""
     try:
         from hermes_cli import kanban_db
         from hermes_constants import profile_name_for_home
@@ -453,6 +447,22 @@ def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
     except Exception as error:
         logger.info("Tasks are off for this Hermes: %s: %s", type(error).__name__, error)
         return None
+    return kanban_db, profile
+
+
+def has_board(home: Optional[Path]) -> bool:
+    """Whether `hermes_board` turns tasks on for the profile whose home is
+    `home`: the writing hint goes with the tasks the app shows."""
+    return _kanban(home) is not None
+
+
+def hermes_board(home: Optional[Path], platform: str) -> Optional[Board]:
+    """The board of the Hermes this plugin runs in, for the profile whose home
+    is `home`; None when this Hermes has no board, which turns `tasks` off."""
+    found = _kanban(home)
+    if found is None:
+        return None
+    kanban_db, profile = found
 
     def files() -> list[str]:
         return [str(path) for _, path in board_databases(kanban_db)]

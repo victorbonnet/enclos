@@ -324,16 +324,18 @@ class HeldDetailTest(unittest.TestCase):
 class WritingHintTest(unittest.TestCase):
     """The hint promises what the app draws of a task, as the platform hint does of a message."""
 
-    def test_it_names_what_the_app_draws_of_a_body_and_comments(self):
-        for element in ("body", "comments", "Markdown", "bold", "italic", "strikethrough", "inline code",
-                        "headings", "lists", "quotes", "code blocks", "tables", "links"):
-            with self.subTest(element):
-                self.assertIn(element, tasks.WRITING_HINT)
+    def test_it_names_what_the_app_draws_as_the_platform_hint_does(self):
+        # The elements themselves are checked once, in test_protocol's Hint.
+        self.assertIn(f"body and its comments render as Markdown: {protocol.MARKDOWN_ELEMENTS}", tasks.WRITING_HINT)
+        self.assertIn(protocol.MARKDOWN_ELEMENTS, protocol.PLATFORM_HINT)
+        self.assertIn("web and mailto links", tasks.WRITING_HINT)
 
-    def test_it_says_the_title_is_plain(self):
-        self.assertIn("title shows as one plain line", tasks.WRITING_HINT)
+    def test_it_says_the_title_and_result_are_plain(self):
+        for part in ("title", "result", "plain line"):
+            with self.subTest(part):
+                self.assertIn(part, tasks.WRITING_HINT)
 
-    def test_it_stays_short_for_every_call(self):
+    def test_it_stays_short_for_every_turn(self):
         self.assertLess(len(tasks.WRITING_HINT), 500)
 
 

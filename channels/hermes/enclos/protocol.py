@@ -27,6 +27,14 @@ USAGE_TOKENS = ("input", "output", "cache_read", "cache_write", "reasoning")
 # The longest conversation title sent (Hermes' own limit is 100 characters).
 MAX_TITLE_CHARS = 100
 
+# What the app draws of an agent's markdown, in a message and in a task's body
+# and comments ("What the agent says is markdown" in docs/protocol.md). Both
+# hints name it (PLATFORM_HINT, tasks.WRITING_HINT), so it changes once when
+# the app's list does.
+MARKDOWN_ELEMENTS = (
+    "bold, italic, strikethrough, inline code, headings, lists, quotes, fenced code blocks, tables and links"
+)
+
 # What the runtime tells the agent about this channel, in its system prompt
 # (Hermes: the platform's `platform_hint`): where the person is, and what the
 # app draws of the markdown it writes ("What the agent says is markdown" in
@@ -34,8 +42,7 @@ MAX_TITLE_CHARS = 100
 # app's list does.
 PLATFORM_HINT = (
     "You talk with the user through the enclos mobile app on their phone. "
-    "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
-    "fenced code blocks, tables and links. Keep tables narrow. A newline is a line break. "
+    f"Markdown renders: {MARKDOWN_ELEMENTS}. Keep tables narrow. A newline is a line break. "
     "Send MEDIA:/absolute/path/to/file on its own line: images show inline, "
     "other files as attachments; both can be shared. "
     "For decisions use clarify with questions:[{question,choices,multi_select?}]; "
