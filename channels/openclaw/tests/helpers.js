@@ -1,11 +1,13 @@
+import { createECDH } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { once } from 'node:events';
+import { tmpdir } from 'node:os';
 import { message, encode } from '../protocol.js';
 
 export function accountFixture(t, id = 'main') {
-  const folder = mkdtempSync('/private/tmp/enclos-channel-');
+  const folder = mkdtempSync(path.join(tmpdir(), 'enclos-channel-'));
   t.after(() => rmSync(folder, { recursive: true, force: true }));
   const tokenFile = path.join(folder, `${id}.env`);
   writeFileSync(tokenFile, JSON.stringify({ MOBILE_APP_TOKEN: 'only-for-tests' }), { mode: 0o600 });
@@ -48,3 +50,6 @@ export async function bridge(socket) {
     async close() { if (!peer.destroyed) { peer.destroy(); await once(peer, 'close'); } },
   };
 }
+
+// A public P-256 fixture key for tests that only negotiate approval capabilities.
+export const bridgeApprovalFixtureKey = createECDH('prime256v1').generateKeys('base64url');
