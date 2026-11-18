@@ -913,6 +913,14 @@ mod tests {
             let mut text = String::new();
             request.read_line(&mut text).unwrap();
             assert_eq!(text, "GET /kanban HTTP/1.1\r\n");
+            // Read the full request before replying and closing the socket.
+            loop {
+                text.clear();
+                assert_ne!(request.read_line(&mut text).unwrap(), 0);
+                if text == "\r\n" {
+                    break;
+                }
+            }
             let body = "<html><head></head><body>test board</body></html>";
             write!(
                 stream,
