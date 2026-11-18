@@ -4354,6 +4354,10 @@ mod connection_end_tests {
 
         /// The next message, conversations' details included.
         fn receive_any(&mut self) -> Option<ToDevice> {
+            self.receive_any_with_timeout_message("nothing from the bridge in time")
+        }
+
+        fn receive_any_with_timeout_message(&mut self, timeout_message: &str) -> Option<ToDevice> {
             loop {
                 match self.socket.read() {
                     Ok(Message::Binary(bytes)) => {
@@ -4366,7 +4370,7 @@ mod connection_end_tests {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        panic!("nothing from the bridge in time")
+                        panic!("{timeout_message}")
                     }
                     Err(_) => return None,
                 }
@@ -4582,8 +4586,11 @@ mod connection_end_tests {
             )
         });
         loop {
-            if let ToDevice::OpenItems { items, .. } =
-                device.receive().expect("the bridge closed after the ask")
+            if let ToDevice::OpenItems { items, .. } = device
+                .receive_any_with_timeout_message(
+                    "no live open-items snapshot within the read timeout",
+                )
+                .expect("the connection ended before the live open-items snapshot")
             {
                 assert!(items.iter().any(|item| item.id == "live-question"));
                 break;
