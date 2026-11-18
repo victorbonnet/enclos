@@ -14,6 +14,9 @@ mod http;
 mod local;
 mod lock;
 
+use std::io;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -27,8 +30,10 @@ use crate::backend::NamespaceHolder;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::now;
+use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::SessionId;
+use crate::relay::inward::WayIn;
 use crate::runtime::{ListenerPorts, RuntimeAdapter, RuntimeDashboard, adapter};
 use local::Local;
 use lock::{DashboardLock, Running};
@@ -60,6 +65,54 @@ pub struct DashboardEnd {
     pub failed: Option<String>,
 }
 
+/// The bridge reaches the task board on an inherited private Unix listener.
+#[derive(Clone)]
+pub(crate) struct TaskBoardUpstream {
+    socket: PathBuf,
+    active: Arc<AtomicBool>,
+}
+
+impl TaskBoardUpstream {
+    #[cfg(test)]
+    pub(crate) fn test_socket(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn connect(&self) -> io::Result<UnixStream> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "task board closed",
+            ));
+        }
+        UnixStream::connect(&self.socket)
+    }
+}
+
+enum DashboardTarget {
+    Namespace(WayIn, u16),
+    Local(PathBuf),
+}
+
+enum OpenFor<'a> {
+    Host(&'a mut dyn FnMut(&DashboardOpen)),
+    TaskBoard {
+        session_life: Duration,
+        opened: &'a mut dyn FnMut(TaskBoardUpstream),
+    },
+}
+
+struct UpstreamLifetime(Arc<AtomicBool>);
+
+impl Drop for UpstreamLifetime {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Engine {
     /// `enclos dashboard`: runs the dashboard of `name`'s runtime as a
     /// session and serves it to this user on the host's 127.0.0.1 at the
@@ -85,8 +138,47 @@ impl Engine {
         ended: &AtomicBool,
         opened: &mut dyn FnMut(&DashboardOpen),
     ) -> Result<DashboardEnd> {
+        self.dashboard_session(by, name, ended, OpenFor::Host(opened))
+    }
+
+    pub(crate) fn task_board_until(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        ended: &AtomicBool,
+        session_life: Duration,
+        opened: &mut dyn FnMut(TaskBoardUpstream),
+    ) -> Result<DashboardEnd> {
+        self.dashboard_session(
+            by,
+            name,
+            ended,
+            OpenFor::TaskBoard {
+                session_life,
+                opened,
+            },
+        )
+    }
+
+    fn dashboard_session(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        ended: &AtomicBool,
+        mut open_for: OpenFor<'_>,
+    ) -> Result<DashboardEnd> {
         let record = self.record(name)?;
         let runtime = adapter(self.runtime_of(name)?);
+        let task_board_session_minutes = match &open_for {
+            OpenFor::Host(_) => None,
+            OpenFor::TaskBoard { session_life, .. } => Some(session_life.as_secs().div_ceil(60)),
+        };
+        let task_board = task_board_session_minutes.is_some();
+        if task_board && runtime.kind() != RuntimeKind::Hermes {
+            return Err(Error::Dashboard {
+                what: format!("the runtime of sandbox {name} has no supported task board"),
+            });
+        }
         let (holder, dashboard) = self.dashboard_of(
             &record,
             runtime.as_ref(),
@@ -103,20 +195,32 @@ impl Engine {
             pid: std::process::id(),
             session: None,
             since: now(),
+            task_board_session_minutes,
         };
-        let mut lock =
-            DashboardLock::take(&self.layout.dashboard_lock(name.as_str()), name, &running)?;
-        let mut local = match holder {
-            None => Some(Local::prepare(
+        let normal_lock = self.layout.dashboard_lock(name.as_str());
+        // Linux's host dashboard uses its namespace relay and can coexist
+        // with the task board. On macOS both use the protected socket path.
+        let lock_path = if task_board && holder.is_some() {
+            normal_lock.with_file_name("task-board.lock")
+        } else {
+            normal_lock
+        };
+        let mut lock = DashboardLock::take(&lock_path, name, &running)?;
+        let mut local = if task_board || holder.is_none() {
+            Some(Local::prepare(
                 self,
                 name,
                 dashboard.socket.clone().ok_or_else(|| Error::Dashboard {
                     what: "this runtime has no dashboard on a private Unix socket".into(),
                 })?,
-            )?),
-            Some(_) => None,
+                !task_board,
+            )?)
+        } else {
+            None
         };
-        if let Some(local) = &local {
+        if let Some(local) = &local
+            && !task_board
+        {
             url = format!(
                 "http://127.0.0.1:{}{}{}",
                 local.port,
@@ -125,7 +229,9 @@ impl Engine {
             );
         }
         self.wait_service_proxy(name)?;
-        let namespace = if let Some(holder) = holder {
+        let namespace = if let Some(holder) = holder
+            && local.is_none()
+        {
             self.ensure_holder(&record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             let way_in = holder.way_in(&ctx);
@@ -179,13 +285,15 @@ impl Engine {
 
         let user = rustix::process::getuid().as_raw();
         let begun = Instant::now();
+        let upstream_lifetime = UpstreamLifetime(Arc::new(AtomicBool::new(true)));
+        let mut ready = false;
         let mut listening = None;
         let mut failed = None;
         let mut look = |_: &mut Vec<String>| {
-            if listening.is_some() || failed.is_some() {
+            if ready || failed.is_some() || ended.load(Ordering::Relaxed) {
                 return;
             }
-            let serving = if let Some(local) = &mut local {
+            let target = if let Some(local) = &local {
                 if !local.ready() {
                     if begun.elapsed() < LISTEN_WAIT {
                         return;
@@ -195,31 +303,12 @@ impl Engine {
                         LISTEN_WAIT.as_secs()
                     ))
                 } else {
-                    host_listener::open_local(
-                        local.front.take().expect("opened once"),
-                        user,
-                        host_listener::owner_on_host,
-                        local.socket.clone(),
-                        local.prefix.clone(),
-                    )
-                    .map_err(|e| format!("cannot serve the private dashboard: {e}"))
+                    Ok(DashboardTarget::Local(local.socket.clone()))
                 }
             } else {
                 let (way_in, held) = namespace.as_ref().expect("a namespace or a private socket");
                 match in_namespace("dashboard", &session.root, held, ListenerPorts::Ephemeral) {
-                    Ok(port) => host_listener::open(
-                        record.proxy_port,
-                        user,
-                        host_listener::owner_on_host,
-                        way_in.clone(),
-                        port,
-                    )
-                    .map_err(|e| {
-                        format!(
-                            "cannot listen on 127.0.0.1:{}, the sandbox's reserved port: {e}",
-                            record.proxy_port
-                        )
-                    }),
+                    Ok(port) => Ok(DashboardTarget::Namespace(way_in.clone(), port)),
                     Err(NoPort::NotYet(_) | NoPort::NotRunning(_))
                         if begun.elapsed() < LISTEN_WAIT =>
                     {
@@ -230,17 +319,58 @@ impl Engine {
                     )),
                 }
             };
-            let why = match serving {
-                Ok(serving) => {
-                    listening = Some(serving);
-                    let port = local.as_ref().map_or(record.proxy_port, |local| local.port);
+            let serving = target.and_then(|target| match &mut open_for {
+                OpenFor::TaskBoard { opened, .. } => {
+                    let DashboardTarget::Local(socket) = target else {
+                        unreachable!("a task board uses the private socket");
+                    };
+                    opened(TaskBoardUpstream {
+                        socket,
+                        active: Arc::clone(&upstream_lifetime.0),
+                    });
+                    Ok(None)
+                }
+                OpenFor::Host(opened) => {
+                    let serving = match target {
+                        DashboardTarget::Local(socket) => {
+                            let local = local.as_mut().expect("prepared private socket");
+                            host_listener::open_local(
+                                local.front.take().expect("opened once"),
+                                user,
+                                host_listener::owner_on_host,
+                                socket,
+                                local.prefix.clone(),
+                            )
+                            .map_err(|e| format!("cannot serve the private dashboard: {e}"))
+                        }
+                        DashboardTarget::Namespace(way_in, port) => host_listener::open(
+                            record.proxy_port,
+                            user,
+                            host_listener::owner_on_host,
+                            way_in,
+                            port,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "cannot listen on 127.0.0.1:{}, the sandbox's reserved port: {e}",
+                                record.proxy_port
+                            )
+                        }),
+                    }?;
                     opened(&DashboardOpen {
                         sandbox: name.clone(),
                         session: session.id,
-                        port,
+                        port: local.as_ref().map_or(record.proxy_port, |local| local.port),
                         url: url.clone(),
                         user,
                     });
+                    Ok(Some(serving))
+                }
+            });
+            let why = match serving {
+                Ok(serving) => {
+                    ready = true;
+                    listening = serving;
                     return;
                 }
                 Err(why) => why,
@@ -251,6 +381,7 @@ impl Engine {
         let waited = self.wait_session(&session, &mut child, Some(ended), &mut look);
         // Closed before the end is recorded, which may wait for the state.
         drop(listening);
+        drop(upstream_lifetime);
         let waited = match waited {
             Ok(waited) => waited,
             Err(error) => return Err(self.record_unended(by, "dashboard end", &session, error)),

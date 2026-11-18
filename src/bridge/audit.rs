@@ -197,12 +197,13 @@ mod tests {
             "usage",
             "usage.series",
             "audit",
+            "held_task.board",
             "approval.close",
             "agent.forget",
         ] {
             assert!(host.iter().any(|c| c == capability), "{host:?}");
         }
-        assert_eq!(host.len(), 10, "{host:?}");
+        assert_eq!(host.len(), 11, "{host:?}");
         // Every person reads the usage of their own conversations.
         assert_eq!(
             hub.capabilities("guest"),

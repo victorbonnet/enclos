@@ -1,8 +1,9 @@
 """Run Hermes's dashboard on a Unix listener already bound by enclos.
 
-The descriptor is the only listening socket this process receives. Seatbelt
-refuses TCP binds for this session, so a changed Hermes/Uvicorn startup
-fails closed instead of publishing the browser token on TCP.
+The adapter serves only on this descriptor. On macOS, Seatbelt refuses
+TCP binds so a changed Hermes/Uvicorn startup fails closed instead of
+publishing the browser token on TCP. On Linux, Bubblewrap's network
+namespace keeps a stray TCP bind away from the host.
 """
 
 import os
@@ -25,7 +26,14 @@ def remove_adapter(source):
 
 
 def main():
-    listener = socket.socket(fileno=int(os.environ.pop("ENCLOS_DASHBOARD_FD")))
+    inherited_fd = os.environ.pop("ENCLOS_DASHBOARD_FD", None)
+    if inherited_fd is None:
+        # Bubblewrap carries the pre-bound listener on stdin. Detach it
+        # before Hermes starts any children that inherit ordinary stdio.
+        inherited_fd = os.dup(0)
+        with open(os.devnull, "rb") as stdin:
+            os.dup2(stdin.fileno(), 0)
+    listener = socket.socket(fileno=int(inherited_fd))
     if (
         listener.family != socket.AF_UNIX
         or listener.type != socket.SOCK_STREAM
@@ -38,6 +46,12 @@ def main():
 
     import uvicorn
     from hermes_cli import web_server
+
+    if port == 0:
+        # The bridge checks paired-device access on every request. Hermes
+        # can use its normal local SPA token here, even if the separately
+        # configured dashboard.public_url requires public authentication.
+        web_server.app.state.listener_public_url = "http://127.0.0.1"
 
     class LocalPeer:
         """The Unix peer is enclos, after its owner and capability checks.

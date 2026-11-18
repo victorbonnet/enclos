@@ -51,6 +51,7 @@ pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use app::{AppAgent, AppAgents, AppEndpoint};
 pub use approvals::{AccessPlan, normalized};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
+pub(crate) use dashboard::TaskBoardUpstream;
 pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
