@@ -187,7 +187,7 @@ impl Engine {
                         name: kind.display_name(),
                         version: facts
                             .version
-                            .map_or(Fact::NotProvided, |v| read_value(&home, &v)),
+                            .map_or(Fact::NotProvided, |v| read_value(&home, &v, rt)),
                         logged_in: facts.login.map_or(Fact::NotProvided, |f| exists(&home, &f)),
                         installed: facts
                             .install
@@ -269,7 +269,8 @@ impl Engine {
                     AgentKind::Untrackable
                 };
                 let facts = runtime.agent_facts(&agent);
-                let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
+                let (provider, choose_provider) =
+                    read_provider(home, facts.provider.as_ref(), runtime);
                 AgentStatus {
                     working: activity
                         .get(&format!("{name}/{}", agent.as_str()))
@@ -281,7 +282,7 @@ impl Engine {
                     last_active: newest(home, &facts.activity),
                     model: facts
                         .model
-                        .map_or(Fact::NotProvided, |v| read_value(home, &v)),
+                        .map_or(Fact::NotProvided, |v| read_value(home, &v, runtime)),
                     // Filled in from the walk.
                     bytes: Fact::NotProvided,
                     name: agent,
