@@ -746,6 +746,44 @@ class Registration(unittest.TestCase):
         with self.assertLogs("enclos.adapter", "INFO"):
             self.assertNotIn("on_kanban_dispatch_tick", self.registered(set()))
 
+    def writing_hooks(self, valid_hooks, board="board", profile="engineer"):
+        """The `pre_llm_call` callbacks registered. `board` is "board", "no functions" (a
+        `kanban_db` without `list_tasks` and `list_boards`) or "no module"; `profile` is what
+        Hermes names the process's home, None when it is not a profile's."""
+        plugins = types.ModuleType("hermes_cli.plugins")
+        plugins.VALID_HOOKS = set(valid_hooks)
+        package = types.ModuleType("hermes_cli")
+        package.plugins = plugins
+        modules = {"hermes_cli": package, "hermes_cli.plugins": plugins}
+        if board != "no module":
+            kanban_db = types.ModuleType("hermes_cli.kanban_db")
+            if board == "board":
+                kanban_db.list_tasks = kanban_db.list_boards = lambda *a, **k: []
+            package.kanban_db = modules["hermes_cli.kanban_db"] = kanban_db
+        constants = types.ModuleType("hermes_constants")
+        constants.get_hermes_home = lambda: "/home/alice/.hermes/profiles/engineer"
+        constants.profile_name_for_home = lambda home: profile
+        modules["hermes_constants"] = constants
+        ctx = Mock()
+        module = sys.modules[EnclosAdapter.__module__]
+        with patch.dict(sys.modules, modules):
+            module.register(ctx)
+        return [c.args[1] for c in ctx.register_hook.call_args_list if c.args[0] == "pre_llm_call"]
+
+    def test_an_agent_with_a_board_is_told_how_the_app_draws_its_tasks(self):
+        tasks = sys.modules[EnclosAdapter.__module__].tasks
+        self.assertIn(tasks.writing_context, self.writing_hooks({"pre_llm_call"}))
+        self.assertEqual(tasks.writing_context(session_id="s", is_first_turn=False),
+                         {"context": tasks.WRITING_HINT})
+
+    def test_the_hint_goes_only_where_tasks_are_on(self):
+        tasks = sys.modules[EnclosAdapter.__module__].tasks
+        for case in ({"board": "no functions"}, {"board": "no module"}, {"profile": None}):
+            with self.subTest(**case), self.assertLogs("enclos.tasks", "INFO") as logs:
+                self.assertNotIn(tasks.writing_context, self.writing_hooks({"pre_llm_call"}, **case))
+            self.assertIn("Tasks are off", logs.output[0])
+        self.assertNotIn(tasks.writing_context, self.writing_hooks(set()))
+
 
 if __name__ == "__main__":
     unittest.main()

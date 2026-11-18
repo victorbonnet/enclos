@@ -1006,4 +1006,9 @@ def register(ctx) -> None:
         ctx.register_hook("on_kanban_dispatch_tick", _kanban_ticked)
     else:
         logger.info("[enclos] This Hermes has no kanban dispatch hook; held tasks are read on a timer only")
+    # Every turn that may write a task gets it, wherever Hermes runs it: the
+    # gateway's conversations, its cron runs and its board's tasks alike. Only
+    # where tasks are on, for this process's own profile, as the adapter checks.
+    if "pre_llm_call" in VALID_HOOKS and tasks.has_board(conversations.capture_home()):
+        ctx.register_hook("pre_llm_call", tasks.writing_context)
     _register_usage_hooks(ctx)
