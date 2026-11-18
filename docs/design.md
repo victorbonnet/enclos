@@ -565,7 +565,7 @@ pub trait RuntimeAdapter {
     fn agent_files(&self, name: &AgentName) -> String;
     fn talk(&self, agent: &AgentName) -> String;
     fn services(&self) -> Vec<RuntimeService>;
-    fn listener(&self) -> Option<RuntimeListener>;
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener>;
     fn dashboard(&self) -> Option<RuntimeDashboard>;
     fn secret_files(&self) -> Option<SecretFiles>;
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath>;
@@ -575,6 +575,7 @@ pub trait RuntimeAdapter {
     fn default_agent(&self, _home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable>;
     fn builtin_agent(&self) -> Option<BuiltinAgent>;
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
+    fn agent_delete_mode(&self) -> AgentDeleteMode;
     fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand>;
     fn export_agent(&self, _name: &AgentName, _prefix: &Path) -> Option<RuntimeExport>;
     fn import_export(
@@ -585,11 +586,11 @@ pub trait RuntimeAdapter {
         _context: &str,
     ) -> Option<SandboxCommand>;
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand>;
-    fn channel_token_file(
+    fn channel_token_files(
         &self,
         _channel: Channel,
         _agent: &RuntimeAgentName,
-    ) -> Option<(HomePath, &'static str)>;
+    ) -> Vec<(HomePath, &'static str)>;
     fn channel_token_is_plain(
         &self,
         _channel: Channel,
@@ -612,8 +613,16 @@ pub trait RuntimeAdapter {
         _key: &str,
         _value: &str,
     ) -> Option<SandboxCommand>;
+    fn set_secret_setting(
+        &self,
+        agent: &RuntimeAgentName,
+        key: &str,
+        variable: &str,
+        _target: SecretTarget,
+    ) -> Option<SandboxCommand>;
     fn channel_settings(
         &self,
+        _agent: &RuntimeAgentName,
         _channel: Channel,
         _token: &str,
         _answers: &[ChannelUser],

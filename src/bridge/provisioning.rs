@@ -29,6 +29,8 @@ pub enum Operation {
     },
 }
 
+const MOBILE_RUNTIMES: [RuntimeKind; 1] = [RuntimeKind::Hermes];
+
 impl Operation {
     pub fn create(sandbox: &str, template: &str) -> Result<Self, String> {
         // Only the built-in templates with explained mobile choices. Custom
@@ -45,9 +47,16 @@ impl Operation {
     }
 
     pub fn install(sandbox: &str, runtime: &str) -> Result<Self, String> {
+        let runtime = runtime.parse::<RuntimeKind>().map_err(|e| e.to_string())?;
+        if !MOBILE_RUNTIMES.contains(&runtime) {
+            return Err(format!(
+                "Install {} and set up its app channel from the host.",
+                runtime.display_name()
+            ));
+        }
         Ok(Self::Install {
             name: sandbox.parse::<SandboxName>().map_err(|e| e.to_string())?,
-            runtime: runtime.parse::<RuntimeKind>().map_err(|e| e.to_string())?,
+            runtime,
         })
     }
 
@@ -100,12 +109,10 @@ impl Host {
     }
 
     pub fn runtimes(&self) -> Vec<RuntimeInfo> {
-        RuntimeKind::ALL.into_iter().map(|kind| RuntimeInfo {
+        MOBILE_RUNTIMES.into_iter().map(|kind| RuntimeInfo {
             runtime: kind.to_string(),
             name: kind.display_name().to_owned(),
-            description: match kind {
-                RuntimeKind::Hermes => "An agent runtime installed inside this sandbox. Login and app channel setup follow on the host.".to_owned(),
-            },
+            description: "An agent runtime installed inside this sandbox. Login and app channel setup follow on the host.".to_owned(),
         }).collect()
     }
 
@@ -638,5 +645,22 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         let mut input = std::io::Cursor::new(vec![42; 100_000]);
         assert_eq!(read_bounded(&mut input, 16).unwrap(), vec![42; 16]);
         assert_eq!(input.position(), 100_000);
+    }
+}
+
+#[cfg(test)]
+mod mobile_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn openclaw_is_unavailable_for_phone_provisioning_until_its_app_channel_exists() {
+        let host = Host::new(Layout::at(std::path::Path::new("/unused")), PathBuf::new());
+        assert!(
+            host.runtimes()
+                .iter()
+                .all(|info| info.runtime != "openclaw")
+        );
+        assert!(Operation::install("lab", "openclaw").is_err());
+        assert!(Operation::install("lab", "hermes").is_ok());
     }
 }

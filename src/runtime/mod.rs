@@ -6,6 +6,7 @@
 
 pub mod hermes;
 pub mod home;
+pub mod openclaw;
 pub mod settings;
 
 use std::ffi::OsString;
@@ -49,6 +50,13 @@ pub struct SecretFiles {
     pub folder_variable: Option<&'static str>,
     pub sandbox: SecretFileFormat,
     pub agent: SecretFileFormat,
+}
+
+/// Which active policy grant supplies a setting's secret reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretTarget {
+    Sandbox,
+    Agent,
 }
 
 /// A file the adapter puts in the sandbox home, relative to it: a plain
@@ -216,6 +224,19 @@ pub struct AgentFacts {
     pub activity: Vec<HomePath>,
 }
 
+/// How an agent's native delete command uses the runtime's services.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentDeleteMode {
+    /// Stop installed runtime services while their files are deleted, then
+    /// install them again. Hermes's gateway holds every agent's files.
+    #[default]
+    PauseRuntime,
+    /// Keep runtime services running: the native command deletes through
+    /// one of them. The command must refuse if its service is unavailable;
+    /// agent removal does not start it or substitute an offline delete.
+    RuntimeService,
+}
+
 /// The agent a runtime always has once installed, such as Hermes's
 /// `default`. Made in code, as a constant, so a name that is not a valid
 /// agent name does not compile: enclos shows it, and names it in commands.
@@ -286,7 +307,7 @@ pub trait RuntimeAdapter {
     /// The service that listens in the sandbox, whose port the sandbox's
     /// sessions then reach (ADR 0028). `None` (the default): the runtime has
     /// no service its sessions must reach.
-    fn listener(&self) -> Option<RuntimeListener> {
+    fn listener(&self, _proxy_port: u16) -> Option<RuntimeListener> {
         None
     }
     /// The runtime's dashboard, a page for a browser on the host, served by
@@ -350,6 +371,11 @@ pub trait RuntimeAdapter {
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
+    /// Whether native deletion needs the runtime's services stopped or
+    /// available. The default preserves runtimes that delete files offline.
+    fn agent_delete_mode(&self) -> AgentDeleteMode {
+        AgentDeleteMode::PauseRuntime
+    }
     /// The runtime's own command that finishes a delete of `name` which
     /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
     /// rm` when that command failed after the runtime stopped listing the
@@ -385,21 +411,19 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
         None
     }
-    /// The file in the home where the runtime's own setup keeps `agent`'s
-    /// bot token for `channel` in plain text, as a `.env` line of the
-    /// variable it names: `runtime configure` refuses while it holds one, so
-    /// that a token the runtime's own setup wrote does not sit readable in
-    /// the home (ADR 0022). `None`: no such file.
-    fn channel_token_file(
+    /// Home files where native setup may keep this channel's token. Each
+    /// identifier is interpreted by `channel_token_is_plain`; the engine
+    /// safely reads every file before executing configuration commands.
+    fn channel_token_files(
         &self,
         _channel: Channel,
         _agent: &RuntimeAgentName,
-    ) -> Option<(HomePath, &'static str)> {
-        None
+    ) -> Vec<(HomePath, &'static str)> {
+        Vec::new()
     }
     /// Whether bounded settings text holds a channel token as a literal
     /// value rather than a supported secret reference. `field` is the
-    /// identifier from `channel_token_file`, interpreted by the runtime.
+    /// identifier from `channel_token_files`, interpreted by the runtime.
     /// An unknown or malformed representation is an error, never a clean
     /// bill of health that would allow overwriting an unexamined token.
     fn channel_token_is_plain(
@@ -443,6 +467,18 @@ pub trait RuntimeAdapter {
     ) -> Option<SandboxCommand> {
         None
     }
+    /// Set one complete secret reference, retaining whether its active
+    /// grant belongs to this agent or to the whole sandbox. Native file
+    /// references need that distinction; dotenv runtimes use `${VAR}`.
+    fn set_secret_setting(
+        &self,
+        agent: &RuntimeAgentName,
+        key: &str,
+        variable: &str,
+        _target: SecretTarget,
+    ) -> Option<SandboxCommand> {
+        self.set_setting(agent, key, &format!("${{{variable}}}"))
+    }
     /// The settings that set up a bot on `channel`, in order, for
     /// [`set_setting`](Self::set_setting): its token read from the variable
     /// `token` as `${token}`, and the people it answers. The people it
@@ -450,6 +486,7 @@ pub trait RuntimeAdapter {
     /// fails turns no bot on. `None`: the runtime has no such channel.
     fn channel_settings(
         &self,
+        _agent: &RuntimeAgentName,
         _channel: Channel,
         _token: &str,
         _answers: &[ChannelUser],
@@ -623,12 +660,27 @@ pub struct RuntimeService {
     pub restart: Option<Signal>,
 }
 
-/// A runtime service that listens in its sandbox, on a loopback port it
-/// picks when it starts, which the runtime's own clients dial (ADR 0028).
+/// Which of a service root process's own IPv4 loopback ports may be its
+/// listener. This selects candidates, never grants access: the engine still
+/// requires one port, exclusive ownership by the recorded process and a
+/// port outside enclos's proxy range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerPorts {
+    /// A bind on port 0, as Hermes uses. Fixed auxiliary listeners outside
+    /// the host's ephemeral range do not become candidates.
+    Ephemeral,
+    /// The exact IPv4 loopback port configured by the runtime launcher.
+    Loopback(u16),
+}
+
+/// A runtime service that listens in its sandbox, whose port the runtime's
+/// own clients dial (ADR 0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
+    /// How to select its port from the recorded service process's sockets.
+    pub ports: ListenerPorts,
 }
 
 /// A runtime's dashboard, served by a command run in its sandbox as a
@@ -710,6 +762,7 @@ impl fmt::Display for ServiceName {
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {
     match kind {
         RuntimeKind::Hermes => Box::new(hermes::Hermes),
+        RuntimeKind::OpenClaw => Box::new(openclaw::OpenClaw),
     }
 }
 
