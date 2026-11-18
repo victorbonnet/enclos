@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enclos task board</title>
+<style>body { color-scheme: light dark; font: 1rem system-ui; margin: 2rem; }</style>
+<main>
+  <h1>Task board</h1>
+  <p id="status" role="status">Opening the board…</p>
+</main>
+<script>
+  const ticket = location.hash.slice(1);
+  history.replaceState(null, "", "/task-board/open");
+  async function openBoard() {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(ticket)) throw new Error();
+    const response = await fetch("/task-board/open", {
+      method: "POST",
+      headers: {"Content-Type": "text/plain"},
+      body: ticket,
+      redirect: "error"
+    });
+    const destination = response.ok ? await response.text() : "";
+    if (!/^\/task-board\/view\/[A-Za-z0-9_-]{43}\/kanban$/.test(destination)) throw new Error();
+    location.replace(destination);
+  }
+  openBoard().catch(() => {
+    document.getElementById("status").textContent = "The board could not be opened. Return to Enclos and try again while connected to the host’s network.";
+  });
+</script>
+</html>

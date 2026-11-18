@@ -110,6 +110,38 @@ class DashboardTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "Unix stream listener"):
                         dashboard.main()
 
+    def test_the_bridge_listener_inherits_stdin_and_uses_local_hermes_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(str(Path(directory) / "d"))
+            listener.listen()
+            fd = os.dup(listener.fileno())
+            startup_sockets = []
+
+            class Server:
+                async def startup(self, sockets=None):
+                    startup_sockets.extend(sockets)
+
+            web = types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace()))
+            web.start_server = lambda **kwargs: asyncio.run(Server().startup())
+            package = types.SimpleNamespace(web_server=web)
+            uvicorn = types.SimpleNamespace(Server=Server)
+            with (
+                patch.dict(sys.modules, {"uvicorn": uvicorn, "hermes_cli": package}),
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(sys, "argv", ["dashboard.py", "0"]),
+                patch.object(os, "dup", return_value=fd) as dup,
+                patch.object(os, "dup2") as dup2,
+            ):
+                dashboard.main()
+            self.assertEqual(web.app.state.listener_public_url, "http://127.0.0.1")
+            dup.assert_called_once_with(0)
+            self.assertEqual(dup2.call_args.args[1], 0)
+            self.assertEqual(len(startup_sockets), 1)
+            self.assertEqual(startup_sockets[0].getsockname(), listener.getsockname())
+            startup_sockets[0].close()
+
 
 if __name__ == "__main__":
     unittest.main()

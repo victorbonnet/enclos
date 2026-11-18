@@ -15,6 +15,14 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 pub enum FromDevice {
     #[serde(rename = "held_task.get")]
     HeldTaskGet { agent: String, task: HeldTaskId },
+    /// Open the native board of the exact held task and revision shown to
+    /// the host's person on a paired device.
+    #[serde(rename = "held_task.board")]
+    HeldTaskBoard {
+        agent: String,
+        task: HeldTaskId,
+        revision: u64,
+    },
     /// Hide only this reminder; no native request is resolved or resumed.
     #[serde(rename = "open_item.dismiss")]
     OpenItemDismiss {
@@ -230,6 +238,8 @@ pub const USAGE_SERIES: &str = "usage.series";
 /// the message type a device sends to forget one, advertised in
 /// `authenticated`'s capabilities.
 pub const AGENT_FORGET: &str = "agent.forget";
+/// The bridge can open a held task's board through its HTTPS origin.
+pub const HELD_TASK_BOARD: &str = "held_task.board";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
@@ -238,6 +248,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "held_task.resume",
     "task.get",
     "held_task.get",
+    HELD_TASK_BOARD,
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -318,6 +329,13 @@ pub enum ToDevice {
     HeldTaskResult {
         of: MessageId,
         held_task: crate::held_task::HeldTaskInfo,
+    },
+    /// A browser handoff, as a path on the paired bridge's HTTPS origin.
+    #[serde(rename = "held_task.board.link")]
+    HeldTaskBoardLink {
+        of: MessageId,
+        #[serde(deserialize_with = "board_link_path")]
+        path: String,
     },
     #[serde(rename = "agent.name")]
     AgentName(crate::agent_name::AgentName),
@@ -493,6 +511,25 @@ pub enum ToDevice {
 /// makes 60,000 characters of them, inside a Noise message's 65,519.
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
+/// The ticket is in the fragment, so the browser's first HTTP request does
+/// not send it in the URL. Accept only this path, never another origin.
+fn board_link_path<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let path = String::deserialize(deserializer)?;
+    if path
+        .strip_prefix("/task-board/open#")
+        .is_some_and(|ticket| {
+            ticket.len() == 43
+                && ticket
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        Ok(path)
+    } else {
+        Err(serde::de::Error::custom("invalid task board handoff path"))
+    }
+}
+
 pub const TO_DEVICE_TYPES: &[&str] = &[
     "question.closed",
     "open_item.dismissed",
@@ -501,6 +538,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "question.result",
     "held_task",
     "held_task.result",
+    "held_task.board.link",
     "agent.name",
     "routine.response",
     "agent.avatar",
@@ -976,6 +1014,74 @@ mod tests {
             },
         ));
         assert!(line.len() < 65_519 - 16, "{} bytes", line.len());
+    }
+
+    #[test]
+    fn opening_a_held_task_board_names_the_exact_card_and_correlates_the_link() {
+        let request = br#"{"v":1,"id":"open-1","type":"held_task.board","agent":"lab/lead","task":"app/t_same","revision":12}"#;
+        let decoded = decode_from_device(request).unwrap();
+        assert_eq!(decoded.id.as_str(), "open-1");
+        assert_eq!(
+            decoded.body,
+            FromDevice::HeldTaskBoard {
+                agent: "lab/lead".into(),
+                task: HeldTaskId::new("app/t_same").unwrap(),
+                revision: 12,
+            }
+        );
+        assert_eq!(decode_from_device(&encode_line(&decoded)).unwrap(), decoded);
+
+        let response = Envelope::new(
+            MessageId::new("link-1").unwrap(),
+            ToDevice::HeldTaskBoardLink {
+                of: decoded.id,
+                path: format!("/task-board/open#{}", "A".repeat(43)),
+            },
+        );
+        let line = encode_line(&response);
+        assert!(String::from_utf8_lossy(&line).contains(r#""type":"held_task.board.link""#));
+        assert_eq!(decode_to_device(&line).unwrap(), response);
+    }
+
+    #[test]
+    fn opening_a_held_task_board_requires_a_valid_task_and_an_explicit_revision() {
+        for request in [
+            r#"{"v":1,"id":"open-1","type":"held_task.board","agent":"lab/lead","task":"","revision":12}"#,
+            r#"{"v":1,"id":"open-1","type":"held_task.board","agent":"lab/lead","task":"t1","revision":-1}"#,
+            r#"{"v":1,"id":"open-1","type":"held_task.board","agent":"lab/lead","task":"t1"}"#,
+        ] {
+            assert!(matches!(
+                decode_from_device(request.as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_board_handoff_requires_the_bridge_path_and_one_fragment_ticket() {
+        let ticket = "A".repeat(43);
+        for path in [
+            format!("//example.net/task-board/open#{ticket}"),
+            format!("https://example.net/task-board/open#{ticket}"),
+            format!("/task-board/open/{ticket}"),
+            format!("/task-board/open?ticket={ticket}"),
+            format!("/task-board/open#{ticket}/extra"),
+            format!("/task-board/open#{ticket}="),
+            format!("/task-board/open#{}+", "A".repeat(42)),
+            "/task-board/open#".to_owned(),
+        ] {
+            let line = encode_line(&Envelope::new(
+                MessageId::new("link-1").unwrap(),
+                ToDevice::HeldTaskBoardLink {
+                    of: MessageId::new("open-1").unwrap(),
+                    path,
+                },
+            ));
+            assert!(matches!(
+                decode_to_device(&line),
+                Err(DecodeError::Bad { .. })
+            ));
+        }
     }
 
     #[test]
