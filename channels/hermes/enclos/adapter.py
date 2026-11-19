@@ -74,6 +74,12 @@ def validate_config(config) -> bool:
 
 
 class EnclosAdapter(BasePlatformAdapter):
+    # Defaults for an adapter that did not run `__init__` (a test, or an older
+    # Hermes building it by hand): no kanban pings to tell apart, and a bridge
+    # that does not take task events (ADR 0071).
+    _pings: Optional["task_events.Recogniser"] = None
+    _bridge_task_events = False
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM))
         self._path = _setting(config, "socket", "MOBILE_APP_SOCKET")
