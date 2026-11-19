@@ -132,6 +132,7 @@ impl Store {
                 "members",
                 "attachments",
                 "usage_hours",
+                "usage_model_hours",
                 "messages",
                 "held_tasks",
             ] {
@@ -151,7 +152,9 @@ impl Store {
         )?;
         // Its usage outside the app, which only the host's person, who
         // forgets it, sees.
-        tx.execute("DELETE FROM agent_usage_hours WHERE agent = ?1", [agent])?;
+        for table in ["agent_usage_hours", "agent_usage_model_hours"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE agent = ?1"), [agent])?;
+        }
         tx.execute(
             "DELETE FROM agent_usage_reporters WHERE agent = ?1",
             [agent],

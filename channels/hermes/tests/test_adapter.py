@@ -475,7 +475,7 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             message = await next_usage(reader)
             self.assertEqual(message["conversation"], "c-42")
             self.assertEqual(message["model"], "gpt-6.1-sol")
-            self.assertEqual(message["provider"], "openai-codex")
+            self.assertEqual(message["model_provider"], "openai-codex")
             self.assertEqual(message["tokens"], {"input": 2104, "output": 96, "cache_read": 31744})
             self.assertNotIn("background", message)
             # Another platform's turn is not an app conversation's, and a

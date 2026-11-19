@@ -907,7 +907,7 @@ def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any
             if not chat_id:
                 return None
             message = protocol.usage(chat_id, tokens, model=model, background=background,
-                                     provider=provider)
+                                     model_provider=provider)
             # Every connected adapter whose bridge takes them: the bridge
             # keeps usage only for a conversation of its connection's agent.
             for adapter in list(_ADAPTERS):
@@ -930,7 +930,7 @@ def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any
             return None
         message = protocol.agent_usage(tokens, model=model, background=background,
                                        source=platform if isinstance(platform, str) else None,
-                                       provider=provider)
+                                       model_provider=provider)
         for adapter in list(_ADAPTERS):
             if adapter._agent == agent and getattr(adapter, "_bridge_agent_usage", False):
                 adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))

@@ -121,6 +121,9 @@ fn by_day(
     since: jiff::Timestamp,
 ) -> Result<u8> {
     let offset = jiff::Zoned::now().offset().seconds();
+    // Whole days: from the start of the host's day that holds the
+    // window's start, so the first row is not part of one.
+    let since = day_start(since, offset);
     let loaded = PriceList::load(&engine.prices_path());
     let mut view = DaysView {
         since,
@@ -166,7 +169,7 @@ fn by_day(
             what: format!("cannot read the bridge's usage: {e}"),
         })?;
         view.bridge = true;
-        view.days = days(&window, offset);
+        view.days = days(&window, offset, since);
         view.total = total(&view.days);
         view.outside_not_counted = window
             .agents
@@ -188,11 +191,23 @@ fn by_day(
     Ok(exit::OK)
 }
 
-/// The window's sum, a day a row, each named by the host's date.
-fn days(window: &Window, offset: i32) -> Vec<Day> {
+/// The start of the day, `offset` seconds from UTC, that holds `at`.
+fn day_start(at: jiff::Timestamp, offset: i32) -> jiff::Timestamp {
+    let offset = i64::from(offset);
+    let start = (at.as_second() + offset).div_euclid(86_400) * 86_400 - offset;
+    jiff::Timestamp::from_second(start).unwrap_or(at)
+}
+
+/// The window's sum from `since` on, a day a row, each named by the host's
+/// date. The bridge keeps usage by the UTC hour, so with an offset not a
+/// whole number of hours the hour that holds `since` may fall in the day
+/// before: left out, not shown as a day of its own.
+fn days(window: &Window, offset: i32, since: jiff::Timestamp) -> Vec<Day> {
+    let from = u64::try_from(since.as_second()).unwrap_or(0);
     window
         .sum
         .iter()
+        .filter(|p| p.at >= from)
         .map(|p| Day {
             day: i64::try_from(p.at)
                 .ok()
@@ -865,10 +880,27 @@ mod tests {
             }],
             ..Window::default()
         };
-        let days = days(&window, 3_600);
+        let since = Timestamp::from_second(1_794_006_000).unwrap();
+        let days = days(&window, 3_600, since);
         assert_eq!(days[0].day, "2026-11-07");
         assert_eq!(days[0].tokens, None);
         assert!(days[0].estimate.is_nothing());
+        // A bucket before the window's first day is left out.
+        let later = Timestamp::from_second(1_794_006_000 + 86_400).unwrap();
+        assert!(super::days(&window, 3_600, later).is_empty());
+    }
+
+    #[test]
+    fn by_day_starts_at_the_hosts_midnight() {
+        // 2026-11-12 15:00 UTC, at UTC+1: 2026-11-12 16:00, whose day starts
+        // at 2026-11-11 23:00 UTC.
+        let at = Timestamp::from_second(1_794_495_600).unwrap();
+        assert_eq!(day_start(at, 3_600).as_second(), 1_794_438_000);
+        // At UTC-5:30, 09:30: the day starts at 05:30 UTC.
+        assert_eq!(day_start(at, -19_800).as_second(), 1_794_461_400);
+        // Midnight itself is the start of its day.
+        let midnight = Timestamp::from_second(1_794_438_000).unwrap();
+        assert_eq!(day_start(midnight, 3_600), midnight);
     }
 
     #[test]

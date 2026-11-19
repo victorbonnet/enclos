@@ -160,6 +160,13 @@ pub enum FromDevice {
         /// Only this agent of `sandbox`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+        /// Costs too, from a bridge that names [`USAGE_COST`]: each agent's
+        /// and each sandbox's, its rows the fewer for it
+        /// ([`crate::usage::MAX_COSTED_AGENTS`]). A window of one sandbox
+        /// or agent has them whatever this says. A device that shows no
+        /// cost leaves it out, and gets the report it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cost: bool,
     },
     #[serde(rename = "agents")]
     Agents,
@@ -1531,6 +1538,7 @@ mod usage_tests {
                 offset: None,
                 sandbox: None,
                 agent: None,
+                cost: false,
             }
         );
         let report = ToDevice::UsageReport {
@@ -1574,6 +1582,7 @@ mod usage_tests {
                 offset: Some(-32_400),
                 sandbox: None,
                 agent: None,
+                cost: false,
             }
         );
         let report = ToDevice::UsageReport {
@@ -1686,13 +1695,13 @@ mod usage_tests {
         format!("{:a<40}/{:b<64}", i, i)
     }
 
-    fn agents(n: usize) -> Vec<AgentUsage> {
+    fn agents(n: usize, cost: bool) -> Vec<AgentUsage> {
         (0..n)
             .map(|i| AgentUsage {
                 agent: name(i),
                 outside: true,
                 total: big_total(),
-                cost: Some(BIG_COST),
+                cost: cost.then_some(BIG_COST),
             })
             .collect()
     }
@@ -1735,13 +1744,25 @@ mod usage_tests {
 
     #[test]
     fn the_largest_usage_report_fits_one_device_message() {
+        // Without costs, as an older device asks.
         fits(ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
             outside: true,
             bucket: None,
             series: Vec::new(),
-            agents: agents(MAX_REPORT_AGENTS),
+            agents: agents(MAX_REPORT_AGENTS, false),
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
+        });
+        // With them.
+        fits(ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            outside: true,
+            bucket: None,
+            series: Vec::new(),
+            agents: agents(MAX_COSTED_AGENTS, true),
             sandboxes: sandboxes(MAX_REPORT_SANDBOXES),
             sum: Vec::new(),
         });
@@ -1752,7 +1773,17 @@ mod usage_tests {
         fits(ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
-            agents: agents(MAX_REPORT_AGENTS_WITH_SERIES),
+            agents: agents(MAX_REPORT_AGENTS_WITH_SERIES, false),
+            outside: true,
+            bucket: Some(86_400),
+            series: series(MAX_SERIES),
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
+        });
+        fits(ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            agents: agents(MAX_COSTED_AGENTS_WITH_SERIES, true),
             outside: true,
             bucket: Some(86_400),
             series: series(MAX_SERIES),
@@ -1766,7 +1797,7 @@ mod usage_tests {
         fits(ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
-            agents: agents(MAX_REPORT_AGENTS_WITH_SERIES),
+            agents: agents(MAX_COSTED_AGENTS_WITH_SERIES, true),
             outside: true,
             bucket: Some(86_400),
             series: series(MAX_SCOPED_SERIES),

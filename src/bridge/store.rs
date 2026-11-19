@@ -309,7 +309,7 @@ pub type UsageWindow = (Vec<(String, UsageTotal)>, Vec<UsageSeries>);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Served<'a> {
     pub model: Option<&'a str>,
-    pub provider: Option<&'a str>,
+    pub model_provider: Option<&'a str>,
 }
 
 /// The most models, each with its model provider, one agent's usage keeps
@@ -380,7 +380,7 @@ struct HourRow {
     agent: String,
     hour: i64,
     model: String,
-    provider: String,
+    model_provider: String,
     counts: UsageTotal,
 }
 
@@ -452,9 +452,14 @@ fn plus(a: UsageTotal, b: UsageTotal) -> UsageTotal {
 /// connection or a transaction of one). Summed here, not in SQL, whose
 /// `SUM` fails past the largest integer.
 fn usage_in(db: &Connection, conversation: &str) -> rusqlite::Result<Option<UsageTotal>> {
+    // Hours kept before models were, and by an older bridge still running,
+    // are in `usage_hours`; the others in `usage_model_hours`.
     let mut query = db.prepare(
         "SELECT calls, input, output, cache_read, cache_write, reasoning
-         FROM usage_hours WHERE conversation = ?1",
+         FROM usage_hours WHERE conversation = ?1
+         UNION ALL
+         SELECT calls, input, output, cache_read, cache_write, reasoning
+         FROM usage_model_hours WHERE conversation = ?1",
     )?;
     let rows = query.query_map(params![conversation], |row| usage_row(row, 0))?;
     let mut total = None;
@@ -465,65 +470,41 @@ fn usage_in(db: &Connection, conversation: &str) -> rusqlite::Result<Option<Usag
 }
 
 /// Keeps each hour's usage by model and model provider too (issue #343),
-/// so that the bridge prices it: each usage table is made again with both
-/// in its key, its rows copied with neither said (`''`). Appended to the
-/// released tables, as [`migrate_approval_cutoffs`] is, and in one
-/// transaction that looks again, as another process opening the database
-/// may have made the change meanwhile.
+/// so that the bridge prices it: in tables of their own, beside
+/// `usage_hours` and `agent_usage_hours`, which stay as they were. An older
+/// bridge, still running after an upgrade or run again after a downgrade,
+/// goes on writing those, and this one reads both, an old row under no
+/// model; neither breaks the other. Without a reference to `conversations`,
+/// so that an older bridge deleting a conversation, which knows nothing of
+/// these rows, is not refused; a read joins `conversations`, and deleting a
+/// conversation here removes its rows. Appended to the released tables, as
+/// [`migrate_approval_cutoffs`] is.
 fn migrate_usage_models(db: &Connection) -> rusqlite::Result<()> {
-    fn has_model(db: &Connection, table: &str) -> rusqlite::Result<bool> {
-        db.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'model'"),
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)
-    }
-    if has_model(db, "usage_hours")? && has_model(db, "agent_usage_hours")? {
-        return Ok(());
-    }
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     let counts = "calls INTEGER NOT NULL CHECK(calls >= 0),
         input INTEGER CHECK(input >= 0),
         output INTEGER CHECK(output >= 0),
         cache_read INTEGER CHECK(cache_read >= 0),
         cache_write INTEGER CHECK(cache_write >= 0),
         reasoning INTEGER CHECK(reasoning >= 0)";
-    let columns = "calls, input, output, cache_read, cache_write, reasoning";
-    if !has_model(&tx, "usage_hours")? {
-        tx.execute_batch(&format!(
-            "CREATE TABLE usage_hours_by_model (
-                conversation TEXT NOT NULL REFERENCES conversations(id),
-                agent TEXT NOT NULL,
-                hour INTEGER NOT NULL CHECK(hour >= 0),
-                model TEXT NOT NULL DEFAULT '',
-                provider TEXT NOT NULL DEFAULT '',
-                {counts},
-                PRIMARY KEY (conversation, agent, hour, model, provider)
-             );
-             INSERT INTO usage_hours_by_model (conversation, agent, hour, {columns})
-                 SELECT conversation, agent, hour, {columns} FROM usage_hours;
-             DROP TABLE usage_hours;
-             ALTER TABLE usage_hours_by_model RENAME TO usage_hours;"
-        ))?;
-    }
-    if !has_model(&tx, "agent_usage_hours")? {
-        tx.execute_batch(&format!(
-            "CREATE TABLE agent_usage_hours_by_model (
-                agent TEXT NOT NULL,
-                hour INTEGER NOT NULL CHECK(hour >= 0),
-                model TEXT NOT NULL DEFAULT '',
-                provider TEXT NOT NULL DEFAULT '',
-                {counts},
-                PRIMARY KEY (agent, hour, model, provider)
-             );
-             INSERT INTO agent_usage_hours_by_model (agent, hour, {columns})
-                 SELECT agent, hour, {columns} FROM agent_usage_hours;
-             DROP TABLE agent_usage_hours;
-             ALTER TABLE agent_usage_hours_by_model RENAME TO agent_usage_hours;"
-        ))?;
-    }
-    tx.commit()
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS usage_model_hours (
+            conversation TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            hour INTEGER NOT NULL CHECK(hour >= 0),
+            model TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            {counts},
+            PRIMARY KEY (conversation, agent, hour, model, model_provider)
+         );
+         CREATE TABLE IF NOT EXISTS agent_usage_model_hours (
+            agent TEXT NOT NULL,
+            hour INTEGER NOT NULL CHECK(hour >= 0),
+            model TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            {counts},
+            PRIMARY KEY (agent, hour, model, model_provider)
+         );"
+    ))
 }
 
 /// Brings a database made by an earlier bridge up to [`SCHEMA`]: columns
@@ -1640,25 +1621,25 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let hour = at.max(0) / 3600;
-        let (mut model, mut provider) = (
+        let (mut model, mut model_provider) = (
             served.model.unwrap_or_default(),
-            served.provider.unwrap_or_default(),
+            served.model_provider.unwrap_or_default(),
         );
         let (known, kept): (bool, i64) = tx.query_row(
-            "SELECT COALESCE(SUM(model = ?4 AND provider = ?5), 0), COUNT(*)
-             FROM usage_hours WHERE conversation = ?1 AND agent = ?2 AND hour = ?3",
-            params![conversation, agent, hour, model, provider],
+            "SELECT COALESCE(SUM(model = ?4 AND model_provider = ?5), 0), COUNT(*)
+             FROM usage_model_hours WHERE conversation = ?1 AND agent = ?2 AND hour = ?3",
+            params![conversation, agent, hour, model, model_provider],
             |row| Ok((row.get::<_, i64>(0)? > 0, row.get(1)?)),
         )?;
         if !known && kept >= MODELS_AN_HOUR {
-            (model, provider) = ("", "");
+            (model, model_provider) = ("", "");
         }
         let before = tx
             .query_row(
                 "SELECT calls, input, output, cache_read, cache_write, reasoning
-                 FROM usage_hours WHERE conversation = ?1 AND agent = ?2 AND hour = ?3
-                     AND model = ?4 AND provider = ?5",
-                params![conversation, agent, hour, model, provider],
+                 FROM usage_model_hours WHERE conversation = ?1 AND agent = ?2 AND hour = ?3
+                     AND model = ?4 AND model_provider = ?5",
+                params![conversation, agent, hour, model, model_provider],
                 |row| usage_row(row, 0),
             )
             .optional()?
@@ -1673,11 +1654,11 @@ impl Store {
         let stored = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
         let t = bucket.tokens;
         tx.execute(
-            "INSERT INTO usage_hours
-                 (conversation, agent, hour, model, provider,
+            "INSERT INTO usage_model_hours
+                 (conversation, agent, hour, model, model_provider,
                   calls, input, output, cache_read, cache_write, reasoning)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(conversation, agent, hour, model, provider) DO UPDATE SET
+             ON CONFLICT(conversation, agent, hour, model, model_provider) DO UPDATE SET
                  calls = excluded.calls, input = excluded.input, output = excluded.output,
                  cache_read = excluded.cache_read, cache_write = excluded.cache_write,
                  reasoning = excluded.reasoning",
@@ -1686,7 +1667,7 @@ impl Store {
                 agent,
                 hour,
                 model,
-                provider,
+                model_provider,
                 stored(Some(bucket.calls)),
                 stored(t.input),
                 stored(t.output),
@@ -1739,25 +1720,25 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let hour = at.max(0) / 3600;
-        let (mut model, mut provider) = (
+        let (mut model, mut model_provider) = (
             served.model.unwrap_or_default(),
-            served.provider.unwrap_or_default(),
+            served.model_provider.unwrap_or_default(),
         );
         let (known, kept): (bool, i64) = tx.query_row(
-            "SELECT COALESCE(SUM(model = ?3 AND provider = ?4), 0), COUNT(*)
-             FROM agent_usage_hours WHERE agent = ?1 AND hour = ?2",
-            params![agent, hour, model, provider],
+            "SELECT COALESCE(SUM(model = ?3 AND model_provider = ?4), 0), COUNT(*)
+             FROM agent_usage_model_hours WHERE agent = ?1 AND hour = ?2",
+            params![agent, hour, model, model_provider],
             |row| Ok((row.get::<_, i64>(0)? > 0, row.get(1)?)),
         )?;
         if !known && kept >= MODELS_AN_HOUR {
-            (model, provider) = ("", "");
+            (model, model_provider) = ("", "");
         }
         let before = tx
             .query_row(
                 "SELECT calls, input, output, cache_read, cache_write, reasoning
-                 FROM agent_usage_hours WHERE agent = ?1 AND hour = ?2
-                     AND model = ?3 AND provider = ?4",
-                params![agent, hour, model, provider],
+                 FROM agent_usage_model_hours WHERE agent = ?1 AND hour = ?2
+                     AND model = ?3 AND model_provider = ?4",
+                params![agent, hour, model, model_provider],
                 |row| usage_row(row, 0),
             )
             .optional()?
@@ -1772,11 +1753,11 @@ impl Store {
         let stored = |n: Option<u64>| n.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
         let t = bucket.tokens;
         tx.execute(
-            "INSERT INTO agent_usage_hours
-                 (agent, hour, model, provider,
+            "INSERT INTO agent_usage_model_hours
+                 (agent, hour, model, model_provider,
                   calls, input, output, cache_read, cache_write, reasoning)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(agent, hour, model, provider) DO UPDATE SET
+             ON CONFLICT(agent, hour, model, model_provider) DO UPDATE SET
                  calls = excluded.calls, input = excluded.input, output = excluded.output,
                  cache_read = excluded.cache_read, cache_write = excluded.cache_write,
                  reasoning = excluded.reasoning",
@@ -1784,7 +1765,7 @@ impl Store {
                 agent,
                 hour,
                 model,
-                provider,
+                model_provider,
                 stored(Some(bucket.calls)),
                 stored(t.input),
                 stored(t.output),
@@ -1793,10 +1774,12 @@ impl Store {
                 stored(t.reasoning)
             ],
         )?;
-        tx.execute(
-            "DELETE FROM agent_usage_hours WHERE hour < ?1",
-            params![hour - AGENT_USAGE_DAYS * 24],
-        )?;
+        for table in ["agent_usage_hours", "agent_usage_model_hours"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE hour < ?1"),
+                params![hour - AGENT_USAGE_DAYS * 24],
+            )?;
+        }
         tx.commit()
     }
 
@@ -1841,25 +1824,34 @@ impl Store {
         let from = since.max(0) / 3600;
         let sums = "SUM(calls), SUM(input), SUM(output), SUM(cache_read), SUM(cache_write), SUM(reasoning)";
         let mut query = self.db.prepare(&format!(
-            "SELECT agent, hour, model, provider, {sums} FROM (
-                 SELECT c.sandbox || '/' || u.agent AS agent, u.hour AS hour, u.model AS model,
-                        u.provider AS provider, u.calls AS calls, u.input AS input,
+            "SELECT agent, hour, model, model_provider, {sums} FROM (
+                 SELECT c.sandbox || '/' || u.agent AS agent, u.hour AS hour, '' AS model,
+                        '' AS model_provider, u.calls AS calls, u.input AS input,
                         u.output AS output, u.cache_read AS cache_read,
                         u.cache_write AS cache_write, u.reasoning AS reasoning
                  FROM usage_hours u JOIN conversations c ON c.id = u.conversation
                  WHERE (?1 IS NULL OR c.owner = ?1) AND u.hour >= ?2
                  UNION ALL
-                 SELECT agent, hour, model, provider, calls, input, output, cache_read,
+                 SELECT c.sandbox || '/' || u.agent, u.hour, u.model, u.model_provider,
+                        u.calls, u.input, u.output, u.cache_read, u.cache_write, u.reasoning
+                 FROM usage_model_hours u JOIN conversations c ON c.id = u.conversation
+                 WHERE (?1 IS NULL OR c.owner = ?1) AND u.hour >= ?2
+                 UNION ALL
+                 SELECT agent, hour, '', '', calls, input, output, cache_read,
                         cache_write, reasoning
                  FROM agent_usage_hours WHERE ?3 AND hour >= ?2
-             ) GROUP BY agent, hour, model, provider"
+                 UNION ALL
+                 SELECT agent, hour, model, model_provider, calls, input, output, cache_read,
+                        cache_write, reasoning
+                 FROM agent_usage_model_hours WHERE ?3 AND hour >= ?2
+             ) GROUP BY agent, hour, model, model_provider"
         ))?;
         let rows = query.query_map(params![owner, from, outside], |row| {
             Ok(HourRow {
                 agent: row.get(0)?,
                 hour: row.get(1)?,
                 model: row.get(2)?,
-                provider: row.get(3)?,
+                model_provider: row.get(3)?,
                 counts: usage_row(row, 4)?,
             })
         })?;
@@ -1933,7 +1925,11 @@ impl Store {
             .into_iter()
             .filter(|h| ask.scope.covers(&h.agent))
             .map(|h| {
-                let cost = prices.cost(said(&h.provider), said(&h.model), h.counts.tokens.into());
+                let cost = prices.cost(
+                    said(&h.model_provider),
+                    said(&h.model),
+                    h.counts.tokens.into(),
+                );
                 (h, cost)
             })
             .collect();
@@ -1943,8 +1939,11 @@ impl Store {
             let sandbox = h.agent.split_once('/').map_or(h.agent.as_str(), |(s, _)| s);
             let agent = agents.entry(h.agent.clone()).or_default();
             *agent = (plus(agent.0, h.counts), agent.1.plus(*cost));
-            let sandbox = sandboxes.entry(sandbox.to_owned()).or_default();
-            *sandbox = (plus(sandbox.0, h.counts), sandbox.1.plus(*cost));
+            // One agent's hours are not its sandbox's: no sandbox total.
+            if !matches!(ask.scope, Scope::Agent { .. }) {
+                let sandbox = sandboxes.entry(sandbox.to_owned()).or_default();
+                *sandbox = (plus(sandbox.0, h.counts), sandbox.1.plus(*cost));
+            }
         }
         let mut window = Window {
             agents: agents
@@ -4175,51 +4174,26 @@ mod tests {
     }
 
     #[test]
-    fn a_database_from_before_models_keeps_its_usage_under_no_model() {
+    fn usage_kept_before_models_and_by_an_older_bridge_counts_under_no_model() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("app.db");
-        {
-            let store = Store::open(&path).unwrap();
-            store.conversation("c-1", "lab", "main", "alice").unwrap();
-            // The tables as the bridge of 0.5 made them, with a row each.
-            store
-                .db
-                .execute_batch(
-                    "DROP TABLE usage_hours; DROP TABLE agent_usage_hours;
-                     CREATE TABLE usage_hours (
-                         conversation TEXT NOT NULL REFERENCES conversations(id),
-                         agent TEXT NOT NULL, hour INTEGER NOT NULL CHECK(hour >= 0),
-                         calls INTEGER NOT NULL CHECK(calls >= 0), input INTEGER, output INTEGER,
-                         cache_read INTEGER, cache_write INTEGER, reasoning INTEGER,
-                         PRIMARY KEY (conversation, agent, hour));
-                     CREATE TABLE agent_usage_hours (
-                         agent TEXT NOT NULL, hour INTEGER NOT NULL CHECK(hour >= 0),
-                         calls INTEGER NOT NULL CHECK(calls >= 0), input INTEGER, output INTEGER,
-                         cache_read INTEGER, cache_write INTEGER, reasoning INTEGER,
-                         PRIMARY KEY (agent, hour));
-                     INSERT INTO usage_hours VALUES ('c-1', 'main', 500000, 2, 10, 1, NULL, NULL, NULL);
-                     INSERT INTO agent_usage_hours VALUES ('lab/main', 500000, 3, 7, NULL, NULL, NULL, NULL);",
-                )
-                .unwrap();
-        }
         let store = Store::open(&path).unwrap();
-        // Opened again by another process: nothing left to do.
-        Store::open(&path).unwrap();
-        let totals = store.usage_since("alice", 0, true).unwrap();
-        assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].1.calls, 5);
-        assert_eq!(totals[0].1.tokens.input, Some(17));
-        assert_eq!(totals[0].1.tokens.output, Some(1));
-        let unsaid: i64 = store
+        store.conversation("c-1", "lab", "main", "alice").unwrap();
+        // An older bridge, still running after the upgrade, writes as it
+        // always did: its tables and their keys are as they were.
+        store
             .db
-            .query_row(
-                "SELECT COUNT(*) FROM usage_hours WHERE model = '' AND provider = ''",
-                [],
-                |r| r.get(0),
+            .execute_batch(
+                "INSERT INTO usage_hours (conversation, agent, hour, calls, input, output)
+                     VALUES ('c-1', 'main', 500000, 2, 10, 1)
+                     ON CONFLICT(conversation, agent, hour) DO UPDATE SET calls = excluded.calls;
+                 INSERT INTO agent_usage_hours (agent, hour, calls, input)
+                     VALUES ('lab/main', 500000, 3, 7)
+                     ON CONFLICT(agent, hour) DO UPDATE SET calls = excluded.calls;",
             )
             .unwrap();
-        assert_eq!(unsaid, 1);
-        // A report naming its model is kept apart from the old row.
+        // Opened again by another process: nothing to do twice.
+        Store::open(&path).unwrap();
         store
             .add_usage_by(
                 "c-1",
@@ -4227,7 +4201,7 @@ mod tests {
                 500_000 * 3600,
                 Served {
                     model: Some("gpt-5.5"),
-                    provider: Some("openai"),
+                    model_provider: Some("openai"),
                 },
                 1,
                 UsageTokens {
@@ -4236,11 +4210,38 @@ mod tests {
                 },
             )
             .unwrap();
-        let rows: i64 = store
-            .db
-            .query_row("SELECT COUNT(*) FROM usage_hours", [], |r| r.get(0))
+        // Both counted: the conversation's total and the window's.
+        assert_eq!(store.usage("c-1").unwrap().unwrap().calls, 3);
+        let totals = store.usage_since("alice", 0, true).unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].1.calls, 6);
+        assert_eq!(totals[0].1.tokens.input, Some(18));
+        assert_eq!(totals[0].1.tokens.output, Some(1));
+        // The old rows have no model: unpriced, the new one priced.
+        let window = store
+            .usage_report(
+                &WindowAsk {
+                    owner: Some("alice"),
+                    since: 0,
+                    outside: true,
+                    series: None,
+                    scope: Scope::Host,
+                    sum: false,
+                },
+                &crate::pricing::PriceList::bundled(),
+            )
             .unwrap();
-        assert_eq!(rows, 2);
+        let cost = window.agents[0].2;
+        assert_eq!(cost.unpriced, 18);
+        assert!(cost.usd_micros > 0);
+        // The new hour is kept apart, by its model.
+        let rows = |table: &str| -> i64 {
+            store
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows("usage_model_hours"), 1);
     }
 
     #[test]
@@ -4256,7 +4257,7 @@ mod tests {
         for model in &models {
             let served = Served {
                 model: Some(model.as_str()),
-                provider: Some("nous"),
+                model_provider: Some("nous"),
             };
             store
                 .add_usage_by("c-1", "main", 3_600, served, 1, one)
@@ -4273,13 +4274,13 @@ mod tests {
                 3_600,
                 Served {
                     model: Some("m0"),
-                    provider: Some("nous"),
+                    model_provider: Some("nous"),
                 },
                 1,
                 one,
             )
             .unwrap();
-        for table in ["usage_hours", "agent_usage_hours"] {
+        for table in ["usage_model_hours", "agent_usage_model_hours"] {
             let count = |sql: &str| -> i64 {
                 store
                     .db
@@ -4306,11 +4307,11 @@ mod tests {
         };
         let opus = Served {
             model: Some("claude-opus-5-5"),
-            provider: Some("anthropic"),
+            model_provider: Some("anthropic"),
         };
         let codex = Served {
             model: Some("gpt-5.5"),
-            provider: Some("openai-codex"),
+            model_provider: Some("openai-codex"),
         };
         let day = 86_400;
         store
@@ -4326,7 +4327,7 @@ mod tests {
             .add_usage_by("c-c", "main", 2 * day, opus, 1, million)
             .unwrap();
         let prices = crate::pricing::PriceList::bundled();
-        let opus_cost = prices.cost(opus.provider, opus.model, million.into());
+        let opus_cost = prices.cost(opus.model_provider, opus.model, million.into());
         assert!(opus_cost.usd_micros > 0);
         let ask = |scope, series, sum| WindowAsk {
             owner: Some("alice"),
@@ -4394,6 +4395,8 @@ mod tests {
         assert_eq!(main.agents.len(), 1);
         assert_eq!(main.agents[0].0, "work/main");
         assert_eq!(main.sum.len(), 1);
+        // One agent's hours are not its sandbox's total.
+        assert!(main.sandboxes.is_empty());
         // Every person's, for the host's own CLI.
         store.conversation("c-d", "lab", "main", "bob").unwrap();
         store

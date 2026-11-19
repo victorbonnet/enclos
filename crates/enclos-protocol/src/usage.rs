@@ -16,7 +16,7 @@ pub const MAX_CALLS: u32 = 1_000;
 /// The most characters of a model's name passed on.
 pub const MAX_MODEL_CHARS: usize = 120;
 /// The most characters of a model provider's name passed on.
-pub const MAX_PROVIDER_CHARS: usize = 64;
+pub const MAX_MODEL_PROVIDER_CHARS: usize = 64;
 
 /// Token counts. `None`: the runtime does not count it, which is not 0.
 /// `input` is input not read from or written to the provider's cache.
@@ -141,7 +141,7 @@ pub struct CallUsage {
     /// (Hermes: `anthropic`, `openai-codex`), so that the bridge prices it
     /// (issue #343).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub model_provider: Option<String>,
     /// A call the runtime made on its own (a title, a summary of a long
     /// context), not one of the agent's answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -168,7 +168,7 @@ pub struct AgentCallUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub model_provider: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
     #[serde(default = "one", skip_serializing_if = "is_one")]
@@ -185,9 +185,12 @@ pub struct UsageTotal {
 }
 
 /// The most agents one `usage.report` lists: far more than a host runs,
-/// and few enough, with their costs, to fit one device message.
-pub const MAX_REPORT_AGENTS: usize = 110;
-/// The most sandboxes one `usage.report` gives a total of: the heaviest.
+/// and few enough to fit one device message.
+pub const MAX_REPORT_AGENTS: usize = 190;
+/// The most agents a report with costs lists (`usage.get`'s `cost`), whose
+/// rows are longer: the heaviest, by name.
+pub const MAX_COSTED_AGENTS: usize = 110;
+/// The most sandboxes a report with costs gives a total of: the heaviest.
 pub const MAX_REPORT_SANDBOXES: usize = 20;
 
 /// What one agent used over a window, in a `usage.report`.
@@ -221,7 +224,9 @@ pub struct SandboxTotal {
 pub const BUCKETS: [u32; 2] = [3_600, 86_400];
 /// The most agents a `usage.report` with series lists totals of: the
 /// heaviest, so that they and the series fit one device message.
-pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 20;
+pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 50;
+/// The same, for a report with costs.
+pub const MAX_COSTED_AGENTS_WITH_SERIES: usize = 20;
 /// The most agents a `usage.report` gives a series of: the heaviest.
 pub const MAX_SERIES: usize = 8;
 /// The most agents a report for one sandbox or agent gives a series of,
