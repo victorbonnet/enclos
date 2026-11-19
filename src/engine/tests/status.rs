@@ -922,7 +922,14 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(s["state"], "created");
     assert_eq!(s["services"], serde_json::json!({"known": []}));
     assert_eq!(s["runtime"]["kind"], "hermes");
-    assert_eq!(s["runtime"]["version"], "not_provided");
+    // Hermes names its install stamp, and this checkout has none.
+    assert_eq!(s["runtime"]["version"], "absent");
+    // Unit tests look nothing up: a lookup refused is "cannot tell".
+    assert!(
+        s["runtime"]["latest"].get("cannot_tell").is_some(),
+        "{}",
+        s["runtime"]
+    );
     assert_eq!(
         s["runtime"]["logged_in"],
         serde_json::json!({"known": false})
@@ -992,4 +999,167 @@ fn an_agent_the_bridge_heard_working_is_said_to_be_working_while_it_runs() {
     assert!(unreadable.activity_unreadable.is_some());
     drop(live);
     assert_eq!(agents(&engine).activity_unreadable, None);
+}
+
+/// Hermes's own reading of a release, served from a file of the test.
+struct Released(&'static str);
+
+impl RuntimeAdapter for Released {
+    fn kind(&self) -> RuntimeKind {
+        Bare.kind()
+    }
+    fn version(&self) -> &'static str {
+        "0"
+    }
+    fn endpoints(&self) -> &'static str {
+        ""
+    }
+    fn installer(&self) -> Installer {
+        Bare.installer()
+    }
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        Bare.home_files(backend)
+    }
+    fn login(&self) -> String {
+        String::new()
+    }
+    fn create_agent(&self, name: &AgentName) -> SandboxCommand {
+        Bare.create_agent(name)
+    }
+    fn agent_files(&self, _: &AgentName) -> String {
+        String::new()
+    }
+    fn talk(&self, _: &AgentName) -> String {
+        String::new()
+    }
+    fn services(&self) -> Vec<crate::runtime::RuntimeService> {
+        Vec::new()
+    }
+    fn agents_in(&self, _: &Path) -> std::result::Result<Vec<RuntimeAgentName>, Unreadable> {
+        Ok(Vec::new())
+    }
+    fn release_source(&self) -> Option<&'static str> {
+        Some(self.0)
+    }
+    fn release_version(&self, answer: &str) -> std::result::Result<String, String> {
+        crate::runtime::hermes::Hermes.release_version(answer)
+    }
+    fn checked_releases(&self) -> &'static [&'static str] {
+        &["0.23.2"]
+    }
+}
+
+#[test]
+fn the_latest_release_is_kept_for_hours_a_failure_for_minutes_and_lookups_can_be_off() {
+    let (dir, engine) = engine();
+    // As `enclos init` makes it: the answers are kept there.
+    std::fs::create_dir_all(engine.layout.data()).unwrap();
+    std::fs::create_dir_all(engine.layout.config_file().parent().unwrap()).unwrap();
+    let answer = dir.path().join("latest.json");
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.2"}"#).unwrap();
+    let url: &'static str = Box::leak(format!("file://{}", answer.display()).into_boxed_str());
+    let runtime = Released(url);
+    let at = Timestamp::from_second(1_800_000_000).unwrap();
+    let later = |hours: i64| Timestamp::from_second(at.as_second() + hours * 3600).unwrap();
+    let release = |version: &str, checked| {
+        Fact::Known(crate::engine::LatestRelease {
+            version: version.into(),
+            checked,
+        })
+    };
+    assert_eq!(engine.latest_release(&runtime, at), release("0.23.2", true));
+
+    // Kept: the answer is not asked for again.
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.3"}"#).unwrap();
+    assert_eq!(
+        engine.latest_release(&runtime, later(5)),
+        release("0.23.2", true)
+    );
+
+    // Asked again after six hours: a release this enclos was not checked with.
+    assert_eq!(
+        engine.latest_release(&runtime, later(7)),
+        release("0.23.3", false)
+    );
+
+    // A failed lookup is "cannot tell", kept half an hour, then asked again.
+    std::fs::write(&answer, r#"{"message": "API rate limit exceeded"}"#).unwrap();
+    let failed = engine.latest_release(&runtime, later(14));
+    assert!(matches!(failed, Fact::CannotTell(_)), "{failed:?}");
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.4"}"#).unwrap();
+    assert_eq!(engine.latest_release(&runtime, later(14)), failed);
+    assert_eq!(
+        engine.latest_release(&runtime, later(15)),
+        release("0.23.4", false)
+    );
+
+    // Turned off in config.toml, nothing is looked up or said.
+    std::fs::write(engine.layout.config_file(), "runtime_releases = false\n").unwrap();
+    assert_eq!(
+        engine.latest_release(&runtime, later(30)),
+        Fact::NotProvided
+    );
+    assert_eq!(engine.latest_release(&Bare, later(30)), Fact::NotProvided);
+
+    // Written wrong, it looks nothing up either, and says why.
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.9"}"#).unwrap();
+    std::fs::write(
+        engine.layout.config_file(),
+        "runtime_releases = \"false\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        engine.latest_release(&runtime, later(60)),
+        Fact::CannotTell(
+            "nothing was looked up: `runtime_releases` in config.toml is string, not true or false"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn status_shows_the_version_an_openclaw_sandbox_reported_and_none_of_another_runtime() {
+    let (_dir, engine, name) = with_runtime();
+    let set = |kind: Option<RuntimeKind>| {
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::OpenClaw);
+                    engine.state.put(lock, &record)?;
+                    match kind {
+                        Some(kind) => {
+                            let version = crate::model::runtime::RuntimeVersion::new("2026.11.5");
+                            engine.state.put_runtime_version(
+                                lock,
+                                &name,
+                                kind,
+                                &version.unwrap(),
+                                crate::model::now(),
+                            )?;
+                        }
+                        None => {
+                            engine.state.forget_runtime_version(lock, &name)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    };
+    let version = || {
+        let json = serde_json::to_value(engine.status(None).unwrap()).unwrap();
+        json["sandboxes"][0]["runtime"]["version"].clone()
+    };
+    set(None);
+    assert_eq!(version(), "absent");
+    set(Some(RuntimeKind::OpenClaw));
+    assert_eq!(version(), serde_json::json!({"known": "2026.11.5"}));
+    // Reported by another runtime than the one recorded: not this one's.
+    set(Some(RuntimeKind::Hermes));
+    assert_eq!(version(), "absent");
 }

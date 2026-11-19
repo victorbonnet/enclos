@@ -168,6 +168,21 @@ impl Engine {
             .map(|(end, _)| end)
     }
 
+    /// [`Engine::run_exec_in_sandbox`], told to end at `deadline` as
+    /// [`Engine::run_in_sandbox_within`] is, for a runtime's own command
+    /// that may not answer. Also says whether it was told to end.
+    pub(super) fn run_exec_in_sandbox_within(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        deadline: Instant,
+    ) -> Result<(SessionEnd, bool)> {
+        let kind = CommandKind::Exec;
+        self.run_in_sandbox_as(by, name, command, audit_name, kind, Some(deadline))
+    }
+
     /// [`Engine::run_in_sandbox`], told to end at `deadline`, as `launch`
     /// is when its service stops: every member of the session is stopped,
     /// TERM then KILL, whatever its process group, and so is what it left

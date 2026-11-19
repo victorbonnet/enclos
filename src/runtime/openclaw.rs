@@ -22,6 +22,12 @@ use crate::model::secret::{is_variable_name, reserved_variable};
 
 pub struct OpenClaw;
 pub const INSTALLER_URL: &str = "https://openclaw.ai/install-cli.sh";
+/// npm's `latest` OpenClaw, which the installer installs by default.
+const LATEST_RELEASE: &str = "https://registry.npmjs.org/openclaw/latest";
+/// The OpenClaw releases enclos's runtime tests passed with before this
+/// enclos release (ADR 0074, proposed): `TESTED_OPENCLAW`, which CI
+/// installs, among them.
+const CHECKED_RELEASES: &[&str] = &["2026.11.5"];
 const CONFIG: &str = ".openclaw/openclaw.json";
 const MAX_CONFIG: u64 = 256 * 1024;
 const MAX_AGENTS: usize = 512;
@@ -815,8 +821,57 @@ impl RuntimeAdapter for OpenClaw {
     fn runtime_facts(&self) -> RuntimeFacts {
         RuntimeFacts {
             install: Some(at(".local/share/openclaw/bin/openclaw")),
+            // The package sits under a folder named after the Node version
+            // the installer chose, so OpenClaw is asked (`version_command`).
             ..RuntimeFacts::default()
         }
+    }
+    fn release_source(&self) -> Option<&'static str> {
+        Some(LATEST_RELEASE)
+    }
+    fn release_version(&self, answer: &str) -> Result<String, String> {
+        let release: Value =
+            serde_json::from_str(answer).map_err(|_| "npm's answer is not JSON".to_owned())?;
+        release
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "npm's answer names no version".to_owned())
+    }
+    fn checked_releases(&self) -> &'static [&'static str] {
+        CHECKED_RELEASES
+    }
+    fn version_command(&self, report: &Path) -> Option<SandboxCommand> {
+        Some(SandboxCommand::new(vec![
+            "sh".into(),
+            "-c".into(),
+            "exec openclaw --version > \"$1\"".into(),
+            "sh".into(),
+            report.into(),
+        ]))
+    }
+    fn reported_version(&self, text: &str) -> Result<String, String> {
+        // `OpenClaw 2026.11.5 (abc1234)` or the version alone: the word
+        // after `OpenClaw`, else the first dotted one such as `2026.11.5`,
+        // so a line printed before it, such as `1 plugin loaded`, is not
+        // taken for the version.
+        let dotted = |w: &&str| {
+            let w = w.strip_prefix('v').unwrap_or(w);
+            w.starts_with(|c: char| c.is_ascii_digit())
+                && w.split('.')
+                    .take(2)
+                    .all(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+                && w.contains('.')
+        };
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let named = words
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("openclaw") && dotted(&pair[1]))
+            .map(|pair| pair[1]);
+        named
+            .or_else(|| words.iter().copied().find(|w| dotted(w)))
+            .map(str::to_owned)
+            .ok_or_else(|| "`openclaw --version` printed no version".to_owned())
     }
     fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts {
         AgentFacts {
@@ -878,6 +933,45 @@ fn transfer(operation: &str, name: &AgentName, archive: &Path, context: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_checked_releases_include_the_openclaw_ci_installs() {
+        let channel = include_str!("../../channels/openclaw/channel.js");
+        let tested = channel
+            .lines()
+            .find_map(|l| l.strip_prefix("export const TESTED_OPENCLAW = '"))
+            .and_then(|rest| rest.strip_suffix("';"))
+            .expect("channel.js names TESTED_OPENCLAW");
+        assert!(CHECKED_RELEASES.contains(&tested), "{tested}");
+    }
+
+    #[test]
+    fn the_latest_release_and_the_installed_version_are_read() {
+        let latest = OpenClaw.release_version(r#"{"name": "openclaw", "version": "2026.11.5"}"#);
+        assert_eq!(latest, Ok("2026.11.5".into()));
+        assert!(
+            OpenClaw
+                .release_version(r#"{"error": "Not found"}"#)
+                .is_err()
+        );
+        assert!(OpenClaw.release_version("<html>").is_err());
+        let reported = |t: &str| OpenClaw.reported_version(t);
+        assert_eq!(
+            reported("OpenClaw 2026.11.5 (3f2a1b0)\n"),
+            Ok("2026.11.5".into())
+        );
+        assert_eq!(reported("2026.11.5\n"), Ok("2026.11.5".into()));
+        assert_eq!(
+            reported("1 plugin loaded\nOpenClaw 2026.11.5\n"),
+            Ok("2026.11.5".into())
+        );
+        assert_eq!(
+            reported("3 warnings\n2026.11.6 (beta)\n"),
+            Ok("2026.11.6".into())
+        );
+        assert!(reported("1 plugin loaded\n").is_err());
+        assert!(reported("").is_err());
+    }
 
     fn agent(name: &str) -> RuntimeAgentName {
         RuntimeAgentName::new(name).unwrap()

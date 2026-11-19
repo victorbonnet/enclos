@@ -80,6 +80,11 @@ impl Lab {
             _turn: turn,
         };
         lab.ok(&["init"]);
+        // `status` looks no runtime release up on the network (ADR 0074).
+        let config = lab.root.path().join("config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("runtime_releases = false\n");
+        std::fs::write(&config, text).unwrap();
         // No `--backend`: bubblewrap is this host's default backend, which
         // `init` wrote to config.toml.
         lab.ok(&["sandbox", "create", "lab", "--template", "assistant"]);

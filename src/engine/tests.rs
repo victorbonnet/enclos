@@ -78,6 +78,21 @@ impl super::staging::Downloader for LocalFiles {
             None => super::staging::Curl.download(url, to),
         }
     }
+
+    /// Tests never reach the network to look a release up: a test that
+    /// wants an answer serves it from a file.
+    fn lookup(
+        &self,
+        url: &str,
+        to: &std::path::Path,
+    ) -> std::result::Result<(), super::staging::DownloadFailed> {
+        match url.strip_prefix("file://") {
+            Some(_) => self.download(url, to),
+            None => Err(super::staging::DownloadFailed::NotRun(
+                "tests look nothing up on the network".into(),
+            )),
+        }
+    }
 }
 
 fn engine() -> (TempDir, Engine) {

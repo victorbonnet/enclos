@@ -139,6 +139,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
                 "installed": end.installed,
                 "session": output::session(&end.end),
                 "recorded": end.recorded.map(|k| k.to_string()),
+                "runtime_version": end.version.as_ref().and_then(|v| v.as_ref().ok()).map(|v| v.to_string()),
+                "runtime_version_unrecorded": end.version.as_ref().and_then(|v| v.as_ref().err()),
                 "policy_version": end.policy,
                 "login": format!("enclos connect {sandbox} -- {}", end.login),
             }),
@@ -157,10 +159,19 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         );
         return Ok(exit::ERROR);
     }
+    let installed = match &end.version {
+        Some(Ok(version)) => format!("{shown} {version}"),
+        _ => shown.to_owned(),
+    };
     println!(
-        "{shown} is installed in sandbox {sandbox} (policy v{}). Log it in and set it up with its own command: `enclos connect {sandbox} -- {}`.",
+        "{installed} is installed in sandbox {sandbox} (policy v{}). Log it in and set it up with its own command: `enclos connect {sandbox} -- {}`.",
         end.policy, end.login
     );
+    if let Some(Err(why)) = &end.version {
+        eprintln!(
+            "enclos: {shown}'s version is not recorded, so `enclos status` cannot say whether it is outdated until the next install records it: {why}."
+        );
+    }
     Ok(exit::OK)
 }
 

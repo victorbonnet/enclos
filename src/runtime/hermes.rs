@@ -33,6 +33,22 @@ pub const INSTALLER_URL: &str = "https://hermes-agent.nousresearch.com/install.s
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
 
+/// The stamp Hermes's installer writes beside the checkout, which Hermes
+/// reads for its own version (`baseVersion`). That `hermes update`
+/// rewrites it is to verify (design §14).
+const INSTALL_STAMP: &str = ".hermes/hermes-agent/install-stamp.json";
+
+/// Hermes's latest stable release, the one its installer installs by
+/// default: what the installer's `latest_stable_release` asks first.
+const LATEST_RELEASE: &str =
+    "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest";
+
+/// The Hermes releases enclos's runtime tests passed with before this
+/// enclos release (ADR 0074, proposed). CI tests Hermes's default branch,
+/// not a release: each release here had CI's Hermes tests run against it
+/// outside CI, 0.23.2 with enclos 334ea6c5 on 2026-11-19 (369 passed).
+const CHECKED_RELEASES: &[&str] = &["0.23.2"];
+
 // The mobile app's channel plugin (`channels/hermes/enclos/`), carried by
 // the binary so that nothing is downloaded to put it in a sandbox.
 const APP_PLUGIN_YAML: &str = include_str!("../../channels/hermes/enclos/plugin.yaml");
@@ -486,15 +502,21 @@ impl RuntimeAdapter for Hermes {
         runtime.into_iter().chain(caches).collect()
     }
 
-    fn fact_value(&self, at: &ValueAt, text: &str) -> Result<Option<String>, String> {
-        facts::value(at, text)
+    fn fact_value(&self, fact: &ValueAt, text: &str) -> Result<Option<String>, String> {
+        match fact.file == at(INSTALL_STAMP) {
+            true => facts::stamp_value(fact, text),
+            false => facts::value(fact, text),
+        }
     }
 
     fn runtime_facts(&self) -> RuntimeFacts {
         RuntimeFacts {
-            // Not on disk where enclos can rely on it: `pyproject.toml` says
-            // 0.0.0 (to verify, design §14).
-            version: None,
+            // The release Hermes was built from, as Hermes reads it for its
+            // own version; `pyproject.toml` says 0.0.0.
+            version: Some(ValueAt {
+                file: at(INSTALL_STAMP),
+                keys: vec!["baseVersion".into()],
+            }),
             // Agents share the root login.
             login: Some(at(".hermes/auth.json")),
             // Where the installer puts Hermes itself.
@@ -537,6 +559,18 @@ impl RuntimeAdapter for Hermes {
                 .to_vec(),
             folder: Some(folder),
         }
+    }
+
+    fn release_source(&self) -> Option<&'static str> {
+        Some(LATEST_RELEASE)
+    }
+
+    fn release_version(&self, answer: &str) -> Result<String, String> {
+        facts::release_tag(answer)
+    }
+
+    fn checked_releases(&self) -> &'static [&'static str] {
+        CHECKED_RELEASES
     }
 
     fn talk(&self, agent: &AgentName) -> String {
@@ -1256,7 +1290,10 @@ mod tests {
         assert_eq!(
             (rt.version, rt.login, rt.install),
             (
-                None,
+                Some(ValueAt {
+                    file: at(".hermes/hermes-agent/install-stamp.json"),
+                    keys: vec!["baseVersion".into()],
+                }),
                 Some(at(".hermes/auth.json")),
                 Some(at(".hermes/hermes-agent"))
             )
