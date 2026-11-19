@@ -163,3 +163,189 @@ fn a_member_record_gets_its_turn_while_a_proxy_logs_a_burst_of_connections() {
     recorded.unwrap();
     assert_eq!(failed, 0, "log writes failed");
 }
+
+#[test]
+fn tagged_connections_keep_provenance_through_the_existing_batched_writer() {
+    use crate::model::net::Reason;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let log = writer_of(&store);
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let registered = "a".repeat(64);
+    let forged = "b".repeat(64);
+    log.begin_probe(&sandbox, &registered).unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|thread| {
+            let log = Arc::clone(&log);
+            let registered = registered.clone();
+            let forged = forged.clone();
+            std::thread::spawn(move || {
+                for index in 0..20 {
+                    let mut connection = event("10.0.0.1");
+                    connection.verdict = Verdict::Denied;
+                    connection.reason = Some(Reason::PrivateAddress);
+                    let tag = if (thread + index) % 2 == 0 {
+                        &registered
+                    } else {
+                        &forged
+                    };
+                    let row = log.record_probe(&connection, Some(tag)).unwrap();
+                    connection.bytes_down = 1000 + index;
+                    log.finish(row, &connection).unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(log.events(&sandbox, None).unwrap().len(), 160);
+    assert_eq!(log.denied(&sandbox).unwrap()[0].count, 160);
+    assert_eq!(log.denied_for_approval(&sandbox).unwrap()[0].count, 80);
+    assert!(
+        log.events(&sandbox, None)
+            .unwrap()
+            .iter()
+            .all(|event| event.bytes_down >= 1000)
+    );
+    log.end_probe(&registered).unwrap();
+    let mut connection = event("10.0.0.1");
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(Reason::PrivateAddress);
+    log.record_probe(&connection, Some(&registered)).unwrap();
+    assert_eq!(
+        log.denied_for_approval(&sandbox).unwrap()[0].count,
+        81,
+        "closing the host run makes later tagged traffic ordinary"
+    );
+    let version: u32 = Connection::open(&store.db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version,
+        crate::state::sqlite::schema::current(),
+        "diagnostic metadata does not change the released schema"
+    );
+}
+
+fn probe_sources(store: &SqliteStateStore) -> Connection {
+    Connection::open(store.db.with_file_name(crate::layout::PROBE_SOURCES_FILE)).unwrap()
+}
+
+fn refused(host: &str) -> NetEvent {
+    let mut connection = event(host);
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(crate::model::net::Reason::PrivateAddress);
+    connection
+}
+
+#[test]
+fn a_side_database_that_refuses_provenance_never_costs_a_log_row() {
+    use super::Write;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&sandbox, &tag).unwrap();
+    probe_sources(&store).execute_batch("CREATE TRIGGER refuse BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'refused'); END;").unwrap();
+    let tagged = Write::Record(refused("10.0.0.1"), Some(tag));
+    let other = Write::Record(event("example.com"), None);
+    let (rows, _) = store.write_log(&[&tagged, &other]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(store.events(&sandbox, None).unwrap().len(), 2);
+    assert_eq!(
+        store.denied_for_approval(&sandbox).unwrap()[0].count,
+        1,
+        "without its provenance, the connection counts as ordinary"
+    );
+}
+
+#[test]
+fn a_forged_tag_never_waits_for_the_side_database() {
+    use super::Write;
+    let (_dir, mut store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let registered = "a".repeat(64);
+    store.begin_probe(&sandbox, &registered).unwrap();
+    store.write_wait = Duration::from_secs(1);
+    // Another writer of the side database, such as the host starting a run.
+    let writer = probe_sources(&store);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let forged = Write::Record(refused("10.0.0.1"), Some("b".repeat(64)));
+    let started = std::time::Instant::now();
+    store.write_log(&[&forged]).unwrap();
+    assert!(
+        started.elapsed() < store.write_wait,
+        "a tag no run registered leaves the side database out of the log's transaction"
+    );
+
+    // A registered run's connection waits for it, then is logged without
+    // its provenance rather than not at all.
+    let tagged = Write::Record(refused("10.0.0.1"), Some(registered));
+    store.write_log(&[&tagged]).unwrap();
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(store.events(&sandbox, None).unwrap().len(), 2);
+    assert_eq!(store.denied_for_approval(&sandbox).unwrap()[0].count, 2);
+}
+
+#[test]
+fn refusals_for_approval_wait_for_a_runs_provenance_to_commit() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    store.begin_probe(&sandbox, &"a".repeat(64)).unwrap();
+    // As a log transaction writing provenance holds it until both databases
+    // have committed.
+    let writer = probe_sources(&store);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        writer.execute_batch("ROLLBACK").unwrap();
+    });
+    let started = std::time::Instant::now();
+    store.denied_for_approval(&sandbox).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    released.join().unwrap();
+}
+
+#[test]
+fn a_failed_batch_rolls_back_both_log_rows_and_their_diagnostic_provenance() {
+    use super::Write;
+    use crate::model::net::Reason;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&sandbox, &tag).unwrap();
+    Connection::open(&store.db).unwrap().execute_batch("CREATE TRIGGER reject_batch BEFORE INSERT ON net_events WHEN NEW.host='fail.example.com' BEGIN SELECT RAISE(ABORT,'batch refused'); END;").unwrap();
+    let mut connection = event("10.0.0.1");
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(Reason::PrivateAddress);
+    let tagged = Write::Record(connection.clone(), Some(tag));
+    let failing = Write::Record(event("fail.example.com"), None);
+    assert!(store.write_log(&[&tagged, &failing]).is_err());
+    assert!(store.events(&sandbox, None).unwrap().is_empty());
+    let marked: i64 = probe_sources(&store)
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(marked, 0, "no provenance survives without its log row");
+    writer_of(&store).record(&connection).unwrap();
+    assert_eq!(
+        store.denied_for_approval(&sandbox).unwrap()[0].count,
+        1,
+        "a later real connection is never hidden by rolled-back metadata"
+    );
+}

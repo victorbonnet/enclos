@@ -4,7 +4,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{SqliteStateStore, netlog};
+use rusqlite::Connection;
+
+use super::{SqliteStateStore, netlog, probe_sources};
 use crate::model::Timestamp;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::SandboxName;
@@ -24,8 +26,10 @@ pub struct NetLogWriter {
     writes: mpsc::Sender<Job>,
 }
 
-enum Write {
-    Record(NetEvent),
+/// A row to write: a connection as it opens, with the tag a host diagnostic
+/// run gave it, or as it closes.
+pub(super) enum Write {
+    Record(NetEvent, Option<String>),
     Finish(i64, NetEvent),
 }
 
@@ -81,27 +85,81 @@ fn write_batches(store: &SqliteStateStore, jobs: &mpsc::Receiver<Job>) {
 
 impl SqliteStateStore {
     /// Makes `writes` in one transaction; returns each one's row and how long
-    /// the transaction held the write lock.
-    fn write_log(&self, writes: &[&Write]) -> Result<(Vec<i64>, Duration)> {
+    /// the transaction held the write lock. A connection tagged by a run the
+    /// host registered gets its provenance in the same transaction. When the
+    /// side database takes part and the transaction fails, the batch is
+    /// written again without it: provenance never costs a log row, the
+    /// batch's or another connection's (ADR 0059).
+    pub(super) fn write_log(&self, writes: &[&Write]) -> Result<(Vec<i64>, Duration)> {
         let mut conn = self.open()?;
-        let tx = conn.transaction().map_err(self.sqlite_err())?;
-        let held = Instant::now();
-        let rows = writes
+        let tagged: Vec<_> = writes
             .iter()
             .map(|write| match write {
-                Write::Record(event) => netlog::record(&tx, event),
-                Write::Finish(row, event) => netlog::finish(&tx, *row, event).map(|()| *row),
+                Write::Record(event, Some(tag)) => Some((event, tag.as_str())),
+                _ => None,
             })
-            .collect::<rusqlite::Result<Vec<i64>>>()
-            .map_err(self.sqlite_err())?;
-        tx.commit().map_err(self.sqlite_err())?;
-        Ok((rows, held.elapsed()))
+            .collect();
+        let ordinary = vec![false; writes.len()];
+        let Some(probes) = self.registered_probes(&conn, &tagged) else {
+            return write_batch(&mut conn, writes, &ordinary).map_err(self.sqlite_err());
+        };
+        match write_batch(&mut conn, writes, &probes) {
+            Ok(written) => Ok(written),
+            Err(e) => {
+                eprintln!(
+                    "enclos: logging a diagnostic run's connections as ordinary: {}",
+                    self.sqlite_err()(e)
+                );
+                // A connection without the side database attached.
+                write_batch(&mut self.open()?, writes, &ordinary).map_err(self.sqlite_err())
+            }
+        }
     }
 }
 
+/// Makes `writes` in one transaction, with the provenance of each record
+/// `probes` marks; returns each one's row and how long the transaction held
+/// the write lock.
+fn write_batch(
+    conn: &mut Connection,
+    writes: &[&Write],
+    probes: &[bool],
+) -> rusqlite::Result<(Vec<i64>, Duration)> {
+    let tx = conn.transaction()?;
+    let held = Instant::now();
+    let rows = writes
+        .iter()
+        .zip(probes)
+        .map(|(write, &probe)| match write {
+            Write::Record(event, tag) => {
+                probe_sources::record(&tx, event, tag.as_deref().filter(|_| probe))
+            }
+            Write::Finish(row, event) => netlog::finish(&tx, *row, event).map(|()| *row),
+        })
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    tx.commit()?;
+    Ok((rows, held.elapsed()))
+}
+
 impl NetLogStore for NetLogWriter {
+    fn record_probe(&self, event: &NetEvent, tag: Option<&str>) -> Result<i64> {
+        self.write(Write::Record(event.clone(), tag.map(str::to_owned)))
+    }
+
+    fn begin_probe(&self, sandbox: &SandboxName, tag: &str) -> Result<()> {
+        self.store.begin_probe(sandbox, tag)
+    }
+
+    fn end_probe(&self, tag: &str) -> Result<()> {
+        self.store.end_probe(tag)
+    }
+
+    fn denied_for_approval(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        self.store.denied_for_approval(sandbox)
+    }
+
     fn record(&self, event: &NetEvent) -> Result<i64> {
-        self.write(Write::Record(event.clone()))
+        self.write(Write::Record(event.clone(), None))
     }
 
     fn finish(&self, row: i64, event: &NetEvent) -> Result<()> {
