@@ -68,6 +68,7 @@ const APP_PLUGIN_RUNTIME_APPROVALS: &str =
     include_str!("../../channels/hermes/enclos/runtime_approvals.py");
 const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/decisions.py");
 const APP_PLUGIN_HELD_TASKS: &str = include_str!("../../channels/hermes/enclos/held_tasks.py");
+const APP_PLUGIN_ASKS: &str = include_str!("../../channels/hermes/enclos/asks.py");
 const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
 const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.py");
 const APP_PLUGIN_SUGGESTED_REPLIES: &str =
@@ -360,6 +361,7 @@ impl RuntimeAdapter for Hermes {
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
                 file("decisions.py", APP_PLUGIN_DECISIONS)?,
                 file("held_tasks.py", APP_PLUGIN_HELD_TASKS)?,
+                file("asks.py", APP_PLUGIN_ASKS)?,
                 file("visible.py", APP_PLUGIN_VISIBLE)?,
                 file("tasks.py", APP_PLUGIN_TASKS)?,
                 file("suggested_replies.py", APP_PLUGIN_SUGGESTED_REPLIES)?,
@@ -1386,6 +1388,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
                 ".hermes/profiles/main/plugins/enclos/decisions.py",
                 ".hermes/profiles/main/plugins/enclos/held_tasks.py",
+                ".hermes/profiles/main/plugins/enclos/asks.py",
                 ".hermes/profiles/main/plugins/enclos/visible.py",
                 ".hermes/profiles/main/plugins/enclos/tasks.py",
                 ".hermes/profiles/main/plugins/enclos/suggested_replies.py",
