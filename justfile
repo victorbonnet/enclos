@@ -34,4 +34,8 @@ gitleaks-rule:
 openclaw-launchers:
     node --test src/runtime/openclaw/*.test.mjs
 
-ci: fmt clippy test deny hermes-plugin hermes-transfer openclaw-transfer openclaw-launchers openclaw-channel
+# The script the bridge adds to a runtime's task board page (Node 24)
+bridge-page:
+    node --test src/bridge/*.test.mjs
+
+ci: fmt clippy test deny hermes-plugin hermes-transfer openclaw-transfer openclaw-launchers openclaw-channel bridge-page

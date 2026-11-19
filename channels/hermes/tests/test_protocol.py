@@ -6,7 +6,9 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
@@ -75,11 +77,13 @@ class Home(unittest.TestCase):
             "send any message and I'll try to pick up where we left off.",
             "⚠️ Hermes is restarting — your current task will be interrupted.",
             "📬 No home channel is set for Enclos. A home channel is where Hermes delivers cron job results.",
+            "💾 Self-improvement review: Skill 'sdlc-review' patched · Memory updated",
         ]
         for text in notices:
             with self.subTest(text[:20]):
                 self.assertTrue(protocol.is_notice(text))
-        for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.", ""]:
+        for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.",
+                     "Self-improvement review: I patched the skill.", ""]:
             with self.subTest(text[:20]):
                 self.assertFalse(protocol.is_notice(text))
 
@@ -95,6 +99,27 @@ class Home(unittest.TestCase):
             self.assertTrue(protocol.is_home_command(text), text)
         for text in ["sethome", "/sethomes", "how do I /sethome?", ""]:
             self.assertFalse(protocol.is_home_command(text), text)
+
+
+@unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
+class NativeHermesNotices(unittest.TestCase):
+    """Each notice key still names a translation in a real Hermes, and its
+    English text still starts as the plugin's own fallback says."""
+
+    def test_every_notice_key_renders_and_starts_as_its_fallback(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        env = patch.dict(os.environ, {"HERMES_HOME": home.name, "HERMES_LANGUAGE": "en"})
+        env.start()
+        self.addCleanup(env.stop)
+        sys.path.insert(0, os.environ["ENCLOS_HERMES_SOURCE"])
+        self.addCleanup(sys.path.remove, os.environ["ENCLOS_HERMES_SOURCE"])
+        starts = protocol._translated_starts()
+        self.assertEqual(len(starts), len(protocol.NOTICE_KEYS), starts)
+        self.assertEqual(len(protocol.NOTICE_STARTS), len(protocol.NOTICE_KEYS))
+        for key, start, fallback in zip(protocol.NOTICE_KEYS, starts, protocol.NOTICE_STARTS):
+            with self.subTest(key):
+                self.assertTrue(start.startswith(fallback), (start, fallback))
 
 
 class ToTheBridge(unittest.TestCase):

@@ -68,8 +68,10 @@ HOME_ANSWER = (
     "Hermes's own notices land there. There is nothing to set."
 )
 
-# Hermes's notices about itself (gateway online, shutting down, restarting,
-# no home channel), by their keys in its translations, sent as `status`:
+# Hermes's own notices (gateway online, shutting down, restarting, no home
+# channel, and the summary of its self-improvement review after a turn or a
+# `/review` or `/refine`, such as a skill it patched), by their keys in its
+# translations, sent as `status`.
 # Hermes marks them as such for Discord only, so they are told by their
 # text, in the gateway's own language.
 NOTICE_KEYS = (
@@ -78,6 +80,7 @@ NOTICE_KEYS = (
     "gateway.shutdown.notice_restart",
     "gateway.restart.restarting",
     "gateway.notify.no_home_channel",
+    "display.review.summary_callback",
 )
 # Their English beginnings, for when Hermes's translations cannot be read.
 NOTICE_STARTS = (
@@ -86,6 +89,7 @@ NOTICE_STARTS = (
     "⚠️ Hermes is restarting",
     "♻ Restarting gateway",
     "📬 No home channel is set",
+    "💾 Self-improvement review:",
 )
 _notice_starts: tuple[str, ...] | None = None
 
@@ -100,7 +104,7 @@ def _translated_starts() -> list[str]:
     starts = []
     for key in NOTICE_KEYS:
         try:
-            text = t(key, platform=mark, sethome_cmd=mark, name=mark, chat_id=mark)
+            text = t(key, platform=mark, sethome_cmd=mark, name=mark, chat_id=mark, summary=mark)
         except Exception:
             continue
         start = str(text).split(mark)[0].strip()
