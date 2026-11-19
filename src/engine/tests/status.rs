@@ -1107,7 +1107,7 @@ fn the_latest_release_is_kept_for_hours_a_failure_for_minutes_and_lookups_can_be
     );
 
     // With nothing found before, a failed lookup is "cannot tell".
-    let (_other, fresh) = engine();
+    let (_other, fresh) = super::engine();
     std::fs::create_dir_all(fresh.layout.data()).unwrap();
     std::fs::write(&answer, r#"{"message": "API rate limit exceeded"}"#).unwrap();
     assert!(matches!(
