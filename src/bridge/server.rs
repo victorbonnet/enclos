@@ -3413,9 +3413,13 @@ fn run_session(
                         })?;
                     }
                 }
-                // Held tasks' cards still held, whatever `since`: a card's
-                // first message may predate it.
-                for card in store.held_tasks_for(person).map_err(|e| e.to_string())? {
+                // Held tasks' cards still held or answered, whatever `since`:
+                // a card's first message may predate it, and a device that
+                // lost an answer's reply learns it was taken (ADR 0073).
+                for card in store
+                    .synced_held_tasks_for(person)
+                    .map_err(|e| e.to_string())?
+                {
                     let body = ToDevice::HeldTask {
                         held_task: card.info,
                     };

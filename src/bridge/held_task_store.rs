@@ -274,6 +274,18 @@ impl Store {
         cards(&self.db, "c.owner = ?1 AND h.state = 'held'", person)
     }
 
+    /// What each sync sends: every card still `held` in `person`'s
+    /// conversations, and every one `answered` and still waiting on its
+    /// agent (ADR 0073), so a device that missed an answer's reply learns
+    /// it was taken. "Needs you" reads only the held ones.
+    pub fn synced_held_tasks_for(&self, person: &str) -> rusqlite::Result<Vec<StoredHeldTask>> {
+        cards(
+            &self.db,
+            "c.owner = ?1 AND h.state IN ('held', 'answered')",
+            person,
+        )
+    }
+
     /// Skip unreadable historical cards just as native card sync does;
     /// actual database failures remain unavailable snapshots.
     pub fn indexed_held_tasks_for(&self, person: &str) -> rusqlite::Result<Vec<StoredHeldTask>> {
@@ -692,8 +704,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // An answered card is out of every sync's held cards.
+        // An answered card is out of "Needs you", and still in every sync.
         assert!(store.held_tasks_for(OWNER).unwrap().is_empty());
+        let synced = store.synced_held_tasks_for(OWNER).unwrap();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].info.state, HeldTaskState::Answered);
 
         // The agent saying the person answered changes no state, and tells no one.
         let changes = store
