@@ -95,18 +95,29 @@ NOTICE_STARTS = (
 )
 _notice_starts: tuple[str, ...] | None = None
 
+# Hermes's "still working" heartbeat ("⏳ Working — 3 min — iteration 2/60, …"),
+# which its gateway sends every few minutes of a long turn and edits in place
+# where a platform can. The app cannot edit a message, so each would be a new
+# one, and the agent's working indicator (`activity`) already says it: the
+# plugin keeps it back. Told by its text up to the minutes, then a number.
+HEARTBEAT_KEY = "gateway.progress.working_heartbeat"
+HEARTBEAT_START = "⏳ Working —"
+_heartbeat_starts: tuple[str, ...] | None = None
+_MINUTES = re.compile(r"\d+\b")
 
-def _translated_starts() -> list[str]:
-    """Each notice's text up to its first placeholder, from Hermes's `t`."""
+
+def _translated_starts(keys: tuple[str, ...] = NOTICE_KEYS) -> list[str]:
+    """Each text's beginning up to its first placeholder, from Hermes's `t`."""
     try:
         from agent.i18n import t  # Hermes's; absent outside the gateway
     except Exception:
         return []
     mark = "\x00"
     starts = []
-    for key in NOTICE_KEYS:
+    for key in keys:
         try:
-            text = t(key, platform=mark, sethome_cmd=mark, name=mark, chat_id=mark, summary=mark)
+            text = t(key, platform=mark, sethome_cmd=mark, name=mark, chat_id=mark, summary=mark,
+                     minutes=mark, detail=mark)
         except Exception:
             continue
         start = str(text).split(mark)[0].strip()
@@ -122,6 +133,16 @@ def is_notice(text: str) -> bool:
         _notice_starts = tuple(dict.fromkeys([*_translated_starts(), *NOTICE_STARTS]))
     stripped = text.strip()
     return any(stripped.startswith(start) for start in _notice_starts)
+
+
+def is_heartbeat(text: str) -> bool:
+    """Whether `text` is Hermes's "still working" heartbeat during a long turn."""
+    global _heartbeat_starts
+    if _heartbeat_starts is None:
+        _heartbeat_starts = tuple(dict.fromkeys([*_translated_starts((HEARTBEAT_KEY,)), HEARTBEAT_START]))
+    stripped = text.strip()
+    return any(stripped.startswith(start) and _MINUTES.match(stripped[len(start):].lstrip())
+               for start in _heartbeat_starts)
 
 
 def is_home_command(text: str) -> bool:
