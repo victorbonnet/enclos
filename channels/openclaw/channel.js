@@ -11,6 +11,7 @@ import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
+import { registerUsage } from './usage.js';
 
 export const TESTED_OPENCLAW = '2026.11.5';
 const MINIMUM_OPENCLAW = '2026.11.5';
@@ -61,7 +62,7 @@ export function createChannel(sdk = {}) {
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   const models = new ModelSettings({ catalogue: sdk.models, runtime: () => runtime });
-  let hooks = { tools: false, policy: false };
+  let hooks = { tools: false, policy: false }, usage = false;
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
@@ -87,8 +88,30 @@ export function createChannel(sdk = {}) {
     return turn;
   }
   const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
+  // A call's app conversation: its turn's, else, for a native chat this
+  // process has not dispatched a message to yet (a routine delivering into
+  // it, or since a restart), the saved route whose native session key it is,
+  // or Home's, worked out without saving a route: observing a call changes
+  // nothing. Not kept in `sessionRoutes`, which also opens tools and policy
+  // context.
+  function appTurn(ctx) {
+    const turn = findTurn(ctx);
+    if (turn || !ctx?.sessionKey || [ctx.messageChannel, ctx.messageProvider, ctx.channel].some(c => c && c !== 'enclos')) return turn;
+    for (const active of running.values()) {
+      if ((ctx.agentId && ctx.agentId !== active.account.agentId) || (ctx.accountId && ctx.accountId !== active.account.accountId)) continue;
+      const { transport } = active;
+      for (const conversation of new Set([...Object.keys(transport.state.routes), transport.home])) {
+        let key;
+        try { key = active.peekSessionKey(conversation); } catch { continue; }
+        if (key === ctx.sessionKey) return { active, conversation };
+      }
+    }
+    return undefined;
+  }
+  const appSession = ctx => [ctx?.messageChannel, ctx?.messageProvider, ctx?.channel].includes('enclos');
   function registerFull(api) {
     hooks = registerFeatures(api, { findTurn, assertTurn, running });
+    usage = registerUsage(api, { appTurn, appSession, assertTurn, running });
     routines.register(api);
   }
 
@@ -111,16 +134,24 @@ export function createChannel(sdk = {}) {
     let transport, titles, approvals, activity;
     const turns = createNativeTurns(() => assertCurrent(ctx.cfg, account, transport));
     const controllers = () => [turns, titles, approvals, activity].filter(Boolean);
+    const keyForPeer = peer => channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
+      peer: { kind: 'direct', id: peer }, dmScope: 'per-account-channel-peer' });
     const sessionKeyFor = (conversation, person) => {
       const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
       if (!saved) return undefined;
       if (person != null && saved.person !== person) throw new ProtocolError('not_allowed', 'native conversation belongs to another person');
-      return channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
-        peer: { kind: 'direct', id: saved.peer }, dmScope: 'per-account-channel-peer' });
+      return keyForPeer(saved.peer);
+    };
+    // The native session key a conversation has, or Home would have, saving
+    // nothing: for usage, which only observes a call.
+    const peekSessionKey = conversation => {
+      const peer = transport.state.routes[conversation]?.peer ??
+        (conversation != null && conversation === transport.home ? transport.homePeer(conversation) : undefined);
+      return peer === undefined ? undefined : keyForPeer(peer);
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...(usage ? ['usage', 'agent_usage'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
@@ -247,7 +278,7 @@ export function createChannel(sdk = {}) {
       },
     });
     activity = createActivity(transport, () => assertCurrent(ctx.cfg, account, transport));
-    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });
+    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor, peekSessionKey });
     const stop = async () => {
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
       for (const [key, turn] of sessionRoutes) if (turn.active?.transport === transport) sessionRoutes.delete(key);
