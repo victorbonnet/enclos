@@ -28,6 +28,194 @@ pub const MAX_RESUME_CHARS: usize = 200;
 /// What a card says when the runtime gave no reason.
 pub const NO_REASON: &str = "Waiting for a person.";
 
+/// An ask's decision, in characters; one line (ADR 0073).
+pub const MAX_DECISION_CHARS: usize = 120;
+/// What is blocked, in characters; lines allowed.
+pub const MAX_BLOCKED_CHARS: usize = 400;
+/// The most choices an ask offers.
+pub const MAX_CHOICES: usize = 4;
+/// One choice, in characters; one line.
+pub const MAX_CHOICE_CHARS: usize = 80;
+/// What an answered card says the person answered, in characters; one line.
+pub const MAX_ANSWER_CHARS: usize = 200;
+/// A typed answer, in characters; lines allowed.
+pub const MAX_ANSWER_TEXT_CHARS: usize = 2_000;
+/// What an answered card says when the agent reports the person answered
+/// in the conversation (`settled`).
+pub const ANSWERED_IN_CONVERSATION: &str = "Answered in the conversation.";
+/// What an answered card says when the person asked the agent to look.
+pub const ASKED_THE_AGENT: &str = "Asked the agent to look into it.";
+
+/// What the agent that started a held task wrote for the person when it
+/// handed the hold to them (ADR 0073, proposed): the card shows it first,
+/// and the person answers it from the app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldTaskAsk {
+    /// The decision, as one question.
+    pub decision: String,
+    /// What is stopped and why, in plain words.
+    #[serde(default)]
+    pub blocked: String,
+    /// Up to [`MAX_CHOICES`] answers, each saying what happens; none asks
+    /// for a free answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// The index of the choice the agent recommends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<u32>,
+    /// The agent says the person answered (in the conversation): only on
+    /// the plugin leg; a device's card never carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled: bool,
+}
+
+impl HeldTaskAsk {
+    /// The ask as a person may read it, or `None` when its decision is
+    /// blank: the decision and each choice on one line and cut, `blocked`
+    /// cut with its lines kept, a blank choice or one reading as an earlier
+    /// one dropped, the first [`MAX_CHOICES`] kept, and `recommended`
+    /// following its choice (dropped with it).
+    pub fn normalized(self) -> Option<Self> {
+        let decision = cut(&one_line(&self.decision), MAX_DECISION_CHARS);
+        if decision.is_empty() {
+            return None;
+        }
+        let mut choices: Vec<String> = Vec::new();
+        let mut recommended = None;
+        for (index, choice) in self.choices.iter().enumerate() {
+            if choices.len() == MAX_CHOICES {
+                break;
+            }
+            let choice = cut(&one_line(choice), MAX_CHOICE_CHARS);
+            let bare = visible::bare(&choice);
+            if choice.is_empty() || choices.iter().any(|kept| visible::bare(kept) == bare) {
+                continue;
+            }
+            if self.recommended == u32::try_from(index).ok() {
+                recommended = u32::try_from(choices.len()).ok();
+            }
+            choices.push(choice);
+        }
+        Some(Self {
+            decision,
+            blocked: cut(&visible::stripped(&self.blocked, true), MAX_BLOCKED_CHARS),
+            choices,
+            recommended,
+            settled: self.settled,
+        })
+    }
+
+    /// The same question, whether or not the agent says it was answered:
+    /// what tells an agent asking again from a mere `settled`.
+    pub fn same_question(&self, other: &Self) -> bool {
+        Self {
+            settled: false,
+            ..self.clone()
+        } == Self {
+            settled: false,
+            ..other.clone()
+        }
+    }
+
+    /// The ask as readable text, for a history message and an older app.
+    pub fn text(&self, title: &str) -> String {
+        let mut text = self.decision.clone();
+        if !self.blocked.is_empty() {
+            text.push('\n');
+            text.push_str(&self.blocked);
+        }
+        for (index, choice) in self.choices.iter().enumerate() {
+            text.push_str(&format!("\n{}. {choice}", index + 1));
+            if self.recommended == u32::try_from(index).ok() {
+                text.push_str(" (recommended)");
+            }
+        }
+        text.push_str(&format!("\nHeld task: {title}"));
+        text
+    }
+}
+
+/// A person's answer to a held card (`held_task.answer`, ADR 0073).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HeldTaskAnswer {
+    /// One of the card's `ask` choices, by its zero-based index.
+    Choice { index: u32 },
+    /// A typed answer.
+    Text { text: String },
+    /// Ask the agent to look into the task and say what it needs.
+    Agent,
+}
+
+/// What an answer becomes: the person's message to the agent, and what
+/// the answered card says the person answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerMessage {
+    pub text: String,
+    pub answer: String,
+}
+
+impl HeldTaskAnswer {
+    /// The message `card`'s answer sends the agent, and the card's
+    /// `answer`; `Err` says why the answer does not fit the card (a choice
+    /// it does not offer, a text outside its rule).
+    pub fn message(&self, card: &HeldTaskInfo) -> Result<AnswerMessage, String> {
+        let about = match &card.ask {
+            Some(ask) => format!(
+                "About held task {} \"{}\": {}",
+                card.task, card.title, ask.decision
+            ),
+            None => format!("About held task {} \"{}\"", card.task, card.title),
+        };
+        let (said, answer) = match self {
+            Self::Choice { index } => {
+                let choice = card
+                    .ask
+                    .as_ref()
+                    .and_then(|ask| ask.choices.get(usize::try_from(*index).ok()?))
+                    .ok_or("This card offers no such choice.")?;
+                (format!("{about}\nMy answer: {choice}"), choice.clone())
+            }
+            Self::Text { text } => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err("An answer cannot be blank.".into());
+                }
+                if text.chars().count() > MAX_ANSWER_TEXT_CHARS {
+                    return Err(format!(
+                        "An answer holds at most {MAX_ANSWER_TEXT_CHARS} characters."
+                    ));
+                }
+                if visible::has_hidden(text, true) {
+                    return Err("An answer cannot hold a hidden character.".into());
+                }
+                let first = text.lines().next().unwrap_or_default();
+                (
+                    format!("{about}\nMy answer: {text}"),
+                    cut(&one_line(first), MAX_ANSWER_CHARS),
+                )
+            }
+            Self::Agent => (
+                format!(
+                    "About held task {} \"{}\": look into it and tell me what you need from me.",
+                    card.task, card.title
+                ),
+                ASKED_THE_AGENT.to_owned(),
+            ),
+        };
+        Ok(AnswerMessage { text: said, answer })
+    }
+
+    /// The answer's kind, as the audit log names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Choice { .. } => "choice",
+            Self::Text { .. } => "text",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 /// One held task, as the plugin reads it from its runtime's own state
 /// (never from the text of the runtime's notifications).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +247,10 @@ pub struct HeldTask {
     /// as from an older plugin, it reads as true.
     #[serde(default = "resumable")]
     pub resumable: bool,
+    /// What the agent wrote for the person when it handed this hold to
+    /// them (ADR 0073), if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<HeldTaskAsk>,
 }
 
 /// `resumable` where a plugin, bridge or card did not say.
@@ -95,6 +287,7 @@ impl HeldTask {
                 .map(|error| cut(&visible::stripped(&error, true), MAX_ERROR_CHARS))
                 .filter(|error| !error.is_empty()),
             resume: cut(&one_line(&self.resume), MAX_RESUME_CHARS),
+            ask: self.ask.and_then(HeldTaskAsk::normalized),
             ..self
         }
     }
@@ -170,6 +363,9 @@ pub fn accept(tasks: Vec<HeldTask>) -> Result<Vec<HeldTask>, String> {
 pub enum HeldTaskState {
     /// The runtime holds the task: waiting for a person.
     Held,
+    /// The runtime still holds it, and the person answered (ADR 0073): it
+    /// waits on the agent.
+    Answered,
     /// A paired device resumed it, and the runtime confirmed.
     Resumed,
     /// The runtime no longer holds it: it runs again, finished or went
@@ -204,6 +400,12 @@ pub struct HeldTaskInfo {
     /// instead of a Resume. Absent, as from an older bridge, it reads as true.
     #[serde(default = "resumable")]
     pub resumable: bool,
+    /// What the agent wrote for the person (ADR 0073), never `settled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<HeldTaskAsk>,
+    /// On an `answered` card, what the person answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
     pub state: HeldTaskState,
     /// The bridge's revision of the card, advanced on every change: a
     /// device keeps the highest it saw, and a resume names it.
@@ -228,6 +430,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:42").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            ask: None,
         }
     }
 
@@ -291,6 +494,8 @@ mod tests {
             since: 1_763_000_000,
             resume: String::new(),
             resumable: true,
+            ask: None,
+            answer: None,
             state: HeldTaskState::Held,
             revision: 3,
         };
@@ -536,6 +741,16 @@ mod tests {
                 since: i64::MIN,
                 resume: wide(MAX_RESUME_CHARS),
                 resumable,
+                // The agent's ask and the person's answer at their widest
+                // (ADR 0073).
+                ask: Some(HeldTaskAsk {
+                    decision: wide(MAX_DECISION_CHARS),
+                    blocked: wide(MAX_BLOCKED_CHARS),
+                    choices: vec![wide(MAX_CHOICE_CHARS); MAX_CHOICES],
+                    recommended: Some(u32::MAX),
+                    settled: false,
+                }),
+                answer: Some(wide(MAX_ANSWER_CHARS)),
                 state: HeldTaskState::Released,
                 revision: u64::MAX,
             };
@@ -555,5 +770,253 @@ mod tests {
             line.len()
         });
         assert_eq!(lengths[1], lengths[0] + 1);
+    }
+
+    fn ask(choices: &[&str], recommended: Option<u32>) -> HeldTaskAsk {
+        HeldTaskAsk {
+            decision: "Allow one more hour to fix Hermes backups?".into(),
+            blocked: "Both reviews found that chat text can stop a backup.".into(),
+            choices: choices.iter().map(|c| (*c).to_owned()).collect(),
+            recommended,
+            settled: false,
+        }
+    }
+
+    #[test]
+    fn an_ask_is_cut_and_its_recommended_choice_follows_it() {
+        let kept = HeldTaskAsk {
+            decision: format!("Allow\none more {}?", "x".repeat(200)),
+            blocked: "line one\nline two\u{0007}".into(),
+            ..ask(
+                &[
+                    "",
+                    "Keep paused",
+                    "Keep\u{200B} paused",
+                    "Allow one fix",
+                    "A",
+                    "B",
+                    "C",
+                ],
+                Some(3),
+            )
+        }
+        .normalized()
+        .unwrap();
+        assert!(kept.decision.starts_with("Allow one more x"));
+        assert_eq!(kept.decision.chars().count(), MAX_DECISION_CHARS);
+        assert_eq!(kept.blocked, "line one\nline two");
+        // The blank and the one reading as an earlier one are dropped,
+        // then the first four kept; the recommended one moves with them.
+        assert_eq!(kept.choices, ["Keep paused", "Allow one fix", "A", "B"]);
+        assert_eq!(kept.recommended, Some(1));
+
+        // Recommending a dropped choice, or one that does not exist, recommends none.
+        let dropped = ask(&["Keep paused", "Keep paused"], Some(1))
+            .normalized()
+            .unwrap();
+        assert_eq!(dropped.choices, ["Keep paused"]);
+        assert_eq!(dropped.recommended, None);
+        assert_eq!(ask(&["A"], Some(7)).normalized().unwrap().recommended, None);
+        let hundred = "c".repeat(100);
+        let long = ask(&[hundred.as_str()], None).normalized().unwrap();
+        assert_eq!(long.choices[0].chars().count(), MAX_CHOICE_CHARS);
+
+        // A blank decision drops the whole ask, and the task keeps its card.
+        let blank = HeldTaskAsk {
+            decision: " \u{200B}\n".into(),
+            ..ask(&["A"], None)
+        };
+        assert_eq!(blank.normalized(), None);
+        let task = HeldTask {
+            ask: Some(HeldTaskAsk {
+                decision: "\u{2066}".into(),
+                ..ask(&[], None)
+            }),
+            ..task("t_1")
+        }
+        .normalized();
+        assert_eq!(task.ask, None);
+    }
+
+    #[test]
+    fn settled_alone_is_the_same_question() {
+        let asked = ask(&["A", "B"], Some(0));
+        let settled = HeldTaskAsk {
+            settled: true,
+            ..asked.clone()
+        };
+        assert!(asked.same_question(&settled));
+        assert!(!asked.same_question(&ask(&["A", "C"], Some(0))));
+        assert!(!asked.same_question(&ask(&["A", "B"], Some(1))));
+    }
+
+    fn card(ask: Option<HeldTaskAsk>) -> HeldTaskInfo {
+        HeldTaskInfo {
+            agent: "lab/main".into(),
+            conversation: ConversationId::new("home.lab.main").unwrap(),
+            task: HeldTaskId::new("t_1").unwrap(),
+            title: "Fix backups".into(),
+            assignee: None,
+            reason: "r".into(),
+            last_error: None,
+            since: 1,
+            resume: String::new(),
+            resumable: false,
+            ask,
+            answer: None,
+            state: HeldTaskState::Held,
+            revision: 3,
+        }
+    }
+
+    #[test]
+    fn an_answer_reads_on_its_own_and_names_its_task() {
+        let asked = card(Some(ask(&["Keep paused", "Allow one fix"], Some(1))));
+        let choice = HeldTaskAnswer::Choice { index: 1 }.message(&asked).unwrap();
+        assert_eq!(
+            choice.text,
+            "About held task t_1 \"Fix backups\": Allow one more hour to fix Hermes backups?\nMy answer: Allow one fix"
+        );
+        assert_eq!(choice.answer, "Allow one fix");
+
+        let text = HeldTaskAnswer::Text {
+            text: "  Allow it,\nbut only tests.  ".into(),
+        }
+        .message(&asked)
+        .unwrap();
+        assert!(
+            text.text
+                .ends_with("\nMy answer: Allow it,\nbut only tests.")
+        );
+        assert_eq!(text.answer, "Allow it,");
+
+        let unasked = card(None);
+        let look = HeldTaskAnswer::Agent.message(&unasked).unwrap();
+        assert_eq!(
+            look.text,
+            "About held task t_1 \"Fix backups\": look into it and tell me what you need from me."
+        );
+        assert_eq!(look.answer, ASKED_THE_AGENT);
+        let typed = HeldTaskAnswer::Text { text: "Go".into() }
+            .message(&unasked)
+            .unwrap();
+        assert_eq!(
+            typed.text,
+            "About held task t_1 \"Fix backups\"\nMy answer: Go"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_does_not_fit_its_card_is_refused() {
+        let asked = card(Some(ask(&["A"], None)));
+        assert!(HeldTaskAnswer::Choice { index: 1 }.message(&asked).is_err());
+        assert!(
+            HeldTaskAnswer::Choice { index: 0 }
+                .message(&card(None))
+                .is_err()
+        );
+        for bad in [
+            " \n ".to_owned(),
+            "a".repeat(MAX_ANSWER_TEXT_CHARS + 1),
+            "yes\u{202E}".to_owned(),
+            "yes\rno".to_owned(),
+        ] {
+            assert!(
+                HeldTaskAnswer::Text { text: bad.clone() }
+                    .message(&asked)
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            HeldTaskAnswer::Text {
+                text: "a".repeat(MAX_ANSWER_TEXT_CHARS)
+            }
+            .message(&asked)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_ask_and_the_answer_round_trip_on_each_leg() {
+        let snapshot = Envelope::new(
+            MessageId::new("h1").unwrap(),
+            FromPlugin::HeldTasks {
+                tasks: vec![HeldTask {
+                    ask: Some(HeldTaskAsk {
+                        settled: true,
+                        ..ask(&["A", "B"], Some(0))
+                    }),
+                    ..task("t_1")
+                }],
+            },
+        );
+        let line = serde_json::to_vec(&snapshot).unwrap();
+        assert_eq!(decode_from_plugin(&line).unwrap(), snapshot);
+        let json: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(json["tasks"][0]["ask"]["settled"], true);
+        assert_eq!(json["tasks"][0]["ask"]["recommended"], 0);
+        // `settled` is a JSON boolean, and absent reads as false.
+        let mut bad = json.clone();
+        bad["tasks"][0]["ask"]["settled"] = "true".into();
+        assert!(decode_from_plugin(bad.to_string().as_bytes()).is_err());
+        let mut absent = json;
+        absent["tasks"][0]["ask"]
+            .as_object_mut()
+            .unwrap()
+            .remove("settled");
+        let FromPlugin::HeldTasks { tasks } = decode_from_plugin(absent.to_string().as_bytes())
+            .unwrap()
+            .body
+        else {
+            panic!("a list");
+        };
+        assert!(!tasks[0].ask.as_ref().unwrap().settled);
+
+        let answered = HeldTaskInfo {
+            answer: Some("A".into()),
+            state: HeldTaskState::Answered,
+            ..card(Some(ask(&["A", "B"], Some(0))))
+        };
+        let frame = Envelope::new(
+            MessageId::new("b1").unwrap(),
+            ToDevice::HeldTask {
+                held_task: answered,
+            },
+        );
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        assert_eq!(decode_to_device(&bytes).unwrap(), frame);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["held_task"]["state"], "answered");
+        assert!(json["held_task"]["ask"].get("settled").is_none());
+
+        for answer in [
+            HeldTaskAnswer::Choice { index: 1 },
+            HeldTaskAnswer::Text { text: "Go".into() },
+            HeldTaskAnswer::Agent,
+        ] {
+            let request = Envelope::new(
+                MessageId::new("a1").unwrap(),
+                FromDevice::HeldTaskAnswer {
+                    agent: "lab/main".into(),
+                    task: HeldTaskId::new("t_1").unwrap(),
+                    revision: 3,
+                    answer,
+                },
+            );
+            let bytes = serde_json::to_vec(&request).unwrap();
+            assert_eq!(decode_from_device(&bytes).unwrap(), request);
+        }
+        let agent = br#"{"v":1,"id":"a","type":"held_task.answer","agent":"lab/main","task":"t_1","revision":3,"answer":{"kind":"agent"}}"#;
+        assert!(decode_from_device(agent).is_ok());
+        // An answer names the card's revision and a known kind.
+        let bad: [&[u8]; 3] = [
+            br#"{"v":1,"id":"a","type":"held_task.answer","agent":"lab/main","task":"t_1","answer":{"kind":"agent"}}"#,
+            br#"{"v":1,"id":"a","type":"held_task.answer","agent":"lab/main","task":"t_1","revision":3,"answer":{"kind":"maybe"}}"#,
+            br#"{"v":1,"id":"a","type":"held_task.answer","agent":"lab/main","task":"t_1","revision":3,"answer":{"kind":"choice"}}"#,
+        ];
+        for bad in bad {
+            assert!(decode_from_device(bad).is_err());
+        }
     }
 }

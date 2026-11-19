@@ -2976,6 +2976,55 @@ fn run_session(
                     link.send(ToDevice::Error(error))?;
                 }
             }
+            FromDevice::HeldTaskAnswer {
+                agent,
+                task,
+                revision,
+                answer,
+            } => {
+                let request = held_tasks::ResumeRequest {
+                    agent,
+                    task,
+                    revision,
+                };
+                match hub.held_task_answer(store, device, person, &message.id, &request, &answer) {
+                    Err(error) => link.send(ToDevice::Error(error))?,
+                    Ok((conversation, said, card)) => {
+                        // The person's message, as a `message.send` of theirs:
+                        // kept for an agent that cannot be reached yet.
+                        let given = send(
+                            hub,
+                            store,
+                            device,
+                            &conversation,
+                            message.id.clone(),
+                            said.text,
+                        );
+                        let refused = match &given {
+                            Ok(Some(ToDevice::Error(error)))
+                                if error.code != ErrorCode::AgentUnavailable =>
+                            {
+                                Some(error.clone())
+                            }
+                            _ => None,
+                        };
+                        if given.is_err() || refused.is_some() {
+                            hub.held_task_unanswered(store, &request, &said.answer);
+                        }
+                        given?;
+                        if let Some(error) = refused {
+                            link.send(ToDevice::Error(error))?;
+                        } else {
+                            // After the echo, which the outbox holds
+                            drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
+                            link.send(ToDevice::HeldTaskResult {
+                                of: message.id,
+                                held_task: card,
+                            })?;
+                        }
+                    }
+                }
+            }
             FromDevice::HeldTaskGet { agent, task } => {
                 if let Err(error) = hub.held_task_get(
                     store,

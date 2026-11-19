@@ -130,6 +130,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_plugin_held_tasks.json"),
     ),
     (
+        "held_tasks_ask",
+        include_str!("fixtures/plugin/from_plugin_held_tasks_ask.json"),
+    ),
+    (
         "held_task_resumed",
         include_str!("fixtures/plugin/from_plugin_held_task_resumed.json"),
     ),
