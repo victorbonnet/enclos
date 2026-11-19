@@ -241,6 +241,55 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await asyncio.sleep(0.1)
 
+    async def test_a_reply_is_never_a_task_event(self):
+        from test_task_events import TRIAGE
+        self.kanban_pings()
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["task_events"]))
+        await writer.drain()
+        json.loads(await asyncio.wait_for(reader.readline(), 5))
+        await self.adapter.send("c-1", TRIAGE, "m1")
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((reply["kind"], reply["reply_to"]), ("reply", "m1"))
+        self.assertNotIn("task_event", reply)
+        writer.close()
+
+    async def test_staged_suggested_replies_wait_past_a_ping_for_the_agents_next_message(self):
+        from test_task_events import TRIAGE
+        self.kanban_pings()
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["task_events"]))
+        await writer.drain()
+        json.loads(await asyncio.wait_for(reader.readline(), 5))
+        now = asyncio.get_running_loop().time()
+        self.adapter._last_in["c-1"] = ("m1", now)
+        replies = ["Fix it", "Leave it"]
+        self.adapter._suggested_replies["c-1"] = suggested_replies.Pending(("m1", now), now, replies)
+        await self.adapter.send("c-1", TRIAGE)
+        ping = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(ping["kind"], "task_event")
+        self.assertNotIn("suggested_replies", ping)
+        await self.adapter.send("c-1", "Task t_a09759c7 needs your call: fix it or leave it?", "m1")
+        answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(answer["suggested_replies"], replies)
+        writer.close()
+
+    async def test_an_adapter_built_without_init_sends_a_ping_shaped_text_as_the_agents(self):
+        from unittest.mock import AsyncMock
+        from enclos.outbox import Outbox
+        from test_task_events import TRIAGE
+        adapter = EnclosAdapter.__new__(EnclosAdapter)
+        adapter.name = "enclos"
+        adapter._outbox = Outbox(os.path.join(self.dir, "bare-outbox"))
+        adapter._write = AsyncMock(return_value=True)
+        adapter._check_title_soon = Mock()
+        adapter._suggested_replies, adapter._last_in = {}, {}
+        result = await adapter.send("c-1", TRIAGE)
+        self.assertTrue(result.success)
+        [sent] = [call.args[0] for call in adapter._write.await_args_list]
+        self.assertEqual((sent["kind"], sent["text"]), ("notify", TRIAGE))
+        self.assertNotIn("task_event", sent)
+
     async def test_a_hermes_without_a_board_announces_no_task_events(self):
         self.assertIsNone(self.adapter._pings)
         reader, writer = await self.bridge()

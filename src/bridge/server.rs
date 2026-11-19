@@ -1043,6 +1043,12 @@ impl Hub {
                                     })
                                     .ok()
                             }
+                            (OutKind::TaskEvent, None) => {
+                                eprintln!(
+                                    "enclos app: {agent}: a task event without a readable task is kept as its text"
+                                );
+                                None
+                            }
                             _ => None,
                         };
                         let kind = match kind {
@@ -1398,7 +1404,12 @@ impl Hub {
         let mut pieces = pieces(id, &measured(&whole, attachments))?;
         // A task event is one line: what does not fit one message of its
         // text is left out, rather than repeat the line.
-        if whole.task_event.is_some() {
+        if whole.task_event.is_some() && pieces.len() > 1 {
+            eprintln!(
+                "enclos app: {}: a task event's text is cut to its first message ({} left out)",
+                whole.agent,
+                pieces.len() - 1
+            );
             pieces.truncate(1);
         }
         let conversation = whole.conversation.as_str();
@@ -4745,6 +4756,16 @@ mod connection_end_tests {
     }
 
     fn connect_as(bridge: &Bridge, phone: &Phone, login: &str) -> (PhoneLink, Option<ToDevice>) {
+        connect_with(bridge, phone, login, Vec::new())
+    }
+
+    /// As [`connect_as`], the device's `auth` naming `capabilities`.
+    fn connect_with(
+        bridge: &Bridge,
+        phone: &Phone,
+        login: &str,
+        capabilities: Vec<Capability>,
+    ) -> (PhoneLink, Option<ToDevice>) {
         let mut device = handshake(bridge, &phone.noise_private, login).expect("no handshake");
         let signature: Signature = phone
             .signing
@@ -4754,7 +4775,7 @@ mod connection_end_tests {
             FromDevice::Auth {
                 device: phone.id.clone(),
                 sig: encode(signature.to_der().as_bytes()),
-                capabilities: Vec::new(),
+                capabilities,
             },
         );
         let first = device.receive();
@@ -4875,6 +4896,102 @@ mod connection_end_tests {
         assert_eq!(
             error_of(guest.receive()),
             (ErrorCode::NotAllowed, Some("board-guest".into()))
+        );
+    }
+
+    #[test]
+    fn a_device_gets_task_lines_only_when_its_auth_names_task_events() {
+        use enclos_protocol::task_event::{TaskEvent, TaskEventKind};
+
+        const PING: &str = "⏸ [enclos-org] @reviewer Kanban t_1 blocked: Which store?";
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        let event = TaskEvent {
+            task: "t_1".into(),
+            title: "S2a".into(),
+            assignee: Some("lab/reviewer".into()),
+            event: TaskEventKind::Blocked,
+            state: None,
+        };
+        // Kept before the devices connect: they get it at sync.
+        let seq = store
+            .add_agent_pieces(
+                &[("m-1".to_owned(), PING.to_owned())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap()
+            .unwrap()[0];
+        let next_message = |device: &mut PhoneLink| loop {
+            if let ToDevice::Message(m) = device.receive().expect("the bridge closed") {
+                return m;
+            }
+        };
+        let newer = paired(&bridge, "n-pixel");
+        let older = paired(&bridge, "n-pixel");
+        let (mut drawing, auth) =
+            connect_with(&bridge, &newer, PERSON, vec![Capability::TaskEvents]);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        let (mut plain, auth) = connect_with(&bridge, &older, PERSON, Vec::new());
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        for device in [&mut drawing, &mut plain] {
+            device.send(
+                "sync",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: false,
+                },
+            );
+        }
+        let synced = next_message(&mut drawing);
+        assert_eq!(
+            (synced.seq, synced.kind.as_str(), synced.task_event.as_ref()),
+            (seq, "task_event", Some(&event))
+        );
+        let synced = next_message(&mut plain);
+        assert_eq!(
+            (
+                synced.seq,
+                synced.kind.as_str(),
+                synced.task_event,
+                synced.text.as_str()
+            ),
+            (seq, "notify", None, PING)
+        );
+        // Live, the same: stored, then passed to the person's devices.
+        let live = store
+            .add_agent_pieces(
+                &[("m-2".to_owned(), PING.to_owned())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap()
+            .unwrap()[0];
+        let [.., line] = &store.messages_after("c-1", 0).unwrap()[..] else {
+            panic!("no message");
+        };
+        bridge
+            .hub
+            .deliver(PERSON, message_frame(&store, line.clone()).unwrap());
+        let got = next_message(&mut drawing);
+        assert_eq!(
+            (got.seq, got.kind.as_str(), got.task_event.as_ref()),
+            (live, "task_event", Some(&event))
+        );
+        let got = next_message(&mut plain);
+        assert_eq!(
+            (got.seq, got.kind.as_str(), got.task_event),
+            (live, "notify", None)
         );
     }
 

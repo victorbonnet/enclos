@@ -45,7 +45,7 @@ pub enum TaskEventKind {
 /// as a [`crate::task::Task`]'s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEvent {
-    /// The runtime's id of the task, as a `task` and `task.get` name it.
+    /// The runtime's id of the task, as `tasks` and `task.get` name it.
     pub task: String,
     pub title: String,
     /// The agent doing it, when it has one.
@@ -69,6 +69,16 @@ fn lenient_state<'de, D: Deserializer<'de>>(
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// A message's `task_event`, read leniently: one that does not parse reads
+/// as none, so its message is still read, and kept as its text alone,
+/// rather than refused whole.
+pub(crate) fn lenient<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TaskEvent>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 /// Why the bridge does not take a task event: it keeps the message's text
 /// as an ordinary `notify` instead.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -85,6 +95,9 @@ impl TaskEvent {
     /// characters and cut to [`MAX_TITLE_CHARS`], and its assignee, a name
     /// in the runtime, written `<sandbox>/<agent>`, left out when it would
     /// not be a name a device takes.
+    ///
+    /// For an event from the plugin leg only, and not idempotent: cleaning
+    /// an already cleaned event drops its assignee, which then holds a `/`.
     pub fn cleaned(self, sandbox: &str) -> Result<TaskEvent, TaskEventError> {
         if !crate::routine::valid_id(&self.task) {
             return Err(TaskEventError::Task);

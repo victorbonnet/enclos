@@ -74,9 +74,9 @@ def validate_config(config) -> bool:
 
 
 class EnclosAdapter(BasePlatformAdapter):
-    # Defaults for an adapter that did not run `__init__` (a test, or an older
-    # Hermes building it by hand): no kanban pings to tell apart, and a bridge
-    # that does not take task events (ADR 0071).
+    # Defaults for an adapter that did not run `__init__` (enclos's tests build
+    # it with EnclosAdapter.__new__): no kanban pings to tell apart, and a
+    # bridge that does not take task events (ADR 0071).
     _pings: Optional["task_events.Recogniser"] = None
     _bridge_task_events = False
 
@@ -708,16 +708,19 @@ class EnclosAdapter(BasePlatformAdapter):
         """The task event `content` is, when it is Hermes's kanban ping for a
         task this chat is subscribed to, read from the board off the loop;
         None for the agent's own text, or when the board cannot be read."""
-        # Hermes does not mark its pings in `metadata` yet (ADR 0071): told by
-        # their text, in the gateway's language as this context says it, and
-        # by the board.
-        found = task_events.candidates(content) if self._pings is not None else []
-        if not found:
+        # Hermes does not mark its pings in `metadata` yet (ADR 0071); a mark
+        # would be read here first. Told by their text, read in the language
+        # of the context send() runs in (that this is the ping's language is
+        # to verify, design §14), and by the board.
+        if self._pings is None:
             return None
         try:
+            found = task_events.candidates(content)
+            if not found:
+                return None
             return await asyncio.to_thread(held_tasks._fresh, self._pings.read, chat_id, found)
         except Exception:
-            logger.warning("[%s] Cannot tell whether a message is a kanban ping; it is sent as one",
+            logger.warning("[%s] Cannot tell whether a message is a kanban ping; it is sent as the agent's message",
                            self.name, exc_info=True)
             return None
 

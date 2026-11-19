@@ -234,8 +234,13 @@ pub enum FromPlugin {
         attachments: Vec<OutAttachment>,
         /// With `kind: task_event`, the task and what happened to it, read
         /// from the runtime's state (ADR 0071, proposed). A bridge keeps the
-        /// text alone, as a `notify`, when it is missing or unusable.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// text alone, as a `notify`, when it is missing or unusable; one
+        /// that does not parse reads as missing, so the message is not lost.
+        #[serde(
+            default,
+            deserialize_with = "crate::task_event::lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
         task_event: Option<crate::task_event::TaskEvent>,
     },
     /// The agent is, or stops, working on an answer.

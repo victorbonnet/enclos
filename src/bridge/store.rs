@@ -74,9 +74,16 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
             .filter(|r| enclos_protocol::suggested_replies::validate(r))
             .unwrap_or_default(),
-        task_event: row
-            .get::<_, Option<String>>(11)?
-            .and_then(|s| serde_json::from_str(&s).ok()),
+        task_event: row.get::<_, Option<String>>(11)?.and_then(|s| {
+            serde_json::from_str(&s)
+                .inspect_err(|e| {
+                    let id = row.get::<_, String>(1).unwrap_or_default();
+                    eprintln!(
+                        "enclos app: message {id}: its stored task event no longer reads, so it goes as its text: {e}"
+                    );
+                })
+                .ok()
+        }),
         held_task: row
             .get::<_, Option<String>>(9)?
             .map(|id| {
@@ -3298,10 +3305,56 @@ mod tests {
         assert_eq!(store.conversation_info("c-1").unwrap().unwrap().revision, 0);
         assert_eq!(store.set_archived("c-1", "v", true).unwrap(), Some(true));
         assert_eq!(store.since("v", 0).unwrap()[0].from, From::Agent);
+        // A message from before task events reads with none.
+        assert_eq!(store.since("v", 0).unwrap()[0].task_event, None);
         store
             .group("g-1", "lab", &["main".into(), "coder".into()], "v")
             .unwrap();
         assert_eq!(store.members("g-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_stored_task_event_that_no_longer_reads_leaves_its_message() {
+        use enclos_protocol::task_event::{TaskEvent, TaskEventKind};
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.conversation("c-1", "lab", "main", "v").unwrap();
+        let event = TaskEvent {
+            task: "t_1".into(),
+            title: "S2a".into(),
+            assignee: None,
+            event: TaskEventKind::Done,
+            state: None,
+        };
+        store
+            .add_agent_pieces(
+                &[("m-1".into(), "✔ Kanban t_1 done — S2a".into())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap();
+        assert_eq!(
+            store.since("v", 0).unwrap()[0].task_event.as_ref(),
+            Some(&event)
+        );
+        store
+            .db
+            .execute(
+                "UPDATE messages SET task_event = '{\"task\":' WHERE id = 'm-1'",
+                [],
+            )
+            .unwrap();
+        let [kept] = &store.since("v", 0).unwrap()[..] else {
+            panic!("one message");
+        };
+        assert_eq!(
+            (kept.kind.as_str(), &kept.task_event),
+            ("task_event", &None)
+        );
     }
 
     #[test]

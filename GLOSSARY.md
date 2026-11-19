@@ -231,7 +231,7 @@ A change of a task that its runtime announces to a conversation, such as a task 
 _Avoid_: ping, task notification, kanban message (except when naming a runtime's own feature, such as Hermes's kanban ping)
 
 **Task line**:
-How the app shows a task event: one quiet line naming the task, its assignee and what happened, which opens the task.
+How the app shows a task event: one quiet line naming the task, its assignee and what happened, from which its task can be opened.
 _Avoid_: task message, task card (a task card is the task itself, where it was asked for)
 
 **Agent activity**:

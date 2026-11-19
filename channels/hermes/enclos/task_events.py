@@ -10,22 +10,30 @@ platform's `send()` like anything the agent says. Its `metadata` holds only
 the subscription's routing keys (Hermes 0.23.x), so the ping is told here:
 
 - by its text, which begins as one of Hermes's ping templates
-  (`gateway.kanban.ping.*`, rendered in the gateway's language: an emoji, an
-  optional `[board]` and `@assignee`, then `Kanban <task id>` and the words
-  of that kind of event), read from Hermes's translations, or the English
-  ones below when they cannot be read; and
+  (`gateway.kanban.ping.*`: an emoji, an optional `[board]` and `@assignee`,
+  then `Kanban <task id>` and the words of that kind of event), read from
+  Hermes's translations in the language of the context `send()` runs in
+  (that this is the ping's language is to verify, design §14), or the
+  English ones below when they cannot be read; and
 - by the board: a subscription of this platform and chat to that task, on
   one of the sandbox's boards (the one the ping names), that delivers pings
-  (not `wake` alone), and that Hermes has claimed an event of that kind for.
+  (not `wake` alone), with an event of that kind that Hermes has claimed for
+  it (at most its `last_event_id`) and not yet recorded as pinged (above its
+  `last_ping_event_id`, which Hermes's `record_notify_ping` writes only once
+  `send()` has returned). The ping is about the oldest such event. A Hermes
+  without `last_ping_event_id` gives the newest claimed one of that kind.
 
 What the line says (the task's title, its assignee, its state) is read from
 the board, read-only (`tasks.read_only`), never cut from the ping's text.
 Anything else, an agent's sentence that starts like a ping included, stays
-the agent's message. Should Hermes mark its pings in `send()`'s metadata
-(enclos asks it to, ADR 0071), `Recogniser.recognise` takes the mark first
-and the match stays for older releases.
+the agent's message, and so does a second text matching an event already
+told as a line. Should Hermes mark its pings in `send()`'s metadata (enclos
+asks it to, ADR 0071), the adapter would read that mark first, in
+`EnclosAdapter._task_event`, called from its `send()`, and keep this match
+for older releases.
 """
 
+import collections
 import contextlib
 import functools
 import itertools
@@ -33,6 +41,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -82,14 +91,32 @@ MAX_TITLE_CHARS = tasks.MAX_TITLE_CHARS
 
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
 
-# The subscription of this chat to the task, and the event a ping is about:
-# the task's latest of that kind that Hermes has claimed for it.
+# The subscriptions of this chat to the task: what each delivers, the last
+# event Hermes claimed for it, and the last it recorded as pinged.
 _SUBSCRIPTION = """
-SELECT delivery_mode, last_event_id FROM kanban_notify_subs
+SELECT delivery_mode, last_event_id, last_ping_event_id FROM kanban_notify_subs
+ WHERE task_id = ? AND LOWER(platform) = LOWER(?) AND chat_id = ?
+"""
+# The same, for a Hermes that records no pings (no `last_ping_event_id`).
+_SUBSCRIPTION_UNRECORDED = """
+SELECT delivery_mode, last_event_id, NULL FROM kanban_notify_subs
  WHERE task_id = ? AND LOWER(platform) = LOWER(?) AND chat_id = ?
 """
 _TASK = "SELECT id, title, assignee, status FROM tasks WHERE id = ?"
-_EVENT = "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? AND id <= ? ORDER BY id DESC LIMIT 1"
+# The event a ping is about: the oldest of its kind claimed and not yet
+# recorded as pinged. Hermes sends a batch's pings oldest first and records
+# each once `send()` returns, so a later text, such as the agent's answer in
+# its wake turn, finds none.
+_EVENT = ("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? AND id > ? AND id <= ?"
+          " ORDER BY id ASC LIMIT 1")
+# Without that record: the newest claimed event of that kind.
+_LATEST_EVENT = ("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? AND id <= ?"
+                 " ORDER BY id DESC LIMIT 1")
+# How many (chat, task, event) told as lines are remembered, so that a second
+# text matching one stays the agent's message.
+MAX_TOLD = 512
+# How many different read failures are logged, each once.
+MAX_FAILURES_LOGGED = 64
 
 
 def _translations() -> Optional[Callable[[str], str]]:
@@ -202,63 +229,89 @@ def _state(status: Any) -> Optional[str]:
 class Recogniser:
     """Tells Hermes's pings for a chat of this platform from the rest, with
     the board: `boards` gives each live board's (slug, database). Blocking:
-    called off the gateway's loop."""
+    called off the gateway's loop, from any thread."""
 
     def __init__(self, boards: Callable[[], list[tuple[str, Path]]], platform: str,
                  read_only: Callable[[Any], sqlite3.Connection] = tasks.read_only):
         self.boards = boards
         self.platform = platform
         self.read_only = read_only
-        self._failure_told = False
+        self._lock = threading.Lock()
+        # Each (chat, task, event id) told as a line, oldest first.
+        self._told: collections.OrderedDict[tuple[str, str, int], None] = collections.OrderedDict()
+        # Each read failure logged so far, and the boards that fail now ("" for the list).
+        self._failures_logged: set[tuple[str, str, str]] = set()
+        self._failing: set[str] = set()
 
-    def recognise(self, chat_id: str, text: str,
-                  metadata: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    def recognise(self, chat_id: str, text: str) -> Optional[dict[str, Any]]:
         """The task event `text`, sent to `chat_id`, is, or None when it is the
-        agent's own message. Hermes does not mark its pings in `metadata` yet:
-        a mark would be read here first. Its templates are read in the
-        caller's context, which says the gateway's language."""
+        agent's own message. Its templates are read in the caller's context,
+        whose language they are read in."""
         return self.read(chat_id, candidates(text))
 
     def read(self, chat_id: str, found: list[dict[str, Optional[str]]]) -> Optional[dict[str, Any]]:
         """The task event of the first of `found` (`candidates`) that the
-        board confirms for `chat_id`, or None."""
+        board confirms for `chat_id`, or None. A board that cannot be read
+        confirms nothing (said in the log); a fault of this code raises."""
         if not found:
             return None
         try:
             boards = self.boards()
         except Exception as error:
-            self._cannot_read(error)
+            self._cannot_read("", error, "Cannot list the kanban boards")
             return None
         for candidate in found:
             for slug, path in boards:
                 if candidate["board"] is not None and candidate["board"] != slug:
                     continue
                 try:
-                    event = self._read(path, chat_id, candidate)
-                except Exception as error:
-                    self._cannot_read(error)
+                    claimed = self._read(path, chat_id, candidate)
+                except (sqlite3.Error, OSError) as error:
+                    self._cannot_read(slug, error, f"Cannot read the kanban board {slug!r}")
                     continue
-                if event is not None:
+                self._reads_again(slug)
+                if claimed is None:
+                    continue
+                task, event_id, payload = claimed
+                event = self._event(task, candidate["kind"], payload)
+                if event is not None and self._first_time((chat_id, event["task"], event_id)):
                     return event
         return None
 
-    def _read(self, path: Any, chat_id: str, candidate: dict[str, Optional[str]]) -> Optional[dict[str, Any]]:
+    def _read(self, path: Any, chat_id: str,
+              candidate: dict[str, Optional[str]]) -> Optional[tuple[Any, int, Any]]:
+        """The task, and the id and payload of the event a ping of
+        `candidate`'s kind to `chat_id` is about, or None when the board
+        shows no such ping. Database reads only."""
         task_id = candidate["task"] or ""
+        kind = candidate["kind"]
         with contextlib.closing(self.read_only(path)) as conn:
-            subscriptions = conn.execute(_SUBSCRIPTION, (task_id, self.platform, chat_id)).fetchall()
+            keys = (task_id, self.platform, chat_id)
+            try:
+                subscriptions = conn.execute(_SUBSCRIPTION, keys).fetchall()
+            except sqlite3.OperationalError as error:
+                if "last_ping_event_id" not in str(error):
+                    raise
+                subscriptions = conn.execute(_SUBSCRIPTION_UNRECORDED, keys).fetchall()
             # Pinged: not `wake` alone, which sends no text.
-            claimed = [int(row[1] or 0) for row in subscriptions if (row[0] or "notify") != "wake"]
-            if not claimed:
+            pinged = [(int(row[1] or 0), row[2]) for row in subscriptions if (row[0] or "notify") != "wake"]
+            if not pinged:
                 return None
             task = conn.execute(_TASK, (task_id,)).fetchone()
             if task is None:
                 return None
-            row = conn.execute(_EVENT, (task_id, candidate["kind"], max(claimed))).fetchone()
-            if row is None:
-                return None
-        return self._event(task, candidate["kind"], row[1])
+            rows = [conn.execute(_LATEST_EVENT, (task_id, kind, claimed)).fetchone() if recorded is None
+                    else conn.execute(_EVENT, (task_id, kind, int(recorded), claimed)).fetchone()
+                    for claimed, recorded in pinged]
+        rows = [row for row in rows if row is not None]
+        if not rows:
+            return None
+        row = min(rows, key=lambda found: int(found[0]))
+        return task, int(row[0]), row[1]
 
     def _event(self, task: Any, kind: str, payload: Any) -> Optional[dict[str, Any]]:
+        """The line's fields: the task's, and for a status change the status
+        that the event chosen for the ping announced (`_read`)."""
         task_id = task["id"]
         title = " ".join(str(task["title"] or "").split())[:MAX_TITLE_CHARS]
         if not isinstance(task_id, str) or not title or _unusable(task_id):
@@ -269,7 +322,7 @@ class Recogniser:
             event["assignee"] = assignee
         state = _state(task["status"])
         if kind == "status":
-            # The status the ping announced, when the board still knows it.
+            # The status that event announced, when the board still knows it.
             try:
                 announced = json.loads(payload).get("status") if payload else None
             except (TypeError, ValueError, AttributeError, RecursionError):
@@ -279,11 +332,36 @@ class Recogniser:
             event["state"] = state
         return event
 
-    def _cannot_read(self, error: Exception) -> None:
-        if not self._failure_told:
-            self._failure_told = True
-            logger.warning("Cannot read the kanban board to tell its pings (%s: %s); they are sent as messages",
-                           type(error).__name__, error)
+    def _first_time(self, key: tuple[str, str, int]) -> bool:
+        """Whether the event `key` names is told as a line for the first time
+        in this chat; remembered. A second text matching it, such as the
+        agent repeating the ping before Hermes records it, is a message."""
+        with self._lock:
+            if key in self._told:
+                return False
+            self._told[key] = None
+            while len(self._told) > MAX_TOLD:
+                self._told.popitem(last=False)
+            return True
+
+    def _cannot_read(self, board: str, error: Exception, what: str) -> None:
+        """Logged once for each board and error: pings are messages meanwhile."""
+        signature = (board, type(error).__name__, str(error))
+        with self._lock:
+            self._failing.add(board)
+            if signature in self._failures_logged or len(self._failures_logged) >= MAX_FAILURES_LOGGED:
+                return
+            self._failures_logged.add(signature)
+        logger.warning("%s to tell Hermes's kanban pings (%s: %s); until it reads, they are sent as the "
+                       "agent's messages", what, type(error).__name__, error, exc_info=True)
+
+    def _reads_again(self, board: str) -> None:
+        with self._lock:
+            if board not in self._failing and "" not in self._failing:
+                return
+            self._failing.discard(board)
+            self._failing.discard("")
+        logger.info("The kanban board %r reads again: Hermes's pings on it are task lines again", board)
 
 
 def _unusable(value: str) -> bool:

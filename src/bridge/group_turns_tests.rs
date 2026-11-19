@@ -542,6 +542,148 @@ fn a_persons_message_sent_during_a_turn_reaches_that_member_next() {
 }
 
 #[test]
+fn a_task_event_during_a_turn_ends_no_turn_and_asks_no_one_it_names() {
+    use enclos_protocol::task_event::{TaskEvent, TaskEventKind};
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["lab/main", "lab/coder", "lab/reviewer"]);
+    let store = hub.store().unwrap();
+    let members = [
+        "lab/main".to_owned(),
+        "lab/coder".to_owned(),
+        "lab/reviewer".to_owned(),
+    ];
+    assert_eq!(
+        new_group(&hub, &store, ALICE, "g-1", &members, None),
+        Ok(Ok(()))
+    );
+    let to_reviewer = member(
+        dir.path(),
+        "reviewer",
+        Duration::ZERO,
+        Vec::new(),
+        |_, _| Vec::new(),
+    );
+    let to_coder = member(
+        dir.path(),
+        "coder",
+        Duration::ZERO,
+        Vec::new(),
+        |sent, _| {
+            vec![(
+                new_id().unwrap(),
+                says("g-1", "Looks fine.", OutKind::Reply, Some(sent)),
+            )]
+        },
+    );
+    let mut ping = says(
+        "g-1",
+        "⏸ [enclos-org] @reviewer Kanban t_1 blocked: Which store?",
+        OutKind::TaskEvent,
+        None,
+    );
+    if let FromPlugin::MessageOut { task_event, .. } = &mut ping {
+        *task_event = Some(TaskEvent {
+            task: "t_1".into(),
+            title: "S2a".into(),
+            assignee: Some("reviewer".into()),
+            event: TaskEventKind::Blocked,
+            state: None,
+        });
+    }
+    // main, during its turn: its runtime's ping first, acknowledged, then,
+    // once the test says so, its reply.
+    let (pinged, ping_acked) = channel::<MessageId>();
+    let (go, wait) = channel::<()>();
+    let listener = UnixListener::bind(dir.path().join("main.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut lines = BufReader::new(stream);
+        let mut line = Vec::new();
+        let mut next = |lines: &mut BufReader<std::os::unix::net::UnixStream>| {
+            line.clear();
+            lines.read_until(b'\n', &mut line).unwrap();
+            decode_from_bridge(&line).unwrap()
+        };
+        next(&mut lines);
+        send(
+            &mut out,
+            "hello",
+            FromPlugin::Hello {
+                runtime: "hermes".into(),
+                agent: "main".into(),
+                capabilities: vec![Capability::TaskEvents],
+            },
+        );
+        let turn = loop {
+            let message = next(&mut lines);
+            if matches!(message.body, FromBridge::MessageIn { .. }) {
+                break message.id;
+            }
+        };
+        send(&mut out, "ping-1", ping);
+        loop {
+            if let FromBridge::Ack { of } = next(&mut lines).body
+                && of.as_str() == "ping-1"
+            {
+                break;
+            }
+        }
+        pinged.send(turn.clone()).unwrap();
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        send(
+            &mut out,
+            "reply-1",
+            says("g-1", "On it.", OutKind::Reply, Some(&turn)),
+        );
+        // Kept open until the bridge is done with it.
+        while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+            line.clear();
+        }
+    });
+    person_says(&hub, &store, "g-1", "p-1", "@main first");
+    ping_acked.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Kept as main's line, and nothing more: its turn runs on, no one it
+    // names is asked for a turn, and no member is given it.
+    let said = store.messages_after("g-1", 0).unwrap();
+    let line = said.iter().find(|m| m.kind == "task_event").expect("kept");
+    assert_eq!(line.from, From::Member("main".into()));
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("working")
+    );
+    assert!(
+        !hub.groups.lock().unwrap()["g-1"]
+            .next
+            .contains(&"reviewer".to_owned())
+    );
+    assert_eq!(turn_of(&hub, &store, "g-1", "reviewer"), None);
+    assert!(
+        to_reviewer
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    );
+    // Its reply ends its turn.
+    go.send(()).unwrap();
+    until(|| state(&hub, &store, "g-1").state == "settled");
+    assert_eq!(
+        turn_of(&hub, &store, "g-1", "main").as_deref(),
+        Some("replied")
+    );
+    assert_eq!(turn_of(&hub, &store, "g-1", "reviewer"), None);
+    assert!(
+        to_reviewer
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    );
+    // A member's next turn is given what was said, without the line.
+    person_says(&hub, &store, "g-1", "p-2", "@coder next");
+    let (_, prompt) = to_coder.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(prompt.contains("On it."), "{prompt}");
+    assert!(!prompt.contains("Kanban t_1"), "{prompt}");
+}
+
+#[test]
 fn only_a_members_message_enters_the_group() {
     let dir = tempfile::tempdir().unwrap();
     let hub = hub(dir.path(), &["lab/main", "lab/coder", "lab/writer"]);
