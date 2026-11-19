@@ -150,8 +150,19 @@ export function createChannel(sdk = {}) {
         (conversation != null && conversation === transport.home ? transport.homePeer(conversation) : undefined);
       return peer === undefined ? undefined : keyForPeer(peer);
     };
+    // ADR 0077: checked on receipt, before the message binds a route or
+    // leaves a receipt; the bridge signed it as it sent it.
+    const senders = new WeakMap();
+    const senderOf = incoming => {
+      const sandbox = process.env.ENCLOS_SANDBOX;
+      const sender = hostSender(account.bridgeKey, sandbox && `${sandbox}/${account.agentId}`, incoming);
+      if (sender.failure) (ctx.log?.warn ?? console.warn)(`enclos: a signed message goes on as its person's, without OpenClaw's owner authority: ${sender.failure}`);
+      if (sender.refused) throw new ProtocolError('not_allowed', sender.refused);
+      return sender;
+    };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
+      admit: incoming => { senders.set(incoming, senderOf(incoming)); },
       capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...(usage ? ['usage', 'agent_usage'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
@@ -197,11 +208,7 @@ export function createChannel(sdk = {}) {
         const cfg = currentConfig(ctx.cfg);
         const assertAuthority = () => { assertCurrent(cfg, account, transport); execution.signal.throwIfAborted(); };
         assertAuthority();
-        // Checked first, on receipt: the bridge signed it as it sent it.
-        const sandbox = process.env.ENCLOS_SANDBOX;
-        const sender = hostSender(account.bridgeKey, sandbox && `${sandbox}/${account.agentId}`, incoming);
-        if (sender.failure) (ctx.log?.warn ?? console.warn)(`enclos: a signed message is passed on as its person's, not the owner's: ${sender.failure}`);
-        if (sender.refused) throw new ProtocolError('not_allowed', sender.refused);
+        const sender = senders.get(incoming) ?? senderOf(incoming);
         const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: incoming.conversation }, dmScope: 'per-account-channel-peer' });

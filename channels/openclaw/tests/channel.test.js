@@ -208,7 +208,7 @@ test('native inbound keeps account, conversation, person and group-member contex
   assert.equal(notice.id, unsolicited.messageId); assert.equal(notice.conversation, one.home); assert.equal(notice.kind, 'notify');
 });
 
-test('only the host\'s person\'s signed message reaches OpenClaw from its owner\'s sender (ADR 0077)', async t => {
+test('only the host\'s person\'s signed message reaches OpenClaw from its owner sender (ADR 0077)', async t => {
   const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const { x, y } = keys.publicKey.export({ format: 'jwk' });
   const bridgeKey = Buffer.concat([Buffer.from([4]), Buffer.from(x, 'base64url'), Buffer.from(y, 'base64url')]).toString('base64url');
@@ -243,6 +243,13 @@ test('only the host\'s person\'s signed message reaches OpenClaw from its owner\
   const refused = await peer.next('error', claimed.id);
   assert.equal(refused.code, 'not_allowed');
   assert.equal(native.calls.contexts.length, 2);
+  // Refused before it binds a route: a conversation it named first stays free.
+  const first = message('message.in', { conversation: 'fresh', person: 'enclos:host', text: 'claim this' });
+  peer.send(first);
+  assert.equal((await peer.next('error', first.id)).code, 'not_allowed');
+  const real = message('message.in', { conversation: 'fresh', person: 'ada@example.com', text: 'hello', host: true });
+  peer.send(real); await peer.next('ack', real.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'ada@example.com');
 });
 
 test('disabled or rebound account authority is checked after awaited native preparation', async t => {

@@ -1571,7 +1571,7 @@ impl Hub {
                 continue;
             }
             let from_host = host.as_deref() == Some(message.person.as_str());
-            let signed = self.host_signature(store, agent, &message, from_host)?;
+            let signed = self.host_signature(store, agent, &message, from_host);
             let body = FromBridge::MessageIn {
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
@@ -1603,24 +1603,22 @@ impl Hub {
     /// plugin (ADR 0077, proposed): only for the host's person's message in
     /// a direct conversation, which a device sent, and only when the bridge
     /// holds its signing key. Signed as it is sent, so that a message
-    /// waiting for its plugin is fresh when it arrives.
+    /// waiting for its plugin is fresh when it arrives. A conversation whose
+    /// members cannot be read is not known to be direct: its message goes
+    /// unsigned, as any other person's, rather than not at all.
     fn host_signature(
         &self,
         store: &Store,
         agent: &str,
         message: &super::store::Pending,
         from_host: bool,
-    ) -> Result<Option<enclos_protocol::decision::SignedDecision>, String> {
-        let Some(key) = self.approval_key.as_ref() else {
-            return Ok(None);
-        };
-        if !from_host
-            || !store
-                .members(&message.conversation)
-                .map_err(|e| e.to_string())?
-                .is_empty()
-        {
-            return Ok(None);
+    ) -> Option<enclos_protocol::decision::SignedDecision> {
+        let key = self.approval_key.as_ref()?;
+        let direct = store
+            .members(&message.conversation)
+            .is_ok_and(|members| members.is_empty());
+        if !from_host || !direct {
+            return None;
         }
         let statement = enclos_protocol::decision::HostMessage {
             agent,
@@ -1629,7 +1627,7 @@ impl Hub {
             person: &message.person,
             text: &message.text,
         };
-        Ok(Some(key.sign_message(&statement, now())))
+        Some(key.sign_message(&statement, now()))
     }
 }
 

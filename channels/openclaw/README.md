@@ -70,7 +70,8 @@ host's person's in a direct conversation (`host-messages.js`, ADR 0077): checked
 on receipt with the account's `bridgeKey`, it comes from `host`, the sender that
 `commands.ownerAllowFrom` names as `enclos:host`, so OpenClaw gives that turn its
 owner-only tools. The display name stays the person's, the session stays the
-person's, and an unsigned message whose person is `host` is refused.
+person's, and an unsigned message whose person is `host` or `enclos:host` is
+refused before it binds a route.
 Bridge groups remain direct per-member contexts; OpenClaw's broadcast coordinator
 is not enabled for them. Account authority is rechecked after asynchronous
 preparation and before dispatch/delivery.

@@ -243,15 +243,18 @@ activation, as required by the native SDK's policy-context hook. The hook adds
 the host's policy context only to enclos-owned turns.
 
 App configuration also adds `enclos:host` to `commands.ownerAllowFrom`, after
-the sandbox's other owners, which it keeps
+the sandbox's other owners, which it keeps, just before it enables the account
 ([ADR 0077](adr/0077-the-hosts-person-speaks-to-openclaw-with-its-owner-authority.md),
 proposed). The channel passes a message to OpenClaw from the sender `host` only
-when the bridge signed it as the host's person's, in a direct conversation:
-those turns, Home's included, may use OpenClaw's owner-only tools, such as
-`automations` for the agent's scheduled jobs. Other persons, groups and
-`enclos app chat` keep their own sender, and once an owner is named OpenClaw
-lets them run `/reset` but not its other text commands. Remove the entry to
-take that authority back; configuring the channel again adds it.
+when the bridge signed it as the host's person's, in a direct conversation.
+By OpenClaw 2026.11.5's source, those turns, Home's included, then have its
+owner-only tools, such as `automations` for the agent's scheduled jobs; other
+persons, groups and `enclos app chat` keep their own sender and, with an owner
+named for the enclos channel, `/reset` but not OpenClaw's other text commands.
+OpenClaw reads an owner entry for its own channel only, so a Telegram account's
+commands are unchanged. A running gateway is still to show this (design §14).
+Remove the entry to take that authority back; configuring the channel again
+adds it.
 
 The completed channel stack supplies direct/Home/group conversations, native
 events, files/static HTML, titles, exact cancellation and negotiated native

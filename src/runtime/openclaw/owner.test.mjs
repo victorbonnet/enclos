@@ -53,6 +53,12 @@ test('another owner is kept, and the entry is added once', t => {
   assert.equal(run(t, '[" Enclos:Host "]').after, '[" Enclos:Host "]');
 });
 
+test('a list set to null counts as none', t => {
+  const { status, stderr, after } = run(t, 'null');
+  assert.equal(status, 0, stderr);
+  assert.deepEqual(JSON.parse(after), ['enclos:host']);
+});
+
 test('a list that is not a list is refused and left as it was', t => {
   const { status, after } = run(t, '{"telegram":"42"}');
   assert.notEqual(status, 0);

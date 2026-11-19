@@ -9,8 +9,10 @@ import { checkSigned, decisionKey } from './native-approvals.js';
 export const OWNER_SENDER = 'host';
 const LABEL = 'enclos/host-message/1';
 
-// OpenClaw compares senders after trimming them, and some channels ignore case.
-const isOwnerSender = person => typeof person === 'string' && person.trim().toLowerCase() === OWNER_SENDER;
+// OpenClaw compares senders after trimming them, some channels ignore case,
+// and an owner entry names the channel too: none of these may be unsigned.
+const reserved = new Set([OWNER_SENDER, `enclos:${OWNER_SENDER}`]);
+const isOwnerSender = person => typeof person === 'string' && reserved.has(person.trim().toLowerCase());
 
 // The sender OpenClaw sees for `incoming`, given the bridge's public key (as
 // configured) and the agent (`sandbox/agent`): { id, owner, refused? }.

@@ -9,19 +9,20 @@ const signedMessage = (overrides = {}) => ({ v: 1, type: 'message.in', id: fixtu
   person: fixture.person, text: fixture.text, host: true, signed: { at: fixture.at, sig: fixture.sig }, ...overrides });
 const now = fixture.at + 10;
 
-test('the bridge\'s signature of the host\'s person\'s message gives it the owner\'s sender', () => {
+test('the bridge\'s signature of the host\'s person\'s message gives it OpenClaw\'s owner sender', () => {
   assert.equal(OWNER_SENDER, 'host');
   assert.deepEqual(hostSender(fixture.bridge, fixture.agent, signedMessage(), now), { id: 'host', owner: true });
 });
 
-test('an unsigned message keeps its person, and none may take the owner\'s sender', () => {
+test('an unsigned message keeps its person, and none may take OpenClaw\'s owner sender', () => {
   const { signed: _signed, ...unsigned } = signedMessage();
   assert.deepEqual(hostSender(fixture.bridge, fixture.agent, unsigned, now), { id: fixture.person, owner: false });
-  for (const person of ['host', 'HOST', ' Host ']) {
+  for (const person of ['host', 'HOST', ' Host ', 'enclos:host', 'Enclos:Host']) {
     const sender = hostSender(fixture.bridge, fixture.agent, { ...unsigned, person }, now);
     assert.equal(sender.owner, false);
     assert.match(sender.refused, /cannot come from host/u);
   }
+  assert.equal(hostSender(fixture.bridge, fixture.agent, { ...unsigned, person: 'hostess' }, now).refused, undefined);
 });
 
 test('an altered, forged, stale or misplaced signature leaves the message its person\'s', () => {
@@ -49,6 +50,6 @@ test('an altered, forged, stale or misplaced signature leaves the message its pe
   // Replayed after a minute, or dated ahead.
   assert.match(hostSender(fixture.bridge, fixture.agent, signedMessage(), fixture.at + 61).failure, /not fresh/u);
   assert.match(hostSender(fixture.bridge, fixture.agent, signedMessage(), fixture.at - 6).failure, /not fresh/u);
-  // A failed signature on the owner's own sender is refused, not passed on.
+  // A failed signature on OpenClaw's owner sender is refused, not passed on.
   assert.ok(hostSender(fixture.bridge, fixture.agent, signedMessage({ person: 'host' }), now).refused);
 });
