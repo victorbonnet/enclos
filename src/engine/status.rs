@@ -63,7 +63,7 @@ impl Engine {
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
         let dashboard_services = super::listener::HostServices::default();
-        let releases = Releases::default();
+        let releases = Releases::looking_up();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
@@ -75,6 +75,10 @@ impl Engine {
                     error: e.to_string(),
                 }),
             }
+        }
+        // What could not be kept, where the person running `status` sees it.
+        for note in releases.notes() {
+            eprintln!("enclos: {note}");
         }
         let suggestions = suggest(&sandboxes, now);
         Ok(StatusView {
@@ -98,7 +102,7 @@ impl Engine {
     ) -> Result<SandboxStatus> {
         let seen = (
             &super::listener::HostServices::default(),
-            &Releases::default(),
+            &Releases::looking_up(),
         );
         self.sandbox_status_in(record, runtime, now, seen)
     }

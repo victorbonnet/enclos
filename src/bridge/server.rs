@@ -291,14 +291,32 @@ impl Hub {
         let hub = Arc::clone(self);
         let person = person.to_owned();
         std::thread::spawn(move || {
-            let host = hub
-                .provisioning
-                .as_ref()
-                .expect("provisioning request checked");
-            if let Some(Ok(sandboxes)) = host.sandboxes_looked_up() {
-                hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
+            let Some(host) = hub.provisioning.as_ref() else {
+                return;
+            };
+            match host.sandboxes_looked_up() {
+                Some(Ok(listed)) => {
+                    hub.log_release_notes(&person, &listed.notes);
+                    let sandboxes = listed.sandboxes;
+                    hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
+                }
+                // The device keeps the list it has; the host's log says why.
+                Some(Err(why)) => hub.log_release_notes(&person, &[why]),
+                // Another lookup runs: its list follows.
+                None => {}
             }
         });
+    }
+
+    /// What went wrong listing the sandboxes with their runtimes' latest
+    /// releases, in the bridge's log, which `enclos app log` shows.
+    fn log_release_notes(&self, person: &str, notes: &[String]) {
+        let Ok(store) = self.store() else {
+            return;
+        };
+        for note in notes {
+            let _ = store.log(None, Some(person), "runtime releases", Some(note));
+        }
     }
 
     fn begin(
@@ -380,12 +398,14 @@ impl Hub {
                 .expect("not poisoned")
                 .remove(&sandbox);
             hub.deliver(&person, response);
-            if let Ok((sandboxes, _)) = hub
+            if let Ok(listed) = hub
                 .provisioning
                 .as_ref()
                 .expect("provisioning request checked")
                 .sandboxes()
             {
+                hub.log_release_notes(&person, &listed.notes);
+                let sandboxes = listed.sandboxes;
                 hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
@@ -3208,14 +3228,17 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok((sandboxes, due)) => {
+                            Ok(listed) => {
+                                hub.log_release_notes(person, &listed.notes);
                                 link.send(policy::fitting(
-                                    ToDevice::SandboxesList { sandboxes },
+                                    ToDevice::SandboxesList {
+                                        sandboxes: listed.sandboxes,
+                                    },
                                     &message.id,
                                 ))?;
                                 // At once with what is kept; a fresh list
                                 // follows the lookup.
-                                if due {
+                                if listed.lookup_due {
                                     hub.look_up_releases(person);
                                 }
                             }

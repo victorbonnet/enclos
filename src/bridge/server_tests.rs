@@ -4186,6 +4186,7 @@ fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
             state: "running".into(),
             runtime_version: None,
             runtime_release: None,
+            runtime_outdated: None,
         })
         .collect();
     assert!(matches!(

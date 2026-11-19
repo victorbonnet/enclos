@@ -50,10 +50,12 @@ struct Lookup {
 }
 
 impl Lookup {
+    /// Whether it is younger than its keep time: a failed lookup's is
+    /// shorter, even when it keeps the release found before.
     fn fresh(&self, now: i64) -> bool {
-        let keep = match self.version {
-            Some(_) => KEEP_FOUND,
-            None => KEEP_FAILED,
+        let keep = match self.failed {
+            None => KEEP_FOUND,
+            Some(_) => KEEP_FAILED,
         };
         // A time ahead of now, from a clock set back, is not trusted.
         (0..keep).contains(&(now - self.at))
@@ -61,28 +63,24 @@ impl Lookup {
 }
 
 /// The latest releases found for one answer, by runtime: each runtime is
-/// asked for once for all its sandboxes, even when nothing can be kept.
+/// asked for once for all its sandboxes, even when nothing can be kept. No
+/// default: a caller chooses whether it may wait on the network.
 pub struct Releases {
     found: RefCell<HashMap<RuntimeKind, Fact<LatestRelease>>>,
     look_up: bool,
     due: Cell<bool>,
-}
-
-impl Default for Releases {
-    /// [`Releases::looking_up`].
-    fn default() -> Releases {
-        Releases::looking_up()
-    }
+    notes: RefCell<Vec<String>>,
 }
 
 impl Releases {
-    /// Each runtime's latest release, looked up when what is kept is too
-    /// old: `status`'s, which may wait on the network.
+    /// Each runtime's latest release, looked up when what is kept is
+    /// missing or too old: `status`'s, which may wait on the network.
     pub fn looking_up() -> Releases {
         Releases {
             found: RefCell::default(),
             look_up: true,
             due: Cell::new(false),
+            notes: RefCell::default(),
         }
     }
 
@@ -102,6 +100,13 @@ impl Releases {
         self.due.get()
     }
 
+    /// What went wrong keeping the answers, for the caller to tell where
+    /// its user sees it: `status` on stderr, the bridge in its log. Not
+    /// kept, each answer waits on the network again.
+    pub fn notes(&self) -> Vec<String> {
+        self.notes.borrow().clone()
+    }
+
     pub(super) fn of(
         &self,
         engine: &Engine,
@@ -111,41 +116,69 @@ impl Releases {
         if let Some(found) = self.found.borrow().get(&runtime.kind()) {
             return found.clone();
         }
-        let (found, due) = engine.release(runtime, now, self.look_up);
-        self.due.set(self.due.get() || due);
+        let asked = engine.release(runtime, now, self.look_up);
+        self.due.set(self.due.get() || asked.due);
+        self.notes.borrow_mut().extend(asked.note);
         self.found
             .borrow_mut()
-            .insert(runtime.kind(), found.clone());
-        found
+            .insert(runtime.kind(), asked.fact.clone());
+        asked.fact
+    }
+}
+
+/// What [`Engine::release`] found.
+struct Asked {
+    fact: Fact<LatestRelease>,
+    /// Whether a lookup is due, when none was made.
+    due: bool,
+    /// What went wrong keeping the answer.
+    note: Option<String>,
+}
+
+impl Asked {
+    fn just(fact: Fact<LatestRelease>) -> Asked {
+        Asked {
+            fact,
+            due: false,
+            note: None,
+        }
     }
 }
 
 impl Engine {
-    /// The latest release of `runtime`, as kept or looked up now. Not
-    /// provided when the runtime names no release or the host turned
-    /// lookups off; "cannot tell" when the lookup failed, or when
-    /// `config.toml` cannot say whether lookups are on, never "up to date".
-    /// Callers go through [`Releases`]; tests ask for one runtime.
+    /// `kind`'s latest release, as `releases` finds it: for a caller that
+    /// looks the releases up before it lists the sandboxes, so the list is
+    /// read after the wait.
+    pub fn look_up_release(&self, kind: RuntimeKind, releases: &Releases) {
+        releases.of(
+            self,
+            crate::runtime::adapter(kind).as_ref(),
+            crate::model::now(),
+        );
+    }
+
+    /// The latest release of `runtime`, as kept or looked up now: tests
+    /// ask for one runtime, callers go through [`Releases`].
     #[cfg(test)]
     pub(super) fn latest_release(
         &self,
         runtime: &dyn RuntimeAdapter,
         now: Timestamp,
     ) -> Fact<LatestRelease> {
-        self.release(runtime, now, true).0
+        self.release(runtime, now, true).fact
     }
 
-    /// [`Engine::latest_release`], looking nothing up unless `look_up`:
-    /// then what is kept, however old, absent when nothing is, and whether
-    /// a lookup is due.
-    fn release(
-        &self,
-        runtime: &dyn RuntimeAdapter,
-        now: Timestamp,
-        look_up: bool,
-    ) -> (Fact<LatestRelease>, bool) {
+    /// The latest release of `runtime`. Not provided when the runtime names
+    /// no release or the host turned lookups off; "cannot tell" when no
+    /// lookup found one, or when `config.toml` cannot say whether lookups
+    /// are on, never "up to date". A failed lookup keeps the release found
+    /// before, if any, and is tried again sooner. With `look_up`, a release
+    /// missing or kept too long is looked up now; without it, nothing is
+    /// looked up: what is kept, however old, absent when nothing is, and
+    /// whether a lookup is due.
+    fn release(&self, runtime: &dyn RuntimeAdapter, now: Timestamp, look_up: bool) -> Asked {
         let Some(url) = runtime.release_source() else {
-            return (Fact::NotProvided, false);
+            return Asked::just(Fact::NotProvided);
         };
         // No `config.toml` is the default, lookups on; one enclos cannot
         // read looks nothing up.
@@ -156,53 +189,60 @@ impl Engine {
         };
         match on {
             Ok(true) => {}
-            Ok(false) => return (Fact::NotProvided, false),
+            Ok(false) => return Asked::just(Fact::NotProvided),
             Err(why) => {
-                let why = format!("nothing was looked up: {why}");
-                return (Fact::CannotTell(why), false);
+                return Asked::just(Fact::CannotTell(format!("nothing was looked up: {why}")));
             }
         }
         let path = self.layout.runtime_releases();
-        let mut kept = read_kept(&path);
+        let (mut kept, unread) = read_kept(&path);
         let kind = runtime.kind().as_str();
         let now = now.as_second();
         if !look_up {
-            return match kept.remove(kind) {
+            let (fact, due) = match kept.remove(kind) {
                 Some(lookup) => {
                     let due = !lookup.fresh(now);
                     (found(lookup, runtime), due)
                 }
                 None => (Fact::Absent, true),
             };
+            return Asked {
+                fact,
+                due,
+                note: unread,
+            };
         }
-        let lookup = match kept.get(kind).filter(|l| l.fresh(now)) {
-            Some(lookup) => lookup.clone(),
-            None => {
-                let lookup = match self.look_up(url, runtime, &path) {
-                    Ok(version) => Lookup {
-                        at: now,
-                        version: Some(version.as_str().to_owned()),
-                        failed: None,
-                    },
-                    Err(why) => Lookup {
-                        at: now,
-                        version: None,
-                        failed: Some(why),
-                    },
-                };
-                kept.insert(kind.to_owned(), lookup.clone());
-                // Not kept, each `status` would wait on the network: said.
-                // The file's name, not its path: the path comes from the
-                // engine, which code scanning takes for secret.
-                if let Err(e) = write_kept(&path, &kept) {
-                    eprintln!(
-                        "enclos: cannot write {KEPT}, in enclos's data folder: {e}; each `enclos status` looks the releases up again"
-                    );
-                }
-                lookup
-            }
+        if let Some(lookup) = kept.get(kind).filter(|l| l.fresh(now)) {
+            return Asked {
+                note: unread,
+                ..Asked::just(found(lookup.clone(), runtime))
+            };
+        }
+        let lookup = match self.look_up(url, runtime, &path) {
+            Ok(version) => Lookup {
+                at: now,
+                version: Some(version.as_str().to_owned()),
+                failed: None,
+            },
+            // The release found before stays the latest known.
+            Err(why) => Lookup {
+                at: now,
+                version: kept.get(kind).and_then(|l| l.version.clone()),
+                failed: Some(why),
+            },
         };
-        (found(lookup, runtime), false)
+        kept.insert(kind.to_owned(), lookup.clone());
+        // The file's name, not its path: the path comes from the engine,
+        // which code scanning takes for secret.
+        let unwritten = write_kept(&path, &kept).err().map(|e| {
+            format!(
+                "cannot write {KEPT}, in enclos's data folder: {e}; each answer looks the releases up again"
+            )
+        });
+        Asked {
+            note: unwritten.or(unread),
+            ..Asked::just(found(lookup, runtime))
+        }
     }
 
     /// Looks the latest release up at `url`, the answer downloaded beside
@@ -253,15 +293,16 @@ fn read_answer(path: &Path) -> Result<String, String> {
 
 /// What is kept, by runtime. A missing file keeps nothing, and so does one
 /// that does not parse, which the next lookup replaces; one that cannot be
-/// read is said, since the next write may fail the same way.
-fn read_kept(path: &Path) -> BTreeMap<String, Lookup> {
+/// read keeps nothing too, and says why, since the next write may fail the
+/// same way.
+fn read_kept(path: &Path) -> (BTreeMap<String, Lookup>, Option<String>) {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(e) if e.kind() == ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => {
-            eprintln!("enclos: cannot read {KEPT}, in enclos's data folder: {e}");
-            BTreeMap::new()
-        }
+        Ok(bytes) => (serde_json::from_slice(&bytes).unwrap_or_default(), None),
+        Err(e) if e.kind() == ErrorKind::NotFound => (BTreeMap::new(), None),
+        Err(e) => (
+            BTreeMap::new(),
+            Some(format!("cannot read {KEPT}, in enclos's data folder: {e}")),
+        ),
     }
 }
 
@@ -301,13 +342,19 @@ mod tests {
         assert!(failed(now - 60).fresh(now));
         assert!(!failed(now - 3600).fresh(now));
         assert!(!found(now + 60).fresh(now));
+        // A failure that keeps the release found before is tried again as soon.
+        let kept_through = Lookup {
+            failed: Some("no answer".into()),
+            ..found(now - 3600)
+        };
+        assert!(!kept_through.fresh(now));
     }
 
     #[test]
     fn kept_releases_are_read_back_and_a_damaged_file_keeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-releases.json");
-        assert!(read_kept(&path).is_empty());
+        assert_eq!(read_kept(&path), (BTreeMap::new(), None));
         let mut kept = BTreeMap::new();
         kept.insert(
             "hermes".to_owned(),
@@ -318,8 +365,14 @@ mod tests {
             },
         );
         write_kept(&path, &kept).unwrap();
-        assert_eq!(read_kept(&path), kept);
+        assert_eq!(read_kept(&path), (kept, None));
         std::fs::write(&path, "{").unwrap();
-        assert!(read_kept(&path).is_empty());
+        assert_eq!(read_kept(&path), (BTreeMap::new(), None));
+        // A folder where the file goes cannot be read: said.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (kept, why) = read_kept(&path);
+        assert!(kept.is_empty());
+        assert!(why.is_some_and(|w| w.starts_with("cannot read runtime-releases.json")));
     }
 }

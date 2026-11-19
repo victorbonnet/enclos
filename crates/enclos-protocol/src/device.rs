@@ -832,22 +832,23 @@ pub struct SandboxInfo {
     /// 0074, proposed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_version: Option<String>,
-    /// Its runtime's latest release, when the host looked it up.
+    /// Its runtime's latest release, when the host has one kept, however
+    /// old: none when it has none, its lookups failed, or they are off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_release: Option<RuntimeRelease>,
+    /// Whether `runtime_release` is newer than `runtime_version`: none
+    /// when the host cannot tell, such as when it does not know either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_outdated: Option<bool>,
 }
 
 /// A runtime's latest release: the one its installer installs by default
-/// (ADR 0074, proposed).
+/// (ADR 0074, proposed). The same for every sandbox of that runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRelease {
     pub version: String,
     /// Whether this host's enclos was checked with it.
     pub checked: bool,
-    /// Whether it is newer than the version installed: none when the host
-    /// cannot tell, such as when it does not know the version installed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newer: Option<bool>,
 }
 
 /// A runtime this host can install.
@@ -1427,6 +1428,7 @@ mod tests {
                         state: "created".into(),
                         runtime_version: None,
                         runtime_release: None,
+                        runtime_outdated: None,
                     },
                     SandboxInfo {
                         sandbox: "home".into(),
@@ -1436,8 +1438,8 @@ mod tests {
                         runtime_release: Some(RuntimeRelease {
                             version: "0.23.2".into(),
                             checked: true,
-                            newer: Some(true),
                         }),
+                        runtime_outdated: Some(true),
                     },
                 ],
             },
@@ -1483,6 +1485,20 @@ mod tests {
             decode_from_device(br#"{"v":1,"id":"m","type":"sandbox.create","sandbox":"lab"}"#)
                 .is_err(),
             "creation must explicitly select a policy template"
+        );
+        // An older bridge's list reads, with no versions; what the host does
+        // not know is left out, not sent as null (ADR 0074, proposed).
+        let older = br#"{"v":1,"id":"m","type":"sandboxes.list","sandboxes":[{"sandbox":"lab","runtime":"hermes","state":"running"}]}"#;
+        let ToDevice::SandboxesList { sandboxes } = decode_to_device(older).unwrap().body else {
+            panic!("a sandboxes.list")
+        };
+        assert_eq!(sandboxes[0].runtime_version, None);
+        assert_eq!(sandboxes[0].runtime_release, None);
+        assert_eq!(sandboxes[0].runtime_outdated, None);
+        let sent = serde_json::to_value(&sandboxes[0]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"sandbox": "lab", "runtime": "hermes", "state": "running"})
         );
     }
 

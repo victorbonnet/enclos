@@ -1076,22 +1076,45 @@ fn the_latest_release_is_kept_for_hours_a_failure_for_minutes_and_lookups_can_be
         release("0.23.2", true)
     );
 
+    // Only what is kept, for the bridge: however old, nothing looked up,
+    // and a lookup due.
+    let kept = crate::engine::Releases::kept();
+    assert_eq!(
+        kept.of(&engine, &runtime, later(7)),
+        release("0.23.2", true)
+    );
+    assert!(kept.due());
+
     // Asked again after six hours: a release this enclos was not checked with.
     assert_eq!(
         engine.latest_release(&runtime, later(7)),
         release("0.23.3", false)
     );
 
-    // A failed lookup is "cannot tell", kept half an hour, then asked again.
+    // A failed lookup keeps the release found before, for half an hour,
+    // then asks again.
     std::fs::write(&answer, r#"{"message": "API rate limit exceeded"}"#).unwrap();
     let failed = engine.latest_release(&runtime, later(14));
-    assert!(matches!(failed, Fact::CannotTell(_)), "{failed:?}");
+    assert_eq!(failed, release("0.23.3", false));
     std::fs::write(&answer, r#"{"tag_name": "v0.23.4"}"#).unwrap();
     assert_eq!(engine.latest_release(&runtime, later(14)), failed);
+    let kept = crate::engine::Releases::kept();
+    kept.of(&engine, &runtime, later(14));
+    assert!(!kept.due(), "a failure is kept too");
     assert_eq!(
         engine.latest_release(&runtime, later(15)),
         release("0.23.4", false)
     );
+
+    // With nothing found before, a failed lookup is "cannot tell".
+    let (_other, fresh) = engine();
+    std::fs::create_dir_all(fresh.layout.data()).unwrap();
+    std::fs::write(&answer, r#"{"message": "API rate limit exceeded"}"#).unwrap();
+    assert!(matches!(
+        fresh.latest_release(&runtime, at),
+        Fact::CannotTell(_)
+    ));
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.4"}"#).unwrap();
 
     // Turned off in config.toml, nothing is looked up or said.
     std::fs::write(engine.layout.config_file(), "runtime_releases = false\n").unwrap();
