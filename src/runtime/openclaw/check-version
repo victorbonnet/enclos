@@ -1,0 +1,41 @@
+set -euf
+# Exits with 3 when the installed OpenClaw is older than $1, the oldest the
+# enclos app channel's plugin loads in, by the rule of the plugin's own
+# supportsRelease (channels/openclaw/channel.js): a prerelease of $1 is
+# older too. Exits with 0 when it is not, and 1 when it cannot tell.
+need=$1
+found=$("$HOME/bin/openclaw" --version)
+unread() {
+    echo "enclos reads no version in what \`openclaw --version\` printed: $found" >&2
+    exit 1
+}
+version=
+for word in $found; do
+    word=${word#v}
+    case $word in [0-9]*.[0-9]*.[0-9]*) version=$word; break ;; esac
+done
+core=${version%%[-+]*}
+IFS=. read -r a b c rest <<EOF
+$core
+EOF
+IFS=. read -r x y z <<EOF
+$need
+EOF
+for n in "$a" "$b" "$c"; do
+    case $n in ''|*[!0-9]*) unread ;; esac
+done
+[ -z "$rest" ] || unread
+older=no
+if [ "$a" -ne "$x" ]; then
+    [ "$a" -gt "$x" ] || older=yes
+elif [ "$b" -ne "$y" ]; then
+    [ "$b" -gt "$y" ] || older=yes
+elif [ "$c" -ne "$z" ]; then
+    [ "$c" -gt "$z" ] || older=yes
+else
+    case $version in "$core"-*) older=yes ;; esac
+fi
+if [ "$older" = yes ]; then
+    echo "OpenClaw $version is installed; the enclos app channel needs $need or newer." >&2
+    exit 3
+fi
