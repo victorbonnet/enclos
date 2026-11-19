@@ -3,7 +3,9 @@
 //! history messages that say when a task was held and when it no longer is,
 //! stored together.
 use super::*;
-use enclos_protocol::held_task::{HeldTask, HeldTaskInfo, HeldTaskState};
+use enclos_protocol::held_task::{
+    ANSWERED_IN_CONVERSATION, HeldTask, HeldTaskAsk, HeldTaskInfo, HeldTaskState,
+};
 use enclos_protocol::{ConversationId, HeldTaskId, HeldTaskRevision};
 
 /// A card as the bridge keeps it: what a device sees, the runtime's own
@@ -23,7 +25,7 @@ pub struct HeldTaskChange {
 }
 
 const HELD_COLUMNS: &str =
-    "SELECT h.agent, h.conversation, h.body, h.state, h.revision, c.owner, h.task
+    "SELECT h.agent, h.conversation, h.body, h.state, h.revision, c.owner, h.task, h.answer
      FROM held_tasks h JOIN conversations c ON c.id = h.conversation";
 
 /// A state a card is stored in: never [`HeldTaskState::Unknown`], which
@@ -31,6 +33,7 @@ const HELD_COLUMNS: &str =
 fn state_text(state: HeldTaskState) -> &'static str {
     match state {
         HeldTaskState::Held => "held",
+        HeldTaskState::Answered => "answered",
         HeldTaskState::Resumed => "resumed",
         HeldTaskState::Released => "released",
         HeldTaskState::Expired => "expired",
@@ -41,6 +44,7 @@ fn state_text(state: HeldTaskState) -> &'static str {
 fn state_of(text: &str) -> Option<HeldTaskState> {
     match text {
         "held" => Some(HeldTaskState::Held),
+        "answered" => Some(HeldTaskState::Answered),
         "resumed" => Some(HeldTaskState::Resumed),
         "released" => Some(HeldTaskState::Released),
         "expired" => Some(HeldTaskState::Expired),
@@ -59,6 +63,7 @@ fn read_card(row: &rusqlite::Row) -> rusqlite::Result<Row> {
     let conversation: String = row.get(1)?;
     let agent: String = row.get(0)?;
     let owner: String = row.get(5)?;
+    let answer: Option<String> = row.get(7)?;
     let task: HeldTask = match serde_json::from_str(&body) {
         Ok(task) => task,
         Err(e) => return Ok(Err(format!("its body does not read: {e}"))),
@@ -83,6 +88,10 @@ fn read_card(row: &rusqlite::Row) -> rusqlite::Result<Row> {
             since: task.since,
             resume: task.resume,
             resumable: task.resumable,
+            // A device never reads `settled` (the card's state says it) or
+            // `asked`.
+            ask: task.ask.map(HeldTaskAsk::for_device),
+            answer: answer.filter(|_| state == HeldTaskState::Answered),
             state,
             revision,
         },
@@ -134,6 +143,10 @@ fn card_in(db: &Connection, agent: &str, task: &str) -> rusqlite::Result<Option<
 /// What a card's first history message says: readable on its own, so an
 /// app that does not know held tasks still tells the person.
 pub fn held_text(task: &HeldTask) -> String {
+    // What the agent wrote for the person comes first (ADR 0073).
+    if let Some(ask) = task.ask.as_ref().filter(|ask| !ask.settled) {
+        return ask.text(&task.title);
+    }
     let mut text = format!("Held task: {}\n{}", task.title, task.reason);
     if let Some(assignee) = &task.assignee {
         text.push_str(&format!("\nAssigned to {assignee}."));
@@ -259,6 +272,18 @@ impl Store {
         cards(&self.db, "c.owner = ?1 AND h.state = 'held'", person)
     }
 
+    /// What each sync sends: every card still `held` in `person`'s
+    /// conversations, and every one `answered` and still waiting on its
+    /// agent (ADR 0073), so a device that missed an answer's reply learns
+    /// it was taken. "Needs you" reads only the held ones.
+    pub fn synced_held_tasks_for(&self, person: &str) -> rusqlite::Result<Vec<StoredHeldTask>> {
+        cards(
+            &self.db,
+            "c.owner = ?1 AND h.state IN ('held', 'answered')",
+            person,
+        )
+    }
+
     /// Skip unreadable historical cards just as native card sync does;
     /// actual database failures remain unavailable snapshots.
     pub fn indexed_held_tasks_for(&self, person: &str) -> rusqlite::Result<Vec<StoredHeldTask>> {
@@ -290,26 +315,83 @@ impl Store {
             let body = serde_json::to_string(task)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             let current = card_in(&tx, agent, task.task.as_str())?;
+            let settled = task.ask.as_ref().is_some_and(|ask| ask.settled);
             let message = match &current {
-                // Still held: new details, no new message. Compared as read,
-                // so a body an earlier build wrote without a field that now
+                // Still held, or answered and waiting on the agent: new
+                // details, and a message only when the agent asks (again)
+                // or the hold is new (ADR 0073). Compared as read, so a
+                // body an earlier build wrote without a field that now
                 // reads as its default is no change.
-                Some(card) if card.info.state == HeldTaskState::Held => {
+                Some(card)
+                    if matches!(
+                        card.info.state,
+                        HeldTaskState::Held | HeldTaskState::Answered
+                    ) =>
+                {
                     let stored: String = tx.query_row(
                         "SELECT body FROM held_tasks WHERE agent = ?1 AND task = ?2",
                         params![agent, task.task.as_str()],
                         |row| row.get(0),
                     )?;
-                    if serde_json::from_str::<HeldTask>(&stored).is_ok_and(|stored| stored == *task)
-                    {
+                    let stored = serde_json::from_str::<HeldTask>(&stored).ok();
+                    if stored.as_ref() == Some(task) {
                         continue;
                     }
-                    tx.execute(
-                        "UPDATE held_tasks SET body = ?3, revision = revision + 1
-                         WHERE agent = ?1 AND task = ?2",
-                        params![agent, task.task.as_str(), body],
-                    )?;
-                    None
+                    let conversation = card.info.conversation.as_str();
+                    let answered = card.info.state == HeldTaskState::Answered;
+                    // The agent asks, and not what the card already asked.
+                    let asks = task.ask.as_ref().is_some_and(|ask| {
+                        !ask.settled
+                            && !stored
+                                .as_ref()
+                                .and_then(|stored| stored.ask.as_ref())
+                                .is_some_and(|before| before.same_question(ask))
+                    });
+                    let new_hold = stored.as_ref().is_some_and(|s| s.since != task.since);
+                    if answered && (asks || new_hold) {
+                        tx.execute(
+                            "UPDATE held_tasks SET body = ?3, state = 'held', answer = NULL,
+                             revision = revision + 1 WHERE agent = ?1 AND task = ?2",
+                            params![agent, task.task.as_str(), body],
+                        )?;
+                        Some(add_message(
+                            &tx,
+                            conversation,
+                            &task.task,
+                            &held_text(task),
+                            "notify",
+                        )?)
+                    } else if !answered && settled {
+                        tx.execute(
+                            "UPDATE held_tasks SET body = ?3, state = 'answered', answer = ?4,
+                             revision = revision + 1 WHERE agent = ?1 AND task = ?2",
+                            params![agent, task.task.as_str(), body, ANSWERED_IN_CONVERSATION],
+                        )?;
+                        Some(add_message(
+                            &tx,
+                            conversation,
+                            &task.task,
+                            &format!("Answered in the conversation: {}", task.title),
+                            "status",
+                        )?)
+                    } else {
+                        tx.execute(
+                            "UPDATE held_tasks SET body = ?3, revision = revision + 1
+                             WHERE agent = ?1 AND task = ?2",
+                            params![agent, task.task.as_str(), body],
+                        )?;
+                        if asks && !answered {
+                            Some(add_message(
+                                &tx,
+                                conversation,
+                                &task.task,
+                                &held_text(task),
+                                "notify",
+                            )?)
+                        } else {
+                            None
+                        }
+                    }
                 }
                 // Read before the resume the runtime confirmed since.
                 Some(card)
@@ -320,12 +402,26 @@ impl Store {
                 }
                 // Held again after its card left `held`, or first held; a
                 // row that no longer reads is written again.
+                _ if settled => {
+                    // Held anew with the agent saying the person already
+                    // answered: the card waits on the agent, and tells no one.
+                    tx.execute(
+                        "INSERT INTO held_tasks(agent, task, conversation, body, state, revision, answer)
+                         VALUES (?1, ?2, ?3, ?4, 'answered', 0, ?5)
+                         ON CONFLICT(agent, task) DO UPDATE SET conversation = excluded.conversation,
+                         body = excluded.body, state = 'answered', answer = excluded.answer,
+                         revision = held_tasks.revision + 1",
+                        params![agent, task.task.as_str(), home, body, ANSWERED_IN_CONVERSATION],
+                    )?;
+                    None
+                }
                 _ => {
                     tx.execute(
                         "INSERT INTO held_tasks(agent, task, conversation, body, state, revision)
                          VALUES (?1, ?2, ?3, ?4, 'held', 0)
                          ON CONFLICT(agent, task) DO UPDATE SET conversation = excluded.conversation,
-                         body = excluded.body, state = 'held', revision = held_tasks.revision + 1",
+                         body = excluded.body, state = 'held', answer = NULL,
+                         revision = held_tasks.revision + 1",
                         params![agent, task.task.as_str(), home, body],
                     )?;
                     Some(add_message(
@@ -341,7 +437,11 @@ impl Store {
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             changes.push(HeldTaskChange { card, message });
         }
-        for card in cards(&tx, "h.agent = ?1 AND h.state = 'held'", agent)? {
+        for card in cards(
+            &tx,
+            "h.agent = ?1 AND h.state IN ('held', 'answered')",
+            agent,
+        )? {
             if !listed.contains(card.info.task.as_str()) {
                 changes.push(leave(&tx, &card, HeldTaskState::Released)?);
             }
@@ -370,7 +470,9 @@ impl Store {
             return Ok(None);
         };
         let resumable = match card.info.state {
-            HeldTaskState::Held => card.runtime_revision == *sent,
+            // An answer taken while the resume was on its way (ADR 0073)
+            // does not hide that the person's resume is what ran.
+            HeldTaskState::Held | HeldTaskState::Answered => card.runtime_revision == *sent,
             HeldTaskState::Released => true,
             _ => false,
         };
@@ -390,11 +492,79 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let mut changes = Vec::new();
-        for card in cards(&tx, "h.agent = ?1 AND h.state = 'held'", agent)? {
+        for card in cards(
+            &tx,
+            "h.agent = ?1 AND h.state IN ('held', 'answered')",
+            agent,
+        )? {
             changes.push(leave(&tx, &card, HeldTaskState::Expired)?);
         }
         tx.commit()?;
         Ok(changes)
+    }
+
+    /// The host's person answered `task`'s card at the card's `revision`
+    /// (ADR 0073): it is `answered`, with `answer`, and no history message,
+    /// the person's own being the record. Marked before their message is
+    /// sent, so the same answer is not taken twice; `None`, changing
+    /// nothing, when the card is no longer held at that revision.
+    pub fn answer_held_task(
+        &self,
+        agent: &str,
+        task: &str,
+        revision: u64,
+        answer: &str,
+    ) -> rusqlite::Result<Option<HeldTaskChange>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let Some(card) = card_in(&tx, agent, task)? else {
+            return Ok(None);
+        };
+        if card.info.state != HeldTaskState::Held || card.info.revision != revision {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE held_tasks SET state = 'answered', answer = ?3, revision = revision + 1
+             WHERE agent = ?1 AND task = ?2",
+            params![agent, task, answer],
+        )?;
+        let card = card_in(&tx, agent, task)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        tx.commit()?;
+        Ok(Some(HeldTaskChange {
+            card,
+            message: None,
+        }))
+    }
+
+    /// The person's answer to `task` could not be given to the agent: its
+    /// card, still `answered` with that answer, is held again. `None` when
+    /// it changed meanwhile.
+    pub fn unanswer_held_task(
+        &self,
+        agent: &str,
+        task: &str,
+        answer: &str,
+    ) -> rusqlite::Result<Option<HeldTaskChange>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let changed = tx.execute(
+            "UPDATE held_tasks SET state = 'held', answer = NULL, revision = revision + 1
+             WHERE agent = ?1 AND task = ?2 AND state = 'answered' AND answer = ?3",
+            params![agent, task, answer],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let card = card_in(&tx, agent, task)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        tx.commit()?;
+        Ok(Some(HeldTaskChange {
+            card,
+            message: None,
+        }))
     }
 }
 
@@ -423,6 +593,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:1").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            ask: None,
         }
     }
 
@@ -466,6 +637,216 @@ mod tests {
                 .as_str(),
             "t1"
         );
+    }
+
+    fn asked(id: &str, decision: &str, settled: bool) -> HeldTask {
+        HeldTask {
+            ask: Some(HeldTaskAsk {
+                decision: decision.into(),
+                blocked: "Both coding runs are used up.".into(),
+                choices: vec!["Allow one fix".into(), "Keep paused".into()],
+                recommended: Some(0),
+                settled,
+                asked: Some(1),
+            }),
+            ..task(id, "r")
+        }
+    }
+
+    /// ADR 0073: the agent's ask tells the person once; their answer makes
+    /// the card wait on the agent until it asks again or the task is held anew.
+    #[test]
+    fn an_ask_tells_the_person_once_and_an_answer_waits_on_the_agent() {
+        let (_dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        // The agent hands the hold to the person: updated, and a notify.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow one more hour?", false)])
+            .unwrap();
+        let message = changes[0].message.as_ref().unwrap();
+        assert_eq!(message.kind, "notify");
+        assert_eq!(
+            message.text,
+            "Allow one more hour?\nBoth coding runs are used up.\n1. Allow one fix (recommended)\n2. Keep paused\nHeld task: Task t1"
+        );
+        let card = &changes[0].card.info;
+        assert_eq!(card.ask.as_ref().unwrap().choices.len(), 2);
+        assert_eq!(card.revision, 1);
+        // The same again changes nothing.
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[asked("t1", "Allow one more hour?", false)])
+                .unwrap()
+                .is_empty()
+        );
+
+        // Answered at another revision: nothing; at its own: answered, quietly.
+        assert!(
+            store
+                .answer_held_task(AGENT, "t1", 0, "Allow one fix")
+                .unwrap()
+                .is_none()
+        );
+        let before = store.newest_seq().unwrap();
+        let answered = store
+            .answer_held_task(AGENT, "t1", 1, "Allow one fix")
+            .unwrap()
+            .unwrap();
+        assert!(answered.message.is_none());
+        assert_eq!(answered.card.info.state, HeldTaskState::Answered);
+        assert_eq!(answered.card.info.answer.as_deref(), Some("Allow one fix"));
+        assert_eq!(store.newest_seq().unwrap(), before);
+        // Taken once: the same answer again changes nothing.
+        assert!(
+            store
+                .answer_held_task(AGENT, "t1", 2, "Allow one fix")
+                .unwrap()
+                .is_none()
+        );
+        // An answered card is out of "Needs you", and still in every sync.
+        assert!(store.held_tasks_for(OWNER).unwrap().is_empty());
+        let synced = store.synced_held_tasks_for(OWNER).unwrap();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].info.state, HeldTaskState::Answered);
+
+        // The agent saying the person answered changes no state, and tells no one.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow one more hour?", true)])
+            .unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Answered);
+        assert!(changes[0].message.is_none());
+        // A device never reads `settled`.
+        assert!(!changes[0].card.info.ask.as_ref().unwrap().settled);
+
+        // The agent asks again: held, with a new notify.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Keep it paused?", false)])
+            .unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].card.info.answer, None);
+        assert!(
+            changes[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Keep it paused?")
+        );
+
+        // Answered, then no longer listed: released, as a held card is.
+        let revision = changes[0].card.info.revision;
+        store
+            .answer_held_task(AGENT, "t1", revision, "Keep paused")
+            .unwrap()
+            .unwrap();
+        let changes = store.report_held_tasks(AGENT, &home, &[]).unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Released);
+        assert_eq!(changes[0].card.info.answer, None);
+    }
+
+    /// The same words asked again (a new `asked`) after an answer ask the
+    /// person again; the same list sent again does not.
+    #[test]
+    fn the_same_question_asked_again_after_an_answer_asks_the_person_again() {
+        let (_dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+            .unwrap();
+        store
+            .answer_held_task(AGENT, "t1", 0, "Allow one fix")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+                .unwrap()
+                .is_empty()
+        );
+        let first = asked("t1", "Allow?", false);
+        let again = HeldTask {
+            ask: Some(HeldTaskAsk {
+                asked: Some(2),
+                ..first.ask.clone().unwrap()
+            }),
+            ..first
+        };
+        let changes = store.report_held_tasks(AGENT, &home, &[again]).unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].message.as_ref().unwrap().kind, "notify");
+        // A device reads neither `asked` nor `settled`.
+        assert_eq!(changes[0].card.info.ask.as_ref().unwrap().asked, None);
+    }
+
+    #[test]
+    fn a_settled_ask_answers_a_held_card_and_a_new_hold_asks_again() {
+        let (_dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+            .unwrap();
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", true)])
+            .unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Answered);
+        assert_eq!(
+            changes[0].card.info.answer.as_deref(),
+            Some(ANSWERED_IN_CONVERSATION)
+        );
+        let line = changes[0].message.as_ref().unwrap();
+        assert_eq!(line.kind, "status");
+        assert_eq!(line.text, "Answered in the conversation: Task t1");
+
+        // The same task held anew (another `since`): held again, with its message.
+        let anew = HeldTask {
+            since: 1_763_000_500,
+            ..task("t1", "Blocked again")
+        };
+        let changes = store.report_held_tasks(AGENT, &home, &[anew]).unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].message.as_ref().unwrap().kind, "notify");
+
+        // A task first seen already settled waits on the agent and tells no one.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[asked("t2", "Allow?", true)])
+            .unwrap();
+        let t2 = changes
+            .iter()
+            .find(|c| c.card.info.task.as_str() == "t2")
+            .unwrap();
+        assert_eq!(t2.card.info.state, HeldTaskState::Answered);
+        assert!(t2.message.is_none());
+    }
+
+    #[test]
+    fn an_answer_not_given_holds_the_card_again_and_expiry_ends_answered_ones() {
+        let (_dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+            .unwrap();
+        store
+            .answer_held_task(AGENT, "t1", 0, "Allow one fix")
+            .unwrap()
+            .unwrap();
+        // Another answer's text changes nothing.
+        assert!(
+            store
+                .unanswer_held_task(AGENT, "t1", "Keep paused")
+                .unwrap()
+                .is_none()
+        );
+        let again = store
+            .unanswer_held_task(AGENT, "t1", "Allow one fix")
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.card.info.state, HeldTaskState::Held);
+        assert_eq!(again.card.info.answer, None);
+        store
+            .answer_held_task(AGENT, "t1", again.card.info.revision, "Allow one fix")
+            .unwrap()
+            .unwrap();
+        let expired = store.expire_held_tasks(AGENT).unwrap();
+        assert_eq!(expired[0].card.info.state, HeldTaskState::Expired);
     }
 
     #[test]

@@ -2976,6 +2976,62 @@ fn run_session(
                     link.send(ToDevice::Error(error))?;
                 }
             }
+            FromDevice::HeldTaskAnswer {
+                agent,
+                task,
+                revision,
+                answer,
+            } => {
+                let request = held_tasks::ResumeRequest {
+                    agent,
+                    task,
+                    revision,
+                };
+                match hub.held_task_answer(store, device, person, &message.id, &request, &answer) {
+                    Err(error) => link.send(ToDevice::Error(error))?,
+                    Ok((conversation, said, card)) => {
+                        // The person's message, as a `message.send` of theirs:
+                        // kept for an agent that cannot be reached yet.
+                        let given = send(
+                            hub,
+                            store,
+                            device,
+                            &conversation,
+                            message.id.clone(),
+                            said.text,
+                        );
+                        let refused = match &given {
+                            Ok(Some(ToDevice::Error(error)))
+                                if error.code != ErrorCode::AgentUnavailable =>
+                            {
+                                Some(error.clone())
+                            }
+                            _ => None,
+                        };
+                        if given.is_err() || refused.is_some() {
+                            hub.held_task_unanswered(
+                                store,
+                                device,
+                                person,
+                                &request,
+                                answer.kind(),
+                                &said.answer,
+                            );
+                        }
+                        given?;
+                        if let Some(error) = refused {
+                            link.send(ToDevice::Error(error))?;
+                        } else {
+                            // After the echo, which the outbox holds
+                            drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
+                            link.send(ToDevice::HeldTaskResult {
+                                of: message.id,
+                                held_task: card,
+                            })?;
+                        }
+                    }
+                }
+            }
             FromDevice::HeldTaskGet { agent, task } => {
                 if let Err(error) = hub.held_task_get(
                     store,
@@ -3364,9 +3420,13 @@ fn run_session(
                         })?;
                     }
                 }
-                // Held tasks' cards still held, whatever `since`: a card's
-                // first message may predate it.
-                for card in store.held_tasks_for(person).map_err(|e| e.to_string())? {
+                // Held tasks' cards still held or answered, whatever `since`:
+                // a card's first message may predate it, and a device that
+                // lost an answer's reply learns it was taken (ADR 0073).
+                for card in store
+                    .synced_held_tasks_for(person)
+                    .map_err(|e| e.to_string())?
+                {
                     let body = ToDevice::HeldTask {
                         held_task: card.info,
                     };

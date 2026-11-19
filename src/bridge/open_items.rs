@@ -150,7 +150,8 @@ impl Hub {
                     kind: OpenItemKind::HeldTask,
                     agent: Some(h.agent),
                     conversation: Some(h.conversation),
-                    summary: summary(&h.reason),
+                    // The agent's question, when it wrote one (ADR 0073).
+                    summary: summary(h.ask.as_ref().map_or(&h.reason, |ask| &ask.decision)),
                     since: h.since,
                     expired: false,
                 });

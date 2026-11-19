@@ -545,6 +545,8 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
         }
     }
     add_column(db, "questions", "confirmed", "INTEGER NOT NULL DEFAULT 0")?;
+    // What the person answered a held card with (ADR 0073, proposed).
+    add_column(db, "held_tasks", "answer", "TEXT")?;
     // Home is never archived (ADR 0049): a Home archived by a development
     // build from before that rule is restored, with a new revision so a
     // device that saw it archived takes the change.
@@ -625,6 +627,8 @@ CREATE TABLE IF NOT EXISTS held_tasks (
     body TEXT NOT NULL,
     state TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0),
+    -- What the person answered an `answered` card with (ADR 0073).
+    answer TEXT,
     PRIMARY KEY (agent, task)
 );
 CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0), display_name TEXT);

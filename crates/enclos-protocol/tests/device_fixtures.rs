@@ -18,6 +18,10 @@ const TO_DEVICE: &[(&str, &str)] = &[
         include_str!("fixtures/device/to_device_message_held_task.json"),
     ),
     (
+        "held_task_answered",
+        include_str!("fixtures/device/to_device_held_task_answered.json"),
+    ),
+    (
         "task_detail",
         include_str!("fixtures/device/to_device_task_detail.json"),
     ),
@@ -55,6 +59,10 @@ const FROM_DEVICE: &[(&str, &str)] = &[
     (
         "held_task_resume",
         include_str!("fixtures/device/from_device_held_task_resume.json"),
+    ),
+    (
+        "held_task_answer",
+        include_str!("fixtures/device/from_device_held_task_answer.json"),
     ),
     (
         "task_get",
