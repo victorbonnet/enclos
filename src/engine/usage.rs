@@ -719,6 +719,36 @@ mod tests {
         assert!(matches!(agents[2].usage, Fact::CannotTell(_)));
     }
 
+    /// The OpenClaw reader's report, as `usage.test.mjs` checks the reader
+    /// writes it, is taken whole (#348).
+    #[test]
+    fn the_openclaw_readers_report_is_taken() {
+        let agents = agents(
+            include_str!("../runtime/openclaw/usage-report.json"),
+            &["main", "scout", "writer"],
+        );
+        let Fact::Known(main) = &agents[0].usage else {
+            panic!("{agents:?}")
+        };
+        assert_eq!(main.models.len(), 2);
+        assert_eq!(main.models[0].model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(main.models[0].tokens.reasoning, None);
+        assert_eq!(main.models[0].cost.kind, CostKind::Estimated);
+        assert_eq!(main.models[1].cost.kind, CostKind::Unknown);
+        assert_eq!(main.top.len(), 2);
+        assert!(
+            matches!(&agents[1].usage, Fact::CannotTell(why) if why.contains("INVALID_REQUEST"))
+        );
+        let Fact::Known(writer) = &agents[2].usage else {
+            panic!("{agents:?}")
+        };
+        assert_eq!(writer.models[0].cost.kind, CostKind::Mixed);
+        assert_eq!(
+            writer.models[0].incomplete,
+            ["calls", "input", "output", "cache_read", "cache_write"]
+        );
+    }
+
     #[test]
     fn a_report_naming_an_agent_not_asked_for_is_refused() {
         let other = REPORT.replace("\"scout\"", "\"intruder\"");

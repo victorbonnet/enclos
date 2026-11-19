@@ -12,8 +12,9 @@
 // Arguments: the report's path, the window's start (Unix seconds), then the
 // agents' names. OpenClaw counts by day: the window starts at the UTC
 // midnight of the day that holds the start, and a chat counts for what it
-// used in those days. The token is resolved in this process's memory, as
-// `enclos-openclaw-delete.mjs` does, never written or passed on.
+// used in those days. The gateway's token or password is resolved in this
+// process's memory, as `enclos-openclaw-delete.mjs` does, never written or
+// passed on.
 //
 // Whatever goes wrong is written into the report (`error`), never to the
 // terminal: enclos sends this program's output nowhere.
@@ -33,6 +34,8 @@ const MINIMUM = '2026.11.5';
 // What OpenClaw counts. It keeps no reasoning count of its own (reasoning is
 // part of `output`), so `reasoning` is null, never 0.
 const KEPT = ['calls', 'input', 'output', 'cache_read', 'cache_write'];
+// The latest start time the host takes (the end of year 9999, in seconds).
+const MAX_TIME = 253402300799;
 
 class Unread extends Error {}
 
@@ -66,17 +69,29 @@ function total(t) {
 }
 
 /**
- * What OpenClaw says a model's calls cost. It estimates each call from its
- * own price table when it records it (a provider-billed figure replaces the
- * estimate, which a total cannot tell apart), so a known cost is
- * `estimated`; a call it could not price makes the sum `mixed`, or
- * `unknown` when no call was priced.
+ * What OpenClaw says a model's calls cost. It keeps the cost recorded with a
+ * call (its estimate then, or the provider's billed figure) and estimates one
+ * recorded without, from its price table when the gateway sums it; a total
+ * cannot tell these apart, so a known cost is `estimated`. Calls it could
+ * not price, or an answer that does not say how many, make the sum `mixed`,
+ * and `unknown` when no call was priced.
  */
 function cost(totals, calls) {
   const usd = amount(totals?.totalCost);
-  const missing = count(totals?.missingCostEntries) ?? 0;
-  if (usd == null || (calls != null && missing >= calls)) return { usd: null, kind: 'unknown' };
-  return { usd, kind: missing > 0 ? 'mixed' : 'estimated' };
+  const missing = count(totals?.missingCostEntries);
+  if (usd == null || (calls != null && missing != null && missing >= calls)) return { usd: null, kind: 'unknown' };
+  return { usd, kind: missing === 0 ? 'estimated' : 'mixed' };
+}
+
+/** When a chat started, in Unix seconds, if OpenClaw's time is one the host takes. */
+function started(ms) {
+  const seconds = amount(ms) == null ? null : ms / 1000;
+  return seconds != null && seconds <= MAX_TIME ? seconds : null;
+}
+
+/** An error's kind, never its message, which may hold OpenClaw's settings. */
+function kind(error) {
+  return typeof error?.name === 'string' ? text(error.name) : 'Error';
 }
 
 /** The UTC day, `YYYY-MM-DD`, that holds `seconds`. */
@@ -86,8 +101,10 @@ export function day(seconds) {
 
 /** One agent's answer from `sessions.usage`, as format 1 lists it. */
 export function agentUsage(answer) {
-  if (!answer || typeof answer !== 'object' || !answer.aggregates || !Array.isArray(answer.sessions)) {
-    throw new Unread('OpenClaw answered sessions.usage without its aggregates');
+  // An answer of another shape (a field OpenClaw renamed) is an error, never
+  // an agent that used nothing.
+  if (!answer || typeof answer !== 'object' || !Array.isArray(answer.aggregates?.byModel) || !Array.isArray(answer.sessions)) {
+    throw new Unread('OpenClaw answered sessions.usage without its per-model sums');
   }
   // A time budget the gateway ran out of, chats whose summaries it has not
   // computed yet (left out of its sums, with no `partial` said on this
@@ -96,7 +113,7 @@ export function agentUsage(answer) {
   const partial = answer.partial != null ||
     (cache != null && (cache.status !== 'fresh' || cache.pendingFiles > 0 || cache.staleFiles > 0)) ||
     answer.sessions.some(s => s?.computing === true || s?.usage?.staleSince != null || s?.usage?.refreshing === true);
-  const byModel = Array.isArray(answer.aggregates.byModel) ? answer.aggregates.byModel : [];
+  const byModel = answer.aggregates.byModel;
   const chats = new Map();
   for (const session of answer.sessions) {
     for (const m of Array.isArray(session?.usage?.modelUsage) ? session.usage.modelUsage : []) {
@@ -122,7 +139,7 @@ export function agentUsage(answer) {
     chat: text(s.sessionId ?? s.key),
     source: text(s.channel ?? s.origin?.provider),
     title: text(s.label),
-    started_at: amount(s.usage.firstActivity) == null ? null : s.usage.firstActivity / 1000,
+    started_at: started(s.usage.firstActivity),
     model: text(s.model),
     calls: count(s.usage.messageCounts?.assistant),
     tokens: tokens(s.usage),
@@ -155,7 +172,7 @@ async function connection({ readConfig, resolveSecret, env }) {
     throw new Unread('OpenClaw\'s gateway port is unknown: this sandbox has no enclos proxy port');
   }
   let snapshot;
-  try { ({ snapshot } = await readConfig()); } catch { throw new Unread('OpenClaw could not read its settings'); }
+  try { ({ snapshot } = await readConfig()); } catch (error) { throw new Unread(`OpenClaw could not read its settings (${kind(error)})`); }
   if (!snapshot?.valid || !snapshot.sourceConfig) throw new Unread('OpenClaw\'s settings are not valid; run OpenClaw doctor');
   const config = snapshot.sourceConfig, auth = config.gateway?.auth;
   if (config.gateway?.mode === 'remote') throw new Unread('OpenClaw\'s gateway is remote, not this sandbox\'s');
@@ -165,14 +182,15 @@ async function connection({ readConfig, resolveSecret, env }) {
   const field = auth.mode === 'password' ? 'password' : 'token';
   let resolved;
   try { resolved = await resolveSecret({ config, env, value: auth[field], path: `gateway.auth.${field}` }); }
-  catch { resolved = undefined; }
+  catch (error) { throw new Unread(`OpenClaw could not resolve its gateway ${field} (${kind(error)})`); }
   if (typeof resolved?.value !== 'string' || !resolved.value.trim() || resolved.unresolvedRefReason) {
-    throw new Unread('OpenClaw could not resolve its gateway secret');
+    throw new Unread(`OpenClaw could not resolve its gateway ${field}`);
   }
   return { [field]: resolved.value, port: String(port), expectUrl: `ws://127.0.0.1:${port}`, json: true, timeout: '60000' };
 }
 
-/** The report for `agents` since `since` (Unix seconds), read through `sdk`. */
+/** The report for `agents` since `since` (Unix seconds), read through the
+ * OpenClaw SDK functions it is given. */
 export async function report({ since, agents, readConfig, resolveSecret, callGateway, env = process.env, now = Date.now() }) {
   let options;
   try { options = await connection({ readConfig, resolveSecret, env }); }
@@ -181,8 +199,13 @@ export async function report({ since, agents, readConfig, resolveSecret, callGat
     throw error;
   }
   try { await callGateway('health', options, {}); }
-  catch {
-    return { format: FORMAT, agents: [], error: 'OpenClaw\'s gateway did not answer: start the sandbox and wait until it is ready' };
+  catch (error) {
+    // A gateway that answered with an error is running: starting the
+    // sandbox would not help, so its code is said instead.
+    const why = typeof error?.gatewayCode === 'string'
+      ? `OpenClaw's gateway refused enclos's request: ${error.gatewayCode}`
+      : `OpenClaw's gateway did not answer (${kind(error)}): start the sandbox and wait until it is ready`;
+    return { format: FORMAT, agents: [], error: text(why) };
   }
   const window = { startDate: day(since), endDate: day(now / 1000), mode: 'utc' };
   const read = [];
@@ -194,7 +217,7 @@ export async function report({ since, agents, readConfig, resolveSecret, callGat
     } catch (error) {
       // A gateway's own error names its code; its message may hold details
       // of the gateway's settings, so only the code is said.
-      const code = typeof error?.gatewayCode === 'string' ? `: ${error.gatewayCode}` : '';
+      const code = typeof error?.gatewayCode === 'string' ? `: ${error.gatewayCode}` : ` (${kind(error)})`;
       entry = { error: error instanceof Unread ? text(error.message) : text(`sessions.usage failed${code}`) };
     }
     read.push({ ...entry, agent });
@@ -204,12 +227,13 @@ export async function report({ since, agents, readConfig, resolveSecret, callGat
 
 export async function nativeSdk() {
   // OpenClaw's rootless installer keeps its private Node in tools/node, with
-  // OpenClaw beside it: its own package exports, never a cwd or NODE_PATH one.
+  // OpenClaw installed in that Node's own lib/node_modules: its own package
+  // exports, never a cwd or NODE_PATH one.
   const nodeRoot = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
   const packageFile = path.join(nodeRoot, 'lib/node_modules/openclaw/package.json');
   let version;
   try { ({ version } = JSON.parse(fs.readFileSync(packageFile))); }
-  catch { throw new Unread('OpenClaw is not installed beside the Node that runs it'); }
+  catch { throw new Unread('OpenClaw is not installed in the Node that runs it'); }
   const parts = typeof version === 'string' && /^v?(\d+\.\d+\.\d+)([+-].+)?$/u.exec(version);
   const order = parts ? parts[1].localeCompare(MINIMUM, 'en', { numeric: true }) : -1;
   if (order < 0 || (order === 0 && parts[2]?.startsWith('-'))) throw new Unread(`OpenClaw ${MINIMUM} or newer reports usage to enclos`);
@@ -217,7 +241,7 @@ export async function nativeSdk() {
   const method = async (subpath, name) => {
     let api;
     try { api = await import(pathToFileURL(require.resolve(`openclaw/plugin-sdk/${subpath}`))); }
-    catch { throw new Unread(`OpenClaw has no plugin-sdk/${subpath}`); }
+    catch (error) { throw new Unread(`OpenClaw's plugin-sdk/${subpath} could not be loaded (${kind(error)})`); }
     if (typeof api?.[name] !== 'function') throw new Unread(`OpenClaw's plugin-sdk/${subpath} has no ${name}`);
     return api[name];
   };
@@ -237,19 +261,23 @@ export function write(out, value) {
 
 export async function main(argv) {
   const [out, start, ...agents] = argv;
+  let value;
   try {
     const since = Number(start);
     if (!Number.isFinite(since)) throw new Unread('the window\'s start is not a time');
-    write(out, await report({ since, agents, ...(await nativeSdk()) }));
+    value = await report({ since, agents, ...(await nativeSdk()) });
   } catch (error) {
     // Said in the report, which enclos shows escaped, never on a terminal.
     const why = error instanceof Unread ? error.message : `${error?.name ?? 'Error'}: ${error?.message ?? error}`;
-    write(out, { format: FORMAT, agents: [], error: text(why) });
+    value = { format: FORMAT, agents: [], error: text(why) };
   }
+  // Written once: a report that could not be written leaves the exit code
+  // for enclos to say.
+  write(out, value);
 }
 
-// Run by the adapter's command (`node -e`, which sets this), not when a test
-// imports it.
+// Run by the adapter's command, whose shell sets this before `node -e`; not
+// when a test imports it.
 if (process.env.ENCLOS_OPENCLAW_USAGE === '1') {
   await main(process.argv.slice(1));
   // The report is written: a handle OpenClaw's client left open must not

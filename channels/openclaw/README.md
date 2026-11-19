@@ -141,21 +141,25 @@ native `llm_output` hook, which OpenClaw lets a plugin outside its bundle
 register only with `plugins.entries.enclos.hooks.allowConversationAccess`,
 already set for `before_prompt_build`. As read in 2026.11.5's source (no
 running gateway has shown it yet, design §14), it fires once per attempt of a
-run, with the tokens of all the attempt's calls summed (`input` uncached,
+run of OpenClaw's own agent loop, with the tokens of all the attempt's calls summed (`input` uncached,
 `cacheRead`, `cacheWrite`, `output`; no reasoning count apart from output) and
 no count of them, so the plugin counts the run's completed calls from
-`model_call_ended` and sends one report of that many calls. A call in an app
+`model_call_ended` and sends one report of that many calls. A run through a
+CLI backend or another harness fires no `model_call_ended`, so its report
+counts as one call. A call in an app
 conversation, matched by its native session key to the turn or to the saved
 conversation route, goes as `usage`; a call in an app conversation's native
 chat it cannot match to its conversation is not sent. Any other call of a connected agent (a routine, another channel) goes as
 `usage.agent` on that agent's connection, with its source (`cron`,
 `heartbeat`, or the channel). Each needs the bridge's matching hello
 capability; the plugin names `usage` and `agent_usage` when OpenClaw takes
-plugin hooks. Without `allowConversationAccess`, OpenClaw drops `llm_output`
-with a warning the plugin cannot see, so it names them and sends nothing. The model provider is OpenClaw's provider id (`anthropic`,
+plugin hooks and `allowConversationAccess` is set, which it reads in its
+settings: without it, OpenClaw would drop `llm_output`, so the plugin
+registers neither hook and logs why once. A failure in a hook, or an app call
+it cannot match, is logged by its kind the first time. The model provider is OpenClaw's provider id (`anthropic`,
 `openai`). Observing a call never changes it or fails the turn. Titles and
-other utility completions do not fire the hook in that source, so they are not
-counted.
+other utility completions do not fire the hook in that source, nor do
+incognito native chats, so they are not counted.
 
 Structured questions remain separate work.
 Unsupported controls return `unsupported`.

@@ -1,18 +1,21 @@
 // What the agent's model calls consumed, from OpenClaw's hooks (issue #348,
 // docs/protocol.md, Usage). No OpenClaw imports.
 //
-// OpenClaw's `llm_output` fires once per attempt of a run, with the tokens
-// of every call the attempt made (its tool loop) summed, and no count of
-// them; `model_call_ended` fires once per call, with its run but no tokens
-// (both read in 2026.11.5's `hook-types.ts` and `attempt-result.ts`). The
-// plugin counts a run's completed calls until its `llm_output`, which then
-// goes as one report of that many calls.
+// As read in 2026.11.5's source (`hook-types.ts`, `attempt-result.ts`):
+// with OpenClaw's own agent loop, `llm_output` fires once per attempt of a
+// run, with the tokens of every call the attempt made (its tool loop) summed
+// and no count of them, and `model_call_ended` fires once per call, with its
+// run but no tokens. The plugin counts a run's completed calls until its
+// `llm_output`, which then goes as one report of that many calls. A run
+// through a CLI backend or another harness (`cli-runner.ts`,
+// `harness/lifecycle-hook-helpers.ts`) fires `llm_output` without
+// `model_call_ended`, so its report counts as one call.
 import { message } from './protocol.js';
 
 const line = (text, maximum) => [...String(text).replace(/[\x00-\x1f\x7f-\x9f]/gu, ' ').replace(/\s+/gu, ' ').trim()].slice(0, maximum).join('');
 // Runs whose calls are counted at once: a run that never reports its usage
 // (an incognito native chat, an attempt skipped) is forgotten past these.
-const MAX_RUNS = 1024;
+export const MAX_RUNS = 1024;
 // The bridge bounds `calls` to this.
 const MAX_CALLS = 1000;
 
@@ -30,12 +33,27 @@ export function usageTokens(usage) {
 
 /**
  * Registers the hooks. `appTurn(ctx)` finds the app conversation of a
- * call's session, `appSession(ctx)` says the call is in one at all, and
- * `running` holds each connected agent's account. Returns whether usage is
- * reported, for the `hello`.
+ * call's native chat, `appSession(ctx)` says the call is in an app
+ * conversation's native chat at all, and `running` holds each connected
+ * agent's account. Returns whether usage is reported, for the `hello`.
  */
 export function registerUsage(api, { appTurn, appSession, assertTurn, running }) {
   if (typeof api.on !== 'function') return false;
+  const warned = new Set();
+  // Said once per reason, by kind, never with an error's message.
+  const warn = (reason, text) => {
+    if (warned.has(reason)) return;
+    warned.add(reason);
+    try { api.logger?.warn?.(`[enclos] ${text}`); } catch { /* A log is never worth a turn. */ }
+  };
+  // OpenClaw drops `llm_output` for a plugin outside its bundle without this
+  // setting, with only a warning of its own: the app would then wait for
+  // usage that never comes, so none is announced.
+  const config = api.config;
+  if (config && typeof config === 'object' && config.plugins?.entries?.enclos?.hooks?.allowConversationAccess !== true) {
+    warn('access', 'plugins.entries.enclos.hooks.allowConversationAccess is not true: the app gets no usage from OpenClaw');
+    return false;
+  }
   const calls = new Map();
   api.on('model_call_ended', event => {
     try {
@@ -44,7 +62,7 @@ export function registerUsage(api, { appTurn, appSession, assertTurn, running })
       calls.delete(event.runId);
       calls.set(event.runId, counted);
       if (calls.size > MAX_RUNS) calls.delete(calls.keys().next().value);
-    } catch { /* Counting never changes the native call. */ }
+    } catch (error) { warn('count', `counting a model call failed (${error?.name ?? 'Error'})`); }
   });
   api.on('llm_output', (event, ctx) => {
     try {
@@ -66,10 +84,15 @@ export function registerUsage(api, { appTurn, appSession, assertTurn, running })
         return;
       }
       // An app call whose conversation cannot be told is not sent.
-      if (appSession(ctx) || typeof ctx?.agentId !== 'string') return;
+      if (appSession(ctx)) {
+        warn('unmatched', 'a model call in an app conversation could not be matched to it: its usage is not passed on');
+        return;
+      }
+      if (typeof ctx?.agentId !== 'string') return;
       const source = ctx.trigger === 'cron' || ctx.trigger === 'heartbeat' ? ctx.trigger : ctx.messageProvider ?? ctx.channel;
       if (typeof source === 'string' && line(source, 32)) fields.source = line(source, 32);
-      // Only on the connection of the agent the call is for, once.
+      // Only on the connection of the agent the call is for, once. An agent
+      // with no app channel running has none, and the bridge counts nothing.
       for (const active of running.values()) {
         if (active.account.agentId !== ctx.agentId || active.transport.closed) continue;
         if (active.transport.bridgeCapabilities.has('agent_usage')) {
@@ -77,7 +100,10 @@ export function registerUsage(api, { appTurn, appSession, assertTurn, running })
         }
         return;
       }
-    } catch { /* Reporting never fails the agent's turn. */ }
+    } catch (error) {
+      // Reporting never fails the agent's turn.
+      warn('report', `a model call's usage was not passed on (${error?.name ?? 'Error'})`);
+    }
   });
   return true;
 }
