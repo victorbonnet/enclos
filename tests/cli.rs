@@ -3204,7 +3204,10 @@ fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() 
         .run(&["prices", "claude-opus-5-5", "--provider", "anthropic"])
         .ok()
         .stdout();
-    assert!(opus.starts_with("claude-opus-5-5 of anthropic: input $"), "{opus}");
+    assert!(
+        opus.starts_with("claude-opus-5-5 of anthropic: input $"),
+        "{opus}"
+    );
     let sub = home
         .run(&["prices", "gpt-5.5", "--provider", "openai-codex"])
         .ok()
@@ -3224,8 +3227,14 @@ fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() 
     assert_eq!(json["override_read"]["read"]["models"], 1);
     // One that does not read is said, and the bundled list used alone.
     std::fs::write(home.root.join("prices.toml"), "[[models]]\n").unwrap();
-    let text = home.run(&["prices", "hermes-9", "--provider", "nous"]).ok().stdout();
-    assert!(text.starts_with("No price for hermes-9 through nous"), "{text}");
+    let text = home
+        .run(&["prices", "hermes-9", "--provider", "nous"])
+        .ok()
+        .stdout();
+    assert!(
+        text.starts_with("No price for hermes-9 through nous"),
+        "{text}"
+    );
     assert!(text.contains("was not read"), "{text}");
 }
 
