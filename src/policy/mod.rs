@@ -18,8 +18,7 @@ use file::PolicyFile;
 /// The built-in defaults every template builds on.
 pub const DEFAULTS: &str = include_str!("templates/defaults.toml");
 
-/// The templates this build of enclos ships (design §7). `coding` comes
-/// with the runtimes it is for.
+/// The templates this build of enclos ships (design §7).
 const TEMPLATES: &[(&str, &str)] = &[
     ("minimal", include_str!("templates/minimal.toml")),
     ("assistant", include_str!("templates/assistant.toml")),
