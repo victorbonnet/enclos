@@ -12,10 +12,10 @@ import update_prices as up  # noqa: E402
 A = "a" * 40
 B = "b" * 40
 
-HEAD = """[providers.anthropic]
+HEAD = """[model_providers.anthropic]
 
 [[models]]
-provider = "anthropic"
+model_provider = "anthropic"
 id = "claude-hand"
 aliases = ["claude-hand-alias"]
 input = 1.0
@@ -55,7 +55,7 @@ def litellm(**overrides):
 
 
 def models(text):
-    return {(m["provider"], m["id"]): m for m in tomllib.loads(text).get("models", [])}
+    return {(m["model_provider"], m["id"]): m for m in tomllib.loads(text).get("models", [])}
 
 
 class UpdatePrices(unittest.TestCase):
@@ -121,7 +121,7 @@ class UpdatePrices(unittest.TestCase):
             text = f.read()
         self.assertEqual((text.count(up.BEGIN), text.count(up.END)), (1, 1))
         doc = tomllib.loads(text)
-        self.assertTrue(doc["providers"]["openai-codex"]["included"])
+        self.assertTrue(doc["model_providers"]["openai-codex"]["included"])
         self.assertTrue(doc["models"])
 
 

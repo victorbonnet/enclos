@@ -66,7 +66,7 @@ pub fn run(engine: &Engine, by: &Actor, args: UsageArgs) -> Result<u8> {
 const HEAD: [&str; 14] = [
     "AGENT",
     "MODEL",
-    "PROVIDER",
+    "MODEL PROVIDER",
     "CHATS",
     "CALLS",
     "INPUT",
@@ -426,7 +426,7 @@ fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
     vec![
         agent.to_owned(),
         m.model.clone().unwrap_or_else(|| "?".into()),
-        m.provider.clone().unwrap_or_else(|| "-".into()),
+        m.model_provider.clone().unwrap_or_else(|| "-".into()),
         m.chats.to_string(),
         at_least("calls", m.calls),
         at_least("input", t.input),
@@ -578,7 +578,7 @@ mod tests {
     fn model(name: &str, input: Option<u64>, incomplete: Vec<&'static str>) -> ModelUsage {
         ModelUsage {
             model: Some(name.into()),
-            provider: Some("openai-codex".into()),
+            model_provider: Some("openai-codex".into()),
             chats: 1,
             calls: Some(26),
             tokens: Tokens {
