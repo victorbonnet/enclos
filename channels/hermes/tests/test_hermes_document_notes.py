@@ -1,8 +1,13 @@
-"""The adapter's media events read by the Hermes installed in this home: its own
-`MessageEvent` and the gateway's note for each document a person sends
+"""The adapter's media events read by a real Hermes: its own `MessageEvent` and
+the gateway's note for each document a person sends
 (`_prepend_inbound_document_notes`, with the helpers it calls), taken from its
 source. A file the adapter writes is not inlined in the text: Hermes must say
-so, and tell the agent to read it. Skipped where no Hermes is installed."""
+so, and tell the agent to read it.
+
+The Hermes is the checkout `ENCLOS_HERMES_SOURCE` names, as in the other
+real-Hermes tests (CI's `hermes-latest` job sets it, and there these tests
+must run: a checkout without the files they read fails them), else the one
+installed in this home. Skipped only where neither is given."""
 
 import ast
 import importlib.util
@@ -19,7 +24,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from test_adapter import _hermes_stand_ins  # noqa: E402
 
-HERMES = Path.home() / ".hermes" / "hermes-agent"
+NAMED = os.environ.get("ENCLOS_HERMES_SOURCE")
+HERMES = Path(NAMED) if NAMED else Path.home() / ".hermes" / "hermes-agent"
+# What these tests read of it
+SOURCES = ("gateway/platforms/event.py", "gateway/run.py", "gateway/run_inbound.py")
 NOT_INLINED = "Its content is not inlined here"
 INLINED = "Its content has been included below"
 
@@ -43,9 +51,13 @@ def _run(nodes: list, namespace: dict, where: str) -> dict:
     return namespace
 
 
-@unittest.skipUnless((HERMES / "gateway" / "run_inbound.py").is_file(), "no Hermes installed")
+@unittest.skipUnless(NAMED or all((HERMES / f).is_file() for f in SOURCES),
+                     "no Hermes checkout named or installed")
 class InstalledHermesDocumentNotesTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # A named checkout is never skipped: one without these files fails
+        self.assertEqual([f for f in SOURCES if not (HERMES / f).is_file()], [],
+                         f"the Hermes checkout at {HERMES} lacks the files these tests read")
         stand_ins = _hermes_stand_ins()
         stand_ins["gateway.session"] = types.SimpleNamespace(SessionSource=object)
         patcher = patch.dict(sys.modules, stand_ins)
