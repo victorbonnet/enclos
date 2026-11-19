@@ -828,6 +828,26 @@ pub struct SandboxInfo {
     pub sandbox: String,
     pub runtime: Option<String>,
     pub state: String,
+    /// The version of its runtime installed, when the host knows it (ADR
+    /// 0074, proposed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    /// Its runtime's latest release, when the host looked it up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_release: Option<RuntimeRelease>,
+}
+
+/// A runtime's latest release: the one its installer installs by default
+/// (ADR 0074, proposed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRelease {
+    pub version: String,
+    /// Whether this host's enclos was checked with it.
+    pub checked: bool,
+    /// Whether it is newer than the version installed: none when the host
+    /// cannot tell, such as when it does not know the version installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer: Option<bool>,
 }
 
 /// A runtime this host can install.
@@ -1400,11 +1420,26 @@ mod tests {
                 capabilities: vec!["sandboxes".into()],
             },
             ToDevice::SandboxesList {
-                sandboxes: vec![SandboxInfo {
-                    sandbox: "lab".into(),
-                    runtime: None,
-                    state: "created".into(),
-                }],
+                sandboxes: vec![
+                    SandboxInfo {
+                        sandbox: "lab".into(),
+                        runtime: None,
+                        state: "created".into(),
+                        runtime_version: None,
+                        runtime_release: None,
+                    },
+                    SandboxInfo {
+                        sandbox: "home".into(),
+                        runtime: Some("hermes".into()),
+                        state: "running".into(),
+                        runtime_version: Some("0.23.1".into()),
+                        runtime_release: Some(RuntimeRelease {
+                            version: "0.23.2".into(),
+                            checked: true,
+                            newer: Some(true),
+                        }),
+                    },
+                ],
             },
             ToDevice::RuntimesList {
                 runtimes: vec![RuntimeInfo {

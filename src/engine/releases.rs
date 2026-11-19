@@ -7,7 +7,7 @@
 //! in `config.toml`; a value enclos cannot read there turns them off too,
 //! and `status` says why.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::path::Path;
@@ -60,23 +60,62 @@ impl Lookup {
     }
 }
 
-/// The latest releases one `status` found, by runtime: each runtime is
-/// looked up once for all its sandboxes, even when nothing can be kept.
-#[derive(Default)]
-pub(super) struct Releases(RefCell<HashMap<RuntimeKind, Fact<LatestRelease>>>);
+/// The latest releases found for one answer, by runtime: each runtime is
+/// asked for once for all its sandboxes, even when nothing can be kept.
+pub struct Releases {
+    found: RefCell<HashMap<RuntimeKind, Fact<LatestRelease>>>,
+    look_up: bool,
+    due: Cell<bool>,
+}
+
+impl Default for Releases {
+    /// [`Releases::looking_up`].
+    fn default() -> Releases {
+        Releases::looking_up()
+    }
+}
 
 impl Releases {
+    /// Each runtime's latest release, looked up when what is kept is too
+    /// old: `status`'s, which may wait on the network.
+    pub fn looking_up() -> Releases {
+        Releases {
+            found: RefCell::default(),
+            look_up: true,
+            due: Cell::new(false),
+        }
+    }
+
+    /// Only what is kept, however old, so the answer comes at once, for a
+    /// caller that must not wait on the network, such as the bridge:
+    /// [`Releases::due`] then says whether a lookup is due.
+    pub fn kept() -> Releases {
+        Releases {
+            look_up: false,
+            ..Releases::looking_up()
+        }
+    }
+
+    /// Whether a runtime asked for had nothing kept, or what was kept is
+    /// older than its keep time, and was not looked up.
+    pub fn due(&self) -> bool {
+        self.due.get()
+    }
+
     pub(super) fn of(
         &self,
         engine: &Engine,
         runtime: &dyn RuntimeAdapter,
         now: Timestamp,
     ) -> Fact<LatestRelease> {
-        if let Some(found) = self.0.borrow().get(&runtime.kind()) {
+        if let Some(found) = self.found.borrow().get(&runtime.kind()) {
             return found.clone();
         }
-        let found = engine.latest_release(runtime, now);
-        self.0.borrow_mut().insert(runtime.kind(), found.clone());
+        let (found, due) = engine.release(runtime, now, self.look_up);
+        self.due.set(self.due.get() || due);
+        self.found
+            .borrow_mut()
+            .insert(runtime.kind(), found.clone());
         found
     }
 }
@@ -91,8 +130,20 @@ impl Engine {
         runtime: &dyn RuntimeAdapter,
         now: Timestamp,
     ) -> Fact<LatestRelease> {
+        self.release(runtime, now, true).0
+    }
+
+    /// [`Engine::latest_release`], looking nothing up unless `look_up`:
+    /// then what is kept, however old, absent when nothing is, and whether
+    /// a lookup is due.
+    fn release(
+        &self,
+        runtime: &dyn RuntimeAdapter,
+        now: Timestamp,
+        look_up: bool,
+    ) -> (Fact<LatestRelease>, bool) {
         let Some(url) = runtime.release_source() else {
-            return Fact::NotProvided;
+            return (Fact::NotProvided, false);
         };
         // No `config.toml` is the default, lookups on; one enclos cannot
         // read looks nothing up.
@@ -103,13 +154,25 @@ impl Engine {
         };
         match on {
             Ok(true) => {}
-            Ok(false) => return Fact::NotProvided,
-            Err(why) => return Fact::CannotTell(format!("nothing was looked up: {why}")),
+            Ok(false) => return (Fact::NotProvided, false),
+            Err(why) => {
+                let why = format!("nothing was looked up: {why}");
+                return (Fact::CannotTell(why), false);
+            }
         }
         let path = self.layout.runtime_releases();
         let mut kept = read_kept(&path);
         let kind = runtime.kind().as_str();
         let now = now.as_second();
+        if !look_up {
+            return match kept.remove(kind) {
+                Some(lookup) => {
+                    let due = !lookup.fresh(now);
+                    (found(lookup, runtime), due)
+                }
+                None => (Fact::Absent, true),
+            };
+        }
         let lookup = match kept.get(kind).filter(|l| l.fresh(now)) {
             Some(lookup) => lookup.clone(),
             None => {
@@ -137,17 +200,7 @@ impl Engine {
                 lookup
             }
         };
-        match (
-            lookup.version.as_deref().and_then(RuntimeVersion::new),
-            lookup.failed,
-        ) {
-            (Some(version), _) => Fact::Known(LatestRelease {
-                checked: runtime.checked_releases().contains(&version.as_str()),
-                version: version.as_str().to_owned(),
-            }),
-            (None, Some(why)) => Fact::CannotTell(why),
-            (None, None) => Fact::CannotTell("the kept release is not a version".into()),
-        }
+        (found(lookup, runtime), false)
     }
 
     /// Looks the latest release up at `url`, the answer downloaded beside
@@ -170,6 +223,21 @@ impl Engine {
         let named = runtime.release_version(&text?)?;
         RuntimeVersion::new(&named)
             .ok_or_else(|| "the latest release is not named as a version".to_owned())
+    }
+}
+
+/// What a lookup, kept or made now, says of `runtime`'s latest release.
+fn found(lookup: Lookup, runtime: &dyn RuntimeAdapter) -> Fact<LatestRelease> {
+    match (
+        lookup.version.as_deref().and_then(RuntimeVersion::new),
+        lookup.failed,
+    ) {
+        (Some(version), _) => Fact::Known(LatestRelease {
+            checked: runtime.checked_releases().contains(&version.as_str()),
+            version: version.as_str().to_owned(),
+        }),
+        (None, Some(why)) => Fact::CannotTell(why),
+        (None, None) => Fact::CannotTell("the kept release is not a version".into()),
     }
 }
 
