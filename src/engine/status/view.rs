@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Serialize, Serializer};
 
 use super::{Disk, Suggestion};
+pub use crate::engine::releases::LatestRelease;
 use crate::model::Timestamp;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -160,7 +161,15 @@ pub struct RuntimeStatus {
     pub kind: RuntimeKind,
     /// The runtime's name as people write it.
     pub name: &'static str,
+    /// The version installed: as a home file says, or as the runtime last
+    /// reported it, after an install.
     pub version: Fact<String>,
+    /// The runtime's latest release, the one its installer installs by
+    /// default, and whether this enclos was checked with it (ADR 0074,
+    /// proposed).
+    pub latest: Fact<LatestRelease>,
+    /// Whether the latest release is newer than the version installed.
+    pub outdated: Fact<bool>,
     pub logged_in: Fact<bool>,
     /// Whether the runtime's own files are still in the home.
     pub installed: Fact<bool>,

@@ -7,8 +7,8 @@ use clap::Args;
 
 use enclos::engine::Engine;
 use enclos::engine::{
-    AgentKind, AgentStatus, Fact, NetworkListener, Presence, SandboxStatus, ServiceState,
-    StatusView, human_bytes,
+    AgentKind, AgentStatus, Fact, LatestRelease, NetworkListener, Presence, RuntimeStatus,
+    SandboxStatus, ServiceState, StatusView, human_bytes,
 };
 use enclos::error::{Result, exit};
 use enclos::model::sandbox::{SandboxName, SandboxState};
@@ -89,6 +89,33 @@ fn state_text(state: &SandboxState) -> String {
         SandboxState::Running => "running".into(),
         SandboxState::Stopped => "stopped".into(),
         SandboxState::Failed { reason } => format!("failed: {reason}"),
+    }
+}
+
+/// What the runtime's latest release means for the sandbox (ADR 0074,
+/// proposed): a line when it is newer than the version installed, or when
+/// enclos cannot tell; nothing when the runtime is up to date or nothing
+/// was looked up.
+fn release_line(rt: &RuntimeStatus) -> Option<String> {
+    let name = rt.name;
+    let checked = |l: &LatestRelease| match l.checked {
+        true => "checked with this enclos",
+        false => "not checked with this enclos yet",
+    };
+    match (&rt.latest, &rt.outdated) {
+        (Fact::Known(latest), Fact::Known(true)) => Some(format!(
+            "{name} {} is out, {}",
+            latest.version,
+            checked(latest)
+        )),
+        (Fact::Known(_), Fact::Known(false)) | (Fact::NotProvided, _) => None,
+        (Fact::Known(latest), Fact::CannotTell(why)) => Some(format!(
+            "{name} {} is its latest release, {}; whether it is newer: cannot tell ({why})",
+            latest.version,
+            checked(latest)
+        )),
+        (Fact::CannotTell(why), _) => Some(format!("{name}'s latest release: cannot tell ({why})")),
+        (Fact::Known(_) | Fact::Absent, _) => None,
     }
 }
 
@@ -193,6 +220,9 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
         facts.push("no agents".into());
     }
     println!("  {}", facts.join(" · "));
+    if let Some(line) = s.runtime.as_ref().and_then(release_line) {
+        println!("  {line}");
+    }
     if let Some(why) = &s.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
@@ -333,6 +363,60 @@ fn agents(tracked: usize, untracked: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_release_is_said_with_whether_this_enclos_was_checked_with_it() {
+        let hermes = |latest: Fact<LatestRelease>, outdated: Fact<bool>| RuntimeStatus {
+            kind: enclos::model::runtime::RuntimeKind::Hermes,
+            name: "Hermes",
+            version: Fact::Known("0.23.1".into()),
+            latest,
+            outdated,
+            logged_in: Fact::Known(true),
+            installed: Fact::Known(true),
+            login: "hermes setup".into(),
+        };
+        let release = |checked| {
+            Fact::Known(LatestRelease {
+                version: "0.23.2".into(),
+                checked,
+            })
+        };
+        assert_eq!(
+            release_line(&hermes(release(true), Fact::Known(true))).as_deref(),
+            Some("Hermes 0.23.2 is out, checked with this enclos")
+        );
+        assert_eq!(
+            release_line(&hermes(release(false), Fact::Known(true))).as_deref(),
+            Some("Hermes 0.23.2 is out, not checked with this enclos yet")
+        );
+        assert_eq!(
+            release_line(&hermes(release(true), Fact::Known(false))),
+            None
+        );
+        assert_eq!(
+            release_line(&hermes(Fact::NotProvided, Fact::NotProvided)),
+            None
+        );
+        assert_eq!(
+            release_line(&hermes(
+                Fact::CannotTell("no answer within 10 seconds".into()),
+                Fact::CannotTell("the latest release is not known".into())
+            ))
+            .as_deref(),
+            Some("Hermes's latest release: cannot tell (no answer within 10 seconds)")
+        );
+        assert_eq!(
+            release_line(&hermes(
+                release(false),
+                Fact::CannotTell("the version installed is not known".into())
+            ))
+            .as_deref(),
+            Some(
+                "Hermes 0.23.2 is its latest release, not checked with this enclos yet; whether it is newer: cannot tell (the version installed is not known)"
+            )
+        );
+    }
 
     #[test]
     fn reachable_listeners_are_named_and_unknown_listeners_say_why() {

@@ -1,6 +1,8 @@
 //! `enclos status`: what is on this host, what it costs on disk, and what
 //! the user could do about it (issue #29). A read: no lock, no audit
-//! entry, and nothing runs in a sandbox, so it works on stopped ones.
+//! entry, and nothing runs in a sandbox, so it works on stopped ones. It
+//! may look up each runtime's latest release on the network, at most every
+//! few hours (`releases.rs`).
 //!
 //! Facts come from enclos's own records (trusted), from the service
 //! manager, and from the sandbox home, which the sandbox writes. The
@@ -28,6 +30,7 @@ use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
 use crate::model::now;
+use crate::model::runtime::RuntimeVersion;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 use crate::runtime::{RuntimeAdapter, RuntimeAgentName, adapter};
@@ -40,8 +43,8 @@ pub use printable::printable_line;
 use suggestion::REFUSED_DAYS;
 pub use suggestion::{IDLE_DAYS, Suggestion, suggest};
 pub use view::{
-    AgentKind, AgentList, AgentStatus, Fact, NetworkListener, Presence, RuntimeStatus,
-    SandboxStatus, ServiceLine, ServiceState, StatusView, Unlisted,
+    AgentKind, AgentList, AgentStatus, Fact, LatestRelease, NetworkListener, Presence,
+    RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Unlisted,
 };
 
 impl Engine {
@@ -182,12 +185,17 @@ impl Engine {
             runtime: match (record.runtime, runtime) {
                 (Some(kind), Some(rt)) => {
                     let facts = rt.runtime_facts();
+                    let version = match facts.version {
+                        Some(at) => read_value(&home, &at, rt),
+                        None => self.reported_version(&name, rt),
+                    };
+                    let latest = self.latest_release(rt, now);
                     Some(RuntimeStatus {
                         kind,
                         name: kind.display_name(),
-                        version: facts
-                            .version
-                            .map_or(Fact::NotProvided, |v| read_value(&home, &v, rt)),
+                        outdated: outdated(&version, &latest),
+                        version,
+                        latest,
                         logged_in: facts.login.map_or(Fact::NotProvided, |f| exists(&home, &f)),
                         installed: facts
                             .install
@@ -317,6 +325,46 @@ fn bridge_activity(
     match read {
         Ok(activity) => (activity, None),
         Err(e) => (Default::default(), Some(e.to_string())),
+    }
+}
+
+impl Engine {
+    /// The version the sandbox's runtime last reported, for a runtime whose
+    /// home holds none enclos reads: absent until it reported one, after
+    /// an install.
+    fn reported_version(&self, name: &SandboxName, runtime: &dyn RuntimeAdapter) -> Fact<String> {
+        if runtime.version_command(Path::new("")).is_none() {
+            return Fact::NotProvided;
+        }
+        match self.state.runtime_version(name) {
+            Ok(Some((kind, version))) if kind == runtime.kind() => {
+                Fact::Known(version.as_str().to_owned())
+            }
+            Ok(_) => Fact::Absent,
+            Err(e) => Fact::CannotTell(e.to_string()),
+        }
+    }
+}
+
+/// Whether `latest` is newer than the version installed.
+fn outdated(installed: &Fact<String>, latest: &Fact<LatestRelease>) -> Fact<bool> {
+    let (installed, latest) = match (installed, latest) {
+        (_, Fact::NotProvided) => return Fact::NotProvided,
+        (Fact::Known(installed), Fact::Known(latest)) => (installed, latest),
+        (_, Fact::Known(_)) => {
+            return Fact::CannotTell("the version installed is not known".into());
+        }
+        (_, _) => return Fact::CannotTell("the latest release is not known".into()),
+    };
+    let newer = RuntimeVersion::new(installed)
+        .zip(RuntimeVersion::new(&latest.version))
+        .and_then(|(installed, latest)| latest.newer_than(&installed));
+    match newer {
+        Some(newer) => Fact::Known(newer),
+        None => Fact::CannotTell(format!(
+            "enclos cannot order versions {installed} and {}",
+            latest.version
+        )),
     }
 }
 

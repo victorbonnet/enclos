@@ -7,6 +7,7 @@ mod log_writer;
 mod netlog;
 mod policy;
 mod probe_sources;
+mod runtime_versions;
 mod schema;
 mod secrets;
 mod sessions;
@@ -33,6 +34,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
@@ -628,6 +630,26 @@ impl StateStore for SqliteStateStore {
     fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>> {
         let conn = self.open()?;
         acceptances::list(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
+
+    fn put_runtime_version(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        runtime: RuntimeKind,
+        version: &RuntimeVersion,
+        at: Timestamp,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        runtime_versions::put(&conn, sandbox, runtime, version, at).map_err(self.sqlite_err())
+    }
+
+    fn runtime_version(
+        &self,
+        sandbox: &SandboxName,
+    ) -> Result<Option<(RuntimeKind, RuntimeVersion)>> {
+        let conn = self.open()?;
+        runtime_versions::get(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 }
 

@@ -578,6 +578,35 @@ pub trait RuntimeAdapter {
     fn agent_facts(&self, _agent: &RuntimeAgentName) -> AgentFacts {
         AgentFacts::default()
     }
+
+    // What `status` says of the runtime's releases (ADR 0074, proposed).
+
+    /// The HTTPS address that names the release the runtime's installer
+    /// installs by default, which enclos looks up on the host.
+    fn release_source(&self) -> Option<&'static str> {
+        None
+    }
+    /// The version of that release, in the answer from `release_source`:
+    /// what the answer says, unchecked; the engine checks it is a version.
+    fn release_version(&self, _answer: &str) -> Result<String, String> {
+        Err("this runtime names no release enclos reads".into())
+    }
+    /// The releases enclos's runtime tests passed with before this enclos
+    /// release, as the runtime names them.
+    fn checked_releases(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// The runtime's own command that writes its version to `report`, a
+    /// file of the sandbox home, for a runtime whose version no home file
+    /// holds (`RuntimeFacts::version`). enclos runs it after an install
+    /// and records what it reports.
+    fn version_command(&self, _report: &Path) -> Option<SandboxCommand> {
+        None
+    }
+    /// The version in what `version_command` wrote, unchecked.
+    fn reported_version(&self, _text: &str) -> Result<String, String> {
+        Err("this runtime reports no version enclos reads".into())
+    }
 }
 
 /// What [`RuntimeAdapter::app_channel`] sets up.

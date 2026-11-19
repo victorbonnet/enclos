@@ -95,6 +95,14 @@ impl Home {
         for _ in 0..times {
             self.run(&["init"]).ok();
         }
+        // `status` looks no runtime release up on the network (ADR 0074).
+        let config = self.root.join("config.toml");
+        if let Ok(mut text) = std::fs::read_to_string(&config)
+            && !text.contains("runtime_releases")
+        {
+            text.push_str("runtime_releases = false\n");
+            std::fs::write(&config, text).unwrap();
+        }
     }
 
     fn audit_lines(&self) -> Vec<String> {
@@ -3167,6 +3175,40 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
         out.stderr().contains("no sandbox named `nope`"),
         "{}",
         out.stderr()
+    );
+}
+
+/// Hermes's install stamp gives the version `status` shows; with lookups
+/// turned off, as `Home::init` turns them off, no release is said (ADR 0074).
+#[cfg(target_os = "macos")]
+#[test]
+fn status_shows_the_version_hermes_records_and_no_release_when_lookups_are_off() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    record_hermes(&home, "home");
+    let checkout = enclos::layout::Layout::at(&home.root)
+        .sandbox_home("home")
+        .join(".hermes/hermes-agent");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(
+        checkout.join("install-stamp.json"),
+        r#"{"schemaVersion": 2, "baseVersion": "0.23.1", "displayVersion": "0.23.1"}"#,
+    )
+    .unwrap();
+
+    let (_, json) = home.json(&["status"]);
+    let runtime = &json["sandboxes"][0]["runtime"];
+    assert_eq!(runtime["version"], serde_json::json!({"known": "0.23.1"}), "{json}");
+    assert_eq!(runtime["latest"], serde_json::json!("not_provided"), "{json}");
+    assert_eq!(runtime["outdated"], serde_json::json!("not_provided"), "{json}");
+    let text = home.run(&["status"]).ok().stdout();
+    assert!(text.contains("Hermes 0.23.1"), "{text}");
+    assert!(!text.contains("latest release"), "{text}");
+    assert!(
+        !home.root.join("runtime-releases.json").exists(),
+        "nothing was looked up"
     );
 }
 

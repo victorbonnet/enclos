@@ -24,7 +24,21 @@ pub trait Downloader {
     /// redirect not on HTTPS with [`DownloadFailed::NotHttps`]: nothing else
     /// checks. A failure may leave part of the file at `to`.
     fn download(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed>;
+
+    /// Downloads a small answer, such as a runtime's latest release (ADR
+    /// 0074, proposed), for a command a person waits on: like `download`,
+    /// within [`LOOKUP_TIME`] and [`LOOKUP_MAX_BYTES`], and saying nothing
+    /// on the terminal.
+    fn lookup(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed> {
+        self.download(url, to)
+    }
 }
+
+/// How long a lookup may take.
+pub const LOOKUP_TIME: std::time::Duration = std::time::Duration::from_secs(10);
+/// The largest answer a lookup reads: GitHub's answer for a release carries
+/// its notes and the list of its files.
+pub const LOOKUP_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Why a download did not end with the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +69,45 @@ impl Downloader for Curl {
             Some(1) => Err(DownloadFailed::NotHttps),
             _ => Err(DownloadFailed::Ended(status.to_string())),
         }
+    }
+
+    fn lookup(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed> {
+        if cfg!(test) {
+            return Err(DownloadFailed::NotRun(
+                "unit tests look nothing up on the network".into(),
+            ));
+        }
+        let status = Command::new("/usr/bin/curl")
+            .args(limited_args(
+                url,
+                to,
+                LOOKUP_TIME.as_secs(),
+                LOOKUP_MAX_BYTES,
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| DownloadFailed::NotRun(format!("cannot run curl: {e}")))?;
+        match status.code() {
+            _ if status.success() => Ok(()),
+            Some(1) => Err(DownloadFailed::NotHttps),
+            Some(code) => Err(DownloadFailed::Ended(curl_failure(code))),
+            None => Err(DownloadFailed::Ended(status.to_string())),
+        }
+    }
+}
+
+/// What curl's exit `code` means, for the failures a lookup meets.
+fn curl_failure(code: i32) -> String {
+    match code {
+        6 => "the host name did not resolve".into(),
+        7 => "the server could not be reached".into(),
+        22 => "the server answered with an error".into(),
+        28 => format!("no answer within {} seconds", LOOKUP_TIME.as_secs()),
+        35 | 60 => "the TLS connection failed".into(),
+        63 => "the answer was too large".into(),
+        _ => format!("curl exited with {code}"),
     }
 }
 
@@ -237,6 +290,11 @@ fn copy_into_home_script(files: &[(&Path, &str, bool)]) -> String {
 /// apply. The download and every redirect must stay on HTTPS, so curl
 /// refuses any other URL.
 fn download_args(url: &str, out: &Path) -> Vec<OsString> {
+    limited_args(url, out, 120, INSTALLER_MAX_BYTES)
+}
+
+/// [`download_args`] within `seconds` and `max_bytes`.
+fn limited_args(url: &str, out: &Path, seconds: u64, max_bytes: u64) -> Vec<OsString> {
     vec![
         "-q".into(),
         "--proto".into(),
@@ -245,9 +303,9 @@ fn download_args(url: &str, out: &Path) -> Vec<OsString> {
         "=https".into(),
         "-fsSL".into(),
         "--max-time".into(),
-        "120".into(),
+        seconds.to_string().into(),
         "--max-filesize".into(),
-        INSTALLER_MAX_BYTES.to_string().into(),
+        max_bytes.to_string().into(),
         "-o".into(),
         out.into(),
         url.into(),

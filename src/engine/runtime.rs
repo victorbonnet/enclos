@@ -3,18 +3,21 @@
 //! `staging.rs`, and a runtime's agents are in `agents.rs`. Logging it in is
 //! the runtime's own command, through `enclos connect` (ADR 0024).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
 use super::service::STOP_GRACE;
 use super::session::{END_WAIT, SessionEnd, spoken};
+use super::usage::{Removed, read_report};
+use crate::bridge::ids::new_id;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
+use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
-use crate::model::runtime::RuntimeKind;
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::policy::file::PolicyFile;
 use crate::runtime::{RuntimeAdapter, adapter};
@@ -41,6 +44,10 @@ pub struct InstallEnd {
     /// The install's time limit, when its installer was still running then
     /// and was stopped: the install failed.
     pub stopped_after: Option<Duration>,
+    /// After an install, the version the runtime reported and enclos
+    /// recorded, for a runtime whose home holds none enclos reads (ADR
+    /// 0074, proposed); or why it was not recorded. None when not asked.
+    pub version: Option<std::result::Result<RuntimeVersion, String>>,
 }
 
 /// How long an install whose installer runs past its time limit
@@ -217,6 +224,7 @@ impl Engine {
                 policy: 0,
                 login: runtime.login(),
                 stopped_after,
+                version: None,
             };
             let why = format!("the installer {}", failed.ended());
             (failed.policy, failed.recorded) = self.undo_install(by, name, kind, &why)?;
@@ -244,6 +252,7 @@ impl Engine {
                     })
             },
         )?;
+        let reported = self.record_reported_version(by, name, runtime).transpose();
         Ok(Planned::Done(InstallEnd {
             kind,
             end,
@@ -252,7 +261,51 @@ impl Engine {
             policy: version.version,
             login: runtime.login(),
             stopped_after: None,
+            version: reported,
         }))
+    }
+
+    /// Asks the runtime its version, with its own command in the sandbox,
+    /// and records it (ADR 0074, proposed), for a runtime whose home holds
+    /// none enclos reads: none for another. Why not, when it could not.
+    pub(super) fn record_reported_version(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+    ) -> std::result::Result<Option<RuntimeVersion>, String> {
+        let home = self.sandbox_home(name);
+        let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
+        let report = home.join(format!(".enclos-version-{id}"));
+        let Some(command) = runtime.version_command(&report) else {
+            return Ok(None);
+        };
+        let _remove = Removed(report.clone());
+        let ended = self
+            .run_exec_in_sandbox(by, name, command, "runtime version")
+            .map_err(|e| e.to_string())?;
+        if ended.exit != 0 || ended.signal.is_some() {
+            return Err(format!("its version command exited with {}", ended.exit));
+        }
+        let text =
+            read_report(&report, &home).map_err(|why| format!("its version report {why}"))?;
+        let version = runtime.reported_version(&text).and_then(|v| {
+            RuntimeVersion::new(&v).ok_or_else(|| "it reported no version enclos reads".to_owned())
+        })?;
+        let kind = runtime.kind();
+        self.write(
+            by,
+            "runtime version",
+            Some(format!("{name} {kind}")),
+            |_| format!("reported {version}"),
+            |lock| {
+                self.state
+                    .put_runtime_version(lock, name, kind, &version, now())?;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(version))
     }
 
     fn plan_install(
@@ -405,6 +458,11 @@ impl InstallPlan {
         changes.push(format!(
             "run the installer in sandbox {name} under that policy, in this terminal, and record {kind} as its runtime if the installer exits 0"
         ));
+        if runtime.version_command(Path::new("")).is_some() {
+            changes.push(format!(
+                "then ask {kind} its version in sandbox {name}, and record it for `enclos status`"
+            ));
+        }
         Plan {
             changes,
             ..Plan::default()

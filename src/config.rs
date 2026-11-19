@@ -65,6 +65,16 @@ pub fn default_backend(text: &str) -> Result<Option<BackendKind>, String> {
     }
 }
 
+/// Whether `text`, a `config.toml`, lets enclos look up the latest release
+/// of each runtime on the network (ADR 0074, proposed): unless it sets
+/// `runtime_releases = false`. A file that does not parse says nothing
+/// here; the commands that read its backend say why.
+pub fn looks_up_releases(text: &str) -> bool {
+    let table = text.parse::<toml::Table>().ok();
+    let set = table.as_ref().and_then(|t| t.get("runtime_releases"));
+    set.and_then(toml::Value::as_bool).unwrap_or(true)
+}
+
 /// `text` with its placeholder line replaced by `kind`, as [`initial`] would
 /// have written it.
 pub fn with_backend(text: &str, kind: BackendKind) -> String {
@@ -74,6 +84,15 @@ pub fn with_backend(text: &str, kind: BackendKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_lookups_are_on_unless_turned_off() {
+        assert!(looks_up_releases(&initial(Some(BackendKind::Seatbelt))));
+        assert!(looks_up_releases("runtime_releases = true\n"));
+        assert!(!looks_up_releases("runtime_releases = false\n"));
+        assert!(looks_up_releases("runtime_releases = \"no\"\n"));
+        assert!(looks_up_releases("not toml ["));
+    }
 
     #[test]
     fn records_the_schema_version_and_default_backend() {

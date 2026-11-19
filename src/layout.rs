@@ -319,6 +319,12 @@ impl Layout {
         self.data.join(PROBE_SOURCES_FILE)
     }
 
+    /// The latest release of each runtime, as enclos last looked it up
+    /// (ADR 0074, proposed), kept for a while.
+    pub fn runtime_releases(&self) -> PathBuf {
+        self.data.join("runtime-releases.json")
+    }
+
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
