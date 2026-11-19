@@ -593,7 +593,9 @@ enclos usage [OPTIONS] [SANDBOX]
 ```
 
 - `[SANDBOX]`: Only this sandbox, read even when it is not running. Without it, every running sandbox.
-- `--since <DURATION>`: Native chats active in this past window, such as 24h or 30d; each counts whole. Default: `7d`.
+- `--since <DURATION>`: Native chats active in this past window, such as 24h or 30d; each counts whole. By day: the days from the one that holds its start. Default: `7d`.
+- `--by <PERIOD>`: Each day's tokens and estimated cost, as the bridge kept them from the app's channel: of the host, the sandbox, or `--agent`. Reads no sandbox. One of `day`.
+- `--agent <AGENT>`: With `--by day` and a sandbox, only this agent of it.
 
 ### `enclos prices`
 

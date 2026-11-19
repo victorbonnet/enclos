@@ -142,6 +142,7 @@ impl Store {
             "members",
             "attachments",
             "usage_hours",
+            "usage_model_hours",
             "messages",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE conversation=?1 AND EXISTS (SELECT 1 FROM conversation_deletions WHERE id=?1 AND owner=?2)"), params![id,owner])?;
