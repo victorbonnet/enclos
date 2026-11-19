@@ -2,6 +2,7 @@
 //! Source contracts were checked against the installed 2026.11.5 package;
 //! all native mutations remain SandboxCommands executed by the engine.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -34,6 +35,11 @@ const MAX_AGENTS: usize = 512;
 const GATEWAY: ServiceName = ServiceName::new("gateway");
 const APP_PLUGIN: &str = ".enclos-openclaw";
 const INSTALL_APP: &str = "exec \"$HOME/bin/openclaw\" plugins install --link \"$HOME/.enclos-openclaw\" --force --no-enable --accept-capabilities";
+/// Runs the usage reader (`openclaw/usage.mjs`, its source the first
+/// argument) with OpenClaw's own Node and this sandbox's state and gateway
+/// port, as `bin/openclaw` selects them. Its output goes nowhere: what it
+/// has to say is in the report.
+const USAGE_READER: &str = "script=$1; shift\nexport OPENCLAW_HOME=\"$HOME\" OPENCLAW_STATE_DIR=\"$HOME/.openclaw\" OPENCLAW_CONFIG_PATH=\"$HOME/.openclaw/openclaw.json\" OPENCLAW_LOAD_SHELL_ENV=0 OPENCLAW_NO_RESPAWN=1 ENCLOS_OPENCLAW_USAGE=1\nproxy_port=${HTTP_PROXY##*:}\ncase \"$proxy_port\" in ''|*[!0-9]*) ;; *) export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000)) ;; esac\nexec \"$HOME/.local/share/openclaw/tools/node/bin/node\" --input-type=module -e \"$script\" \"$@\" </dev/null >/dev/null 2>&1";
 const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind --agent \"$agent\" --bind \"enclos:$agent\" --json\n\"$HOME/bin/openclaw\" config set channels.enclos.enabled true\nexec \"$HOME/bin/openclaw\" config set \"channels.enclos.accounts.$agent.enabled\" true";
 
 fn at(path: &str) -> HomePath {
@@ -315,6 +321,29 @@ impl RuntimeAdapter for OpenClaw {
     ) -> Option<SandboxCommand> {
         (format == "openclaw-data-v1").then(|| transfer("import", name, archive, context))
     }
+    fn usage(
+        &self,
+        agents: &[RuntimeAgentName],
+        since: i64,
+        report: &Path,
+    ) -> Option<SandboxCommand> {
+        // OpenClaw counts each agent's model calls in its own databases,
+        // which its gateway sums (`sessions.usage`, read in 2026.11.5's
+        // `server-methods/usage.ts`); the reader asks the sandbox's running
+        // gateway, authenticated as `enclos-openclaw-delete.mjs` is, so a
+        // stopped gateway is "cannot tell".
+        let mut words: Vec<OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            USAGE_READER.into(),
+            "enclos-openclaw-usage".into(),
+            include_str!("openclaw/usage.mjs").into(),
+            report.as_os_str().to_owned(),
+            since.to_string().into(),
+        ];
+        words.extend(agents.iter().map(|a| OsString::from(a.as_str())));
+        Some(SandboxCommand::new(words))
+    }
     fn agent_files(&self, name: &AgentName) -> String {
         format!("~/.openclaw/agents/{name}")
     }
@@ -586,6 +615,10 @@ impl RuntimeAdapter for OpenClaw {
                 (
                     plugin.child("native-turns.js")?,
                     include_str!("../../channels/openclaw/native-turns.js"),
+                ),
+                (
+                    plugin.child("usage.js")?,
+                    include_str!("../../channels/openclaw/usage.js"),
                 ),
                 (
                     plugin.child("openclaw.plugin.json")?,
@@ -1488,6 +1521,47 @@ mod tests {
         assert!(
             stdout.contains("external\n43007\ngateway\nrun\n--bind\nloopback\n--port\n43007\n")
         );
+    }
+
+    /// The usage reader runs with OpenClaw's own Node, this sandbox's
+    /// state and gateway port, its source and arguments as given, and its
+    /// output going nowhere (#348).
+    #[test]
+    fn the_usage_reader_runs_with_openclaws_node_state_and_gateway_port() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let node = home
+            .path()
+            .join(".local/share/openclaw/tools/node/bin/node");
+        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+        // Writes what it was given to a file, and prints, which must go nowhere.
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nprintf '%s\\n' \"$OPENCLAW_STATE_DIR\" \"$OPENCLAW_GATEWAY_PORT\" \"$ENCLOS_OPENCLAW_USAGE\" \"$1\" \"$2\" \"$4\" \"$5\" \"$6\" \"$7\" > \"$HOME/seen\"\necho printed\necho warned >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let agents = [agent("main"), agent("scout")];
+        let report = home.path().join(".enclos-usage-1.json");
+        let command = OpenClaw.usage(&agents, 1_763_164_800, &report).unwrap();
+        let words = &command.words;
+        assert_eq!(words[4], include_str!("openclaw/usage.mjs"));
+        let out = std::process::Command::new(&words[0])
+            .args(&words[1..])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("HTTP_PROXY", "http://127.0.0.1:41007")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty() && out.stderr.is_empty());
+        let seen = std::fs::read_to_string(home.path().join("seen")).unwrap();
+        let expected = format!(
+            "{}\n43007\n1\n--input-type=module\n-e\n{}\n1763164800\nmain\nscout\n",
+            home.path().join(".openclaw").display(),
+            report.display()
+        );
+        assert_eq!(seen, expected);
     }
 
     /// The app channel requires the plugin's own minimum, which its package

@@ -11,6 +11,7 @@ import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
+import { registerUsage } from './usage.js';
 
 export const TESTED_OPENCLAW = '2026.11.5';
 const MINIMUM_OPENCLAW = '2026.11.5';
@@ -61,7 +62,7 @@ export function createChannel(sdk = {}) {
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   const models = new ModelSettings({ catalogue: sdk.models, runtime: () => runtime });
-  let hooks = { tools: false, policy: false };
+  let hooks = { tools: false, policy: false }, usage = false;
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
@@ -87,8 +88,30 @@ export function createChannel(sdk = {}) {
     return turn;
   }
   const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
+  // A call's app conversation: its turn's, else, for a session this process
+  // has not dispatched a message to yet (a routine delivering into it, or
+  // since a restart), the saved route whose native session key it is.
+  function appTurn(ctx) {
+    const turn = findTurn(ctx);
+    if (turn || !ctx?.sessionKey || [ctx.messageChannel, ctx.messageProvider, ctx.channel].some(c => c && c !== 'enclos')) return turn;
+    for (const active of running.values()) {
+      if ((ctx.agentId && ctx.agentId !== active.account.agentId) || (ctx.accountId && ctx.accountId !== active.account.accountId)) continue;
+      const { transport } = active;
+      for (const conversation of new Set([...Object.keys(transport.state.routes), transport.home])) {
+        let key;
+        try { key = active.sessionKeyFor(conversation); } catch { continue; }
+        if (key !== ctx.sessionKey) continue;
+        const found = { active, conversation };
+        sessionRoutes.set(ctx.sessionKey, found);
+        return found;
+      }
+    }
+    return undefined;
+  }
+  const appSession = ctx => [ctx?.messageChannel, ctx?.messageProvider, ctx?.channel].includes('enclos');
   function registerFull(api) {
     hooks = registerFeatures(api, { findTurn, assertTurn, running });
+    usage = registerUsage(api, { appTurn, appSession, assertTurn, running });
     routines.register(api);
   }
 
@@ -120,7 +143,7 @@ export function createChannel(sdk = {}) {
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...(usage ? ['usage', 'agent_usage'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
