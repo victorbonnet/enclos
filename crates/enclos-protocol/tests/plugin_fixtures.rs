@@ -102,6 +102,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
     ),
     (
+        "message_out_task_event",
+        include_str!("fixtures/plugin/from_plugin_message_out_task_event.json"),
+    ),
+    (
         "commands",
         include_str!("fixtures/plugin/from_plugin_commands.json"),
     ),
@@ -192,6 +196,25 @@ fn every_fixture_from_a_plugin_round_trips() {
 }
 
 #[test]
+fn a_task_event_that_does_not_parse_leaves_its_message_read() {
+    // Not in FROM_PLUGIN: the unusable task event is dropped, so it does not
+    // encode back to the fixture.
+    let fixture = include_str!("fixtures/plugin/from_plugin_message_out_task_event_malformed.json");
+    let message = decode_from_plugin(fixture.trim().as_bytes()).expect("still a message");
+    let FromPlugin::MessageOut {
+        kind,
+        task_event,
+        text,
+        ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!((kind, task_event), (OutKind::TaskEvent, None));
+    assert!(text.contains("Kanban t_a09759c7"));
+}
+
+#[test]
 fn a_message_reads_as_its_fields_say() {
     let message = decode_from_bridge(FROM_BRIDGE[1].1.as_bytes()).unwrap();
     let FromBridge::MessageIn {
@@ -248,6 +271,30 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(
         (kind, conversation.as_str()),
         (OutKind::Status, "home.lab.main")
+    );
+
+    // The runtime about one of its tasks: a task event, with the task.
+    let message = decode_from_plugin(fixture("message_out_task_event").as_bytes()).unwrap();
+    let FromPlugin::MessageOut {
+        kind, task_event, ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    let event = task_event.expect("a task event");
+    assert_eq!(
+        (
+            kind,
+            event.task.as_str(),
+            event.assignee.as_deref(),
+            event.event
+        ),
+        (
+            OutKind::TaskEvent,
+            "t_a09759c7",
+            Some("reviewer"),
+            enclos_protocol::task_event::TaskEventKind::Triage
+        )
     );
 
     // The bridge's hello names the agent's Home; an older one, without it, still reads.

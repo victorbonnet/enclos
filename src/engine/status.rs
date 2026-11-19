@@ -32,7 +32,7 @@ use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
 use crate::model::now;
-use crate::model::runtime::RuntimeVersion;
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 use crate::runtime::{RuntimeAdapter, RuntimeAgentName, adapter};
@@ -63,7 +63,7 @@ impl Engine {
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
         let dashboard_services = super::listener::HostServices::default();
-        let releases = Releases::default();
+        let releases = Releases::looking_up();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
@@ -75,6 +75,10 @@ impl Engine {
                     error: e.to_string(),
                 }),
             }
+        }
+        // What could not be kept, where the person running `status` sees it.
+        for note in releases.notes() {
+            eprintln!("enclos: {note}");
         }
         let suggestions = suggest(&sandboxes, now);
         Ok(StatusView {
@@ -98,7 +102,7 @@ impl Engine {
     ) -> Result<SandboxStatus> {
         let seen = (
             &super::listener::HostServices::default(),
-            &Releases::default(),
+            &Releases::looking_up(),
         );
         self.sandbox_status_in(record, runtime, now, seen)
     }
@@ -192,17 +196,13 @@ impl Engine {
             runtime: match (record.runtime, runtime) {
                 (Some(kind), Some(rt)) => {
                     let facts = rt.runtime_facts();
-                    let version = match facts.version {
-                        Some(at) => read_value(&home, &at, rt),
-                        None => self.reported_version(&name, rt),
-                    };
-                    let latest = releases.of(self, rt, now);
+                    let versions = self.versions_of(&name, rt, releases, now);
                     Some(RuntimeStatus {
                         kind,
                         name: kind.display_name(),
-                        outdated: outdated(&version, &latest),
-                        version,
-                        latest,
+                        version: versions.version,
+                        latest: versions.latest,
+                        outdated: versions.outdated,
                         logged_in: facts.login.map_or(Fact::NotProvided, |f| exists(&home, &f)),
                         installed: facts
                             .install
@@ -335,7 +335,50 @@ fn bridge_activity(
     }
 }
 
+/// A sandbox runtime's version and latest release, as `status` shows them
+/// (ADR 0074, proposed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeVersions {
+    /// The version installed.
+    pub version: Fact<String>,
+    pub latest: Fact<LatestRelease>,
+    /// Whether `latest` is newer than `version`.
+    pub outdated: Fact<bool>,
+}
+
 impl Engine {
+    /// Sandbox `name`'s versions of `kind`, its runtime, the latest release
+    /// as `releases` finds it: for the mobile app's bridge, which lists the
+    /// sandboxes without the rest of their status.
+    pub fn runtime_versions(
+        &self,
+        name: &SandboxName,
+        kind: RuntimeKind,
+        releases: &Releases,
+    ) -> RuntimeVersions {
+        self.versions_of(name, adapter(kind).as_ref(), releases, now())
+    }
+
+    fn versions_of(
+        &self,
+        name: &SandboxName,
+        rt: &dyn RuntimeAdapter,
+        releases: &Releases,
+        now: Timestamp,
+    ) -> RuntimeVersions {
+        let home = self.layout.sandbox_home(name.as_str());
+        let version = match rt.runtime_facts().version {
+            Some(at) => read_value(&home, &at, rt),
+            None => self.reported_version(name, rt),
+        };
+        let latest = releases.of(self, rt, now);
+        RuntimeVersions {
+            outdated: outdated(&version, &latest),
+            version,
+            latest,
+        }
+    }
+
     /// The version the sandbox's runtime last reported, for a runtime whose
     /// home holds none enclos reads: absent until it reported one, after
     /// an install.

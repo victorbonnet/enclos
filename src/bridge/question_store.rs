@@ -138,7 +138,7 @@ fn history_message(
     question: &str,
     kind: &str,
 ) -> rusqlite::Result<Option<Message>> {
-    db.query_row("SELECT seq,id,conversation,person,text,kind,at,speaker,question,held_task,suggested_replies FROM messages WHERE question=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1", params![question,kind], message_row).optional()
+    db.query_row("SELECT seq,id,conversation,person,text,kind,at,speaker,question,held_task,suggested_replies,task_event FROM messages WHERE question=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1", params![question,kind], message_row).optional()
 }
 
 fn origin_conversation(

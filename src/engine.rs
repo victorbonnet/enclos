@@ -65,6 +65,7 @@ pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use portable::{AgentImportOptions, ImportedAgentExport};
 pub use probe::TestReport;
+pub use releases::Releases;
 pub use runtime::{INSTALL_STOP_TIME, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
@@ -76,8 +77,8 @@ use staging::{Curl, Downloader};
 pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, LatestRelease, NetworkListener,
-    Presence, RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion,
-    Unlisted, human_bytes, printable_line,
+    Presence, RuntimeStatus, RuntimeVersions, SandboxStatus, ServiceLine, ServiceState, StatusView,
+    Suggestion, Unlisted, human_bytes, printable_line,
 };
 pub use usage::{
     AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, PricesRead, REPORT_FORMAT,

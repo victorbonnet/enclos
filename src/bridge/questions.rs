@@ -418,6 +418,7 @@ impl Hub {
                 attachments: vec![],
                 question: Some(question.id.clone()),
                 held_task: None,
+                task_event: None,
             })
         };
         if !bounded(&introduction()) {
@@ -904,6 +905,7 @@ impl Hub {
                 suggested_replies: Vec::new(),
                 question: message.question,
                 held_task: None,
+                task_event: None,
                 conversation: current.info.conversation.clone(),
                 agent: current.info.agent.clone(),
                 from: "agent".into(),

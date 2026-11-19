@@ -2199,6 +2199,7 @@ mod tests {
                 session: bridge_session,
                 heard: std::time::Instant::now(),
                 scoped_approvals: false,
+                task_events: false,
             };
             let store = server_hub.store().unwrap();
             run_session(&server_hub, &store, &mut link, &phone, OWNER, &rx)

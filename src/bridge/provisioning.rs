@@ -5,11 +5,12 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use enclos_protocol::device::{RuntimeInfo, SandboxInfo};
+use enclos_protocol::device::{RuntimeInfo, RuntimeRelease, SandboxInfo};
 use serde_json::Value;
 
-use crate::engine::{Engine, INSTALL_STOP_TIME, SandboxSpec};
+use crate::engine::{Engine, INSTALL_STOP_TIME, Releases, RuntimeVersions, SandboxSpec};
 use crate::layout::Layout;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Planned};
@@ -89,23 +90,91 @@ pub enum Completed {
     Installed { runtime: String, login: String },
 }
 
+/// The sandboxes for the host's person.
+#[derive(Debug)]
+pub struct Listed {
+    pub sandboxes: Vec<SandboxInfo>,
+    /// Whether a runtime's latest release was missing or kept too long,
+    /// and was not looked up: a lookup is due.
+    pub lookup_due: bool,
+    /// What went wrong keeping the releases, for the bridge's log.
+    pub notes: Vec<String>,
+}
+
+/// Clears the flag of a lookup under way when the lookup ends.
+struct Running<'a>(&'a AtomicBool);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Data a worker needs to open its own engine and to run enclos. It
 /// contains no connection, database or device keys.
 pub struct Host {
     layout: Layout,
     executable: PathBuf,
+    /// Whether a thread looks the runtimes' releases up now.
+    looking_up: AtomicBool,
 }
 
 impl Host {
     pub fn new(layout: Layout, executable: PathBuf) -> Self {
-        Self { layout, executable }
+        Self {
+            layout,
+            executable,
+            looking_up: AtomicBool::new(false),
+        }
     }
 
-    pub fn sandboxes(&self) -> Result<Vec<SandboxInfo>, String> {
-        sandbox_list(&Engine::open(
-            self.layout.clone(),
-            crate::state::Wait::Command,
-        ))
+    /// The sandboxes, at once, with what is kept of each runtime's latest
+    /// release (ADR 0074, proposed), and whether a lookup is due.
+    pub fn sandboxes(&self) -> Result<Listed, String> {
+        let releases = Releases::kept();
+        let sandboxes = sandbox_list(&self.engine(), &releases)?;
+        Ok(Listed {
+            sandboxes,
+            lookup_due: releases.due(),
+            notes: releases.notes(),
+        })
+    }
+
+    /// The sandboxes once each of their runtimes' latest release is looked
+    /// up, which can take 10 seconds a runtime; none when another thread is
+    /// looking them up already. The sandboxes are read after the lookups,
+    /// so a list sent meanwhile, after a sandbox was made, is not undone.
+    pub fn sandboxes_looked_up(&self) -> Option<Result<Listed, String>> {
+        if self.looking_up.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        // Cleared however this ends, a panic included, so lookups go on.
+        let _running = Running(&self.looking_up);
+        let engine = self.engine();
+        let releases = Releases::looking_up();
+        let listed = engine.list_sandboxes().map_err(|e| e.to_string());
+        Some(listed.and_then(|views| {
+            let mut kinds: Vec<RuntimeKind> = Vec::new();
+            for kind in views.iter().filter_map(|v| v.record.runtime) {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            for kind in kinds {
+                engine.look_up_release(kind, &releases);
+            }
+            // Each runtime is found once: this pass waits on nothing.
+            let sandboxes = sandbox_list(&engine, &releases)?;
+            Ok(Listed {
+                sandboxes,
+                lookup_due: false,
+                notes: releases.notes(),
+            })
+        }))
+    }
+
+    fn engine(&self) -> Engine {
+        Engine::open(self.layout.clone(), crate::state::Wait::Command)
     }
 
     pub fn runtimes(&self) -> Vec<RuntimeInfo> {
@@ -269,26 +338,58 @@ fn read_bounded(mut stream: impl Read, limit: usize) -> Result<Vec<u8>, String> 
     Ok(saved)
 }
 
-fn sandbox_list(engine: &Engine) -> Result<Vec<SandboxInfo>, String> {
+fn sandbox_list(engine: &Engine, releases: &Releases) -> Result<Vec<SandboxInfo>, String> {
     engine
         .list_sandboxes()
         .map_err(|e| e.to_string())
         .map(|views| {
             views
                 .into_iter()
-                .map(|view| SandboxInfo {
-                    sandbox: view.record.name.to_string(),
-                    runtime: view.record.runtime.map(|kind| kind.to_string()),
-                    state: match view.record.state {
-                        SandboxState::Created => "created",
-                        SandboxState::Running => "running",
-                        SandboxState::Stopped => "stopped",
-                        SandboxState::Failed { .. } => "failed",
+                .map(|view| {
+                    let name = &view.record.name;
+                    let versions = view
+                        .record
+                        .runtime
+                        .map(|kind| engine.runtime_versions(name, kind, releases));
+                    let told = versions.map(released).unwrap_or_default();
+                    SandboxInfo {
+                        sandbox: name.to_string(),
+                        runtime: view.record.runtime.map(|kind| kind.to_string()),
+                        state: match view.record.state {
+                            SandboxState::Created => "created",
+                            SandboxState::Running => "running",
+                            SandboxState::Stopped => "stopped",
+                            SandboxState::Failed { .. } => "failed",
+                        }
+                        .to_owned(),
+                        runtime_version: told.version,
+                        runtime_release: told.release,
+                        runtime_outdated: told.outdated,
                     }
-                    .to_owned(),
                 })
                 .collect()
         })
+}
+
+/// What a device is told of a runtime's versions: what the host knows,
+/// leaving out what it cannot tell.
+fn released(versions: RuntimeVersions) -> Released {
+    Released {
+        version: versions.version.known().cloned(),
+        release: versions.latest.known().map(|latest| RuntimeRelease {
+            version: latest.version.clone(),
+            checked: latest.checked,
+        }),
+        outdated: versions.outdated.known().copied(),
+    }
+}
+
+/// A sandbox's runtime versions, as a device is told them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Released {
+    version: Option<String>,
+    release: Option<RuntimeRelease>,
+    outdated: Option<bool>,
 }
 
 /// Creates sandbox `name` with the backend `sandbox create` takes when it
@@ -447,6 +548,158 @@ mod tests {
     }
 
     #[test]
+    fn a_sandbox_lists_its_runtime_version_and_the_kept_release_without_waiting() {
+        use crate::audit::jsonl::JsonlAuditLog;
+        use crate::backend::fake::FakeBackend;
+        use crate::state::StateStore;
+        use crate::state::sqlite::SqliteStateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path().join("data"));
+        let state = || {
+            SqliteStateStore::new(
+                layout.state_db(),
+                layout.state_lock(),
+                crate::state::Wait::Command,
+            )
+        };
+        let engine = Engine::new(
+            layout.clone(),
+            Box::new(state()),
+            Box::new(JsonlAuditLog::new(layout.audit_log())),
+            vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+        );
+        engine.init(&actor(), Confirm::Yes).unwrap();
+        let name: SandboxName = "lab".parse().unwrap();
+        create(&engine, &actor(), name.clone(), "minimal".parse().unwrap()).unwrap();
+        // Hermes recorded, with the stamp its installer writes.
+        let store = state();
+        let lock = store.lock().unwrap();
+        let mut record = store.get(&name).unwrap().unwrap();
+        record.runtime = Some(RuntimeKind::Hermes);
+        store.put(&lock, &record).unwrap();
+        drop(lock);
+        let checkout = layout.sandbox_home("lab").join(".hermes/hermes-agent");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join("install-stamp.json"),
+            r#"{"baseVersion": "0.23.1"}"#,
+        )
+        .unwrap();
+
+        // Nothing kept: the version installed at once, and a lookup due.
+        let releases = Releases::kept();
+        let listed = sandbox_list(&engine, &releases).unwrap();
+        assert_eq!(listed[0].runtime_version.as_deref(), Some("0.23.1"));
+        assert_eq!(listed[0].runtime_release, None);
+        assert!(releases.due());
+
+        // Kept: sent as it is, with whether it is newer and checked.
+        let at = crate::model::now().as_second();
+        let kept = format!(r#"{{"hermes": {{"at": {at}, "version": "0.23.2"}}}}"#);
+        std::fs::write(layout.runtime_releases(), kept).unwrap();
+        let releases = Releases::kept();
+        let listed = sandbox_list(&engine, &releases).unwrap();
+        assert_eq!(
+            listed[0].runtime_release,
+            Some(RuntimeRelease {
+                version: "0.23.2".into(),
+                checked: true,
+            })
+        );
+        assert_eq!(listed[0].runtime_outdated, Some(true));
+        assert!(!releases.due());
+
+        // Kept longer than its keep time: still sent, and a lookup due.
+        let old = at - 7 * 3600;
+        let kept = format!(r#"{{"hermes": {{"at": {old}, "version": "0.23.2"}}}}"#);
+        std::fs::write(layout.runtime_releases(), kept).unwrap();
+        let releases = Releases::kept();
+        let listed = sandbox_list(&engine, &releases).unwrap();
+        assert!(listed[0].runtime_release.is_some());
+        assert!(releases.due());
+
+        // A lookup that just failed, with nothing found before: no release,
+        // and none due, so an offline host does not look up at each request.
+        let failed = format!(r#"{{"hermes": {{"at": {at}, "failed": "offline"}}}}"#);
+        std::fs::write(layout.runtime_releases(), failed).unwrap();
+        let releases = Releases::kept();
+        let listed = sandbox_list(&engine, &releases).unwrap();
+        assert_eq!(listed[0].runtime_release, None);
+        assert_eq!(listed[0].runtime_outdated, None);
+        assert!(!releases.due());
+
+        // Turned off: the version still, no release, nothing due.
+        let mut config = std::fs::read_to_string(layout.config_file()).unwrap();
+        config.push_str("runtime_releases = false\n");
+        std::fs::write(layout.config_file(), config).unwrap();
+        std::fs::remove_file(layout.runtime_releases()).unwrap();
+        let releases = Releases::kept();
+        let listed = sandbox_list(&engine, &releases).unwrap();
+        assert_eq!(listed[0].runtime_version.as_deref(), Some("0.23.1"));
+        assert_eq!(listed[0].runtime_release, None);
+        assert!(!releases.due());
+    }
+
+    #[test]
+    fn one_lookup_runs_at_a_time_and_the_next_runs_after_one_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never initialised: listing fails, as the lookup would.
+        let host = Host::new(Layout::at(dir.path().join("none")), "/unused".into());
+        host.looking_up.store(true, Ordering::SeqCst);
+        assert!(host.sandboxes_looked_up().is_none(), "one runs already");
+        host.looking_up.store(false, Ordering::SeqCst);
+        assert!(matches!(host.sandboxes_looked_up(), Some(Err(_))));
+        assert!(!host.looking_up.load(Ordering::SeqCst), "cleared after it");
+        assert!(host.sandboxes_looked_up().is_some());
+    }
+
+    #[test]
+    fn a_device_is_told_what_the_host_knows_of_a_runtimes_versions() {
+        use crate::engine::{Fact, LatestRelease};
+        let latest = |version: &str| {
+            Fact::Known(LatestRelease {
+                version: version.into(),
+                checked: false,
+            })
+        };
+        let versions = |version: Fact<String>, latest, outdated| RuntimeVersions {
+            version,
+            latest,
+            outdated,
+        };
+        // The version installed is newer than the latest release.
+        let told = released(versions(
+            Fact::Known("0.24.0".into()),
+            latest("0.23.2"),
+            Fact::Known(false),
+        ));
+        assert_eq!(told.version.as_deref(), Some("0.24.0"));
+        assert_eq!(told.outdated, Some(false));
+        // The latest release unknown: the version alone.
+        let told = released(versions(
+            Fact::Known("0.23.1".into()),
+            Fact::CannotTell("offline".into()),
+            Fact::CannotTell("the latest release is not known".into()),
+        ));
+        assert_eq!(
+            told,
+            Released {
+                version: Some("0.23.1".into()),
+                ..Released::default()
+            }
+        );
+        // The version installed unknown: the release, and no comparison.
+        let told = released(versions(
+            Fact::Absent,
+            latest("2026.11.6"),
+            Fact::CannotTell("the version installed is not known".into()),
+        ));
+        assert_eq!((told.version, told.outdated), (None, None));
+        assert!(told.release.is_some());
+    }
+
+    #[test]
     fn creates_and_lists_an_empty_sandbox_with_the_hosts_backend_and_audit() {
         use crate::audit::jsonl::JsonlAuditLog;
         use crate::backend::fake::FakeBackend;
@@ -465,7 +718,7 @@ mod tests {
             vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
         );
         engine.init(&actor(), Confirm::Yes).unwrap();
-        assert!(sandbox_list(&engine).unwrap().is_empty());
+        assert!(sandbox_list(&engine, &Releases::kept()).unwrap().is_empty());
         create(
             &engine,
             &actor(),
@@ -474,11 +727,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            sandbox_list(&engine).unwrap(),
+            sandbox_list(&engine, &Releases::kept()).unwrap(),
             vec![SandboxInfo {
                 sandbox: "lab".into(),
                 runtime: None,
-                state: "created".into()
+                state: "created".into(),
+                runtime_version: None,
+                runtime_release: None,
+                runtime_outdated: None,
             }]
         );
         assert!(engine.app_agents().unwrap().agents.is_empty());

@@ -120,7 +120,7 @@ impl Hub {
             let own = From::Member(member.clone());
             let said: Vec<Said> = unseen
                 .iter()
-                .filter(|m| m.kind != "status" && m.from != own)
+                .filter(|m| m.kind != "status" && m.kind != "task_event" && m.from != own)
                 .map(|m| Said {
                     member: match &m.from {
                         From::Member(a) => Some(a.as_str()),
@@ -215,6 +215,12 @@ impl Hub {
         files: bool,
         kind: &str,
     ) -> Option<bool> {
+        // Its runtime about one of its tasks (ADR 0071, proposed): kept, and
+        // neither its reply nor something it says, whose mentions would ask
+        // the members it names for a turn.
+        if kind == "task_event" {
+            return Some(false);
+        }
         // The group's members, as the caller read them: not read again,
         // where a failing store would read as no group
         let handles = members.to_vec();
