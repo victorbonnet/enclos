@@ -18,6 +18,62 @@ class TransferTests(unittest.TestCase):
         self.source.mkdir(); self.dest.mkdir(); self.profile = self.source / '.hermes/profiles/main'; self.profile.mkdir(parents=True)
         (self.profile / 'config.yaml').write_text('model: test\ncwd: ' + str(self.source / 'project') + '\n')
         self.archive = self.base / 'agent.tar.gz'
+    def test_referenced_pruned_archives_roundtrip_from_wal(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        (cache / 'active.txt').write_text('full active output')
+        (cache / 'inactive.json').write_text('{"full":"inactive"}')
+        (cache / 'unused.txt').write_text('not durable')
+        db = sqlite3.connect(self.profile / 'state.db'); self.addCleanup(db.close)
+        db.execute('pragma journal_mode=wal')
+        db.execute('create table messages(id integer primary key, content text, api_content text, active integer)')
+        for n, name in enumerate(('active.txt', 'inactive.json')):
+            pointer = 'short — full result: ' + str(cache / name)
+            db.execute('insert into messages values (?,?,?,?)', (n, pointer, json.dumps([{'text': pointer}]), n))
+        db.commit()
+        transfer.export(self.source, 'main', self.archive)
+        transfer.restore(self.dest, 'renamed', self.archive)
+        target = self.dest / '.hermes/profiles/renamed'
+        self.assertEqual((target / 'cache/pruned/active.txt').read_text(), 'full active output')
+        self.assertFalse((target / 'cache/pruned/unused.txt').exists())
+        with sqlite3.connect(target / 'state.db') as restored:
+            for content, api in restored.execute('select content, api_content from messages'):
+                self.assertIn(str(target / 'cache/pruned'), content)
+                self.assertIn(str(target / 'cache/pruned'), json.loads(api)[0]['text'])
+
+    def test_missing_or_linked_pruned_reference_refuses_export(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table messages(content text)')
+            db.execute('insert into messages values (?)', ('short — full result: ' + str(cache / 'gone.txt'),))
+        with self.assertRaises(ValueError): transfer.export(self.source, 'main', self.archive)
+        self.assertFalse(self.archive.exists())
+        outside = self.base / 'private'; outside.write_text('private')
+        (cache / 'gone.txt').symlink_to(outside)
+        with self.assertRaises(ValueError): transfer.export(self.source, 'main', self.archive)
+        self.assertFalse(self.archive.exists())
+
+    def test_outside_and_traversing_archive_pointers_are_refused(self):
+        for pointer in ('/outside/cache/pruned/x.txt', str(self.profile / 'cache/pruned') + '/../secret',
+                        '~/.hermes/profiles/another/cache/pruned/x.txt'):
+            with self.subTest(pointer=pointer):
+                with sqlite3.connect(self.profile / 'state.db') as db:
+                    db.execute('create table if not exists messages(content text)')
+                    db.execute('delete from messages')
+                    db.execute('insert into messages values (?)', (pointer,))
+                with self.assertRaises(ValueError): transfer.export(self.source, 'main', self.archive)
+                self.assertFalse(self.archive.exists())
+
+    def test_restore_rejects_unreferenced_or_other_cache_entries(self):
+        transfer.export(self.source, 'main', self.archive)
+        for entry in ('profile/cache/pruned/unreferenced.txt', 'profile/cache/other/private'):
+            malicious = self.base / 'malicious.tgz'
+            with tarfile.open(self.archive) as src, tarfile.open(malicious, 'w:gz') as dst:
+                for item in src: dst.addfile(item, src.extractfile(item))
+                item = tarfile.TarInfo(entry); item.size = 4
+                dst.addfile(item, io.BytesIO(b'data'))
+            with self.assertRaises(ValueError): transfer.restore(self.dest, 'renamed', malicious)
+            self.assertFalse((self.dest / '.hermes/profiles/renamed').exists())
+
     def test_credentials_plugins_sqlite_wal_and_shared_files_survive_a_rename(self):
         (self.source / '.hermes/auth.json').write_text('{"refresh_token":"retain-exactly"}')
         plugin = self.profile / 'plugins/custom'; plugin.mkdir(parents=True)

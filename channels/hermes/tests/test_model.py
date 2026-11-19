@@ -214,7 +214,10 @@ class ModelTest(unittest.TestCase):
         # With a Hermes installed (CI's `hermes-latest`), the latest release
         # must still have every function the plugin uses; without one, the
         # capability is off and says why.
-        real = model.Manager("default", functions=None)
+        # Use a named temporary profile without changing the launch settings.
+        home = self.home / 'profiles' / 'coder'
+        home.mkdir(parents=True)
+        real = model.Manager("coder", home=home, functions=None)
         if HERMES:
             self.assertTrue(real.available, real.unavailable)
         else:
