@@ -165,6 +165,19 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("suggested_replies", following)
         writer.close()
 
+    async def test_the_still_working_heartbeat_is_kept_back(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        before = len(self.adapter._outbox.pending())
+        result = await self.adapter.send("c-1", "⏳ Working — 3 min — iteration 2/60, receiving stream response")
+        self.assertTrue(result.success)
+        self.assertIsNone(result.message_id)
+        self.assertEqual(len(self.adapter._outbox.pending()), before)
+        await self.adapter.send("c-1", "Done.", "m1")
+        sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(sent["text"], "Done.")
+        writer.close()
+
     async def test_review_replies_remain_staged_after_outbox_rejection(self):
         for with_files in (False, True):
             now = asyncio.get_running_loop().time()

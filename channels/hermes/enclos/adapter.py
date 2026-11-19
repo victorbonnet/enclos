@@ -631,6 +631,10 @@ class EnclosAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         literal_approval = _APPROVAL_SEND.get() or bool((metadata or {}).get("is_approval_prompt"))
+        if not literal_approval and protocol.is_heartbeat(content):
+            # Kept back, said sent: the working indicator shows it. No id, so
+            # Hermes does not try to edit it and sends the next one here too.
+            return SendResult(success=True)
         if literal_approval and len(protocol.encode_line(protocol.message_out(chat_id, content, reply_to))) > questions.MAX_APPROVAL_FRAME_BYTES:
             # Refuse before persistence. Base's visibility gate then keeps Deny
             # alone; our fallback sends complete, independently fenced parts.
