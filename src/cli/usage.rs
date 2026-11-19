@@ -723,9 +723,8 @@ mod tests {
                         tokens: model("gpt", Some(83_087), Vec::new()).tokens,
                         estimate: UsageCost {
                             usd_micros: 1_234_567,
-                            included: 0,
-                            included_usd_micros: 0,
                             unpriced: 9,
+                            ..UsageCost::default()
                         },
                     }),
                 },
