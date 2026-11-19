@@ -223,13 +223,28 @@ fn bad_dashboard(client: &mut TcpStream) -> io::Result<()> {
     )
 }
 
-fn rewrite_body(route: Route, raw: &[u8], board: &str) -> io::Result<Vec<u8>> {
+/// Opens the held task's details once the board has drawn its card. Hermes's
+/// Kanban page opens a task only when its card is tapped, and keeps no URL or
+/// stored setting for one; each card carries `data-task-id`. The card is
+/// tapped once, so a person who closes the details stays on the board. A task
+/// the board does not show (a filter hides it) leaves the board as it is.
+const OPEN_TASK: &str = "(function(){var id=TASK,done=false,seen;function open(){var c=document.querySelectorAll('.hermes-kanban-card[data-task-id]');for(var i=0;i<c.length;i++){if(c[i].getAttribute('data-task-id')===id){done=true;c[i].scrollIntoView({block:'center',inline:'center'});c[i].click();return true}}return false}function watch(){if(open())return;seen=new MutationObserver(function(){if(!done&&open())seen.disconnect()});seen.observe(document.body,{childList:true,subtree:true});setTimeout(function(){seen.disconnect()},30000)}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',watch);else watch()})()";
+
+fn rewrite_body(route: Route, raw: &[u8], board: &str, task: &str) -> io::Result<Vec<u8>> {
     if route == Route::Document {
         let page = std::str::from_utf8(raw).map_err(|_| invalid())?;
         let (head, rest) = page.split_once("<head>").ok_or_else(invalid)?;
         // Hermes initializes Kanban from localStorage, not the URL. Seed
         // the board selected by the held task before the bundle starts.
-        return Ok(format!("{head}<head><script>try{{localStorage.setItem('hermes.kanban.selectedBoard','{board}')}}catch{{}}</script>{rest}").into_bytes());
+        let mut script = format!(
+            "try{{localStorage.setItem('hermes.kanban.selectedBoard','{board}')}}catch{{}}"
+        );
+        // Only an id of the characters a path component allows is written
+        // into the script, so it cannot end the string or the element.
+        if component(task) {
+            script.push_str(&OPEN_TASK.replace("TASK", &format!("'{task}'")));
+        }
+        return Ok(format!("{head}<head><script>{script}</script>{rest}").into_bytes());
     }
     let mut data: serde_json::Value = serde_json::from_slice(raw).map_err(|_| invalid())?;
     match route {
@@ -338,7 +353,7 @@ pub(super) fn forward(
         {
             return bad_dashboard(client);
         }
-        let Ok(rewritten) = rewrite_body(route, &output, board) else {
+        let Ok(rewritten) = rewrite_body(route, &output, board, task) else {
             return bad_dashboard(client);
         };
         output = rewritten;
@@ -577,6 +592,7 @@ mod tests {
             Route::Plugins,
             br#"[{"name":"kanban"},{"name":"diagnostics"}]"#,
             "reviews",
+            "t1",
         )
         .unwrap();
         assert_eq!(plugins, br#"[{"name":"kanban"}]"#);
@@ -584,6 +600,7 @@ mod tests {
             Route::Boards,
             br#"{"boards":[{"slug":"default"},{"slug":"reviews"}],"current":"default"}"#,
             "reviews",
+            "t1",
         )
         .unwrap();
         assert_eq!(
@@ -594,12 +611,38 @@ mod tests {
             Route::Document,
             b"<html><head><script src=\"kanban.js\"></script></head></html>",
             "reviews",
+            "t1",
         )
         .unwrap();
+        let document = String::from_utf8(document).unwrap();
         assert!(
-            String::from_utf8(document)
-                .unwrap()
-                .contains("selectedBoard','reviews')}catch{}</script><script src")
+            document.starts_with("<html><head><script>try{localStorage.setItem('hermes.kanban.selectedBoard','reviews')}catch{}(function(){var id='t1',"),
+            "{document}"
         );
+        assert!(
+            document.ends_with("})()</script><script src=\"kanban.js\"></script></head></html>")
+        );
+    }
+
+    #[test]
+    fn the_page_opens_only_a_task_id_that_cannot_leave_its_script() {
+        for task in ["t_ab12", "a.b-c@d"] {
+            let document =
+                rewrite_body(Route::Document, b"<head></head>", "reviews", task).unwrap();
+            assert!(
+                String::from_utf8(document)
+                    .unwrap()
+                    .contains(&format!("var id='{task}',"))
+            );
+        }
+        for task in ["", "..", "t'1", "t</script>", "t\\1", "t 1"] {
+            let document =
+                rewrite_body(Route::Document, b"<head></head>", "reviews", task).unwrap();
+            assert_eq!(
+                document,
+                b"<head><script>try{localStorage.setItem('hermes.kanban.selectedBoard','reviews')}catch{}</script></head>",
+                "{task:?}"
+            );
+        }
     }
 }

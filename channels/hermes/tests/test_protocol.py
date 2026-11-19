@@ -75,11 +75,13 @@ class Home(unittest.TestCase):
             "send any message and I'll try to pick up where we left off.",
             "⚠️ Hermes is restarting — your current task will be interrupted.",
             "📬 No home channel is set for Enclos. A home channel is where Hermes delivers cron job results.",
+            "💾 Self-improvement review: Skill 'sdlc-review' patched · Memory updated",
         ]
         for text in notices:
             with self.subTest(text[:20]):
                 self.assertTrue(protocol.is_notice(text))
-        for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.", ""]:
+        for text in ["Gateway online is a nice name", "Hermes is shutting down the server, as asked.",
+                     "Self-improvement review: I patched the skill.", ""]:
             with self.subTest(text[:20]):
                 self.assertFalse(protocol.is_notice(text))
 
