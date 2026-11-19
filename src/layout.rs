@@ -23,6 +23,8 @@ pub const APP_MEDIA_DIR: &str = "app-media";
 /// The side database of diagnostic provenance (ADR 0059), beside
 /// `state.db` ([`Layout::probe_sources`]).
 pub const PROBE_SOURCES_FILE: &str = "probe-sources.db";
+/// What enclos keeps of each runtime's latest release, in its data folder.
+pub const RUNTIME_RELEASES_FILE: &str = "runtime-releases.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -322,7 +324,7 @@ impl Layout {
     /// The latest release of each runtime, as enclos last looked it up
     /// (ADR 0074, proposed), kept for a while.
     pub fn runtime_releases(&self) -> PathBuf {
-        self.data.join("runtime-releases.json")
+        self.data.join(RUNTIME_RELEASES_FILE)
     }
 
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.

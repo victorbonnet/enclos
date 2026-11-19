@@ -18,7 +18,7 @@ use super::Engine;
 use super::staging::{DownloadFailed, LOOKUP_MAX_BYTES};
 use super::status::Fact;
 use crate::config;
-use crate::layout::LayoutError;
+use crate::layout::{LayoutError, RUNTIME_RELEASES_FILE as KEPT};
 use crate::model::Timestamp;
 use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::runtime::RuntimeAdapter;
@@ -127,10 +127,11 @@ impl Engine {
                 };
                 kept.insert(kind.to_owned(), lookup.clone());
                 // Not kept, each `status` would wait on the network: said.
+                // The file's name, not its path: the path comes from the
+                // engine, which code scanning takes for secret.
                 if let Err(e) = write_kept(&path, &kept) {
                     eprintln!(
-                        "enclos: cannot keep the runtime releases looked up in {}: {e}; each `enclos status` looks them up again",
-                        path.display()
+                        "enclos: cannot write {KEPT}, in enclos's data folder: {e}; each `enclos status` looks the releases up again"
                     );
                 }
                 lookup
@@ -188,10 +189,7 @@ fn read_kept(path: &Path) -> BTreeMap<String, Lookup> {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(e) if e.kind() == ErrorKind::NotFound => BTreeMap::new(),
         Err(e) => {
-            eprintln!(
-                "enclos: cannot read the runtime releases kept in {}: {e}",
-                path.display()
-            );
+            eprintln!("enclos: cannot read {KEPT}, in enclos's data folder: {e}");
             BTreeMap::new()
         }
     }
