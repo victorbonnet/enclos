@@ -20,6 +20,8 @@ Decision (proposed), amending 0066:
 
 Reason: the agent that asked for a task knows whether a worker's question is its own to answer. Only it can say the person must act, and the board cannot tell one question from the other. A typed statement from the agent, kept against the hold it answers, makes "Needs you" mean that someone is waiting on the person.
 
+[ADR 0073](0073-the-person-answers-a-held-task-from-its-card.md) (proposed) extends this: the agent asks with choices, and the person answers from the card.
+
 ## Considered options
 
 - **Hold every `needs_input` block, as in 0066.** Rejected: a worker's question for its assigning agent reaches the person, worded as theirs.
