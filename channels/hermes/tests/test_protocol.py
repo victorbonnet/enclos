@@ -94,6 +94,17 @@ class Home(unittest.TestCase):
         self.assertTrue(protocol.is_notice(
             "\u267b\ufe0f Gateway online \u2014 that is what the log said at 9:00."))
 
+    def test_the_still_working_heartbeat_is_told_apart(self):
+        for text in ["⏳ Working — 3 min — iteration 2/60, receiving stream response",
+                     "⏳ Working — 0 min", "  ⏳ Working — 12 min — terminal  "]:
+            with self.subTest(text[:24]):
+                self.assertTrue(protocol.is_heartbeat(text))
+                self.assertFalse(protocol.is_notice(text))
+        for text in ["⏳ Working — on it, give me a minute.", "Working — 3 min", "⏳ Draining 1 active agent(s)",
+                     "⏳ Working —", ""]:
+            with self.subTest(text[:24]):
+                self.assertFalse(protocol.is_heartbeat(text))
+
     def test_sethome_is_caught_however_written(self):
         for text in ["/sethome", "  /SetHome ", "/set-home now"]:
             self.assertTrue(protocol.is_home_command(text), text)
@@ -120,6 +131,8 @@ class NativeHermesNotices(unittest.TestCase):
         for key, start, fallback in zip(protocol.NOTICE_KEYS, starts, protocol.NOTICE_STARTS):
             with self.subTest(key):
                 self.assertTrue(start.startswith(fallback), (start, fallback))
+        heartbeat = protocol._translated_starts((protocol.HEARTBEAT_KEY,))
+        self.assertEqual(heartbeat, [protocol.HEARTBEAT_START])
 
 
 class ToTheBridge(unittest.TestCase):

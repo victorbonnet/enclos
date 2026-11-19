@@ -35,6 +35,7 @@ from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
 from . import decisions
+from . import asks
 from . import held_tasks
 from . import model
 from . import routines
@@ -119,6 +120,10 @@ class EnclosAdapter(BasePlatformAdapter):
         # This agent's blocked tasks on Hermes's kanban board (ADR 0066): the
         # agent is the Hermes profile its socket names.
         self._held = held_tasks.Manager(self._agent, self._write)
+        # What the agent writes for the person on those tasks (ADR 0073),
+        # kept beside its socket so a restart keeps it.
+        self._asks = asks.Asks(f"{self._path}.held-asks.json")
+        self._held.asks = self._asks
         # What the agent is doing, and its tasks on Hermes's board (ADR 0068).
         self._reporter = tasks.Reporter(self._agent, self._write,
                                         tasks.hermes_board(self._conversation_home, PLATFORM))
@@ -631,6 +636,10 @@ class EnclosAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         literal_approval = _APPROVAL_SEND.get() or bool((metadata or {}).get("is_approval_prompt"))
+        if not literal_approval and protocol.is_heartbeat(content):
+            # Kept back, said sent: the working indicator shows it. No id, so
+            # Hermes does not try to edit it and sends the next one here too.
+            return SendResult(success=True)
         if literal_approval and len(protocol.encode_line(protocol.message_out(chat_id, content, reply_to))) > questions.MAX_APPROVAL_FRAME_BYTES:
             # Refuse before persistence. Base's visibility gate then keeps Deny
             # alone; our fallback sends complete, independently fenced parts.
@@ -1012,6 +1021,7 @@ def _env_enablement() -> dict | None:
 def register(ctx) -> None:
     questions.register_skill(ctx)
     suggested_replies.register(ctx, _ADAPTERS, PLATFORM)
+    asks.register(ctx, _ADAPTERS, _current_agent)
     approvals.register(ctx, _ADAPTERS, lambda: _setting(None, "socket", "MOBILE_APP_SOCKET"), PLATFORM)
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),
@@ -1042,4 +1052,6 @@ def register(ctx) -> None:
     # where tasks are on, for this process's own profile, as the adapter checks.
     if "pre_llm_call" in VALID_HOOKS and tasks.has_board(conversations.capture_home()):
         ctx.register_hook("pre_llm_call", tasks.writing_context)
+        # And how to hand a held task to the person (ADR 0073).
+        ctx.register_hook("pre_llm_call", asks.context)
     _register_usage_hooks(ctx)

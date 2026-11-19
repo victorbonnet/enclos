@@ -49,6 +49,17 @@ pub enum FromDevice {
         task: HeldTaskId,
         revision: u64,
     },
+    /// Answer a held task from its card (ADR 0073, proposed): the host's
+    /// person, on a still-paired device, at the card's current revision.
+    /// The bridge gives the agent the person's message; it changes nothing
+    /// on the runtime itself.
+    #[serde(rename = "held_task.answer")]
+    HeldTaskAnswer {
+        agent: String,
+        task: HeldTaskId,
+        revision: u64,
+        answer: crate::held_task::HeldTaskAnswer,
+    },
     /// The detail of a task the bridge keeps (`task.detail`): the host's
     /// person, on a still-paired device, from an agent whose channel
     /// announces `task_details`.
@@ -275,12 +286,15 @@ pub const USAGE_COST: &str = "usage.cost";
 pub const AGENT_FORGET: &str = "agent.forget";
 /// The bridge can open a held task's board through its HTTPS origin.
 pub const HELD_TASK_BOARD: &str = "held_task.board";
+/// The bridge takes a person's answer to a held card (ADR 0073, proposed).
+pub const HELD_TASK_ANSWER: &str = "held_task.answer";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
     "open_item.dismiss",
     "question.answer",
     "held_task.resume",
+    HELD_TASK_ANSWER,
     "task.get",
     "held_task.get",
     HELD_TASK_BOARD,
@@ -1628,6 +1642,8 @@ mod usage_tests {
         let cost = UsageCost {
             usd_micros: 1_250_000,
             included: 0,
+            included_usd_micros: 0,
+            included_unpriced: 0,
             unpriced: 12,
         };
         let total = UsageTotal {
@@ -1687,6 +1703,8 @@ mod usage_tests {
     const BIG_COST: UsageCost = UsageCost {
         usd_micros: u64::MAX,
         included: u64::MAX,
+        included_usd_micros: u64::MAX,
+        included_unpriced: u64::MAX,
         unpriced: u64::MAX,
     };
 

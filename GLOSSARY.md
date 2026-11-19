@@ -124,7 +124,7 @@ What an agent's model calls consumed, as its runtime counts them: requests, inpu
 _Avoid_: consumption, spend, billing, quota (a provider's limit)
 
 **Cost**:
-What enclos estimates an agent's usage cost in US dollars, from its price list: the tokens of a model it has a price for, at that price; those on a subscription, included; the others, unknown, which is not $0. An estimate that guides; the model provider's own account is the record of what was billed.
+What enclos estimates an agent's usage cost in US dollars, from its price list: the tokens of a model it has a price for, at that price; those on a subscription, included, and priced at their model's list price as if paid, to show how heavy an agent is; the others, unknown, which is not $0. An estimate that guides; the model provider's own account is the record of what was billed.
 _Avoid_: spend, billing, charge
 
 **Price list**:
