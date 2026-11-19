@@ -1138,6 +1138,7 @@ mod tests {
                 seq: 1,
                 question: Some(question.id.clone()),
                 held_task: None,
+                task_event: None,
                 attachments: vec![],
             });
             assert!(

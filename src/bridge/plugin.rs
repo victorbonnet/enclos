@@ -119,6 +119,7 @@ fn connect_within(
             Capability::Usage,
             Capability::HeldTasks,
             Capability::AgentUsage,
+            Capability::TaskEvents,
         ],
         home: ConversationId::new(home).ok(),
     })?;
@@ -482,6 +483,7 @@ mod tests {
                             kind: OutKind::Reply,
                             reply_to: Some(message.id),
                             attachments: Vec::new(),
+                            task_event: None,
                         },
                     );
                 }
@@ -635,6 +637,7 @@ mod tests {
             kind: OutKind::Reply,
             reply_to: None,
             attachments: vec![],
+            task_event: None,
         };
         encode_line(&Envelope::new(MessageId::new(id).unwrap(), body))
     }

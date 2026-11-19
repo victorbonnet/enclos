@@ -19,6 +19,10 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "task_event_tests.rs"]
+mod task_event_tests;
+
 #[path = "agent_names.rs"]
 mod agent_names;
 #[path = "approvals.rs"]
@@ -1045,6 +1049,7 @@ impl Hub {
                         kind,
                         attachments,
                         reply_to,
+                        task_event,
                     } => {
                         match store.deletion_started(conversation.as_str()) {
                             Ok(false) => {}
@@ -1063,10 +1068,33 @@ impl Hub {
                         // at a pace, so that a loop fills neither the
                         // database nor the devices' queues.
                         hub.pace(&agent);
+                        // A runtime's task event keeps its task, cleaned
+                        // here; one without a usable task is its text alone,
+                        // as a `notify` (ADR 0071, proposed).
+                        let task_event = match (kind, task_event) {
+                            (OutKind::TaskEvent, Some(event)) => {
+                                let sandbox = agent.split_once('/').map_or("", |(s, _)| s);
+                                event
+                                    .cleaned(sandbox)
+                                    .inspect_err(|e| {
+                                        eprintln!("enclos app: {agent}: a task event is kept as its text: {e}")
+                                    })
+                                    .ok()
+                            }
+                            (OutKind::TaskEvent, None) => {
+                                eprintln!(
+                                    "enclos app: {agent}: a task event without a readable task is kept as its text"
+                                );
+                                None
+                            }
+                            _ => None,
+                        };
                         let kind = match kind {
                             OutKind::Reply => "reply",
                             OutKind::Notify => "notify",
                             OutKind::Status => "status",
+                            OutKind::TaskEvent if task_event.is_some() => "task_event",
+                            OutKind::TaskEvent => "notify",
                         };
                         // A group this agent is a member of: its reply may end
                         // its turn, or pass, or come too late to be kept.
@@ -1132,13 +1160,14 @@ impl Hub {
                             From::Agent
                         };
                         let whole = ConversationMessage {
-                            suggested_replies: if kind == "status" {
+                            suggested_replies: if kind == "status" || kind == "task_event" {
                                 vec![]
                             } else {
                                 suggested_replies
                             },
                             question: None,
                             held_task: None,
+                            task_event,
                             conversation: conversation.clone(),
                             agent: agent.clone(),
                             from: "agent".to_owned(),
@@ -1410,7 +1439,17 @@ impl Hub {
         home: &Path,
         from: &From,
     ) -> Result<Option<i64>, String> {
-        let pieces = pieces(id, &measured(&whole, attachments))?;
+        let mut pieces = pieces(id, &measured(&whole, attachments))?;
+        // A task event is one line: what does not fit one message of its
+        // text is left out, rather than repeat the line.
+        if whole.task_event.is_some() && pieces.len() > 1 {
+            eprintln!(
+                "enclos app: {}: a task event's text is cut to its first message ({} left out)",
+                whole.agent,
+                pieces.len() - 1
+            );
+            pieces.truncate(1);
+        }
         let conversation = whole.conversation.as_str();
         // Sent again (its `ack` lost, or the bridge stopped before it): its
         // files were stored with it, and the plugin's copies, if the bridge
@@ -1429,13 +1468,14 @@ impl Hub {
         let media = self.media();
         let taken = take_attachments(home, &media, &whole.agent, conversation, attachments)?;
         let stored: Vec<StoredAttachment> = taken.iter().map(|t| t.stored.clone()).collect();
-        let seqs = match store.add_pieces_with_replies(
+        let seqs = match store.add_agent_pieces(
             &pieces,
             conversation,
             from,
             &whole.kind,
             &stored,
             &whole.suggested_replies,
+            whole.task_event.as_ref(),
         ) {
             Ok(Some(seqs)) => seqs,
             // Stored meanwhile, with copies of its own: the plugin's are
@@ -1470,8 +1510,10 @@ impl Hub {
         if let Some(owner) = store.owner(conversation).map_err(|e| e.to_string())? {
             // A runtime's `status` line is a quiet line about itself, which an
             // agent can also write: it waits for the next sync, unannounced.
+            // So does its task event, a line about a task (ADR 0071).
             if let Some(last) = last
                 && whole.kind != "status"
+                && whole.kind != "task_event"
             {
                 self.push_if_away(store, &owner, &whole.agent, conversation, last, &whole.text);
             }
@@ -1626,6 +1668,7 @@ pub(super) fn message_frame(store: &Store, m: super::store::Message) -> Result<T
         suggested_replies: m.suggested_replies,
         question: m.question,
         held_task: m.held_task,
+        task_event: m.task_event,
         conversation: ConversationId::new(m.conversation).map_err(|e| e.to_string())?,
         agent,
         from: match m.from {
@@ -2100,6 +2143,25 @@ enum Unread {
     Ended(String),
 }
 
+/// `body` as a device gets it: a task event, to a device that does not
+/// draw them (`task_events`) or kept without its task, is the runtime's text
+/// as a `notify`, as before task events (ADR 0071, proposed).
+pub(super) fn for_device(body: ToDevice, task_events: bool) -> ToDevice {
+    match body {
+        ToDevice::Message(mut m) => {
+            let drawn = task_events && m.kind == "task_event" && m.task_event.is_some();
+            if !drawn {
+                if m.kind == "task_event" {
+                    m.kind = "notify".to_owned();
+                }
+                m.task_event = None;
+            }
+            ToDevice::Message(m)
+        }
+        body => body,
+    }
+}
+
 /// What a device's connection is once the handshake is done.
 struct Link {
     socket: WebSocket<TcpStream>,
@@ -2108,6 +2170,9 @@ struct Link {
     heard: std::time::Instant,
     /// Negotiated on this authenticated connection alone.
     scoped_approvals: bool,
+    /// Whether the device draws task events (`task_events` in its `auth`);
+    /// one that does not gets each as a `notify`, its text alone.
+    task_events: bool,
 }
 
 impl Link {
@@ -2120,6 +2185,7 @@ impl Link {
     }
 
     fn send(&mut self, body: ToDevice) -> Result<(), String> {
+        let body = for_device(body, self.task_events);
         let id = MessageId::new(new_id().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let plain = encode_line(&Envelope::new(id, body));
         let sealed = self.session.encrypt(&plain).map_err(|e| e.to_string())?;
@@ -2389,6 +2455,7 @@ fn connection(
         session,
         heard: std::time::Instant::now(),
         scoped_approvals: false,
+        task_events: false,
     };
     let known = store
         .device_by_noise_key(&noise_key)
@@ -2520,6 +2587,7 @@ fn connection(
     hub.ensure_homes(&store);
     let (sender, outbox) = channel();
     link.scoped_approvals = device_capabilities.contains(&Capability::RuntimeApprovalScopes);
+    link.task_events = device_capabilities.contains(&Capability::TaskEvents);
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     {
         let mut devices = hub.devices.lock().expect("not poisoned");
@@ -4405,6 +4473,7 @@ fn send(
         suggested_replies: Vec::new(),
         question: None,
         held_task: None,
+        task_event: None,
         conversation: conversation.clone(),
         // A group is its sandbox's
         agent: if group { sandbox } else { name.clone() },
@@ -4735,6 +4804,16 @@ mod connection_end_tests {
     }
 
     fn connect_as(bridge: &Bridge, phone: &Phone, login: &str) -> (PhoneLink, Option<ToDevice>) {
+        connect_with(bridge, phone, login, Vec::new())
+    }
+
+    /// As [`connect_as`], the device's `auth` naming `capabilities`.
+    fn connect_with(
+        bridge: &Bridge,
+        phone: &Phone,
+        login: &str,
+        capabilities: Vec<Capability>,
+    ) -> (PhoneLink, Option<ToDevice>) {
         let mut device = handshake(bridge, &phone.noise_private, login).expect("no handshake");
         let signature: Signature = phone
             .signing
@@ -4744,7 +4823,7 @@ mod connection_end_tests {
             FromDevice::Auth {
                 device: phone.id.clone(),
                 sig: encode(signature.to_der().as_bytes()),
-                capabilities: Vec::new(),
+                capabilities,
             },
         );
         let first = device.receive();
@@ -4794,6 +4873,7 @@ mod connection_end_tests {
                                     kind: OutKind::Reply,
                                     reply_to: None,
                                     attachments: vec![],
+                                    task_event: None,
                                 });
                             }
                         }
@@ -4864,6 +4944,102 @@ mod connection_end_tests {
         assert_eq!(
             error_of(guest.receive()),
             (ErrorCode::NotAllowed, Some("board-guest".into()))
+        );
+    }
+
+    #[test]
+    fn a_device_gets_task_lines_only_when_its_auth_names_task_events() {
+        use enclos_protocol::task_event::{TaskEvent, TaskEventKind};
+
+        const PING: &str = "⏸ [enclos-org] @reviewer Kanban t_1 blocked: Which store?";
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-1", "lab", "main", PERSON).unwrap();
+        let event = TaskEvent {
+            task: "t_1".into(),
+            title: "S2a".into(),
+            assignee: Some("lab/reviewer".into()),
+            event: TaskEventKind::Blocked,
+            state: None,
+        };
+        // Kept before the devices connect: they get it at sync.
+        let seq = store
+            .add_agent_pieces(
+                &[("m-1".to_owned(), PING.to_owned())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap()
+            .unwrap()[0];
+        let next_message = |device: &mut PhoneLink| loop {
+            if let ToDevice::Message(m) = device.receive().expect("the bridge closed") {
+                return m;
+            }
+        };
+        let newer = paired(&bridge, "n-pixel");
+        let older = paired(&bridge, "n-pixel");
+        let (mut drawing, auth) =
+            connect_with(&bridge, &newer, PERSON, vec![Capability::TaskEvents]);
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        let (mut plain, auth) = connect_with(&bridge, &older, PERSON, Vec::new());
+        assert!(matches!(auth, Some(ToDevice::Authenticated { .. })));
+        for device in [&mut drawing, &mut plain] {
+            device.send(
+                "sync",
+                FromDevice::Sync {
+                    since: 0,
+                    open_items: false,
+                },
+            );
+        }
+        let synced = next_message(&mut drawing);
+        assert_eq!(
+            (synced.seq, synced.kind.as_str(), synced.task_event.as_ref()),
+            (seq, "task_event", Some(&event))
+        );
+        let synced = next_message(&mut plain);
+        assert_eq!(
+            (
+                synced.seq,
+                synced.kind.as_str(),
+                synced.task_event,
+                synced.text.as_str()
+            ),
+            (seq, "notify", None, PING)
+        );
+        // Live, the same: stored, then passed to the person's devices.
+        let live = store
+            .add_agent_pieces(
+                &[("m-2".to_owned(), PING.to_owned())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap()
+            .unwrap()[0];
+        let [.., line] = &store.messages_after("c-1", 0).unwrap()[..] else {
+            panic!("no message");
+        };
+        bridge
+            .hub
+            .deliver(PERSON, message_frame(&store, line.clone()).unwrap());
+        let got = next_message(&mut drawing);
+        assert_eq!(
+            (got.seq, got.kind.as_str(), got.task_event.as_ref()),
+            (live, "task_event", Some(&event))
+        );
+        let got = next_message(&mut plain);
+        assert_eq!(
+            (got.seq, got.kind.as_str(), got.task_event),
+            (live, "notify", None)
         );
     }
 
@@ -6284,6 +6460,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 kind: OutKind::Reply,
                 reply_to: None,
                 attachments: vec![],
+                task_event: None,
             };
             out.write_all(&encode_line(&Envelope::new(
                 MessageId::new("o-1").unwrap(),

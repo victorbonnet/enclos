@@ -443,6 +443,7 @@ fn kept_message(conversation: &str) -> Vec<u8> {
             kind: OutKind::Reply,
             reply_to: None,
             attachments: vec![],
+            task_event: None,
         },
     ))
 }
