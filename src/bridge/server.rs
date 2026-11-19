@@ -1570,15 +1570,18 @@ impl Hub {
             if plugin.sent.contains(&message.id) {
                 continue;
             }
+            let from_host = host.as_deref() == Some(message.person.as_str());
+            let signed = self.host_signature(store, agent, &message, from_host);
             let body = FromBridge::MessageIn {
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
                 // Whether the person is the host's. Not signed, so it grants
                 // nothing: runtime approvals are decided with the app's
                 // buttons, whose decisions the bridge signs (ADR 0060).
-                host: Some(host.as_deref() == Some(message.person.as_str())),
+                host: Some(from_host),
                 person: Person::new(message.person).map_err(|e| e.to_string())?,
                 text: message.text,
+                signed,
             };
             let id = MessageId::new(message.id.clone()).map_err(|e| e.to_string())?;
             if let Err(e) = plugin.writer.send_as(&id, body) {
@@ -1594,6 +1597,37 @@ impl Hub {
             plugin.sent.insert(message.id);
         }
         Ok(())
+    }
+
+    /// The bridge's signature of `message` as it now goes to `agent`'s
+    /// plugin (ADR 0077, proposed): only for the host's person's message in
+    /// a direct conversation, which a device sent, and only when the bridge
+    /// holds its signing key. Signed as it is sent, so that a message
+    /// waiting for its plugin is fresh when it arrives. A conversation whose
+    /// members cannot be read is not known to be direct: its message goes
+    /// unsigned, as any other person's, rather than not at all.
+    fn host_signature(
+        &self,
+        store: &Store,
+        agent: &str,
+        message: &super::store::Pending,
+        from_host: bool,
+    ) -> Option<enclos_protocol::decision::SignedDecision> {
+        let key = self.approval_key.as_ref()?;
+        let direct = store
+            .members(&message.conversation)
+            .is_ok_and(|members| members.is_empty());
+        if !from_host || !direct {
+            return None;
+        }
+        let statement = enclos_protocol::decision::HostMessage {
+            agent,
+            conversation: &message.conversation,
+            id: &message.id,
+            person: &message.person,
+            text: &message.text,
+        };
+        Some(key.sign_message(&statement, now()))
     }
 }
 

@@ -47,9 +47,11 @@ export function readToken(file) {
 function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 
 export class ChannelTransport {
-  constructor(account, { onMessage, onControl, onHello, onStop = () => {}, capabilities = [], canDeliver = () => true, supportsAttachments = false }) {
+  constructor(account, { onMessage, onControl, onHello, onStop = () => {}, capabilities = [], canDeliver = () => true, supportsAttachments = false, admit = () => {} }) {
     this.account = account;
     this.onMessage = onMessage;
+    // Refuses a message (by throwing) before it binds a route or leaves a receipt.
+    this.admit = admit;
     this.onControl = onControl;
     this.onHello = onHello;
     this.onStop = onStop;
@@ -334,6 +336,7 @@ export class ChannelTransport {
       throw new ProtocolError('agent_unavailable', 'earlier native delivery is uncertain and will not be replayed');
     }
     if (this.inflight.size >= MAX_INFLIGHT) throw new ProtocolError('agent_unavailable', 'the agent is busy; try again after a message finishes');
+    this.admit(incoming);
     const route = this.route(incoming.conversation, incoming.person);
     const receipts = this.state.receipts;
     const previousOrder = route.order;

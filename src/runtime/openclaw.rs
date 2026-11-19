@@ -45,7 +45,13 @@ const INSTALL_APP: &str = "exec \"$HOME/bin/openclaw\" plugins install --link \"
 /// send it to the proxy, which refuses loopback. Its output goes nowhere:
 /// what it has to say is in the report.
 const USAGE_READER: &str = "script=$1; shift\nexport OPENCLAW_HOME=\"$HOME\" OPENCLAW_STATE_DIR=\"$HOME/.openclaw\" OPENCLAW_CONFIG_PATH=\"$HOME/.openclaw/openclaw.json\" OPENCLAW_SUPERVISOR_MODE=external OPENCLAW_SERVICE_REPAIR_POLICY=external OPENCLAW_NO_RESPAWN=1 OPENCLAW_DISABLE_BONJOUR=1 OPENCLAW_LOAD_SHELL_ENV=0 OPENCLAW_EXEC_SHELL_SNAPSHOT=0 ENCLOS_OPENCLAW_USAGE=1\nproxy_port=${HTTP_PROXY##*:}\ncase \"$proxy_port\" in ''|*[!0-9]*) ;; *) if [ \"$proxy_port\" -ge 41000 ] && [ \"$proxy_port\" -le 41999 ]; then export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000)); fi ;; esac\nexec \"$HOME/.local/share/openclaw/tools/node/bin/node\" --input-type=module -e \"$script\" \"$@\" </dev/null >/dev/null 2>&1";
-const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind --agent \"$agent\" --bind \"enclos:$agent\" --json\n\"$HOME/bin/openclaw\" config set channels.enclos.enabled true\nexec \"$HOME/bin/openclaw\" config set \"channels.enclos.accounts.$agent.enabled\" true";
+/// `$2` is [`OWNER`]: the owner entry is written after the account's other
+/// settings (its `bridgeKey` among them) and before the account is enabled,
+/// so a configure that fails before then names no owner (ADR 0077).
+const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind --agent \"$agent\" --bind \"enclos:$agent\" --json\n\"$HOME/bin/openclaw\" config set channels.enclos.enabled true\nsh -c \"$2\" enclos-openclaw-owner\nexec \"$HOME/bin/openclaw\" config set \"channels.enclos.accounts.$agent.enabled\" true";
+/// Names the sender the app channel gives the host's person's signed
+/// messages one of OpenClaw's owners, keeping the others (ADR 0077).
+const OWNER: &str = include_str!("openclaw/owner");
 
 fn at(path: &str) -> HomePath {
     HomePath::new(path).expect("a literal home-relative path")
@@ -545,6 +551,7 @@ impl RuntimeAdapter for OpenClaw {
                 ENABLE_APP,
                 "enclos-enable-app",
                 agent.as_str(),
+                OWNER,
             ]));
         }
         Some(setting(key, value))
@@ -624,6 +631,10 @@ impl RuntimeAdapter for OpenClaw {
                 (
                     plugin.child("usage.js")?,
                     include_str!("../../channels/openclaw/usage.js"),
+                ),
+                (
+                    plugin.child("host-messages.js")?,
+                    include_str!("../../channels/openclaw/host-messages.js"),
                 ),
                 (
                     plugin.child("openclaw.plugin.json")?,
@@ -1382,6 +1393,7 @@ mod tests {
         let install = app.commands[0].shown();
         assert!(install.contains("plugins install --link"));
         assert!(install.contains("--no-enable --accept-capabilities"));
+        assert_eq!(app.commands.len(), 1);
         assert!(
             !app.settings
                 .iter()
@@ -1408,6 +1420,22 @@ mod tests {
             .shown();
         assert!(activate.contains("agents bind --agent"));
         assert!(activate.contains("enclos:$agent"));
+        // ADR 0077: the owner entry comes after every other setting and just
+        // before the account is enabled, and only by OpenClaw's
+        // compare-and-set, so another owner is never replaced.
+        assert!(activate.contains("enclos:host"));
+        assert!(activate.contains("--expect-current-json"));
+        assert!(activate.contains("--expect-current-absent"));
+        assert!(
+            ENABLE_APP.find("channels.enclos.enabled true").unwrap()
+                < ENABLE_APP.find("enclos-openclaw-owner").unwrap()
+        );
+        assert!(
+            ENABLE_APP.find("enclos-openclaw-owner").unwrap()
+                < ENABLE_APP
+                    .find("\"channels.enclos.accounts.$agent.enabled\" true")
+                    .unwrap()
+        );
         assert!(
             ENABLE_APP.find("agents bind").unwrap()
                 < ENABLE_APP.find("channels.enclos.enabled true").unwrap()

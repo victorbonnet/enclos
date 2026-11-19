@@ -1,0 +1,22 @@
+#!/bin/sh
+# Names the sender the enclos channel gives the host's person's signed
+# messages one of OpenClaw's owners (ADR 0077, proposed). Every other entry,
+# such as a Telegram owner, is kept; the list is only written if nobody
+# changed it meanwhile. OpenClaw's `config get --json` exits 1 for an unset
+# path; any other failure makes the compare-and-set below fail too.
+set -eu
+openclaw="$HOME/bin/openclaw"
+node="$HOME/.local/share/openclaw/tools/node/bin/node"
+entry=enclos:host
+if current=$("$openclaw" config get commands.ownerAllowFrom --json); then
+  next=$("$node" -e '
+const [current, entry] = process.argv.slice(1);
+const list = current.trim() === "" ? null : JSON.parse(current);
+if (list !== null && !Array.isArray(list)) throw new Error("commands.ownerAllowFrom is not a list");
+if (!(list ?? []).some(value => typeof value === "string" && value.trim().toLowerCase() === entry)) {
+  process.stdout.write(JSON.stringify([...(list ?? []), entry]));
+}' "$current" "$entry")
+  [ -n "$next" ] || exit 0
+  exec "$openclaw" config set commands.ownerAllowFrom "$next" --strict-json --expect-current-json "$current"
+fi
+exec "$openclaw" config set commands.ownerAllowFrom "[\"$entry\"]" --strict-json --expect-current-absent

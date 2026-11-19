@@ -222,6 +222,7 @@ fn a_message_reads_as_its_fields_say() {
         person,
         text,
         host,
+        signed,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
@@ -233,6 +234,7 @@ fn a_message_reads_as_its_fields_say() {
         host, None,
         "a message.in without host comes from an older bridge"
     );
+    assert_eq!(signed, None, "an unsigned message.in grants nothing");
 
     let message = decode_from_plugin(FROM_PLUGIN[2].1.as_bytes()).unwrap();
     let FromPlugin::MessageOut { kind, reply_to, .. } = message.body else {
