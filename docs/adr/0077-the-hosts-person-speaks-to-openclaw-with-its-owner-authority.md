@@ -20,11 +20,11 @@ The Hermes plugin ignores the signature for now: a Hermes agent already manages 
 
 Reason: OpenClaw's owner is the person a bot belongs to, writing on their own channel, which the host's person in a direct conversation is. The bridge already holds a key no sandbox reads and the plugin already trusts, so a second label proves the person without a new secret or a new setting. Naming a fixed sender, not the person, keeps the person's identity out of the sandbox's settings and the entry the same when the host's person changes.
 
+Considered options: writing the host's person into `commands.ownerAllowFrom` with no signature, which also makes `enclos app chat` and group turns the owner's and is what 0060 refused for typed approvals; and a key of its own, which needs a second public key in every channel's settings for no separation the label does not already give.
+
 ## Consequences
 
 - In those turns the agent can create, change and remove its runtime's scheduled jobs and change OpenClaw's settings, also when a page or file it reads that turn steers it there. The sandbox's policy still bounds what it reaches; its spending is bounded only by its model provider and accounts.
 - Once an owner is named for the channel, OpenClaw runs its text commands (`/model`, `/new` and the like) only for the owner: other persons, `enclos app chat` and group turns may still use `/reset`, not the others.
 - A message with files is not the owner's until the statement covers its attachments.
 - That a running OpenClaw gateway grants `automations` to a signed Home message, and refuses it to an unsigned one, is to verify on a real host (design §14).
-
-Considered options: writing the host's person into `commands.ownerAllowFrom` with no signature, which also makes `enclos app chat` and group turns the owner's and is what 0060 refused for typed approvals; and a key of its own, which needs a second public key in every channel's settings for no separation the label does not already give.
