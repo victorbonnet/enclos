@@ -116,7 +116,7 @@ impl Engine {
         confirm: Confirm,
     ) -> Result<Planned<Configured>> {
         let runtime = adapter(self.runtime_of(name)?);
-        self.configure_agent_with(by, name, agent, channel, settings, confirm, runtime)
+        self.configure_agent_with(by, name, agent, channel, settings, confirm, &*runtime)
     }
 
     /// `configure_agent` with its adapter given, so tests can exercise a
