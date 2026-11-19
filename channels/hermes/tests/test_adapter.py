@@ -65,6 +65,8 @@ def _hermes_stand_ins() -> dict:
 
     class MessageType:
         TEXT = "text"
+        PHOTO = "photo"
+        DOCUMENT = "document"
 
     modules = {
         "gateway": types.ModuleType("gateway"),
@@ -214,6 +216,49 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             ack = json.loads(await asyncio.wait_for(reader.readline(), 5))
             self.assertEqual(ack["of"], json.loads(again)["id"])
         self.assertEqual([e.text for e in self.adapter.received], ["hi"])
+        writer.close()
+
+    async def test_a_message_with_files_reaches_the_runtime_whole_with_its_media(self):
+        import base64
+        files = [{"name": "doc.pdf", "mime": "application/pdf", "size": 3}]
+        begin = line("message.in", conversation="c-1", person="alice@example.com", text="read", files=files)
+        message_id = json.loads(begin)["id"]
+        data = base64.urlsafe_b64encode(b"%PD").decode().rstrip("=")
+
+        def part(data: str) -> bytes:
+            return line("message.part", message=message_id, file=0, offset=0, data=data)
+
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        root = os.path.join(self.dir, "app", "incoming", "main")
+        # A part that cannot be read drops the whole message
+        writer.write(begin + part("a+b/"))
+        errors = [json.loads(await asyncio.wait_for(reader.readline(), 5)) for _ in range(2)]
+        self.assertEqual((errors[1]["code"], errors[1]["of"]), ("bad_message", message_id))
+        self.assertEqual(os.listdir(root), [])
+        # The connection ends before the last byte: nothing reaches the runtime, nothing stays
+        writer.write(begin + part(data[:2]))
+        await writer.drain()
+        writer.close()
+        for _ in range(250):
+            if self.adapter._bridge is None:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual(os.listdir(root), [])
+        self.assertEqual(self.adapter.received, [])
+        # Sent again whole, then once more after it was taken: one turn
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        for _ in range(2):
+            writer.write(begin + part(data))
+            await writer.drain()
+            ack = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            self.assertEqual((ack["type"], ack["of"]), ("ack", message_id))
+        [event] = self.adapter.received
+        self.assertEqual((event.text, event.message_type, event.media_types), ("read", "document", ["application/pdf"]))
+        with open(event.media_urls[0], "rb") as f:
+            self.assertEqual(f.read(), b"%PD")
+        self.assertTrue(event.media_urls[0].startswith(root + os.sep))
         writer.close()
 
     async def test_a_line_over_the_limit_closes_the_connection(self):

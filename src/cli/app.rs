@@ -848,6 +848,7 @@ fn typed_message(conversation: &ConversationId, person: &Person, text: &str) -> 
         person: person.clone(),
         text: text.to_owned(),
         host: Some(false),
+        files: Vec::new(),
     }
 }
 
@@ -1148,6 +1149,7 @@ mod tests {
                     person: person.clone(),
                     text: text.into(),
                     host: Some(false),
+                    files: Vec::new(),
                 }
             );
         }

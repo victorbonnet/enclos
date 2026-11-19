@@ -38,6 +38,8 @@ mod forget;
 mod group_turns;
 #[path = "held_tasks.rs"]
 mod held_tasks;
+#[path = "incoming.rs"]
+mod incoming;
 #[path = "models.rs"]
 mod models;
 #[path = "open_items.rs"]
@@ -1471,12 +1473,16 @@ impl Hub {
         self.plugin(agent)?;
         // The plugins lock is let go before writing: a write waits for the
         // plugin to read, up to the plugin leg's write timeout
-        let (out, generation) = {
+        let (out, generation, takes_files) = {
             let plugins = self.plugins.lock().expect("not poisoned");
             let Some(plugin) = plugins.get(agent) else {
                 return Err(format!("{agent}'s app channel closed"));
             };
-            (Arc::clone(&plugin.out), plugin.generation)
+            (
+                Arc::clone(&plugin.out),
+                plugin.generation,
+                plugin.capabilities.contains(&Capability::IncomingFiles),
+            )
         };
         let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
@@ -1490,7 +1496,23 @@ impl Hub {
             if plugin.sent.contains(&message.id) {
                 continue;
             }
+            // A message with files goes whole, to a plugin that takes them,
+            // or waits: never as its text alone (ADR 0076, proposed).
+            let files = match incoming::stored_files(self, store, &message.id) {
+                Ok(files) if files.is_empty() || takes_files => files,
+                Ok(_) => {
+                    eprintln!(
+                        "enclos app: {agent}: a message with files waits for an app channel that takes them"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("enclos app: {agent}: a message's files cannot be sent: {e}");
+                    continue;
+                }
+            };
             let body = FromBridge::MessageIn {
+                files: files.iter().map(|(file, _)| file.clone()).collect(),
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
                 // Whether the person is the host's. Not signed, so it grants
@@ -1501,7 +1523,7 @@ impl Hub {
                 text: message.text,
             };
             let id = MessageId::new(message.id.clone()).map_err(|e| e.to_string())?;
-            if let Err(e) = plugin.writer.send_as(&id, body) {
+            if let Err(e) = incoming::send_with_files(&mut plugin.writer, &id, body, files) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
                 drop(plugin);
@@ -2680,6 +2702,9 @@ fn run_session(
     // The newest `seq` of the person's messages this connection sent, once
     // its device synced; none before.
     let mut sent: Option<i64> = None;
+    // The message with files being sent on this connection: dropped, with
+    // its files, when the connection ends first.
+    let mut upload: Option<incoming::Upload> = None;
     loop {
         if link.heard.elapsed() > hub.silence {
             return Err(SILENT.to_owned());
@@ -2700,6 +2725,10 @@ fn run_session(
             Ok(None) => continue,
             Err(Unread::Refused(error)) => {
                 link.send(ToDevice::Error(error))?;
+                // A malformed part, or any line unread, drops the message with files
+                if let Some(answer) = incoming::dropped(&mut upload) {
+                    link.send(answer)?;
+                }
                 continue;
             }
             Err(Unread::Ended(why)) => return Err(why),
@@ -3304,6 +3333,20 @@ fn run_session(
             }
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
+                    // After the echo, which the outbox holds
+                    drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
+                    link.send(answer)?;
+                }
+            }
+            FromDevice::MessageBegin(begin) => {
+                let begun = incoming::begin(hub, store, device, &mut upload, message.id, begin)?;
+                if let Some(answer) = begun {
+                    link.send(answer)?;
+                }
+            }
+            FromDevice::MessagePart(part) => {
+                let answer = incoming::part(hub, store, device, &mut upload, message.id, part)?;
+                if let Some(answer) = answer {
                     // After the echo, which the outbox holds
                     drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
                     link.send(answer)?;
@@ -4451,6 +4494,8 @@ mod connection_end_tests {
 
     const PERSON: &str = "victor@example.com";
     const TOKEN: &str = "t0ken";
+
+    mod incoming_tests;
 
     /// A bridge on a free port of the loopback, serving `lab/main`, whose
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs

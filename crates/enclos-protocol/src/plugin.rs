@@ -120,7 +120,20 @@ pub enum FromBridge {
         /// (`None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<bool>,
+        /// The files the person sent with it (ADR 0076, proposed), only to a
+        /// plugin that names [`Capability::IncomingFiles`]: their bytes follow
+        /// in `message.part`s naming this message's id, and the plugin gives
+        /// the runtime the message once it has every byte.
+        #[serde(
+            default,
+            deserialize_with = "crate::incoming::some_files",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        files: Vec<crate::incoming::IncomingFile>,
     },
+    /// The next bytes of a file of a `message.in` with files.
+    #[serde(rename = "message.part")]
+    MessagePart(crate::incoming::Part),
     /// Requests cancellation of this exact ingress, when the plugin advertises
     /// `abort`. Unknown or settled targets have no effect on later turns. An ack
     /// accepts the request; it does not certify native cleanup has drained.
@@ -156,6 +169,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "policy.context",
     "hello",
     "message.in",
+    "message.part",
     "turn.abort",
     "conversation.rename",
     "conversation.delete",
@@ -425,6 +439,10 @@ pub enum Capability {
     /// It reads and changes the agent's model with the runtime's own
     /// catalogue and setting (`model.request`).
     Model,
+    /// It takes the files a person sends with a message (`message.in`'s
+    /// `files`, `message.part`), writes them inside its sandbox and gives
+    /// them to the runtime with the message (ADR 0076, proposed).
+    IncomingFiles,
     #[serde(other)]
     Unknown,
 }

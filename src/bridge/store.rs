@@ -2225,6 +2225,28 @@ impl Store {
         })
     }
 
+    /// [`Store::add_from_device`], with the records of its `files`, in one
+    /// transaction: none of them when the message was stored before.
+    pub fn add_from_device_with_files(
+        &self,
+        origin: &str,
+        id: &str,
+        conversation: &str,
+        person: &str,
+        text: &str,
+        files: &[StoredAttachment],
+    ) -> rusqlite::Result<Added> {
+        let transaction = self.db.unchecked_transaction()?;
+        let added = self.add_from_device(origin, id, conversation, person, text)?;
+        if let Added::New(_) = added {
+            for file in files {
+                self.add_attachment(file, id)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(added)
+    }
+
     /// A person's message in a group, from a device, as
     /// [`Store::add_from_device`] stores one, but given to no plugin: the
     /// bridge runs the group's turns itself.

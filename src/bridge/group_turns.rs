@@ -504,6 +504,7 @@ impl Hub {
                     person,
                     text: text.to_owned(),
                     host: Some(host),
+                    files: Vec::new(),
                 },
             )
             .map_err(|e| e.to_string())

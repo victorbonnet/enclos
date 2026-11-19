@@ -31,6 +31,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
 from . import conversations
+from . import incoming
 from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
@@ -97,6 +98,9 @@ class EnclosAdapter(BasePlatformAdapter):
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
+        # The files a person sends with a message, written beside the socket
+        # (ADR 0076, proposed).
+        self._incoming = incoming.Receiver(self._path, self._agent)
         # Work beside the connection (routine controls, deletions, the report
         # after a hello), kept so that none is collected early.
         self._routine_tasks: set[asyncio.Task] = set()
@@ -232,6 +236,7 @@ class EnclosAdapter(BasePlatformAdapter):
             if self._held.native:
                 capabilities.append("held_tasks")
             capabilities.extend(self._reporter.capabilities)
+            capabilities.append("incoming_files")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
@@ -278,6 +283,8 @@ class EnclosAdapter(BasePlatformAdapter):
         finally:
             # Only the connection that holds the slot gives it back
             if self._bridge is writer:
+                # A message whose bytes did not all come: the bridge sends it again
+                self._incoming.drop()
                 self._held.stop()
                 self._bridge = None
                 self._bridge_usage = False
@@ -330,6 +337,10 @@ class EnclosAdapter(BasePlatformAdapter):
             message = protocol.decode_from_bridge(line)
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), e.message_id))
+            # A line unread, a bad part or any other, drops the message with files whole
+            dropped = self._incoming.drop()
+            if dropped is not None:
+                await self._write(protocol.error("bad_message", "a line could not be read during its files", dropped))
             # A version this plugin does not speak ends the connection
             # (docs/protocol.md, Errors); any other bad message does not
             return e.code != "version"
@@ -343,7 +354,22 @@ class EnclosAdapter(BasePlatformAdapter):
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
         elif kind == "message.in":
-            await self._on_message(message)
+            if message.get("files") and message["id"] not in self._seen:
+                # Given to the runtime once its files' last byte came
+                try:
+                    self._incoming.begin(message)
+                except incoming.Refused as e:
+                    await self._write(protocol.error(e.code, str(e), e.message_id))
+            else:
+                await self._on_message(message)
+        elif kind == "message.part":
+            try:
+                received = self._incoming.part(message)
+            except incoming.Refused as e:
+                await self._write(protocol.error(e.code, str(e), e.message_id))
+                return True
+            if received is not None:
+                await self._on_message(received[0], received[1:])
         elif kind == "turn.abort":
             try:
                 await self._interrupts.abort(message)
@@ -427,7 +453,9 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.error("[%s] A model request could not answer", self.name, exc_info=True)
             await self._write(protocol.error("unknown", model.UNKNOWN, message["id"]))
 
-    async def _on_message(self, message: dict[str, Any]) -> None:
+    async def _on_message(self, message: dict[str, Any], media: Optional[tuple] = None) -> None:
+        """Gives the runtime a person's message; `media` is its files' paths in
+        the sandbox, their media types and their names, when it has files."""
         if message["id"] in self._seen:
             # The runtime has it: the ack was lost on the way
             await self._write(protocol.ack(message["id"]))
@@ -435,16 +463,31 @@ class EnclosAdapter(BasePlatformAdapter):
         # enclos keeps the home channel (the agent's Home): /sethome is
         # answered here, not run, which would move it into this conversation.
         if protocol.is_home_command(message["text"]):
-            await self.send(message["conversation"], protocol.HOME_ANSWER, reply_to=message["id"])
+            # The bridge refuses files with it; any that came are said to go nowhere
+            answer = protocol.HOME_ANSWER + (" The files sent with it were not given to the agent." if media else "")
+            await self.send(message["conversation"], answer, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
         self._last_in[message["conversation"]] = (message["id"], asyncio.get_running_loop().time())
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
-        event = MessageEvent(
-            text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
-            raw_message=message, timestamp=datetime.now(tz=UTC))
+        if media:
+            # As Hermes's own platforms hand it media: paths it reads, each with
+            # its type, so a photo goes to vision and a document is noted by path
+            paths, types, names = media
+            kind = MessageType.PHOTO if any(t.startswith("image/") for t in types) else MessageType.DOCUMENT
+            event = MessageEvent(
+                text=message["text"], message_type=kind, source=source, message_id=message["id"],
+                raw_message=message, timestamp=datetime.now(tz=UTC),
+                media_urls=list(paths), media_types=list(types))
+            if hasattr(event, "media_filenames"):
+                # A newer Hermes shows the person's own names
+                event.media_filenames = list(names)
+        else:
+            event = MessageEvent(
+                text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
+                raw_message=message, timestamp=datetime.now(tz=UTC))
         # Hermes reads its approval commands from whoever it is told speaks, and a
         # message carries no proof of its person: `host` is the bridge's word, which
         # any program with the token can send. So none is passed on, read with

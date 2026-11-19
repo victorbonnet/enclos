@@ -199,10 +199,12 @@ fn a_message_reads_as_its_fields_say() {
         person,
         text,
         host,
+        files,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
     };
+    assert!(files.is_empty(), "a message.in without files has none");
     assert_eq!(conversation.as_str(), "c-42");
     assert_eq!(person.as_str(), "alice@example.com");
     assert_eq!(text, "What's the weather in Paris?");
