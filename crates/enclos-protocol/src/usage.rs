@@ -15,6 +15,8 @@ pub const MAX_CALL_TOKENS: u64 = 1 << 40;
 pub const MAX_CALLS: u32 = 1_000;
 /// The most characters of a model's name passed on.
 pub const MAX_MODEL_CHARS: usize = 120;
+/// The most characters of a model provider's name passed on.
+pub const MAX_PROVIDER_CHARS: usize = 64;
 
 /// Token counts. `None`: the runtime does not count it, which is not 0.
 /// `input` is input not read from or written to the provider's cache.
@@ -135,6 +137,11 @@ pub struct CallUsage {
     /// The model, as the runtime names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The model provider that served it, as the runtime names it
+    /// (Hermes: `anthropic`, `openai-codex`), so that the bridge prices it
+    /// (issue #343).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// A call the runtime made on its own (a title, a summary of a long
     /// context), not one of the agent's answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -160,6 +167,8 @@ pub struct AgentCallUsage {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
     #[serde(default = "one", skip_serializing_if = "is_one")]
@@ -176,8 +185,10 @@ pub struct UsageTotal {
 }
 
 /// The most agents one `usage.report` lists: far more than a host runs,
-/// and few enough to fit one device message.
-pub const MAX_REPORT_AGENTS: usize = 190;
+/// and few enough, with their costs, to fit one device message.
+pub const MAX_REPORT_AGENTS: usize = 110;
+/// The most sandboxes one `usage.report` gives a total of: the heaviest.
+pub const MAX_REPORT_SANDBOXES: usize = 20;
 
 /// What one agent used over a window, in a `usage.report`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,15 +202,31 @@ pub struct AgentUsage {
     /// device says.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outside: bool,
+    /// What it cost, as the bridge estimates it from the host's price
+    /// list: from a bridge that names `usage.cost`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<UsageCost>,
+}
+
+/// What one sandbox's agents used over a window, all of them summed, in a
+/// `usage.report` from a bridge that names `usage.cost`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxTotal {
+    pub sandbox: String,
+    pub total: UsageTotal,
+    pub cost: UsageCost,
 }
 
 /// The bucket sizes a device may ask a series in: an hour, or a day.
 pub const BUCKETS: [u32; 2] = [3_600, 86_400];
 /// The most agents a `usage.report` with series lists totals of: the
 /// heaviest, so that they and the series fit one device message.
-pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 50;
+pub const MAX_REPORT_AGENTS_WITH_SERIES: usize = 20;
 /// The most agents a `usage.report` gives a series of: the heaviest.
 pub const MAX_SERIES: usize = 8;
+/// The most agents a report for one sandbox or agent gives a series of,
+/// beside the series of their sum.
+pub const MAX_SCOPED_SERIES: usize = 4;
 /// The most buckets in one series: the latest.
 pub const MAX_POINTS: usize = 62;
 /// The furthest a device's offset from UTC may be, in seconds.
@@ -215,6 +242,9 @@ pub struct UsagePoint {
     /// runtime counted no token, which is not 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    /// What it cost, in a report's `sum` series alone (`usage.cost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<UsageCost>,
 }
 
 /// One agent's usage over time, in a `usage.report`: its buckets that saw

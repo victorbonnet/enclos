@@ -21,6 +21,8 @@ CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
 MAX_MODEL_CHARS = 120
+# The most characters of a model provider's name passed on.
+MAX_PROVIDER_CHARS = 64
 # The token counts a `usage` message may carry; one the runtime does not
 # keep is left out, which the bridge reads as not counted, not 0.
 USAGE_TOKENS = ("input", "output", "cache_read", "cache_write", "reasoning")
@@ -395,14 +397,18 @@ def tool(conversation: str, call: str, name: str, phase: str, label: str | None 
 
 
 def usage(conversation: str, tokens: dict[str, Any], model: str | None = None,
-          background: bool = False) -> dict[str, Any]:
+          background: bool = False, provider: str | None = None) -> dict[str, Any]:
     """What one model call of the agent consumed: `tokens` by the names of
-    `USAGE_TOKENS`, each a whole number of at least 0, the others left out."""
+    `USAGE_TOKENS`, each a whole number of at least 0, the others left out;
+    `provider`, the model provider that served it, as Hermes names it, so
+    that the bridge prices it."""
     counts = {k: int(v) for k, v in tokens.items()
               if k in USAGE_TOKENS and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
     fields: dict[str, Any] = {"conversation": conversation}
     if model:
         fields["model"] = " ".join(str(model).split())[:MAX_MODEL_CHARS]
+    if provider:
+        fields["provider"] = " ".join(str(provider).split())[:MAX_PROVIDER_CHARS]
     if background:
         fields["background"] = True
     fields["tokens"] = counts
@@ -413,11 +419,11 @@ MAX_SOURCE_CHARS = 32
 
 
 def agent_usage(tokens: dict[str, Any], model: str | None = None, background: bool = False,
-                source: str | None = None) -> dict[str, Any]:
+                source: str | None = None, provider: str | None = None) -> dict[str, Any]:
     """What a model call of the agent outside any app conversation used (a
     routine's run, a talk in the sandbox, another channel's chat): `source`
     says where it came from, in Hermes's words (`cron`, `cli`, `telegram`)."""
-    message = usage("", tokens, model=model, background=background)
+    message = usage("", tokens, model=model, background=background, provider=provider)
     del message["conversation"]
     message["type"] = "usage.agent"
     if source:

@@ -191,12 +191,17 @@ impl PriceList {
     /// The list enclos ships. It is read at build time and checked by a
     /// test, so it always reads.
     pub fn bundled() -> PriceList {
-        let mut list = PriceList::empty();
-        if let Err(why) = list.add(BUNDLED, Origin::Bundled) {
-            // The bundled list is checked by a test (`the_bundled_list_reads`).
-            unreachable!("the bundled price list does not read: {why}")
-        }
-        list
+        static BUNDLED_LIST: std::sync::OnceLock<PriceList> = std::sync::OnceLock::new();
+        BUNDLED_LIST
+            .get_or_init(|| {
+                let mut list = PriceList::empty();
+                if let Err(why) = list.add(BUNDLED, Origin::Bundled) {
+                    // Checked by a test (`the_bundled_list_reads_and_prices_a_known_model`).
+                    unreachable!("the bundled price list does not read: {why}")
+                }
+                list
+            })
+            .clone()
     }
 
     fn empty() -> PriceList {

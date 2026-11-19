@@ -869,7 +869,8 @@ def _kanban_ticked(**_: Any) -> None:
     return None
 
 
-def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any = None, **_: Any) -> None:
+def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any = None,
+           provider: Any = None, **_: Any) -> None:
     """Passes on what a model call used, from Hermes's `post_api_request`
     (the agent's own calls) or `post_auxiliary_call` (a title, a summary of
     a long context: background). A call of a turn in an app conversation
@@ -897,12 +898,16 @@ def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any
         # Hermes's normalized buckets (`agent/usage_pricing.CanonicalUsage`).
         tokens = {name: usage.get(name + "_tokens") for name in protocol.USAGE_TOKENS}
         model = model if isinstance(model, str) else None
+        # The model provider Hermes called, so that the bridge prices the
+        # call (`openai-codex`, a subscription, costs nothing in dollars).
+        provider = provider if isinstance(provider, str) else None
         platform = get_session_env("HERMES_SESSION_PLATFORM") or platform
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
         if platform == PLATFORM:
             if not chat_id:
                 return None
-            message = protocol.usage(chat_id, tokens, model=model, background=background)
+            message = protocol.usage(chat_id, tokens, model=model, background=background,
+                                     provider=provider)
             # Every connected adapter whose bridge takes them: the bridge
             # keeps usage only for a conversation of its connection's agent.
             for adapter in list(_ADAPTERS):
@@ -924,7 +929,8 @@ def _usage(background: bool, usage: Any = None, model: Any = None, platform: Any
                        "its usage outside the app is not passed on")
             return None
         message = protocol.agent_usage(tokens, model=model, background=background,
-                                       source=platform if isinstance(platform, str) else None)
+                                       source=platform if isinstance(platform, str) else None,
+                                       provider=provider)
         for adapter in list(_ADAPTERS):
             if adapter._agent == agent and getattr(adapter, "_bridge_agent_usage", False):
                 adapter._loop.call_soon_threadsafe(lambda a=adapter: asyncio.ensure_future(a._write(message)))

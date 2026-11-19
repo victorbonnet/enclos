@@ -79,7 +79,9 @@ use enclos_protocol::plugin::{
     Capability, Command, ErrorBody, ErrorCode, FromBridge, FromPlugin, OutAttachment, OutKind,
     ToolStep,
 };
-use enclos_protocol::usage::{CallUsage, MAX_CALLS, MAX_MODEL_CHARS, UsageUpdate};
+use enclos_protocol::usage::{
+    CallUsage, MAX_CALLS, MAX_MODEL_CHARS, MAX_PROVIDER_CHARS, UsageUpdate,
+};
 use enclos_protocol::{ConversationId, DecodeError, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::protocol::WebSocketConfig;
@@ -1298,11 +1300,22 @@ impl Hub {
                         hub.pace_usage(&agent);
                         let at = crate::bridge::store::now();
                         let calls = call.calls.min(MAX_CALLS);
-                        // Under the connection's agent, by the hour; where
-                        // the plugin says the calls came from is not kept.
-                        if let Err(e) =
-                            store.add_agent_usage(&agent, at, calls, call.tokens.bounded())
-                        {
+                        let model = one_line(call.model.as_deref(), MAX_MODEL_CHARS);
+                        let provider = one_line(call.provider.as_deref(), MAX_PROVIDER_CHARS);
+                        let served = crate::bridge::store::Served {
+                            model: model.as_deref(),
+                            provider: provider.as_deref(),
+                        };
+                        // Under the connection's agent, by the hour, model
+                        // and model provider; where the plugin says the
+                        // calls came from is not kept.
+                        if let Err(e) = store.add_agent_usage_by(
+                            &agent,
+                            at,
+                            served,
+                            calls,
+                            call.tokens.bounded(),
+                        ) {
                             eprintln!("enclos app: {agent}: usage not kept: {e}");
                         }
                     }
@@ -1727,17 +1740,19 @@ fn call_usage(
     };
     let calls = call.calls.min(MAX_CALLS);
     let tokens = call.tokens.bounded();
-    let total = store.add_usage(id, &member, at, calls, tokens)?;
-    let model = call.model.as_deref().map(|m| {
-        let words: Vec<&str> = m.split_whitespace().collect();
-        let cut: String = words.join(" ").chars().take(MAX_MODEL_CHARS).collect();
-        enclos_protocol::visible::revealed(&cut)
-    });
+    let model = one_line(call.model.as_deref(), MAX_MODEL_CHARS);
+    let provider = one_line(call.provider.as_deref(), MAX_PROVIDER_CHARS);
+    let served = crate::bridge::store::Served {
+        model: model.as_deref(),
+        provider: provider.as_deref(),
+    };
+    let total = store.add_usage_by(id, &member, at, served, calls, tokens)?;
     Ok(Some((
         owner,
         UsageUpdate {
             call: CallUsage {
                 model,
+                provider,
                 calls,
                 tokens,
                 ..call
@@ -1746,6 +1761,19 @@ fn call_usage(
         },
     )))
 }
+
+/// A name a plugin reported, such as a model's: on one line, its runs of
+/// blanks made one space, cut to `most` characters, its hidden characters
+/// written out; none when it is blank.
+fn one_line(text: Option<&str>, most: usize) -> Option<String> {
+    let words: Vec<&str> = text?.split_whitespace().collect();
+    let cut: String = words.join(" ").chars().take(most).collect();
+    (!cut.is_empty()).then(|| enclos_protocol::visible::revealed(&cut))
+}
+
+/// The most characters of a sandbox's or an agent's name a device may ask
+/// a usage window of: longer than any enclos makes.
+const MAX_SCOPE_CHARS: usize = 128;
 
 /// Serves on `127.0.0.1:port` until the process ends: the agents `watch`
 /// read first, then as it reads them again.
@@ -2654,6 +2682,8 @@ fn run_session(
                 since,
                 bucket,
                 offset,
+                sandbox,
+                agent,
             } => {
                 let since = i64::try_from(since).unwrap_or(i64::MAX);
                 let max = enclos_protocol::usage::MAX_OFFSET;
@@ -2678,22 +2708,64 @@ fn run_session(
                     _ if offset.abs() > max => {
                         Some("A device's offset from UTC is at most 14 hours.".to_owned())
                     }
+                    _ if agent.is_some() && sandbox.is_none() => {
+                        Some("A usage window of one agent names its sandbox too.".to_owned())
+                    }
+                    _ if [&sandbox, &agent].iter().any(|name| {
+                        name.as_deref()
+                            .is_some_and(|n| n.is_empty() || n.chars().count() > MAX_SCOPE_CHARS)
+                    }) =>
+                    {
+                        Some(
+                            "A usage window names a sandbox or an agent of at most 128 characters."
+                                .to_owned(),
+                        )
+                    }
                     _ => None,
+                };
+                let scope = match (sandbox.as_deref(), agent.as_deref()) {
+                    (Some(sandbox), Some(agent)) => {
+                        crate::bridge::store::Scope::Agent { sandbox, agent }
+                    }
+                    (Some(sandbox), None) => crate::bridge::store::Scope::Sandbox(sandbox),
+                    _ => crate::bridge::store::Scope::Host,
                 };
                 // The agents' calls outside app conversations are the
                 // host's person's to see, as the host is.
                 let outside = hub.known_host().as_deref() == Some(person);
                 let read = match refused {
-                    Some(_) => Ok((Vec::new(), Vec::new(), Vec::new())),
-                    None => store
-                        .usage_window(person, since, outside, bucket.map(|b| (b, offset)))
-                        .and_then(|(agents, series)| {
-                            let reporters = match outside {
-                                true => store.outside_reporters()?,
-                                false => Vec::new(),
-                            };
-                            Ok((agents, series, reporters))
-                        }),
+                    Some(_) => Ok((Default::default(), Vec::new())),
+                    None => {
+                        // Read each time, so a price the user corrects
+                        // applies without a restart; the bundled list is
+                        // read once.
+                        let prices = crate::pricing::PriceList::load(&hub.layout.prices_file());
+                        if let crate::pricing::OverrideRead::Refused(why) = &prices.override_read {
+                            eprintln!(
+                                "enclos app: {} was not read ({why}): the bundled prices alone are used",
+                                prices.override_file.display()
+                            );
+                        }
+                        store
+                            .usage_report(
+                                &crate::bridge::store::WindowAsk {
+                                    owner: Some(person),
+                                    since,
+                                    outside,
+                                    series: bucket.map(|b| (b, offset)),
+                                    scope,
+                                    sum: scope != crate::bridge::store::Scope::Host,
+                                },
+                                &prices.list,
+                            )
+                            .and_then(|window| {
+                                let reporters = match outside {
+                                    true => store.outside_reporters()?,
+                                    false => Vec::new(),
+                                };
+                                Ok((window, reporters))
+                            })
+                    }
                 };
                 match (refused, read) {
                     (Some(why), _) => link.send(ToDevice::Error(ErrorBody {
@@ -2701,7 +2773,13 @@ fn run_session(
                         code: ErrorCode::BadMessage,
                         message: why,
                     }))?,
-                    (None, Ok((mut agents, series, reporters))) => {
+                    (None, Ok((window, reporters))) => {
+                        let crate::bridge::store::Window {
+                            mut agents,
+                            mut sandboxes,
+                            series,
+                            mut sum,
+                        } = window;
                         let cap = match bucket {
                             Some(_) => enclos_protocol::usage::MAX_REPORT_AGENTS_WITH_SERIES,
                             None => enclos_protocol::usage::MAX_REPORT_AGENTS,
@@ -2709,28 +2787,43 @@ fn run_session(
                         if agents.len() > cap {
                             // The heaviest, then back in name order; a stable
                             // sort keeps names in order among equals.
-                            agents
-                                .sort_by_key(|(_, total)| std::cmp::Reverse(total.tokens.total()));
+                            agents.sort_by_key(|(_, total, _)| {
+                                std::cmp::Reverse(total.tokens.total())
+                            });
                             agents.truncate(cap);
                             agents.sort_by(|a, b| a.0.cmp(&b.0));
                         }
+                        let most = enclos_protocol::usage::MAX_REPORT_SANDBOXES;
+                        if sandboxes.len() > most {
+                            sandboxes.sort_by_key(|s| std::cmp::Reverse(s.total.tokens.total()));
+                            sandboxes.truncate(most);
+                            sandboxes.sort_by(|a, b| a.sandbox.cmp(&b.sandbox));
+                        }
+                        // The window holds at most this many buckets
+                        // (refused past them): the latest, should a clock
+                        // have moved.
+                        let cut = sum.len().saturating_sub(enclos_protocol::usage::MAX_POINTS);
+                        sum.drain(..cut);
                         link.send(ToDevice::UsageReport {
                             of: message.id,
                             // The hour that holds `since`, where the sums start.
                             since: u64::try_from(since.max(0) / 3600 * 3600).unwrap_or(0),
                             agents: agents
                                 .into_iter()
-                                .map(|(agent, total)| enclos_protocol::usage::AgentUsage {
+                                .map(|(agent, total, cost)| enclos_protocol::usage::AgentUsage {
                                     // Its calls outside the app counted, as
                                     // its plugin said it reports them.
                                     outside: reporters.contains(&agent),
                                     agent,
                                     total,
+                                    cost: Some(cost),
                                 })
                                 .collect(),
                             outside,
                             bucket,
                             series,
+                            sandboxes,
+                            sum,
                         })?;
                     }
                     (None, Err(e)) => {
@@ -6527,6 +6620,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         CallUsage {
             conversation: ConversationId::new(conversation).unwrap(),
             model: model.map(str::to_owned),
+            provider: None,
             background: false,
             calls,
             tokens: enclos_protocol::usage::UsageTokens {
@@ -6602,6 +6696,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 since,
                 bucket: None,
                 offset: None,
+                sandbox: None,
+                agent: None,
             },
         );
         let Some(ToDevice::UsageReport {
@@ -6626,6 +6722,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 since: u64::MAX,
                 bucket: None,
                 offset: None,
+                sandbox: None,
+                agent: None,
             },
         );
         assert!(
@@ -6653,6 +6751,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 since: 0,
                 bucket: None,
                 offset: None,
+                sandbox: None,
+                agent: None,
             },
         );
         let Some(ToDevice::UsageReport { agents, .. }) = device.receive() else {
@@ -6661,6 +6761,117 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_eq!(agents.len(), enclos_protocol::usage::MAX_REPORT_AGENTS);
         assert_eq!(agents[0].agent, "lab/a000");
         assert!(agents.windows(2).all(|w| w[0].agent < w[1].agent));
+    }
+
+    #[test]
+    fn a_device_asks_for_one_sandbox_by_the_day_and_gets_its_costs_and_its_sum() {
+        let folder = tempfile::tempdir().unwrap();
+        let bridge = bridge(folder.path());
+        let phone = paired(&bridge, "n-pixel");
+        let store = Store::open(&bridge.store).unwrap();
+        store.conversation("c-lab", "lab", "main", PERSON).unwrap();
+        store
+            .conversation("c-work", "work", "main", PERSON)
+            .unwrap();
+        let now = crate::bridge::store::now();
+        let priced = |conversation: &str, provider: Option<&str>| CallUsage {
+            model: Some("claude-opus-5-5".into()),
+            provider: provider.map(str::to_owned),
+            ..call(conversation, None, 1, 1_000_000)
+        };
+        // Through a model provider with a price, and through none named.
+        call_usage(
+            &store,
+            "lab/main",
+            priced("c-lab", Some(" anthropic ")),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        call_usage(&store, "work/main", priced("c-work", None), now)
+            .unwrap()
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        device.send(
+            "u1",
+            FromDevice::UsageGet {
+                since: u64::try_from(now - 86_400).unwrap(),
+                bucket: Some(86_400),
+                offset: None,
+                sandbox: Some("lab".into()),
+                agent: None,
+            },
+        );
+        let Some(ToDevice::UsageReport {
+            agents,
+            sandboxes,
+            sum,
+            ..
+        }) = device.receive()
+        else {
+            panic!("a usage report")
+        };
+        let expected = crate::pricing::PriceList::bundled().cost(
+            Some("anthropic"),
+            Some("claude-opus-5-5"),
+            enclos_protocol::usage::UsageTokens {
+                input: Some(1_000_000),
+                cache_read: Some(1_000),
+                ..Default::default()
+            }
+            .into(),
+        );
+        assert!(expected.usd_micros > 0);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].cost, Some(expected));
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(
+            (sandboxes[0].sandbox.as_str(), sandboxes[0].cost),
+            ("lab", expected)
+        );
+        assert_eq!(sum.len(), 1);
+        assert_eq!(sum[0].cost, Some(expected));
+        // The whole host: each sandbox's total, and no sum.
+        device.send(
+            "u2",
+            FromDevice::UsageGet {
+                since: 0,
+                bucket: None,
+                offset: None,
+                sandbox: None,
+                agent: None,
+            },
+        );
+        let Some(ToDevice::UsageReport { sandboxes, sum, .. }) = device.receive() else {
+            panic!("a usage report")
+        };
+        assert_eq!(sandboxes.len(), 2);
+        assert!(sum.is_empty());
+        // The model ran through no model provider named, and the list
+        // looks for it under each: priced the same.
+        assert_eq!(sandboxes[1].cost, expected);
+        // An agent named without its sandbox, or a name past its bound, is
+        // refused.
+        for (id, sandbox, agent) in [
+            ("u3", None, Some("main".to_owned())),
+            ("u4", Some("x".repeat(MAX_SCOPE_CHARS + 1)), None),
+            ("u5", Some(String::new()), None),
+        ] {
+            device.send(
+                id,
+                FromDevice::UsageGet {
+                    since: 0,
+                    bucket: None,
+                    offset: None,
+                    sandbox,
+                    agent,
+                },
+            );
+            assert!(
+                matches!(device.receive(), Some(ToDevice::Error(ErrorBody { code: ErrorCode::BadMessage, of: Some(of), .. })) if of.as_str() == id),
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -6743,6 +6954,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                     since,
                     bucket: Some(bucket),
                     offset: Some(offset),
+                    sandbox: None,
+                    agent: None,
                 },
             );
             assert!(
@@ -6761,6 +6974,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                     since,
                     bucket: Some(bucket),
                     offset: Some(14 * 3_600),
+                    sandbox: None,
+                    agent: None,
                 },
             );
             assert!(
@@ -6803,6 +7018,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                     since,
                     bucket,
                     offset: None,
+                    sandbox: None,
+                    agent: None,
                 },
             );
             let Some(ToDevice::UsageReport { agents, .. }) = device.receive() else {
@@ -6950,6 +7167,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                     since,
                     bucket,
                     offset: Some(3_600),
+                    sandbox: None,
+                    agent: None,
                 },
             );
             device.receive()
@@ -6992,6 +7211,8 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 since: u64::try_from(now - 3_600).unwrap(),
                 bucket: Some(3_600),
                 offset: None,
+                sandbox: None,
+                agent: None,
             },
         );
         let Some(ToDevice::UsageReport {
