@@ -152,6 +152,21 @@ pub enum FromDevice {
         /// its midnight.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<i32>,
+        /// Only this sandbox's agents, from a bridge that names
+        /// [`USAGE_COST`]: with a bucket, the report's `sum` is their
+        /// usage over time, summed, with its cost.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
+        /// Only this agent of `sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// Costs too, from a bridge that names [`USAGE_COST`]: each agent's
+        /// and each sandbox's, its rows the fewer for it
+        /// ([`crate::usage::MAX_COSTED_AGENTS`]). A window of one sandbox
+        /// or agent has them whatever this says. A device that shows no
+        /// cost leaves it out, and gets the report it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cost: bool,
     },
     #[serde(rename = "agents")]
     Agents,
@@ -249,6 +264,10 @@ pub const USAGE: &str = "usage";
 /// The host capability that says it answers with series over time
 /// (`usage.get`'s `bucket`).
 pub const USAGE_SERIES: &str = "usage.series";
+/// The host capability that says it estimates what usage cost (issue
+/// #343): each agent's and sandbox's cost, and a window of one sandbox or
+/// agent (`usage.get`'s `sandbox` and `agent`) with its sum over time.
+pub const USAGE_COST: &str = "usage.cost";
 
 /// The host feature of forgetting a removed agent (ADR 0067, proposed):
 /// the message type a device sends to forget one, advertised in
@@ -404,11 +423,21 @@ pub enum ToDevice {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         outside: bool,
         /// The bucket asked for, and a series for each of the
-        /// [`crate::usage::MAX_SERIES`] agents that used the most.
+        /// [`crate::usage::MAX_SERIES`] agents that used the most
+        /// ([`crate::usage::MAX_SCOPED_SERIES`] for one sandbox).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bucket: Option<u32>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         series: Vec<crate::usage::UsageSeries>,
+        /// Each sandbox's total, of the [`crate::usage::MAX_REPORT_SANDBOXES`]
+        /// that used the most, by name: from a bridge that names
+        /// [`USAGE_COST`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sandboxes: Vec<crate::usage::SandboxTotal>,
+        /// For a window of one sandbox or agent with a bucket: its usage
+        /// over time, every agent of it summed, each bucket with its cost.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sum: Vec<crate::usage::UsagePoint>,
     },
     #[serde(rename = "pair.accepted")]
     PairAccepted { device: String, push_key: String },
@@ -1491,7 +1520,11 @@ mod audit_compatibility_tests {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
-    use crate::usage::{AgentUsage, MAX_CALL_TOKENS, MAX_REPORT_AGENTS, UsageTokens, UsageTotal};
+    use crate::usage::{
+        AgentUsage, MAX_CALL_TOKENS, MAX_COSTED_AGENTS, MAX_COSTED_AGENTS_WITH_SERIES, MAX_POINTS,
+        MAX_REPORT_AGENTS, MAX_REPORT_AGENTS_WITH_SERIES, MAX_REPORT_SANDBOXES, MAX_SCOPED_SERIES,
+        MAX_SERIES, SandboxTotal, UsageCost, UsagePoint, UsageSeries, UsageTokens, UsageTotal,
+    };
 
     #[test]
     fn a_usage_window_is_asked_and_answered_by_agent() {
@@ -1503,6 +1536,9 @@ mod usage_tests {
                 since: 1_800_000_000,
                 bucket: None,
                 offset: None,
+                sandbox: None,
+                agent: None,
+                cost: false,
             }
         );
         let report = ToDevice::UsageReport {
@@ -1523,7 +1559,10 @@ mod usage_tests {
                         ..UsageTokens::default()
                     },
                 },
+                cost: None,
             }],
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
         };
         let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report.clone()));
         assert_eq!(decode_to_device(&wire).unwrap().body, report);
@@ -1540,7 +1579,10 @@ mod usage_tests {
             FromDevice::UsageGet {
                 since: 0,
                 bucket: Some(86_400),
-                offset: Some(-32_400)
+                offset: Some(-32_400),
+                sandbox: None,
+                agent: None,
+                cost: false,
             }
         );
         let report = ToDevice::UsageReport {
@@ -1549,14 +1591,17 @@ mod usage_tests {
             agents: Vec::new(),
             outside: true,
             bucket: Some(86_400),
-            series: vec![crate::usage::UsageSeries {
+            series: vec![UsageSeries {
                 agent: "lab/main".into(),
-                points: vec![crate::usage::UsagePoint {
+                points: vec![UsagePoint {
                     at: 1_799_971_200,
                     calls: 3,
                     tokens: Some(1_234),
+                    cost: None,
                 }],
             }],
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
         };
         let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report.clone()));
         assert_eq!(decode_to_device(&wire).unwrap().body, report);
@@ -1566,85 +1611,199 @@ mod usage_tests {
         )
         .unwrap();
         assert!(
-            matches!(old.body, ToDevice::UsageReport { outside: false, bucket: None, series, .. } if series.is_empty())
+            matches!(old.body, ToDevice::UsageReport { outside: false, bucket: None, series, sandboxes, sum, .. } if series.is_empty() && sandboxes.is_empty() && sum.is_empty())
         );
     }
 
     #[test]
-    fn the_largest_usage_report_fits_one_device_message() {
-        let big = Some(MAX_CALL_TOKENS * 1_000_000);
+    fn a_window_of_one_sandbox_or_agent_is_answered_with_costs_and_its_sum_over_time() {
+        let ask = decode_from_device(
+            br#"{"v":1,"id":"u1","type":"usage.get","since":0,"bucket":86400,"sandbox":"lab","agent":"main"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ask.body,
+            FromDevice::UsageGet { sandbox: Some(s), agent: Some(a), .. } if s == "lab" && a == "main"
+        ));
+        let cost = UsageCost {
+            usd_micros: 1_250_000,
+            included: 0,
+            unpriced: 12,
+        };
+        let total = UsageTotal {
+            calls: 2,
+            tokens: UsageTokens {
+                input: Some(100),
+                ..UsageTokens::default()
+            },
+        };
         let report = ToDevice::UsageReport {
+            of: MessageId::new("u1").unwrap(),
+            since: 0,
+            agents: vec![AgentUsage {
+                agent: "lab/main".into(),
+                total,
+                outside: false,
+                cost: Some(cost),
+            }],
+            outside: false,
+            bucket: Some(86_400),
+            series: Vec::new(),
+            sandboxes: vec![SandboxTotal {
+                sandbox: "lab".into(),
+                total,
+                cost,
+            }],
+            sum: vec![UsagePoint {
+                at: 86_400,
+                calls: 2,
+                tokens: Some(100),
+                cost: Some(cost),
+            }],
+        };
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report.clone()));
+        let text = String::from_utf8(wire.clone()).unwrap();
+        assert!(
+            text.contains(r#""cost":{"usd_micros":1250000,"unpriced":12}"#),
+            "{text}"
+        );
+        assert_eq!(decode_to_device(&wire).unwrap().body, report);
+    }
+
+    fn big_total() -> UsageTotal {
+        let big = Some(MAX_CALL_TOKENS * 1_000_000);
+        UsageTotal {
+            calls: u64::MAX,
+            tokens: UsageTokens {
+                input: big,
+                output: big,
+                cache_read: big,
+                cache_write: big,
+                reasoning: big,
+            },
+        }
+    }
+
+    const BIG_COST: UsageCost = UsageCost {
+        usd_micros: u64::MAX,
+        included: u64::MAX,
+        unpriced: u64::MAX,
+    };
+
+    /// A sandbox and an agent name at their longest.
+    fn name(i: usize) -> String {
+        format!("{:a<40}/{:b<64}", i, i)
+    }
+
+    fn agents(n: usize, cost: bool) -> Vec<AgentUsage> {
+        (0..n)
+            .map(|i| AgentUsage {
+                agent: name(i),
+                outside: true,
+                total: big_total(),
+                cost: cost.then_some(BIG_COST),
+            })
+            .collect()
+    }
+
+    fn sandboxes(n: usize) -> Vec<SandboxTotal> {
+        (0..n)
+            .map(|i| SandboxTotal {
+                sandbox: format!("{:a<40}", i),
+                total: big_total(),
+                cost: BIG_COST,
+            })
+            .collect()
+    }
+
+    fn points(cost: Option<UsageCost>) -> Vec<UsagePoint> {
+        vec![
+            UsagePoint {
+                at: u64::MAX,
+                calls: u64::MAX,
+                tokens: Some(u64::MAX),
+                cost,
+            };
+            MAX_POINTS
+        ]
+    }
+
+    fn series(n: usize) -> Vec<UsageSeries> {
+        (0..n)
+            .map(|i| UsageSeries {
+                agent: name(i),
+                points: points(None),
+            })
+            .collect()
+    }
+
+    fn fits(report: ToDevice) {
+        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
+        assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
+    }
+
+    #[test]
+    fn the_largest_usage_report_fits_one_device_message() {
+        // Without costs, as an older device asks.
+        fits(ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
             outside: true,
             bucket: None,
             series: Vec::new(),
-            agents: (0..MAX_REPORT_AGENTS)
-                .map(|i| AgentUsage {
-                    // A sandbox and an agent name at their longest.
-                    agent: format!("{:a<40}/{:b<64}", i, i),
-                    outside: true,
-                    total: UsageTotal {
-                        calls: u64::MAX,
-                        tokens: UsageTokens {
-                            input: big,
-                            output: big,
-                            cache_read: big,
-                            cache_write: big,
-                            reasoning: big,
-                        },
-                    },
-                })
-                .collect(),
-        };
-        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
-        assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
+            agents: agents(MAX_REPORT_AGENTS, false),
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
+        });
+        // With them.
+        fits(ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            outside: true,
+            bucket: None,
+            series: Vec::new(),
+            agents: agents(MAX_COSTED_AGENTS, true),
+            sandboxes: sandboxes(MAX_REPORT_SANDBOXES),
+            sum: Vec::new(),
+        });
     }
 
     #[test]
     fn the_largest_usage_report_with_series_fits_one_device_message() {
-        use crate::usage::{
-            MAX_POINTS, MAX_REPORT_AGENTS_WITH_SERIES, MAX_SERIES, UsagePoint, UsageSeries,
-        };
-        let big = Some(MAX_CALL_TOKENS * 1_000_000);
-        let name = |i: usize| format!("{:a<40}/{:b<64}", i, i);
-        let report = ToDevice::UsageReport {
+        fits(ToDevice::UsageReport {
             of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
             since: u64::MAX,
-            agents: (0..MAX_REPORT_AGENTS_WITH_SERIES)
-                .map(|i| AgentUsage {
-                    agent: name(i),
-                    outside: true,
-                    total: UsageTotal {
-                        calls: u64::MAX,
-                        tokens: UsageTokens {
-                            input: big,
-                            output: big,
-                            cache_read: big,
-                            cache_write: big,
-                            reasoning: big,
-                        },
-                    },
-                })
-                .collect(),
+            agents: agents(MAX_REPORT_AGENTS_WITH_SERIES, false),
             outside: true,
             bucket: Some(86_400),
-            series: (0..MAX_SERIES)
-                .map(|i| UsageSeries {
-                    agent: name(i),
-                    points: vec![
-                        UsagePoint {
-                            at: u64::MAX,
-                            calls: u64::MAX,
-                            tokens: Some(u64::MAX),
-                        };
-                        MAX_POINTS
-                    ],
-                })
-                .collect(),
-        };
-        let wire = encode_line(&Envelope::new(MessageId::new("r").unwrap(), report));
-        assert!(wire.len() <= MAX_DEVICE_MESSAGE, "{} bytes", wire.len());
+            series: series(MAX_SERIES),
+            sandboxes: Vec::new(),
+            sum: Vec::new(),
+        });
+        fits(ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            agents: agents(MAX_COSTED_AGENTS_WITH_SERIES, true),
+            outside: true,
+            bucket: Some(86_400),
+            series: series(MAX_SERIES),
+            sandboxes: sandboxes(MAX_REPORT_SANDBOXES),
+            sum: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn the_largest_report_of_one_sandbox_with_its_sum_fits_one_device_message() {
+        fits(ToDevice::UsageReport {
+            of: MessageId::new("u".repeat(MAX_ID_BYTES)).unwrap(),
+            since: u64::MAX,
+            agents: agents(MAX_COSTED_AGENTS_WITH_SERIES, true),
+            outside: true,
+            bucket: Some(86_400),
+            series: series(MAX_SCOPED_SERIES),
+            sandboxes: sandboxes(1),
+            sum: points(Some(BIG_COST)),
+        });
     }
 }
 

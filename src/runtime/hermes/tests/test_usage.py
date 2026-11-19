@@ -122,6 +122,31 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(top['s1']['tokens']['input'], 330)
         self.assertEqual(top['s1']['calls'], 4)
 
+    def test_one_model_through_two_providers_is_two_rows_each_naming_its_provider(self):
+        db = self.db('default', FULL + ', billing_provider text')
+        db.execute('create table session_model_usage(session_id text, model text, task text, '
+                   'billing_provider text, api_call_count integer, input_tokens integer, '
+                   'output_tokens integer, cache_read_tokens integer, cache_write_tokens integer, '
+                   'reasoning_tokens integer, estimated_cost_usd real, actual_cost_usd real, cost_status text)')
+        rows = [
+            ('s1', 'enclos', 'gpt-5.5', 'T', 100, None, 1000, 1, 100, 10, 0, 0, 0, 0.0, None, 'included', 'openai-codex'),
+            ('s2', 'cli', 'gpt-5.5', None, 100, None, 1000, 1, 50, 5, 0, 0, 0, 0.1, None, 'estimated', 'openai'),
+            # Hermes's empty default: not said.
+            ('s3', 'cli', 'm', None, 100, None, 1000, 1, 7, 0, 0, 0, 0, 0.0, None, 'unknown', ''),
+        ]
+        db.executemany('insert into sessions values (' + ','.join('?' * 17) + ')', rows)
+        calls = [
+            ('s1', 'gpt-5.5', '', 'openai-codex', 1, 100, 10, 0, 0, 0, 0.0, 0.0, 'included'),
+            # A background call whose row names no provider takes its chat's.
+            ('s2', 'gpt-5.5', 'title_generation', '', 1, 4, 1, 0, 0, 0, 0.0, 0.0, None),
+        ]
+        db.executemany('insert into session_model_usage values (' + ','.join('?' * 13) + ')', calls); db.commit()
+        models = {(m['model'], m['model_provider']): m for m in self.run_reader(0, 'default')['default']['models']}
+        self.assertEqual(set(models), {('gpt-5.5', 'openai-codex'), ('gpt-5.5', 'openai'), ('m', None)})
+        self.assertEqual(models[('gpt-5.5', 'openai-codex')]['tokens']['input'], 100)
+        # s2: its title's row (4) and its counters beyond it (50 - 4).
+        self.assertEqual(models[('gpt-5.5', 'openai')]['tokens']['input'], 50)
+
     def run_reader_again(self, since, *agents):
         self.out.unlink()
         return self.run_reader(since, *(agents or ('default',)))

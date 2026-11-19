@@ -6,7 +6,9 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
@@ -99,6 +101,27 @@ class Home(unittest.TestCase):
             self.assertFalse(protocol.is_home_command(text), text)
 
 
+@unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
+class NativeHermesNotices(unittest.TestCase):
+    """Each notice key still names a translation in a real Hermes, and its
+    English text still starts as the plugin's own fallback says."""
+
+    def test_every_notice_key_renders_and_starts_as_its_fallback(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        env = patch.dict(os.environ, {"HERMES_HOME": home.name, "HERMES_LANGUAGE": "en"})
+        env.start()
+        self.addCleanup(env.stop)
+        sys.path.insert(0, os.environ["ENCLOS_HERMES_SOURCE"])
+        self.addCleanup(sys.path.remove, os.environ["ENCLOS_HERMES_SOURCE"])
+        starts = protocol._translated_starts()
+        self.assertEqual(len(starts), len(protocol.NOTICE_KEYS), starts)
+        self.assertEqual(len(protocol.NOTICE_STARTS), len(protocol.NOTICE_KEYS))
+        for key, start, fallback in zip(protocol.NOTICE_KEYS, starts, protocol.NOTICE_STARTS):
+            with self.subTest(key):
+                self.assertTrue(start.startswith(fallback), (start, fallback))
+
+
 class ToTheBridge(unittest.TestCase):
     def assert_like_fixture(self, message, name):
         expected = json.loads(fixture(name))
@@ -133,11 +156,12 @@ class ToTheBridge(unittest.TestCase):
             "from_plugin_tool_end.json")
         self.assert_like_fixture(
             protocol.usage("c-42", {"input": 2104, "output": 96, "cache_read": 31744,
-                                    "cache_write": 0, "reasoning": 32}, model="gpt-6.1-sol"),
+                                    "cache_write": 0, "reasoning": 32}, model="gpt-6.1-sol",
+                           model_provider="openai-codex"),
             "from_plugin_usage.json")
         self.assert_like_fixture(
             protocol.agent_usage({"input": 5120, "output": 240, "cache_read": 0}, model="gpt-6.1-sol",
-                                 source="cron"),
+                                 source="cron", model_provider="openai-codex"),
             "from_plugin_usage_agent.json")
 
     def test_held_tasks_have_the_fixtures_shape(self):

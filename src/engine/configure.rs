@@ -11,11 +11,12 @@ use crate::model::audit::Actor;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::Policy;
+use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::proxy::decide::{Destination, allowed};
 use crate::runtime::settings::names_a_secret;
-use crate::runtime::{RuntimeAgentName, SandboxCommand, SecretTarget, adapter};
+use crate::runtime::{RuntimeAgentName, RuntimeRequirement, SandboxCommand, SecretTarget, adapter};
 use std::path::PathBuf;
 
 /// One setting `runtime configure` gives an agent, written `KEY=VALUE`: a
@@ -102,7 +103,9 @@ impl Engine {
     /// value is a `${VAR}` the active policy grants the agent, or the whole
     /// sandbox; one written as itself is refused where its setting's name
     /// says it is one. A running service restarts on its own once its
-    /// settings change (ADR 0031).
+    /// settings change (ADR 0031); one that refuses the runtime's commands
+    /// from a session is stopped while they run, then installed again
+    /// (#337), which `Confirm::Ask` asks for first.
     pub fn configure_agent(
         &self,
         by: &Actor,
@@ -112,8 +115,24 @@ impl Engine {
         settings: &[Setting],
         confirm: Confirm,
     ) -> Result<Planned<Configured>> {
+        let runtime = adapter(self.runtime_of(name)?);
+        self.configure_agent_with(by, name, agent, channel, settings, confirm, &*runtime)
+    }
+
+    /// `configure_agent` with its adapter given, so tests can exercise a
+    /// runtime whose service is stopped meanwhile without installing one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn configure_agent_with(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: Option<&AgentName>,
+        channel: Option<ChannelRequest>,
+        settings: &[Setting],
+        confirm: Confirm,
+        runtime: &dyn crate::runtime::RuntimeAdapter,
+    ) -> Result<Planned<Configured>> {
         let kind = self.runtime_of(name)?;
-        let runtime = adapter(kind);
         let shown = kind.display_name();
         let session = |what: String| Error::Session { what };
         let default = self.default_agent(name)?;
@@ -174,6 +193,7 @@ impl Engine {
         };
         let mut keys = Vec::new();
         let mut staged = Vec::new();
+        let mut requires = None;
         for setting in settings {
             self.check_setting(name, &agent, setting, policy, pending)?;
             commands.push(set(&setting.key, &setting.value)?);
@@ -189,6 +209,7 @@ impl Engine {
                     keys.push(key.clone());
                 }
                 staged = plan.staged;
+                requires = plan.requires;
                 Some(plan.set)
             }
             Some(request) => {
@@ -206,16 +227,50 @@ impl Engine {
             settings: keys,
             channel,
         };
+        // The runtime's services that refuse its commands from a session,
+        // stopped while they run (#337): none while the sandbox is stopped.
+        let pausing = match runtime.configure_pauses(self.recorded_backend(name)?) {
+            true => self.installed_runtime_services(name)?,
+            false => Vec::new(),
+        };
+        if confirm == Confirm::Ask && !pausing.is_empty() {
+            for path in &staged {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(Error::NeedsConfirmation {
+                what: format!(
+                    "setting up agent {name}/{agent}, which stops the sandbox's service {} while {shown}'s commands run and so ends a chat in progress,",
+                    pausing
+                        .iter()
+                        .map(|(u, _)| u.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
+            });
+        }
         if confirm == Confirm::DryRun {
-            let mut changes: Vec<String> = commands
+            let check = requires.iter().map(|r| {
+                format!(
+                    "check that sandbox {name} has {shown} {} or newer, which the app channel's plugin loads in, and change nothing when it has not",
+                    r.minimum
+                )
+            });
+            let stop = pausing
                 .iter()
-                .map(|c| {
+                .map(|(_, l)| format!("stop service {l}, which ends a chat in progress"));
+            let start = pausing
+                .iter()
+                .map(|(_, l)| format!("install service {l} again"));
+            let mut changes: Vec<String> = check
+                .chain(stop)
+                .chain(commands.iter().map(|c| {
                     format!(
                         "run `{}` in sandbox {name} under policy v{}",
                         c.shown(),
                         view.version.version
                     )
-                })
+                }))
+                .chain(start)
                 .collect();
             if let Some(ChannelSet::Bot {
                 channel,
@@ -230,7 +285,16 @@ impl Engine {
                 ..Plan::default()
             }));
         }
-        let ran = self.run_all(by, name, commands);
+        // The runtime's release is checked before anything else runs, so
+        // that one too old for the channel's plugin is left as it was.
+        let ran = match requires {
+            Some(requires) => self.check_runtime(by, name, kind, requires),
+            None => Ok(()),
+        }
+        .and_then(|()| match pausing.is_empty() {
+            true => self.run_all(by, name, commands),
+            false => self.run_paused(by, name, &agent, commands),
+        });
         // The staged plugin is the binary's own, and the sandbox may not
         // write `installers/`: one left there when its removal fails does
         // no harm, so that failure does not undo what ran.
@@ -514,7 +578,61 @@ impl Engine {
             commands,
             settings: app.settings,
             staged,
+            requires: app.requires,
         })
+    }
+
+    /// Runs the check of `requires` in the sandbox: refused, with nothing
+    /// changed, when the runtime installed is older than the app channel's
+    /// plugin loads in (#336), or when the check cannot tell.
+    fn check_runtime(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        kind: RuntimeKind,
+        requires: RuntimeRequirement,
+    ) -> Result<()> {
+        let shown = kind.display_name();
+        let minimum = requires.minimum;
+        let end = self.run_in_sandbox(by, name, requires.check, "runtime configure")?;
+        match end.exit {
+            0 => Ok(()),
+            RuntimeRequirement::TOO_OLD => Err(Error::Session {
+                what: format!(
+                    "the app channel's plugin loads in {shown} {minimum} or newer, and sandbox {name} has an older one, as its output above says; nothing was changed. Update it with `enclos runtime install --sandbox {name} {}`, then run `enclos runtime configure` again",
+                    kind.as_str()
+                ),
+            }),
+            exit => Err(Error::Session {
+                what: format!(
+                    "enclos cannot tell whether sandbox {name}'s {shown} is {minimum} or newer, which the app channel's plugin loads in: its check exited with {exit}, and its output above says why; nothing was changed"
+                ),
+            }),
+        }
+    }
+
+    /// Runs `commands` as `run_all` does, with the runtime's services
+    /// stopped meanwhile, then installs them again, whether the commands
+    /// succeeded or not (#337).
+    fn run_paused(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &RuntimeAgentName,
+        commands: Vec<SandboxCommand>,
+    ) -> Result<()> {
+        let paused =
+            self.pause_runtime(by, name, &format!("for runtime configure {name}/{agent}"))?;
+        let ran = self.run_all(by, name, commands);
+        let resumed = self.resume_runtime(by, name, paused);
+        match (ran, resumed) {
+            (Ok(()), resumed) => resumed,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(resumed)) => Err(Error::CleanupFailed {
+                error: Box::new(error),
+                left: resumed.to_string(),
+            }),
+        }
     }
 
     /// Runs `commands` in the sandbox in order; one that fails stops the
@@ -577,6 +695,8 @@ struct AppChannelPlan {
     /// The plugin's files staged in `installers/`, removed once the
     /// commands have run.
     staged: Vec<PathBuf>,
+    /// The runtime release its plugin needs, checked before anything runs.
+    requires: Option<RuntimeRequirement>,
 }
 
 /// What a dry run says of a channel whose host the policy does not reach.

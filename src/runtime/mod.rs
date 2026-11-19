@@ -395,6 +395,14 @@ pub trait RuntimeAdapter {
     fn agent_delete_mode(&self) -> AgentDeleteMode {
         AgentDeleteMode::PauseRuntime
     }
+    /// Whether `runtime configure` stops the runtime's installed services
+    /// while its commands run in a sandbox of `backend`, then installs them
+    /// again: for a runtime whose running service refuses those commands
+    /// from a session there. The default, for a runtime that takes its
+    /// settings while it runs, stops nothing.
+    fn configure_pauses(&self, _backend: BackendKind) -> bool {
+        false
+    }
     /// The runtime's own command that finishes a delete of `name` which
     /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
     /// rm` when that command failed after the runtime stopped listing the
@@ -578,6 +586,35 @@ pub trait RuntimeAdapter {
     fn agent_facts(&self, _agent: &RuntimeAgentName) -> AgentFacts {
         AgentFacts::default()
     }
+
+    // What `status` says of the runtime's releases (ADR 0074, proposed).
+
+    /// The HTTPS address that names the release the runtime's installer
+    /// installs by default, which enclos looks up on the host.
+    fn release_source(&self) -> Option<&'static str> {
+        None
+    }
+    /// The version of that release, in the answer from `release_source`:
+    /// what the answer says, unchecked; the engine checks it is a version.
+    fn release_version(&self, _answer: &str) -> Result<String, String> {
+        Err("this runtime names no release enclos reads".into())
+    }
+    /// The releases enclos's runtime tests passed with before this enclos
+    /// release, as the runtime names them.
+    fn checked_releases(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// The runtime's own command that writes its version to `report`, a
+    /// file of the sandbox home, for a runtime whose version no home file
+    /// holds (`RuntimeFacts::version`). enclos runs it after an install
+    /// and records what it reports.
+    fn version_command(&self, _report: &Path) -> Option<SandboxCommand> {
+        None
+    }
+    /// The version in what `version_command` wrote, unchecked.
+    fn reported_version(&self, _text: &str) -> Result<String, String> {
+        Err("this runtime reports no version enclos reads".into())
+    }
 }
 
 /// What [`RuntimeAdapter::app_channel`] sets up.
@@ -590,6 +627,26 @@ pub struct AppChannel {
     /// Settings for [`RuntimeAdapter::set_setting`], in order, the channel
     /// turned on last.
     pub settings: Vec<(String, String)>,
+    /// The oldest release of the runtime the plugin loads in, and how to
+    /// tell: `None` when any release does.
+    pub requires: Option<RuntimeRequirement>,
+}
+
+/// The oldest runtime release an app channel's plugin loads in (#336).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRequirement {
+    /// That release, as the runtime names it.
+    pub minimum: &'static str,
+    /// A command that exits with [`RuntimeRequirement::TOO_OLD`] when the
+    /// installed runtime is older than `minimum`, 0 when it is not, and
+    /// otherwise when it cannot tell. `runtime configure` runs it before
+    /// anything else, so an older runtime is left as it was.
+    pub check: SandboxCommand,
+}
+
+impl RuntimeRequirement {
+    /// The exit of a check that found the runtime too old.
+    pub const TOO_OLD: i32 = 3;
 }
 
 /// A name a runtime gives one of its agents, as the runtime writes it.

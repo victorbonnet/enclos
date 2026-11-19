@@ -28,6 +28,7 @@ use crate::model::Timestamp;
 use crate::model::audit::Actor;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxState};
+use crate::pricing::{Counts, OverrideRead, PriceList, UsageCost};
 use crate::runtime::{RuntimeAgentName, adapter};
 
 /// The usage report's format, which every adapter's command writes.
@@ -68,6 +69,32 @@ impl Tokens {
     /// output, as providers count them, so they are not added again.
     pub fn total(&self) -> u64 {
         self.prompt().saturating_add(self.output.unwrap_or(0))
+    }
+
+    /// The sum of both: a count either keeps is kept, one neither keeps
+    /// stays `None`.
+    pub fn plus(self, other: Tokens) -> Tokens {
+        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        };
+        Tokens {
+            input: sum(self.input, other.input),
+            output: sum(self.output, other.output),
+            cache_read: sum(self.cache_read, other.cache_read),
+            cache_write: sum(self.cache_write, other.cache_write),
+            reasoning: sum(self.reasoning, other.reasoning),
+        }
+    }
+
+    /// The counts a price applies to: reasoning is part of output.
+    pub fn counts(&self) -> Counts {
+        Counts {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        }
     }
 
     /// The share of the prompt read from the cache, when the runtime
@@ -113,16 +140,22 @@ pub const COUNTS: [&str; 6] = [
     "reasoning",
 ];
 
-/// What one agent used with one model.
+/// What one agent used with one model, through one model provider.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelUsage {
     pub model: Option<String>,
+    /// The model provider that served it, as the runtime names it; none
+    /// when the runtime does not say.
+    pub model_provider: Option<String>,
     /// The native chats that used it.
     pub chats: u64,
     /// Requests to the provider.
     pub calls: Option<u64>,
     pub tokens: Tokens,
+    /// What the runtime says it cost.
     pub cost: Cost,
+    /// What enclos estimates it cost, from its price list (issue #343).
+    pub estimate: UsageCost,
     /// The counts (of [`COUNTS`]) that only some of the runtime's records
     /// held: each is at least what is shown.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -189,6 +222,50 @@ pub struct SandboxUsage {
     /// Absent: no runtime is installed. Not provided: its adapter reads no
     /// usage.
     pub agents: Fact<Vec<AgentUsage>>,
+    /// What its agents whose usage is known used, summed; none when no
+    /// agent's is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<Total>,
+}
+
+/// What some agents used, summed: a sandbox's, or the host's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Total {
+    /// Requests, of the models whose runtime counts them.
+    pub calls: Option<u64>,
+    pub tokens: Tokens,
+    /// What enclos estimates it cost.
+    pub estimate: UsageCost,
+}
+
+impl Total {
+    fn add_model(&mut self, m: &ModelUsage) {
+        self.calls = match (self.calls, m.calls) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        };
+        self.tokens = self.tokens.plus(m.tokens);
+        self.estimate = self.estimate.plus(m.estimate);
+    }
+
+    fn plus(self, other: Total) -> Total {
+        Total {
+            calls: match (self.calls, other.calls) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            },
+            tokens: self.tokens.plus(other.tokens),
+            estimate: self.estimate.plus(other.estimate),
+        }
+    }
+}
+
+/// The price list the estimates come from: whether the user's override
+/// file was read.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PricesRead {
+    pub override_file: PathBuf,
+    pub override_read: OverrideRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -196,6 +273,9 @@ pub struct UsageView {
     /// Native chats active since then are counted, each whole.
     pub since: Timestamp,
     pub sandboxes: Vec<SandboxUsage>,
+    /// Every sandbox's total, summed.
+    pub total: Total,
+    pub prices: PricesRead,
 }
 
 fn as_text<S: Serializer>(
@@ -244,9 +324,25 @@ impl Engine {
                 name,
                 runtime: runtime.map(RuntimeKind::display_name),
                 agents,
+                total: None,
             });
         }
-        Ok(UsageView { since, sandboxes })
+        let loaded = PriceList::load(&self.prices_path());
+        let total = priced(&mut sandboxes, &loaded.list);
+        Ok(UsageView {
+            since,
+            sandboxes,
+            total,
+            prices: PricesRead {
+                override_file: loaded.override_file,
+                override_read: loaded.override_read,
+            },
+        })
+    }
+
+    /// The user's price list, which overrides the bundled one (issue #343).
+    pub fn prices_path(&self) -> PathBuf {
+        self.layout.prices_file()
     }
 
     fn sandbox_usage(
@@ -299,8 +395,39 @@ impl Engine {
     }
 }
 
+/// Sets each model's estimate from `list`, and each sandbox's total, and
+/// returns the host's.
+fn priced(sandboxes: &mut [SandboxUsage], list: &PriceList) -> Total {
+    let mut host = Total::default();
+    for s in sandboxes {
+        let Fact::Known(agents) = &mut s.agents else {
+            continue;
+        };
+        let mut total = None::<Total>;
+        for a in agents {
+            let Fact::Known(records) = &mut a.usage else {
+                continue;
+            };
+            let sum = total.get_or_insert_default();
+            for m in &mut records.models {
+                m.estimate = list.cost(
+                    m.model_provider.as_deref(),
+                    m.model.as_deref(),
+                    m.tokens.counts(),
+                );
+                sum.add_model(m);
+            }
+        }
+        if let Some(total) = total {
+            host = host.plus(total);
+        }
+        s.total = total;
+    }
+    host
+}
+
 /// Removes the report once read, or when the read failed.
-struct Removed(PathBuf);
+pub(super) struct Removed(pub(super) PathBuf);
 
 impl Drop for Removed {
     fn drop(&mut self) {
@@ -314,7 +441,7 @@ impl Drop for Removed {
 
 /// The report's text: a plain file in the sandbox home, not a link, of at
 /// most `MAX_REPORT_BYTES`.
-fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> {
+pub(super) fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> {
     let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits();
     let file = OpenOptions::new()
         .read(true)
@@ -373,6 +500,9 @@ struct ReportAgent {
 #[serde(deny_unknown_fields)]
 struct ReportModel {
     model: Option<String>,
+    /// The model provider that served it, as the runtime names it.
+    #[serde(default)]
+    model_provider: Option<String>,
     chats: u64,
     calls: Option<u64>,
     tokens: Tokens,
@@ -481,6 +611,7 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
     }
     Ok(ModelUsage {
         model: shown(m.model),
+        model_provider: shown(m.model_provider),
         chats: m.chats,
         calls: m.calls,
         tokens: m.tokens,
@@ -488,6 +619,8 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
             usd: m.cost.usd,
             kind: m.cost.kind,
         },
+        // Set once the whole view is read ([`priced`]).
+        estimate: UsageCost::default(),
         incomplete,
     })
 }
@@ -667,6 +800,7 @@ mod tests {
         assert_eq!(tokens.cache_hit(), None);
         let m = ModelUsage {
             model: None,
+            model_provider: None,
             chats: 1,
             calls: Some(2),
             tokens,
@@ -674,6 +808,7 @@ mod tests {
                 usd: None,
                 kind: CostKind::Unknown,
             },
+            estimate: UsageCost::default(),
             incomplete: Vec::new(),
         };
         assert_eq!(m.per_call(), None);
@@ -760,15 +895,25 @@ mod tests {
     #[test]
     fn a_known_read_is_json_with_counts_not_kept_as_null() {
         let agents = agents(REPORT, &["default", "scout"]);
+        let mut sandboxes = vec![SandboxUsage {
+            name: "lab".parse().unwrap(),
+            runtime: Some("Hermes"),
+            agents: Fact::Known(agents),
+            total: None,
+        }];
+        let total = priced(&mut sandboxes, &PriceList::bundled());
         let view = UsageView {
             since: Timestamp::from_second(0).unwrap(),
-            sandboxes: vec![SandboxUsage {
-                name: "lab".parse().unwrap(),
-                runtime: Some("Hermes"),
-                agents: Fact::Known(agents),
-            }],
+            sandboxes,
+            total,
+            prices: PricesRead {
+                override_file: PathBuf::from("/c/prices.toml"),
+                override_read: OverrideRead::Absent,
+            },
         };
         let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["prices"]["override_read"], "absent");
+        assert_eq!(json["total"]["tokens"]["input"], 83087);
         let sandbox = &json["sandboxes"][0];
         assert_eq!(sandbox["name"], "lab");
         let model = &sandbox["agents"]["known"][0]["usage"]["known"]["models"][0];
@@ -777,5 +922,90 @@ mod tests {
         assert_eq!(model["cost"]["kind"], "included");
         assert!(model.get("incomplete").is_none());
         assert_eq!(sandbox["agents"]["known"][1]["usage"], "absent");
+    }
+
+    fn records(models: Vec<(Option<&str>, Option<&str>, u64)>) -> AgentRecords {
+        AgentRecords {
+            models: models
+                .into_iter()
+                .map(|(model_provider, model, input)| ModelUsage {
+                    model: model.map(str::to_owned),
+                    model_provider: model_provider.map(str::to_owned),
+                    chats: 1,
+                    calls: Some(2),
+                    tokens: Tokens {
+                        input: Some(input),
+                        output: Some(0),
+                        ..Tokens::default()
+                    },
+                    cost: Cost {
+                        usd: None,
+                        kind: CostKind::Unknown,
+                    },
+                    estimate: UsageCost::default(),
+                    incomplete: Vec::new(),
+                })
+                .collect(),
+            top: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_model_is_priced_by_its_provider_and_sandboxes_and_the_host_sum_them() {
+        let known = |name: &str, models| AgentUsage {
+            agent: name.into(),
+            usage: Fact::Known(records(models)),
+        };
+        let mut sandboxes = vec![
+            SandboxUsage {
+                name: "lab".parse().unwrap(),
+                runtime: Some("Hermes"),
+                agents: Fact::Known(vec![
+                    known(
+                        "default",
+                        vec![
+                            (Some("anthropic"), Some("claude-opus-5-5"), 1_000_000),
+                            (Some("openai-codex"), Some("gpt-5.5"), 500),
+                        ],
+                    ),
+                    known("scout", vec![(Some("nous"), Some("hermes-9"), 70)]),
+                    AgentUsage {
+                        agent: "idle".into(),
+                        usage: Fact::Absent,
+                    },
+                ]),
+                total: None,
+            },
+            SandboxUsage {
+                name: "spare".parse().unwrap(),
+                runtime: Some("Hermes"),
+                agents: Fact::CannotTell("not running".into()),
+                total: None,
+            },
+        ];
+        let list = PriceList::bundled();
+        let host = priced(&mut sandboxes, &list);
+        let Fact::Known(agents) = &sandboxes[0].agents else {
+            panic!()
+        };
+        let Fact::Known(default) = &agents[0].usage else {
+            panic!()
+        };
+        let opus = list.cost(
+            Some("anthropic"),
+            Some("claude-opus-5-5"),
+            default.models[0].tokens.counts(),
+        );
+        assert!(opus.usd_micros > 0);
+        assert_eq!(default.models[0].estimate, opus);
+        assert_eq!(default.models[1].estimate.included, 500);
+        let lab = sandboxes[0].total.unwrap();
+        assert_eq!(lab.estimate.usd_micros, opus.usd_micros);
+        assert_eq!((lab.estimate.included, lab.estimate.unpriced), (500, 70));
+        assert_eq!(lab.tokens.input, Some(1_000_570));
+        assert_eq!(lab.calls, Some(6));
+        // A sandbox whose usage is not known has no total.
+        assert_eq!(sandboxes[1].total, None);
+        assert_eq!(host, lab);
     }
 }

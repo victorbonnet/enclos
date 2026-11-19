@@ -1,1 +1,1 @@
-{"v":1,"id":"2f6c1d8a-3b4e-4a5f-8c7d-9e0f1a2b3c51","type":"usage","conversation":"c-42","model":"gpt-6.1-sol","tokens":{"input":2104,"output":96,"cache_read":31744,"cache_write":0,"reasoning":32}}
+{"v":1,"id":"2f6c1d8a-3b4e-4a5f-8c7d-9e0f1a2b3c51","type":"usage","conversation":"c-42","model":"gpt-6.1-sol","model_provider":"openai-codex","tokens":{"input":2104,"output":96,"cache_read":31744,"cache_write":0,"reasoning":32}}

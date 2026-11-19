@@ -78,13 +78,20 @@ enum Command {
     /// from a sandbox is `{"known": …}`, `"absent"`, `{"cannot_tell": why}`
     /// or `"not_provided"`.
     Status(cli::status::StatusArgs),
-    /// What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them.
+    /// What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them, and enclos's estimate of the cost.
     ///
-    /// Reads the runtime's records inside the sandbox, as an exec session.
-    /// In JSON, each count the runtime does not keep is `null`, and each
-    /// read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or
-    /// `"not_provided"`.
+    /// Reads the runtime's records inside the sandbox, as an exec session,
+    /// and prices them with enclos's price list (`enclos prices`). In JSON,
+    /// each count the runtime does not keep is `null`, each read is
+    /// `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or
+    /// `"not_provided"`, and each estimate is in millionths of a dollar.
     Usage(cli::usage::UsageArgs),
+    /// What a model's tokens cost, from the price list enclos estimates cost from.
+    ///
+    /// The list ships inside enclos, in US dollars per million tokens;
+    /// `prices.toml` in enclos's config folder, in the same format,
+    /// overrides it. enclos fetches no price when it runs.
+    Prices(cli::prices::PricesArgs),
     /// Run one of a sandbox's runtime services; started by the service manager.
     #[command(hide = true)]
     Launch(cli::launch::LaunchArgs),
@@ -358,6 +365,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Dashboard(args) => cli::dashboard::run(&engine, &current_actor(), args),
         Command::Status(args) => cli::status::run(&engine, args),
         Command::Usage(args) => cli::usage::run(&engine, &current_actor(), args),
+        Command::Prices(args) => cli::prices::run(&engine, args),
     }
 }
 
@@ -390,6 +398,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Secret(_)
         | Command::State(_)
         | Command::Net(_)
+        | Command::Prices(_)
         | Command::Status(_) => true,
         Command::Agent(args) => args.runs_no_program(),
         Command::Connect(_)
@@ -434,6 +443,7 @@ fn writes_wait(command: &Command) -> Wait {
         | Command::Inside(_)
         | Command::Dashboard(_)
         | Command::Usage(_)
+        | Command::Prices(_)
         | Command::Logs(_)
         | Command::App(_) => Wait::Command,
     }

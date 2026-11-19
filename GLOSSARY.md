@@ -123,6 +123,14 @@ _Avoid_: session (a sandbox's word), thread
 What an agent's model calls consumed, as its runtime counts them: requests, input, output, cache-read, cache-write and reasoning tokens, and cost. A runtime counts it inside the sandbox, so it guides, and bills nothing.
 _Avoid_: consumption, spend, billing, quota (a provider's limit)
 
+**Cost**:
+What enclos estimates an agent's usage cost in US dollars, from its price list: the tokens of a model it has a price for, at that price; those on a subscription, included; the others, unknown, which is not $0. An estimate that guides; the model provider's own account is the record of what was billed.
+_Avoid_: spend, billing, charge
+
+**Price list**:
+What each model's tokens cost, in US dollars per million tokens, by model provider: the list enclos ships, kept current by reviewed updates, and the user's own entries, which win.
+_Avoid_: pricing table, rate card
+
 **Model provider**:
 A service, such as OpenAI or OpenRouter, through which an agent's runtime calls a model, with the runtime's own login or a secret granted to the agent. An agent can use only the model providers set up for it.
 _Avoid_: provider alone (it also names other things), backend, vendor

@@ -14,6 +14,10 @@ deny:
 hermes-plugin:
     python3 -I -m unittest discover -s channels/hermes/tests
 
+# The price list's update script (standard library only)
+prices-script:
+    python3 -I -m unittest discover -s scripts/tests
+
 # Complete Hermes data transfer (standard library only)
 hermes-transfer:
     python3 -I -m unittest discover -s src/runtime/hermes/tests
@@ -34,4 +38,8 @@ gitleaks-rule:
 openclaw-launchers:
     node --test src/runtime/openclaw/*.test.mjs
 
-ci: fmt clippy test deny hermes-plugin hermes-transfer openclaw-transfer openclaw-launchers openclaw-channel
+# The script the bridge adds to a runtime's task board page (Node 24)
+bridge-page:
+    node --test src/bridge/*.test.mjs
+
+ci: fmt clippy test deny hermes-plugin prices-script hermes-transfer openclaw-transfer openclaw-launchers openclaw-channel bridge-page

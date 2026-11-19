@@ -29,6 +29,7 @@ mod portable;
 mod portable_state;
 mod probe;
 mod proxy;
+mod releases;
 mod restart;
 mod runtime;
 mod sandbox;
@@ -74,13 +75,13 @@ pub(crate) use staging::home_files_script;
 use staging::{Curl, Downloader};
 pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
-    AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
-    RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted,
-    human_bytes, printable_line,
+    AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, LatestRelease, NetworkListener,
+    Presence, RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion,
+    Unlisted, human_bytes, printable_line,
 };
 pub use usage::{
-    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, REPORT_FORMAT, SandboxUsage,
-    Tokens, UsageView,
+    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, PricesRead, REPORT_FORMAT,
+    SandboxUsage, Tokens, Total, UsageView,
 };
 
 use std::path::PathBuf;

@@ -25,6 +25,7 @@ impl Hub {
             "suggested_replies".to_owned(),
             enclos_protocol::device::USAGE.to_owned(),
             enclos_protocol::device::USAGE_SERIES.to_owned(),
+            enclos_protocol::device::USAGE_COST.to_owned(),
         ];
         if self.known_host().as_deref() == Some(person) {
             capabilities.push("audit".to_owned());

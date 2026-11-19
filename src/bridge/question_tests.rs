@@ -331,6 +331,7 @@ fn usage(conversation: &str, input: u64) -> FromPlugin {
     FromPlugin::Usage(enclos_protocol::usage::CallUsage {
         conversation: ConversationId::new(conversation).unwrap(),
         model: Some("gpt".into()),
+        model_provider: None,
         background: false,
         calls: 1,
         tokens: enclos_protocol::usage::UsageTokens {
@@ -383,6 +384,7 @@ fn an_agents_calls_outside_the_app_count_under_it_for_the_hosts_person() {
         FromPlugin::AgentUsage(enclos_protocol::usage::AgentCallUsage {
             source: Some("cron".into()),
             model: None,
+            model_provider: None,
             background: false,
             calls: 3,
             tokens: enclos_protocol::usage::UsageTokens {
