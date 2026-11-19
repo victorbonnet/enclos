@@ -205,6 +205,35 @@ fn a_part_that_is_not_the_next_or_goes_past_its_size_drops_the_message() {
     assert!(got.lock().unwrap().is_empty());
 }
 
+/// Home changes owner while its files are sent: the message is refused at
+/// its last byte, its copies go, nothing is stored or given to the agent.
+/// One sent whole before the change is stored and given, as ever.
+#[test]
+fn a_conversation_that_changes_owner_while_files_are_sent_refuses_them() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let got = files_plugin(&socket, true);
+    let (bridge, mut device) = ready(folder.path(), socket);
+    let store = Store::open(&bridge.store).unwrap();
+    store.ensure_home("lab/main", PERSON, true).unwrap();
+    let two = [file("a.txt", "text/plain", 2)];
+    begin(&mut device, "m-1", "home.lab.main", "", &two);
+    part(&mut device, "p-1", "m-1", 0, 0, b"ok");
+    assert_eq!(answer_to(&mut device, "m-1"), None);
+    assert!(eventually(|| got.lock().unwrap().len() == 2));
+    let seq = store.newest_seq().unwrap();
+    begin(&mut device, "m-2", "home.lab.main", "", &two);
+    part(&mut device, "p-2", "m-2", 0, 0, b"a");
+    // Its first byte is kept: the message was let in
+    assert!(eventually(|| incoming_left(&bridge) == 1));
+    store.set_host("someone@example.com").unwrap();
+    part(&mut device, "p-3", "m-2", 0, 1, b"b");
+    assert_eq!(answer_to(&mut device, "m-2"), Some(ErrorCode::NotAllowed));
+    assert_eq!(incoming_left(&bridge), 0);
+    assert_eq!(store.newest_seq().unwrap(), seq);
+    assert_eq!(got.lock().unwrap().len(), 2);
+}
+
 /// The Hermes plugin's own adapter, in Python, on a socket in a synthetic
 /// sandbox home (a temporary folder laid out as one; no sandbox runs),
 /// stopped if the test fails first.

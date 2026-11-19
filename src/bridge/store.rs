@@ -865,6 +865,16 @@ pub enum Added {
     Again,
 }
 
+/// Why [`Store::add_from_device_with_files`] stored nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotStored {
+    /// The conversation is not the person's now, goes to another agent or
+    /// to a group, or is gone.
+    NotAllowed,
+    /// The conversation is being deleted.
+    Deleting,
+}
+
 /// What a plugin's `ack` did ([`Store::delivered`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acked {
@@ -2226,17 +2236,33 @@ impl Store {
     }
 
     /// [`Store::add_from_device`], with the records of its `files`, in one
-    /// transaction: none of them when the message was stored before.
+    /// transaction: none of them when the message was stored before. Stored
+    /// only while `conversation` is still `person`'s, goes to `sandbox`'s
+    /// `agent` alone and is not being deleted, checked in that transaction:
+    /// it holds the write lock from its start, so nothing changes them
+    /// between the check and the message.
     pub fn add_from_device_with_files(
         &self,
         origin: &str,
         id: &str,
-        conversation: &str,
+        (conversation, sandbox, agent): (&str, &str, &str),
         person: &str,
         text: &str,
         files: &[StoredAttachment],
-    ) -> rusqlite::Result<Added> {
-        let transaction = self.db.unchecked_transaction()?;
+    ) -> rusqlite::Result<Result<Added, NotStored>> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let to = (sandbox.to_owned(), agent.to_owned(), person.to_owned());
+        if self.conversation_of(conversation)? != Some(to)
+            || !self.members(conversation)?.is_empty()
+        {
+            return Ok(Err(NotStored::NotAllowed));
+        }
+        if self.deletion_started(conversation)? {
+            return Ok(Err(NotStored::Deleting));
+        }
         let added = self.add_from_device(origin, id, conversation, person, text)?;
         if let Added::New(_) = added {
             for file in files {
@@ -2244,7 +2270,7 @@ impl Store {
             }
         }
         transaction.commit()?;
-        Ok(added)
+        Ok(Ok(added))
     }
 
     /// A person's message in a group, from a device, as
@@ -3771,6 +3797,68 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    /// A message with files is stored only where it was let in: the
+    /// person's conversation with the same agent, not a group, not being
+    /// deleted. Sent again, it is stored once, its files too.
+    #[test]
+    fn a_message_with_files_is_stored_only_to_its_first_destination() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        let file = |id: &str, conversation: &str| StoredAttachment {
+            id: id.into(),
+            conversation: conversation.into(),
+            mime: "text/plain".into(),
+            name: "a.txt".into(),
+            size: 1,
+        };
+        let add_as = |n: &str, id: &str, c: &str, agent: &str, person: &str| {
+            let (origin, files) = (format!("d-1/{n}"), [file(&format!("f-{id}"), c)]);
+            let to = (c, "lab", agent);
+            let id = format!("b-{id}");
+            store
+                .add_from_device_with_files(&origin, &id, to, person, "", &files)
+                .unwrap()
+        };
+        let add = |n: &str, c: &str, agent: &str, person: &str| add_as(n, n, c, agent, person);
+        for c in ["c-1", "c-2", "c-3", "c-4"] {
+            store.conversation(c, "lab", "main", owner).unwrap();
+        }
+        assert!(matches!(
+            add("m-1", "c-1", "main", owner),
+            Ok(Added::New(_))
+        ));
+        // Sent again: whatever ids the bridge would give it, nothing more
+        let again = add_as("m-1", "retry", "c-1", "main", owner);
+        assert_eq!(again, Ok(Added::Again));
+        assert!(!store.has_message("b-retry").unwrap());
+        assert!(!store.has_attachment("f-retry").unwrap());
+        let refused = Err(NotStored::NotAllowed);
+        assert_eq!(add("m-2", "c-9", "main", owner), refused);
+        assert_eq!(add("m-3", "c-1", "main", "alice@example.com"), refused);
+        assert_eq!(add("m-4", "c-1", "scout", owner), refused);
+        store
+            .db
+            .execute("UPDATE conversations SET agent='scout' WHERE id='c-2'", [])
+            .unwrap();
+        assert_eq!(add("m-5", "c-2", "main", owner), refused);
+        store
+            .db
+            .execute(
+                "INSERT INTO members (conversation, agent, position) VALUES ('c-3', 'main', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(add("m-6", "c-3", "main", owner), refused);
+        store.begin_deletion("c-4", owner).unwrap().unwrap();
+        assert_eq!(add("m-7", "c-4", "main", owner), Err(NotStored::Deleting));
+        for n in ["m-2", "m-3", "m-4", "m-5", "m-6", "m-7"] {
+            assert!(!store.has_message(&format!("b-{n}")).unwrap());
+            assert!(!store.has_attachment(&format!("f-{n}")).unwrap());
+        }
+        assert!(store.has_attachment("f-m-1").unwrap());
     }
 
     #[test]

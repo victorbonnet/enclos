@@ -11,6 +11,7 @@ use enclos_protocol::incoming::{Begin, IncomingFile, MAX_PART_BYTES, Part, PartD
 
 use super::*;
 use crate::bridge::plugin::PluginError;
+use crate::bridge::store::NotStored;
 
 /// A message with files coming from a device, held by its connection
 /// alone. Its files are written in the bridge's `.incoming` folder, and
@@ -18,7 +19,10 @@ use crate::bridge::plugin::PluginError;
 pub(super) struct Upload {
     id: MessageId,
     conversation: ConversationId,
+    /// Its agent, as `sandbox/agent`, and the two apart: the destination
+    /// it was let in for, checked again as it is stored.
     agent: String,
+    to: (String, String),
     text: String,
     files: Vec<IncomingFile>,
     /// The bridge's id of each file, and its copy in `.incoming`.
@@ -129,6 +133,7 @@ pub(super) fn begin(
         id,
         conversation,
         agent: name,
+        to: (sandbox, agent),
         text,
         files,
         copies: Vec::new(),
@@ -218,16 +223,6 @@ fn finish(
     mut u: Upload,
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
-    if store
-        .deletion_started(u.conversation.as_str())
-        .map_err(|e| e.to_string())?
-    {
-        return refuse(
-            &u.id,
-            ErrorCode::Conflict,
-            "This conversation is being deleted.",
-        );
-    }
     // Its plugin may have connected again since, as one that takes no files
     if !takes_files(hub, &u.agent) {
         let why = "This agent's app channel does not take files: nothing was sent.";
@@ -248,16 +243,21 @@ fn finish(
     // Sent again (the device did not hear back): stored the first time
     let origin = format!("{}/{}", device.id, u.id.as_str());
     let stored_as = new_id().map_err(|e| e.to_string())?;
-    let added = store
-        .add_from_device_with_files(
-            &origin,
-            &stored_as,
-            u.conversation.as_str(),
-            person,
-            &u.text,
-            &stored,
-        )
-        .map_err(|e| e.to_string())?;
+    // Still the person's, to the same agent alone: else its copies go with `u`
+    let to = (u.conversation.as_str(), u.to.0.as_str(), u.to.1.as_str());
+    let added = match store
+        .add_from_device_with_files(&origin, &stored_as, to, person, &u.text, &stored)
+        .map_err(|e| e.to_string())?
+    {
+        Ok(added) => added,
+        Err(NotStored::NotAllowed) => {
+            return refuse(&u.id, ErrorCode::NotAllowed, "No such conversation.");
+        }
+        Err(NotStored::Deleting) => {
+            let why = "This conversation is being deleted.";
+            return refuse(&u.id, ErrorCode::Conflict, why);
+        }
+    };
     let new = matches!(added, Added::New(_));
     if let Added::New(seq) = added {
         // Recorded: one not moved now is moved when the bridge starts again

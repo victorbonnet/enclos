@@ -484,6 +484,9 @@ class EnclosAdapter(BasePlatformAdapter):
             if hasattr(event, "media_filenames"):
                 # A newer Hermes shows the person's own names
                 event.media_filenames = list(names)
+            if hasattr(event, "media_text_inlined"):
+                # None of their text is in `text`: unflagged, Hermes says it is
+                event.media_text_inlined = [False] * len(paths)
         else:
             event = MessageEvent(
                 text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
