@@ -459,6 +459,9 @@ class Manager:
         self._cut: frozenset[str] = frozenset()
         # Resumes in progress, kept so that none is collected early.
         self.tasks: set[asyncio.Task] = set()
+        # What the agent wrote for the person on its held tasks (`asks.Asks`,
+        # ADR 0073), attached to each list; None sends none.
+        self.asks: Any = None
 
     @property
     def native(self) -> bool:
@@ -559,6 +562,13 @@ class Manager:
             self._failed("Cannot list the kanban boards for held tasks")
             return
         self._failure_told = None
+        if self.asks is not None:
+            try:
+                held = await asyncio.to_thread(self.asks.attach, held)
+            except Exception:
+                # The list goes without them: a card the agent wrote reads
+                # as one it did not, until the next read.
+                self._failed("The held tasks' asks could not be read")
         listed = held[:MAX_TASKS]
         cut = frozenset(entry["task"] for entry in held[MAX_TASKS:])
         if cut and cut != self._cut:
