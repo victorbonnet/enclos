@@ -4,6 +4,8 @@ status: proposed
 
 # The bridge signs runtime-approval decisions
 
+Amended by [0077](0077-the-hosts-person-speaks-to-openclaw-with-its-owner-authority.md) (proposed): the key also signs the host's person's direct messages, under another label, for OpenClaw's owner authority.
+
 A runtime approval ([0053](0053-runtime-approvals-use-exact-native-requests-and-explicit-scopes.md)) reaches the agent's channel plugin as a `question.answer` from the bridge. The plugin knows the bridge only by the agent's token, which the agent can read ([0036](0036-an-agent-has-its-own-bot.md)), on a socket in the sandbox home. So a program of the sandbox can connect to its own plugin while the bridge is away, or listen on the socket's path and take the bridge's messages, and send an approval of its own command. A typed `/approve` in a `message.in` that says `host: true` does the same.
 
 Decision (proposed):

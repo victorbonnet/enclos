@@ -65,6 +65,12 @@ session. Home has its own deterministic account/agent/conversation route even
 before a person first speaks there. Its first authenticated inbound message binds
 the owner without replacing that native session or inventing a human identity
 for earlier output. The exact ingress result is passed to the native context builder.
+The native sender is the person, except for a message the bridge signed as the
+host's person's in a direct conversation (`host-messages.js`, ADR 0077): checked
+on receipt with the account's `bridgeKey`, it comes from `host`, the sender that
+`commands.ownerAllowFrom` names as `enclos:host`, so OpenClaw gives that turn its
+owner-only tools. The display name stays the person's, the session stays the
+person's, and an unsigned message whose person is `host` is refused.
 Bridge groups remain direct per-member contexts; OpenClaw's broadcast coordinator
 is not enabled for them. Account authority is rechecked after asynchronous
 preparation and before dispatch/delivery.

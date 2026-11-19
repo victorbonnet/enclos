@@ -120,6 +120,13 @@ pub enum FromBridge {
         /// (`None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<bool>,
+        /// The bridge's signature of this message ([`crate::decision`],
+        /// `HostMessage`): only on a message the host's person sent from a
+        /// paired device in a direct conversation, with no attachments. A
+        /// channel may give that turn its runtime's owner authority, after
+        /// checking it (ADR 0077, proposed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed: Option<crate::decision::SignedDecision>,
     },
     /// Requests cancellation of this exact ingress, when the plugin advertises
     /// `abort`. Unknown or settled targets have no effect on later turns. An ack

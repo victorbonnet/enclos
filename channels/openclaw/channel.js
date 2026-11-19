@@ -12,6 +12,7 @@ import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
 import { registerUsage } from './usage.js';
+import { hostSender } from './host-messages.js';
 
 export const TESTED_OPENCLAW = '2026.11.5';
 const MINIMUM_OPENCLAW = '2026.11.5';
@@ -196,6 +197,11 @@ export function createChannel(sdk = {}) {
         const cfg = currentConfig(ctx.cfg);
         const assertAuthority = () => { assertCurrent(cfg, account, transport); execution.signal.throwIfAborted(); };
         assertAuthority();
+        // Checked first, on receipt: the bridge signed it as it sent it.
+        const sandbox = process.env.ENCLOS_SANDBOX;
+        const sender = hostSender(account.bridgeKey, sandbox && `${sandbox}/${account.agentId}`, incoming);
+        if (sender.failure) (ctx.log?.warn ?? console.warn)(`enclos: a signed message is passed on as its person's, not the owner's: ${sender.failure}`);
+        if (sender.refused) throw new ProtocolError('not_allowed', sender.refused);
         const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: incoming.conversation }, dmScope: 'per-account-channel-peer' });
@@ -208,7 +214,7 @@ export function createChannel(sdk = {}) {
         const ingress = await channel.inbound.ingress.resolve({
           channelId: 'enclos', accountId: account.accountId,
           identity: { primary: { key: 'enclos-person', normalize: value => value, authentication: 'verified', sensitivity: 'pii' } },
-          subject: { stableId: incoming.person },
+          subject: { stableId: sender.id },
           conversation: { kind: 'direct', id: incoming.conversation },
           contextBinding: { agentId: account.agentId, sessionKey, messageId: incoming.id,
             nativeChannelId: incoming.conversation, inboundEventKind: 'user_request' },
@@ -216,15 +222,17 @@ export function createChannel(sdk = {}) {
           // The bridge authenticated this person before presenting the agent's
           // token. OpenClaw does not add another channel pairing database.
           policy: { dmPolicy: 'allowlist', groupPolicy: 'disabled' },
-          allowFrom: [incoming.person], useDefaultPairingStore: false,
+          allowFrom: [sender.id], useDefaultPairingStore: false,
           command: { allowTextCommands: true, hasControlCommand: isCommand },
         });
         assertAuthority();
         if (ingress.ingress?.admission !== 'dispatch' || !ingress.senderAccess?.allowed || !ingress.routeAccess?.allowed || ingress.activationAccess?.shouldSkip || ingress.commandAccess?.shouldBlockControlCommand) throw new Error('native channel ingress refused this message');
         const ctxPayload = channel.inbound.buildContext({
           channel: 'enclos', accountId: account.accountId,
-          messageId: incoming.id, timestamp: Date.now(), from: incoming.person,
-          sender: { id: incoming.person, name: incoming.person },
+          // OpenClaw's owner authority follows the sender (ADR 0077); the
+          // name stays the person's.
+          messageId: incoming.id, timestamp: Date.now(), from: sender.id,
+          sender: { id: sender.id, name: incoming.person },
           // Bridge groups deliberately remain ordinary direct contexts per
           // member; the bridge owns their turns, not OpenClaw broadcast groups.
           conversation: { kind: 'direct', id: incoming.conversation, nativeChannelId: incoming.conversation },

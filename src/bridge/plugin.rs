@@ -223,7 +223,7 @@ impl PluginWriter {
     }
 
     /// A person's message to the agent, in `conversation`; `host` when
-    /// the person is the host's person.
+    /// the person is the host's person. Unsigned: it grants nothing.
     pub fn message(
         &mut self,
         conversation: &ConversationId,
@@ -236,6 +236,7 @@ impl PluginWriter {
             person: person.clone(),
             text: text.to_owned(),
             host: Some(host),
+            signed: None,
         })
     }
 

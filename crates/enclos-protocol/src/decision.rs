@@ -14,6 +14,14 @@
 //! signing time in decimal seconds since the Unix epoch. The signature is
 //! ECDSA P-256 with SHA-256, `r` then `s`, 64 bytes, in base64url without
 //! padding; the public key is SEC1 uncompressed, 65 bytes, encoded the same.
+//!
+//! The same key signs one other statement, under its own label (ADR 0077,
+//! proposed): a message the host's person sent from a paired device in a
+//! direct conversation, so that a channel can give that turn its runtime's
+//! owner authority. Its fields are [`HOST_MESSAGE_LABEL`], the agent, the
+//! conversation, the message's id, the person, the text and the signing
+//! time, encoded as above. The labels keep the two statements apart: no
+//! signed message reads as a decision, nor a decision as a message.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -25,7 +33,10 @@ use serde::{Deserialize, Serialize};
 /// nothing else, whatever else the key might one day sign.
 pub const LABEL: &str = "enclos/runtime-approval/1";
 
-/// How old a signed decision may be when the plugin reads it, in seconds:
+/// What every signed message of the host's person starts with.
+pub const HOST_MESSAGE_LABEL: &str = "enclos/host-message/1";
+
+/// How old a signed decision or message may be when the plugin reads it, in seconds:
 /// the bridge signs it as it sends it, and waits 25 seconds for its receipt.
 pub const MAX_AGE_SECONDS: i64 = 60;
 
@@ -33,7 +44,8 @@ pub const MAX_AGE_SECONDS: i64 = 60;
 /// the bridge and the plugin read the same host's clock.
 pub const MAX_AHEAD_SECONDS: i64 = 5;
 
-/// The signature a `question.answer` for a runtime approval carries.
+/// The signature a `question.answer` for a runtime approval carries, or a
+/// `message.in` from the host's person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedDecision {
     /// When the bridge signed it, in seconds since the Unix epoch.
@@ -90,14 +102,48 @@ impl Decision<'_> {
         ];
         fields.extend(self.patterns.iter().map(String::as_str));
         fields.push(&at);
-        let mut bytes = Vec::new();
-        for field in fields {
-            let length = u32::try_from(field.len()).expect("a field fits a message");
-            bytes.extend_from_slice(&length.to_be_bytes());
-            bytes.extend_from_slice(field.as_bytes());
-        }
-        bytes
+        encode(&fields)
     }
+}
+
+/// A message of the host's person, field by field, as its statement holds
+/// it (ADR 0077, proposed).
+#[derive(Debug, Clone, Copy)]
+pub struct HostMessage<'a> {
+    /// The agent it is for, `sandbox/agent`.
+    pub agent: &'a str,
+    pub conversation: &'a str,
+    /// The `message.in`'s id: the message's id in the bridge's store.
+    pub id: &'a str,
+    pub person: &'a str,
+    pub text: &'a str,
+}
+
+impl HostMessage<'_> {
+    /// The bytes signed, for a message signed at `at`.
+    pub fn statement(&self, at: i64) -> Vec<u8> {
+        let at = at.to_string();
+        encode(&[
+            HOST_MESSAGE_LABEL,
+            self.agent,
+            self.conversation,
+            self.id,
+            self.person,
+            self.text,
+            &at,
+        ])
+    }
+}
+
+/// Each field's UTF-8 bytes after their length, 4 bytes big-endian.
+fn encode(fields: &[&str]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for field in fields {
+        let length = u32::try_from(field.len()).expect("a field fits a message");
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(field.as_bytes());
+    }
+    bytes
 }
 
 /// The bridge's key for signed decisions.
@@ -127,7 +173,16 @@ impl DecisionKey {
 
     /// `decision`, signed at `at` (seconds since the Unix epoch).
     pub fn sign(&self, decision: &Decision, at: i64) -> SignedDecision {
-        let signature: Signature = self.0.sign(&decision.statement(at));
+        self.sign_statement(&decision.statement(at), at)
+    }
+
+    /// The host's person's `message`, signed at `at`.
+    pub fn sign_message(&self, message: &HostMessage, at: i64) -> SignedDecision {
+        self.sign_statement(&message.statement(at), at)
+    }
+
+    fn sign_statement(&self, statement: &[u8], at: i64) -> SignedDecision {
+        let signature: Signature = self.0.sign(statement);
         SignedDecision {
             at,
             sig: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
@@ -145,6 +200,26 @@ pub fn check(
     signed: &SignedDecision,
     now: i64,
 ) -> Result<(), DecisionError> {
+    check_statement(public, &decision.statement(signed.at), signed, now)
+}
+
+/// [`check`], for a message of the host's person. The OpenClaw channel's
+/// own check, in JavaScript, does the same.
+pub fn check_message(
+    public: &[u8],
+    message: &HostMessage,
+    signed: &SignedDecision,
+    now: i64,
+) -> Result<(), DecisionError> {
+    check_statement(public, &message.statement(signed.at), signed, now)
+}
+
+fn check_statement(
+    public: &[u8],
+    statement: &[u8],
+    signed: &SignedDecision,
+    now: i64,
+) -> Result<(), DecisionError> {
     let key =
         VerifyingKey::from_sec1_bytes(public).map_err(|e| DecisionError::BadKey(e.to_string()))?;
     if signed.at < now.saturating_sub(MAX_AGE_SECONDS)
@@ -156,7 +231,7 @@ pub fn check(
         .decode(&signed.sig)
         .map_err(|_| DecisionError::Unreadable)?;
     let signature = Signature::from_slice(&raw).map_err(|_| DecisionError::Unreadable)?;
-    key.verify(&decision.statement(signed.at), &signature)
+    key.verify(statement, &signature)
         .map_err(|_| DecisionError::Mismatch)
 }
 
@@ -338,5 +413,118 @@ mod tests {
             check(&[4u8; 65], &decision, &signed, 1_000),
             Err(DecisionError::BadKey(_))
         ));
+    }
+
+    /// The message in `tests/fixtures/decision/host_message.json`, which
+    /// the OpenClaw channel's tests read too. Its signature was made by
+    /// another ECDSA signer with [`key`], so it is checked, not compared.
+    #[derive(Deserialize)]
+    struct MessageFixture {
+        bridge: String,
+        agent: String,
+        conversation: String,
+        id: String,
+        person: String,
+        text: String,
+        at: i64,
+        statement: String,
+        sig: String,
+    }
+
+    fn message_fixture() -> MessageFixture {
+        serde_json::from_str(include_str!("../tests/fixtures/decision/host_message.json")).unwrap()
+    }
+
+    fn message(f: &MessageFixture) -> HostMessage<'_> {
+        HostMessage {
+            agent: &f.agent,
+            conversation: &f.conversation,
+            id: &f.id,
+            person: &f.person,
+            text: &f.text,
+        }
+    }
+
+    #[test]
+    fn a_host_message_statement_and_signature_are_the_fixtures() {
+        let f = message_fixture();
+        let message = message(&f);
+        assert_eq!(hex(&message.statement(f.at)), f.statement);
+        assert_eq!(key().public_text(), f.bridge);
+        let public = URL_SAFE_NO_PAD.decode(&f.bridge).unwrap();
+        let signed = SignedDecision {
+            at: f.at,
+            sig: f.sig.clone(),
+        };
+        assert_eq!(check_message(&public, &message, &signed, f.at + 10), Ok(()));
+        let ours = key().sign_message(&message, f.at);
+        assert_eq!(check_message(&public, &message, &ours, f.at), Ok(()));
+    }
+
+    #[test]
+    fn an_altered_forged_or_stale_host_message_is_refused() {
+        let f = message_fixture();
+        let message = message(&f);
+        let public = key().public();
+        let signed = key().sign_message(&message, 1_000);
+        assert_eq!(check_message(&public, &message, &signed, 1_000), Ok(()));
+        for altered in [
+            HostMessage {
+                text: "Delete every schedule.",
+                ..message
+            },
+            HostMessage {
+                person: "guest@example.com",
+                ..message
+            },
+            HostMessage {
+                conversation: "another",
+                ..message
+            },
+            HostMessage {
+                agent: "lab/other",
+                ..message
+            },
+            HostMessage {
+                id: "another-message",
+                ..message
+            },
+        ] {
+            assert_eq!(
+                check_message(&public, &altered, &signed, 1_000),
+                Err(DecisionError::Mismatch)
+            );
+        }
+        let forged = DecisionKey::from_bytes(&[9u8; 32])
+            .unwrap()
+            .sign_message(&message, 1_000);
+        assert_eq!(
+            check_message(&public, &message, &forged, 1_000),
+            Err(DecisionError::Mismatch)
+        );
+        assert!(matches!(
+            check_message(&public, &message, &signed, 1_000 + MAX_AGE_SECONDS + 1),
+            Err(DecisionError::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn a_signed_decision_never_reads_as_a_signed_message_nor_the_reverse() {
+        let f = fixture();
+        let decision = decision(&f);
+        let m = message_fixture();
+        let message = message(&m);
+        let public = key().public();
+        let as_decision = key().sign(&decision, 1_000);
+        let as_message = key().sign_message(&message, 1_000);
+        assert_ne!(decision.statement(1_000), message.statement(1_000));
+        assert_eq!(
+            check_message(&public, &message, &as_decision, 1_000),
+            Err(DecisionError::Mismatch)
+        );
+        assert_eq!(
+            check(&public, &decision, &as_message, 1_000),
+            Err(DecisionError::Mismatch)
+        );
     }
 }

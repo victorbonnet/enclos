@@ -510,6 +510,9 @@ impl Hub {
                     person,
                     text: text.to_owned(),
                     host: Some(host),
+                    // A group turn is never the host's person's alone, so
+                    // never signed: it grants no owner authority (ADR 0077).
+                    signed: None,
                 },
             )
             .map_err(|e| e.to_string())

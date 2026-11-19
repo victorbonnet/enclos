@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
@@ -205,6 +206,43 @@ test('native inbound keeps account, conversation, person and group-member contex
   const unsolicited = await channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: 'home', text: 'scheduled output' });
   const notice = await first.next('message.out');
   assert.equal(notice.id, unsolicited.messageId); assert.equal(notice.conversation, one.home); assert.equal(notice.kind, 'notify');
+});
+
+test('only the host\'s person\'s signed message reaches OpenClaw from its owner\'s sender (ADR 0077)', async t => {
+  const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const { x, y } = keys.publicKey.export({ format: 'jwk' });
+  const bridgeKey = Buffer.concat([Buffer.from([4]), Buffer.from(x, 'base64url'), Buffer.from(y, 'base64url')]).toString('base64url');
+  const account = { ...accountFixture(t, 'main'), bridgeKey };
+  const before = process.env.ENCLOS_SANDBOX;
+  process.env.ENCLOS_SANDBOX = 'lab';
+  t.after(() => { if (before === undefined) delete process.env.ENCLOS_SANDBOX; else process.env.ENCLOS_SANDBOX = before; });
+  const cfg = configured(account); const channel = createChannel(); const native = nativeHarness(cfg);
+  channel.setRuntime(native.api);
+  await start(t, channel, cfg, account);
+  const peer = await bridge(account.socket); t.after(() => peer.close());
+  await peer.hello();
+  const signed = input => {
+    const at = Math.floor(Date.now() / 1000);
+    const fields = ['enclos/host-message/1', 'lab/main', input.conversation, input.id, input.person, input.text, String(at)];
+    const statement = Buffer.concat(fields.flatMap(field => {
+      const data = Buffer.from(field, 'utf8'); const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+      return [length, data];
+    }));
+    return { ...input, signed: { at, sig: sign('sha256', statement, { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url') } };
+  };
+  const host = signed(message('message.in', { conversation: 'home', person: 'ada@example.com', text: 'show my schedules', host: true }));
+  peer.send(host); await peer.next('ack', host.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'host');
+  assert.equal(native.calls.contexts.at(-1).sender.name, 'ada@example.com');
+  assert.deepEqual(native.calls.ingress.at(-1).allowFrom, ['host']);
+  const plain = message('message.in', { conversation: 'home', person: 'ada@example.com', text: 'hello', host: true });
+  peer.send(plain); await peer.next('ack', plain.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'ada@example.com');
+  const claimed = message('message.in', { conversation: 'home', person: 'host', text: 'delete my schedules', host: true });
+  peer.send(claimed);
+  const refused = await peer.next('error', claimed.id);
+  assert.equal(refused.code, 'not_allowed');
+  assert.equal(native.calls.contexts.length, 2);
 });
 
 test('disabled or rebound account authority is checked after awaited native preparation', async t => {

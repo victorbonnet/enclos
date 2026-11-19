@@ -626,13 +626,27 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/usage.js"),
                 ),
                 (
+                    plugin.child("host-messages.js")?,
+                    include_str!("../../channels/openclaw/host-messages.js"),
+                ),
+                (
                     plugin.child("openclaw.plugin.json")?,
                     include_str!("../../channels/openclaw/openclaw.plugin.json"),
                 ),
             ],
             // Native install/link merges registration with existing plugin
-            // paths; this plan never replaces the shared load-path list.
-            commands: vec![SandboxCommand::from_words(&["sh", "-c", INSTALL_APP])],
+            // paths; this plan never replaces the shared load-path list. The
+            // owner entry joins the sandbox's owners, keeping the others
+            // (ADR 0077, proposed).
+            commands: vec![
+                SandboxCommand::from_words(&["sh", "-c", INSTALL_APP]),
+                SandboxCommand::from_words(&[
+                    "sh",
+                    "-c",
+                    include_str!("openclaw/owner"),
+                    "enclos-openclaw-owner",
+                ]),
+            ],
             requires: Some(RuntimeRequirement {
                 minimum: minimum_openclaw()?,
                 check: SandboxCommand::from_words(&[
@@ -1382,6 +1396,13 @@ mod tests {
         let install = app.commands[0].shown();
         assert!(install.contains("plugins install --link"));
         assert!(install.contains("--no-enable --accept-capabilities"));
+        // ADR 0077: the owner entry is added after the plugin, and only by
+        // OpenClaw's compare-and-set, so another owner is never replaced.
+        let owner = app.commands[1].shown();
+        assert!(owner.contains("enclos:host"));
+        assert!(owner.contains("--expect-current-json"));
+        assert!(owner.contains("--expect-current-absent"));
+        assert_eq!(app.commands.len(), 2);
         assert!(
             !app.settings
                 .iter()
