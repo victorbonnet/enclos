@@ -36,10 +36,15 @@ const GATEWAY: ServiceName = ServiceName::new("gateway");
 const APP_PLUGIN: &str = ".enclos-openclaw";
 const INSTALL_APP: &str = "exec \"$HOME/bin/openclaw\" plugins install --link \"$HOME/.enclos-openclaw\" --force --no-enable --accept-capabilities";
 /// Runs the usage reader (`openclaw/usage.mjs`, its source the first
-/// argument) with OpenClaw's own Node and this sandbox's state and gateway
-/// port, as `bin/openclaw` selects them. Its output goes nowhere: what it
-/// has to say is in the report.
-const USAGE_READER: &str = "script=$1; shift\nexport OPENCLAW_HOME=\"$HOME\" OPENCLAW_STATE_DIR=\"$HOME/.openclaw\" OPENCLAW_CONFIG_PATH=\"$HOME/.openclaw/openclaw.json\" OPENCLAW_LOAD_SHELL_ENV=0 OPENCLAW_NO_RESPAWN=1 ENCLOS_OPENCLAW_USAGE=1\nproxy_port=${HTTP_PROXY##*:}\ncase \"$proxy_port\" in ''|*[!0-9]*) ;; *) export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000)) ;; esac\nexec \"$HOME/.local/share/openclaw/tools/node/bin/node\" --input-type=module -e \"$script\" \"$@\" </dev/null >/dev/null 2>&1";
+/// argument) with OpenClaw's own Node and the settings `bin/openclaw`
+/// (`openclaw/command`) exports: this sandbox's state, no supervision,
+/// repair, Bonjour or shell snapshot, and the gateway port of a proxy port
+/// in 41000..41999 (the reader says it is unknown otherwise). All but
+/// `NODE_USE_ENV_PROXY`: the reader only connects to the gateway on
+/// loopback, which under Seatbelt `NO_PROXY` does not name, so Node would
+/// send it to the proxy, which refuses loopback. Its output goes nowhere:
+/// what it has to say is in the report.
+const USAGE_READER: &str = "script=$1; shift\nexport OPENCLAW_HOME=\"$HOME\" OPENCLAW_STATE_DIR=\"$HOME/.openclaw\" OPENCLAW_CONFIG_PATH=\"$HOME/.openclaw/openclaw.json\" OPENCLAW_SUPERVISOR_MODE=external OPENCLAW_SERVICE_REPAIR_POLICY=external OPENCLAW_NO_RESPAWN=1 OPENCLAW_DISABLE_BONJOUR=1 OPENCLAW_LOAD_SHELL_ENV=0 OPENCLAW_EXEC_SHELL_SNAPSHOT=0 ENCLOS_OPENCLAW_USAGE=1\nproxy_port=${HTTP_PROXY##*:}\ncase \"$proxy_port\" in ''|*[!0-9]*) ;; *) if [ \"$proxy_port\" -ge 41000 ] && [ \"$proxy_port\" -le 41999 ]; then export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000)); fi ;; esac\nexec \"$HOME/.local/share/openclaw/tools/node/bin/node\" --input-type=module -e \"$script\" \"$@\" </dev/null >/dev/null 2>&1";
 const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind --agent \"$agent\" --bind \"enclos:$agent\" --json\n\"$HOME/bin/openclaw\" config set channels.enclos.enabled true\nexec \"$HOME/bin/openclaw\" config set \"channels.enclos.accounts.$agent.enabled\" true";
 
 fn at(path: &str) -> HomePath {
@@ -997,6 +1002,23 @@ fn transfer(operation: &str, name: &AgentName, archive: &Path, context: &str) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_usage_reader_exports_what_bin_openclaw_does_but_the_env_proxy() {
+        let exported = include_str!("openclaw/command")
+            .lines()
+            .filter_map(|l| l.strip_prefix("export ")?.split('=').next());
+        let mut names = 0;
+        for name in exported.filter(|n| *n != "NODE_USE_ENV_PROXY") {
+            names += 1;
+            assert!(
+                super::USAGE_READER.contains(&format!(" {name}=")),
+                "the usage reader does not export {name}"
+            );
+        }
+        assert!(names >= 10, "read {names} exports from bin/openclaw");
+        assert!(!super::USAGE_READER.contains("NODE_USE_ENV_PROXY"));
+    }
+
     use super::*;
 
     #[test]

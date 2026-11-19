@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { agentUsage, day, main, report, write } from './usage.mjs';
+import { MAX_TIME, agentUsage, day, main, report, write } from './usage.mjs';
 
 // The report the reader writes for `contract()`'s answers, which the host's
 // parser reads in `src/engine/usage.rs` (`the_openclaw_readers_report_is_taken`).
@@ -100,6 +100,21 @@ test('the top chats are the 5 that used the most, and a start time the host cann
   assert.deepEqual(top.map(c => c.chat), ['s6', 's5', 's4', 's3', 's2']);
   assert.equal(top[0].started_at, null);
   assert.equal(top[1].started_at, 1763164800);
+  // The host's latest time is jiff's, a day short of the end of year 9999.
+  a.sessions = [MAX_TIME, MAX_TIME + 1].map((s, i) => ({ key: `e${i}`, sessionId: `e${i}`,
+    usage: { ...totals(2 - i, 0, 0, 0, 0), firstActivity: s * 1000, modelUsage: [] } }));
+  assert.deepEqual(agentUsage(a).top.map(c => c.started_at), [MAX_TIME, null]);
+});
+
+test('chats are counted among the 100 listed, so a full list marks them as a lower bound', () => {
+  const a = answer();
+  assert.ok(agentUsage(a).models.every(m => m.incomplete === undefined));
+  a.sessions = Array.from({ length: 100 }, (_, i) => ({ key: `k${i}`, sessionId: `s${i}`,
+    usage: { ...totals(1, 0, 0, 0, 0), modelUsage: [{ provider: 'openai', model: 'gpt-6.1' }] } }));
+  const read = agentUsage(a).models;
+  assert.deepEqual(read.map(m => [m.model, m.chats, m.incomplete]), [['claude-sonnet-5-5', 0, ['chats']], ['gpt-6.1', 100, ['chats']]]);
+  a.partial = true;
+  assert.deepEqual(agentUsage(a).models[0].incomplete, ['chats', 'calls', 'input', 'output', 'cache_read', 'cache_write']);
 });
 
 /** `n` models, the i-th of `1000 - i` input tokens, in a shuffled order. */

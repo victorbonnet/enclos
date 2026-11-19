@@ -130,8 +130,10 @@ pub struct Cost {
     pub kind: CostKind,
 }
 
-/// The counts a usage report names: requests, then each kind of token.
-pub const COUNTS: [&str; 6] = [
+/// The counts a usage report names: native chats, requests, then each kind
+/// of token.
+pub const COUNTS: [&str; 7] = [
+    "chats",
     "calls",
     "input",
     "output",
@@ -815,6 +817,13 @@ mod tests {
         assert_eq!(m.incomplete, ["input", "calls"]);
         assert!(m.at_least("input") && !m.at_least("output"));
         assert_eq!(m.per_call(), None);
+        // A runtime that counts chats among those it lists says so.
+        let row = model_row(r#","incomplete":["chats"]"#);
+        let listed = super::tests::agents(&with_models(&[row]), &["default"]);
+        let Fact::Known(records) = &listed[0].usage else {
+            panic!("{listed:?}")
+        };
+        assert!(records.models[0].at_least("chats") && !records.models[0].at_least("calls"));
         let unknown = model_row(r#","incomplete":["joules"]"#);
         assert!(refused(&with_models(&[unknown])).contains("does not have"));
     }

@@ -604,4 +604,15 @@ test('model calls report usage to the app conversation, or outside it on their a
   await again.hello({ capabilities: ['usage'] });
   hooks.get('llm_output')({ usage: { input: 7 } }, { sessionKey, agentId: 'main' });
   assert.equal((await again.next('usage')).conversation, 'c');
+
+  // Observing a call saves no route: neither a call outside the app nor one
+  // in Home's native chat before Home has a saved route of its own.
+  const active = channel.running.get(account.accountId), { transport } = active;
+  assert.equal(transport.state.routes[transport.home], undefined);
+  const routes = JSON.stringify(transport.state.routes);
+  hooks.get('llm_output')({ usage: { input: 8 } }, { sessionKey: 'agent:main:main', agentId: 'main' });
+  hooks.get('llm_output')({ usage: { input: 9 } }, { sessionKey: active.peekSessionKey(transport.home), agentId: 'main' });
+  const home = await again.next('usage');
+  assert.deepEqual([home.conversation, home.tokens.input], [transport.home, 9]);
+  assert.equal(JSON.stringify(transport.state.routes), routes);
 });

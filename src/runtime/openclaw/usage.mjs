@@ -34,8 +34,9 @@ const MINIMUM = '2026.11.5';
 // What OpenClaw counts. It keeps no reasoning count of its own (reasoning is
 // part of `output`), so `reasoning` is null, never 0.
 const KEPT = ['calls', 'input', 'output', 'cache_read', 'cache_write'];
-// The latest start time the host takes (the end of year 9999, in seconds).
-const MAX_TIME = 253402300799;
+// The latest start time the host takes, in seconds: its time library's
+// (jiff's `Timestamp::MAX`, 9999-12-30T22:00:00Z, whole seconds).
+export const MAX_TIME = 253402207200;
 
 class Unread extends Error {}
 
@@ -70,7 +71,7 @@ function total(t) {
 
 /**
  * What OpenClaw says a model's calls cost. It keeps the cost recorded with a
- * call (its estimate then, or the provider's billed figure) and estimates one
+ * call (its estimate then, or the model provider's billed figure) and estimates one
  * recorded without, from its price table when the gateway sums it; a total
  * cannot tell these apart, so a known cost is `estimated`. Calls it could
  * not price, or an answer that does not say how many, make the sum `mixed`,
@@ -114,6 +115,8 @@ export function agentUsage(answer) {
     (cache != null && (cache.status !== 'fresh' || cache.pendingFiles > 0 || cache.staleFiles > 0)) ||
     answer.sessions.some(s => s?.computing === true || s?.usage?.staleSince != null || s?.usage?.refreshing === true);
   const byModel = answer.aggregates.byModel;
+  // Chats are counted among those listed: a full list may leave some out.
+  const unlisted = answer.sessions.length >= LISTED_CHATS;
   const chats = new Map();
   for (const session of answer.sessions) {
     for (const m of Array.isArray(session?.usage?.modelUsage) ? session.usage.modelUsage : []) {
@@ -131,7 +134,8 @@ export function agentUsage(answer) {
       tokens: tokens(m.totals),
       cost: cost(m.totals, calls),
     };
-    if (partial) entry.incomplete = [...KEPT];
+    const incomplete = [...(unlisted ? ['chats'] : []), ...(partial ? KEPT : [])];
+    if (incomplete.length) entry.incomplete = incomplete;
     return entry;
   }).sort((a, b) => total(b.tokens) - total(a.tokens));
   const models = rows.length > MAX_MODELS ? [...rows.slice(0, MAX_MODELS - 1), folded(rows.slice(MAX_MODELS - 1))] : rows;

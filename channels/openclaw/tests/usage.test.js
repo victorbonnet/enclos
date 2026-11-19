@@ -45,6 +45,30 @@ test('each attempt reports its own completed calls, and a report without tokens 
   assert.equal(s.warnings.length, 0);
 });
 
+test('a call still to end at its attempt\'s report counts with it, and its late or dropped end never moves to the next report', () => {
+  const main = account('main'), s = setup({ accounts: [main] });
+  const started = (runId, callId) => s.hooks.get('model_call_started')({ runId, callId }, {});
+  const ended = (runId, callId, outcome = 'completed') => s.hooks.get('model_call_ended')({ runId, callId, outcome }, {});
+  // Three calls; OpenClaw's queue delivers the last end after the report.
+  for (const id of ['a', 'b', 'c']) started('run', id);
+  ended('run', 'a'); ended('run', 'b');
+  s.output({ runId: 'run', usage: { input: 1 } });
+  ended('run', 'c');
+  // The next attempt's one call, whose end the full queue dropped.
+  started('run', 'd');
+  s.output({ runId: 'run', usage: { input: 1 } });
+  // And one more, seen whole.
+  started('run', 'e'); ended('run', 'e');
+  ended('run', 'd');
+  s.output({ runId: 'run', usage: { input: 1 } });
+  assert.deepEqual(main.sent.map(m => m.calls), [3, undefined, undefined]);
+  // A failed call seen ending is no call; a start never seen still counts its end.
+  started('other', 'x'); ended('other', 'x', 'error'); ended('other', 'y');
+  s.output({ runId: 'other', usage: { input: 1 } });
+  assert.equal(main.sent.at(-1).calls, undefined);
+  assert.equal(s.warnings.length, 0);
+});
+
 test('past the runs counted at once, the oldest is forgotten and a run that saw a call lately is kept', () => {
   const main = account('main'), s = setup({ accounts: [main] });
   s.ended('old'); s.ended('old');

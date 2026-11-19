@@ -447,7 +447,7 @@ fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
         agent.to_owned(),
         m.model.clone().unwrap_or_else(|| "?".into()),
         m.model_provider.clone().unwrap_or_else(|| "-".into()),
-        m.chats.to_string(),
+        at_least("chats", Some(m.chats)),
         at_least("calls", m.calls),
         at_least("input", t.input),
         at_least("cache_read", t.cache_read),
