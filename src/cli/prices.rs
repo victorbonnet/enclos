@@ -37,9 +37,29 @@ struct ListView<'a> {
 #[derive(Serialize)]
 #[serde(tag = "price", rename_all = "snake_case")]
 enum Found<'a> {
-    Rates { entry: &'a ModelPrice },
-    Included { model_provider: &'a ModelProvider },
+    Rates {
+        entry: &'a ModelPrice,
+    },
+    Included {
+        model_provider: &'a ModelProvider,
+        /// The rates its tokens are priced at, as if paid; none: no list
+        /// price, so what they would cost is unknown.
+        list: Option<&'a ModelPrice>,
+    },
     Unknown,
+}
+
+impl<'a> Found<'a> {
+    fn of(list: &'a PriceList, model_provider: Option<&str>, model: &str) -> Found<'a> {
+        match list.find(model_provider, Some(model)) {
+            Price::Rates(entry) => Found::Rates { entry },
+            Price::Included(model_provider) => Found::Included {
+                model_provider,
+                list: list.list_price(model_provider, Some(model)),
+            },
+            Price::Unknown => Found::Unknown,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -82,14 +102,7 @@ pub fn run(engine: &Engine, args: PricesArgs) -> Result<u8> {
             let _ = print_list(&mut std::io::stdout().lock(), &view, &loaded.list);
         }
         Some(model) => {
-            let found = match loaded
-                .list
-                .find(args.model_provider.as_deref(), Some(model))
-            {
-                Price::Rates(entry) => Found::Rates { entry },
-                Price::Included(model_provider) => Found::Included { model_provider },
-                Price::Unknown => Found::Unknown,
-            };
+            let found = Found::of(&loaded.list, args.model_provider.as_deref(), model);
             let view = ModelView {
                 model,
                 model_provider: args.model_provider.as_deref(),
@@ -194,50 +207,30 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
         .map(|p| format!(" through {p}"))
         .unwrap_or_default();
     match &view.found {
-        Found::Rates { entry } => {
-            let r = &entry.rates;
-            let mut parts = vec![
-                format!("input {}", rate(r.input)),
-                format!("output {}", rate(r.output)),
-            ];
-            parts.push(format!(
-                "cache read {}",
-                r.cache_read
-                    .map(rate)
-                    .unwrap_or_else(|| format!("{} (as input)", rate(r.input)))
-            ));
-            parts.push(format!(
-                "cache write {}",
-                r.cache_write
-                    .map(rate)
-                    .unwrap_or_else(|| format!("{} (as input)", rate(r.input)))
-            ));
+        Found::Rates { entry } => print_rates(out, entry, &view.override_file),
+        Found::Included {
+            model_provider,
+            list,
+        } => {
             writeln!(
                 out,
-                "{} of {}: {} per million tokens.",
-                entry.id,
-                entry.model_provider,
-                parts.join(", ")
+                "{} is a subscription: what {}{through} uses counts against its limits, not in dollars, so its cost is included.",
+                model_provider.name, view.model
             )?;
-            let from = entry
-                .source
-                .as_deref()
-                .map(|s| match s.strip_prefix("litellm@") {
-                    Some(commit) => format!("LiteLLM {}", short(commit)),
-                    None => s.to_owned(),
-                })
-                .unwrap_or_else(|| "no source given".into());
-            let origin = match entry.origin {
-                Origin::Bundled => "the list bundled with enclos".to_owned(),
-                Origin::Override => view.override_file.clone(),
-            };
-            writeln!(out, "From {from}, in {origin}.")
+            match list {
+                Some(entry) => {
+                    writeln!(
+                        out,
+                        "Priced as if paid, to show how heavy an agent is, at the list price of"
+                    )?;
+                    print_rates(out, entry, &view.override_file)
+                }
+                None => writeln!(
+                    out,
+                    "It has no list price in the price list: what it would cost if paid is unknown."
+                ),
+            }
         }
-        Found::Included { model_provider } => writeln!(
-            out,
-            "{} is a subscription: what {}{through} uses counts against its limits, not in dollars, so its cost is included.",
-            model_provider.name, view.model
-        ),
         Found::Unknown => {
             writeln!(
                 out,
@@ -261,6 +254,51 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
             }
         }
     }
+}
+
+/// A model's rates, per million tokens, and where they came from.
+fn print_rates(
+    out: &mut impl Write,
+    entry: &ModelPrice,
+    override_file: &str,
+) -> std::io::Result<()> {
+    let r = &entry.rates;
+    let mut parts = vec![
+        format!("input {}", rate(r.input)),
+        format!("output {}", rate(r.output)),
+    ];
+    parts.push(format!(
+        "cache read {}",
+        r.cache_read
+            .map(rate)
+            .unwrap_or_else(|| format!("{} (as input)", rate(r.input)))
+    ));
+    parts.push(format!(
+        "cache write {}",
+        r.cache_write
+            .map(rate)
+            .unwrap_or_else(|| format!("{} (as input)", rate(r.input)))
+    ));
+    writeln!(
+        out,
+        "{} of {}: {} per million tokens.",
+        entry.id,
+        entry.model_provider,
+        parts.join(", ")
+    )?;
+    let from = entry
+        .source
+        .as_deref()
+        .map(|s| match s.strip_prefix("litellm@") {
+            Some(commit) => format!("LiteLLM {}", short(commit)),
+            None => s.to_owned(),
+        })
+        .unwrap_or_else(|| "no source given".into());
+    let origin = match entry.origin {
+        Origin::Bundled => "the list bundled with enclos".to_owned(),
+        Origin::Override => override_file.to_owned(),
+    };
+    writeln!(out, "From {from}, in {origin}.")
 }
 
 fn override_line(file: &str, read: &OverrideRead) -> String {
@@ -296,11 +334,7 @@ mod tests {
     use super::*;
 
     fn shown_model(model: &str, model_provider: Option<&str>, list: &PriceList) -> String {
-        let found = match list.find(model_provider, Some(model)) {
-            Price::Rates(entry) => Found::Rates { entry },
-            Price::Included(model_provider) => Found::Included { model_provider },
-            Price::Unknown => Found::Unknown,
-        };
+        let found = Found::of(list, model_provider, model);
         let view = ModelView {
             model,
             model_provider,
@@ -337,6 +371,9 @@ mod tests {
             codex.starts_with("openai-codex is a subscription"),
             "{codex}"
         );
+        // And the list price it is priced at, as if paid: OpenAI's.
+        assert!(codex.contains("Priced as if paid"), "{codex}");
+        assert!(codex.contains("gpt-5.5 of openai: input $"), "{codex}");
         let unknown = shown_model("hermes-9", Some("nous"), &list);
         assert!(
             unknown.starts_with("No price for hermes-9 through nous"),

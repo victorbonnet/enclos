@@ -94,7 +94,13 @@ pub struct UsageCost {
     /// dollars.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub included: u64,
-    /// Tokens of a model the price list has no price for: their cost is
+    /// What those of them with a list price would cost if they were paid
+    /// for, in millionths of a US dollar: a measure of how heavy an agent
+    /// on a subscription is, not what it is billed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub included_usd_micros: u64,
+    /// Tokens of a model the price list has no price for, paid or at list
+    /// price on a subscription (those are in `included` too): their cost is
     /// unknown, which is not 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unpriced: u64,
@@ -106,6 +112,9 @@ impl UsageCost {
         UsageCost {
             usd_micros: self.usd_micros.saturating_add(other.usd_micros),
             included: self.included.saturating_add(other.included),
+            included_usd_micros: self
+                .included_usd_micros
+                .saturating_add(other.included_usd_micros),
             unpriced: self.unpriced.saturating_add(other.unpriced),
         }
     }
@@ -314,11 +323,13 @@ mod tests {
         let a = UsageCost {
             usd_micros: 1_250_000,
             included: 0,
+            included_usd_micros: 0,
             unpriced: 40,
         };
         let b = UsageCost {
             usd_micros: u64::MAX,
             included: 7,
+            included_usd_micros: 9,
             unpriced: 0,
         };
         let sum = a.plus(b);

@@ -53,6 +53,8 @@ struct ModelProviderEntry {
     #[serde(default)]
     included: bool,
     #[serde(default)]
+    priced_as: Option<String>,
+    #[serde(default)]
     source: Option<String>,
 }
 
@@ -111,6 +113,9 @@ pub struct ModelProvider {
     pub aliases: Vec<String>,
     /// A subscription: its tokens' cost is included.
     pub included: bool,
+    /// For a subscription, the model provider whose list prices its models
+    /// are priced at, as if paid; none: any that has the model.
+    pub priced_as: Option<String>,
     pub source: Option<String>,
     pub origin: Origin,
 }
@@ -278,6 +283,11 @@ impl PriceList {
                     name: key,
                     aliases,
                     included: p.included,
+                    priced_as: p
+                        .priced_as
+                        .as_deref()
+                        .map(|n| checked_name(n, "a model provider's `priced_as`"))
+                        .transpose()?,
                     source: p.source.clone(),
                     origin,
                 },
@@ -320,6 +330,34 @@ impl PriceList {
                 source: m.source.clone(),
                 origin,
             });
+        }
+        // A subscription is priced as a model provider the list has, not
+        // as another subscription; only a subscription is priced as another.
+        let names = next.names.clone();
+        for p in next.model_providers.values_mut() {
+            let Some(target) = p.priced_as.clone() else {
+                continue;
+            };
+            if !p.included {
+                return Err(format!(
+                    "prices {} as {target}, but only a subscription is priced as another model provider",
+                    p.name
+                ));
+            }
+            let Some(name) = names.get(&target.to_lowercase()) else {
+                return Err(format!(
+                    "prices {} as {target}, which it does not name under [model_providers]",
+                    p.name
+                ));
+            };
+            p.priced_as = Some(name.clone());
+        }
+        for p in next.model_providers.values() {
+            if let Some(target) = &p.priced_as
+                && next.model_providers[target].included
+            {
+                return Err(format!("prices {} as {target}, a subscription too", p.name));
+            }
         }
         *self = next;
         Ok((file.models.len(), file.model_providers.len()))
@@ -429,7 +467,19 @@ impl PriceList {
         Price::Unknown
     }
 
-    /// What `counts` of `model`, as `model provider` serves it, cost.
+    /// What `model` would cost on subscription `included` if it were paid
+    /// for: its rates under the model provider the subscription is priced
+    /// as, else under any model provider that has it.
+    pub fn list_price(&self, included: &ModelProvider, model: Option<&str>) -> Option<&ModelPrice> {
+        match self.find(included.priced_as.as_deref(), model) {
+            Price::Rates(price) => Some(price),
+            _ => None,
+        }
+    }
+
+    /// What `counts` of `model`, as `model provider` serves it, cost. On a
+    /// subscription, its tokens are included and priced at the model's list
+    /// price too; with none, they are unpriced as well.
     pub fn cost(
         &self,
         model_provider: Option<&str>,
@@ -438,9 +488,17 @@ impl PriceList {
     ) -> UsageCost {
         let total = counts.total();
         match self.find(model_provider, model) {
-            Price::Included(_) => UsageCost {
-                included: total,
-                ..UsageCost::default()
+            Price::Included(provider) => match self.list_price(provider, model) {
+                Some(price) => UsageCost {
+                    included: total,
+                    included_usd_micros: price.rates.micros(counts),
+                    ..UsageCost::default()
+                },
+                None => UsageCost {
+                    included: total,
+                    unpriced: total,
+                    ..UsageCost::default()
+                },
             },
             Price::Unknown => UsageCost {
                 unpriced: total,
@@ -688,6 +746,49 @@ output = 30.0
             },
         );
         assert_eq!((cost.usd_micros, cost.included, cost.unpriced), (0, 15, 0));
+        // Priced as if paid: gpt-5.5 at OpenAI's rates, 10 × $5 + 5 × $30.
+        assert_eq!(cost.included_usd_micros, 200);
+        // A model with no list price: included, and unpriced too.
+        let unknown = list.cost(
+            Some("openai-codex"),
+            Some("gpt-unknown"),
+            Counts {
+                input: Some(4),
+                ..Counts::default()
+            },
+        );
+        assert_eq!(
+            (
+                unknown.included,
+                unknown.included_usd_micros,
+                unknown.unpriced
+            ),
+            (4, 0, 4)
+        );
+    }
+
+    #[test]
+    fn a_subscription_is_priced_as_the_model_provider_it_names() {
+        let mut list = list(LIST);
+        list.add(
+            "[model_providers.cheap]\n[model_providers.sub]\nincluded = true\npriced_as = \"cheap\"\n[[models]]\nmodel_provider = \"cheap\"\nid = \"gpt-5.5\"\ninput = 1.0\noutput = 1.0\n",
+            Origin::Override,
+        )
+        .unwrap();
+        let counts = Counts {
+            input: Some(1_000_000),
+            ..Counts::default()
+        };
+        // Its own model provider's rates, not OpenAI's.
+        assert_eq!(
+            list.cost(Some("sub"), Some("gpt-5.5"), counts)
+                .included_usd_micros,
+            1_000_000
+        );
+        // The bundled openai-codex: OpenAI's.
+        let bundled = PriceList::bundled();
+        let codex = bundled.model_provider("openai-codex").unwrap();
+        assert_eq!(codex.priced_as.as_deref(), Some("openai"));
     }
 
     #[test]
@@ -867,6 +968,12 @@ output = 15.0
         let clash =
             "[model_providers.a]\naliases = [\"x\"]\n[model_providers.b]\naliases = [\"X\"]\n";
         assert!(refused(clash).contains("both"));
+        let paid_as = "[model_providers.a]\n[model_providers.b]\npriced_as = \"a\"\n";
+        assert!(refused(paid_as).contains("only a subscription"));
+        let nowhere = "[model_providers.s]\nincluded = true\npriced_as = \"z\"\n";
+        assert!(refused(nowhere).contains("does not name"));
+        let chained = "[model_providers.s]\nincluded = true\npriced_as = \"t\"\n[model_providers.t]\nincluded = true\n";
+        assert!(refused(chained).contains("subscription too"));
     }
 
     #[test]
