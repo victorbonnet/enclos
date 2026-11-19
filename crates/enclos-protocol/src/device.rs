@@ -1521,9 +1521,9 @@ mod audit_compatibility_tests {
 mod usage_tests {
     use super::*;
     use crate::usage::{
-        AgentUsage, MAX_CALL_TOKENS, MAX_POINTS, MAX_REPORT_AGENTS, MAX_REPORT_AGENTS_WITH_SERIES,
-        MAX_REPORT_SANDBOXES, MAX_SCOPED_SERIES, MAX_SERIES, SandboxTotal, UsageCost, UsagePoint,
-        UsageSeries, UsageTokens, UsageTotal,
+        AgentUsage, MAX_CALL_TOKENS, MAX_COSTED_AGENTS, MAX_COSTED_AGENTS_WITH_SERIES, MAX_POINTS,
+        MAX_REPORT_AGENTS, MAX_REPORT_AGENTS_WITH_SERIES, MAX_REPORT_SANDBOXES, MAX_SCOPED_SERIES,
+        MAX_SERIES, SandboxTotal, UsageCost, UsagePoint, UsageSeries, UsageTokens, UsageTotal,
     };
 
     #[test]
