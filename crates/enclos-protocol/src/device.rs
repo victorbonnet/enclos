@@ -852,7 +852,9 @@ pub struct ConversationMessage {
     /// `agent`, or the person who wrote it.
     pub from: String,
     pub text: String,
-    /// `message` for a person's, `reply` or `notify` for the agent's.
+    /// `message` for a person's; `reply` or `notify` for the agent's;
+    /// `status` for its runtime about itself; `question` for a question's
+    /// readable text; `task_event` for its runtime about one of its tasks.
     pub kind: String,
     /// Seconds since the Unix epoch.
     pub time: i64,
@@ -864,6 +866,11 @@ pub struct ConversationMessage {
     /// metadata arrives in a separate `held_task` frame before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_task: Option<HeldTaskId>,
+    /// With `kind: task_event`, the task and what happened to it: only to a
+    /// device whose `auth` names `task_events`; another gets the message as
+    /// `notify`, its text alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_event: Option<crate::task_event::TaskEvent>,
     /// Its files, which the device fetches with `attachment.get`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -938,6 +945,7 @@ mod tests {
             suggested_replies: Vec::new(),
             question: None,
             held_task: None,
+            task_event: None,
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
             from: "agent".into(),
@@ -1234,6 +1242,7 @@ mod tests {
             seq: 7,
             question: None,
             held_task: None,
+            task_event: None,
             attachments: vec![Attachment {
                 id: "a-1".into(),
                 mime: "image/png".into(),

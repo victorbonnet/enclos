@@ -1407,6 +1407,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         let store = server_hub.store().unwrap();
         run_session(&server_hub, &store, &mut link, &device, OWNER, &rx)
@@ -2288,6 +2289,7 @@ fn device_session(
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         let store = server_hub.store().unwrap();
         run_session(&server_hub, &store, &mut link, &device, person, &rx)
@@ -3486,6 +3488,7 @@ fn encrypted_session_subscribes_before_synced_and_delivers_dismissal_receipts() 
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         run_session(
             &server_hub,

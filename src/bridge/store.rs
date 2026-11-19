@@ -46,19 +46,24 @@ pub struct Message {
     pub question: Option<enclos_protocol::QuestionId>,
     /// The held task this message is about: a card of its conversation's agent.
     pub held_task: Option<enclos_protocol::HeldTaskId>,
+    /// For `kind: task_event`, the task and what happened to it (ADR 0071,
+    /// proposed); none when it was not kept or can no longer be read, and
+    /// the message then reaches devices as a `notify`.
+    pub task_event: Option<enclos_protocol::task_event::TaskEvent>,
     pub seq: i64,
     pub id: String,
     pub conversation: String,
     pub from: From,
     pub text: String,
-    /// `reply` or `notify` for the agent's; `message` for a person's.
+    /// `reply`, `notify`, `status`, `question` or `task_event` for the
+    /// agent's; `message` for a person's.
     pub kind: String,
     /// When the bridge stored it, in seconds since the Unix epoch.
     pub at: i64,
 }
 
 /// The columns [`message_row`] reads, in its order.
-const MESSAGE_COLUMNS: &str = "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages";
+const MESSAGE_COLUMNS: &str = "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies, task_event FROM messages";
 
 fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let person: Option<String> = row.get(3)?;
@@ -69,6 +74,16 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
             .filter(|r| enclos_protocol::suggested_replies::validate(r))
             .unwrap_or_default(),
+        task_event: row.get::<_, Option<String>>(11)?.and_then(|s| {
+            serde_json::from_str(&s)
+                .inspect_err(|e| {
+                    let id = row.get::<_, String>(1).unwrap_or_default();
+                    eprintln!(
+                        "enclos app: message {id}: its stored task event no longer reads, so it goes as its text: {e}"
+                    );
+                })
+                .ok()
+        }),
         held_task: row
             .get::<_, Option<String>>(9)?
             .map(|id| {
@@ -530,6 +545,8 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     // A history line about a held task names it (ADR 0066, proposed).
     add_column(db, "messages", "held_task", "TEXT")?;
     add_column(db, "messages", "suggested_replies", "TEXT")?;
+    // A runtime's task event keeps its task with the line (ADR 0071, proposed).
+    add_column(db, "messages", "task_event", "TEXT")?;
     // A question's owner is its conversation's, read from there: the copy
     // an earlier build kept went stale when a Home was claimed.
     let mut query = db.prepare("SELECT name FROM pragma_table_info('questions')")?;
@@ -660,7 +677,8 @@ CREATE TABLE IF NOT EXISTS messages (
     at INTEGER NOT NULL,
     question TEXT,
     held_task TEXT,
-    suggested_replies TEXT
+    suggested_replies TEXT,
+    task_event TEXT
 );
 CREATE TABLE IF NOT EXISTS open_item_dismissals (person TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT NOT NULL, item TEXT NOT NULL, version TEXT NOT NULL, request TEXT NOT NULL, PRIMARY KEY(person,kind,agent,item), UNIQUE(person,request));
 -- Reminder state follows its source through deletion/agent forgetting.
@@ -2156,6 +2174,22 @@ impl Store {
         files: &[StoredAttachment],
         replies: &[String],
     ) -> rusqlite::Result<Option<Vec<i64>>> {
+        self.add_agent_pieces(pieces, conversation, from, kind, files, replies, None)
+    }
+
+    /// As [`Store::add_pieces_with_replies`], with a runtime's task event
+    /// kept on each piece (ADR 0071, proposed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_agent_pieces(
+        &self,
+        pieces: &[(String, String)],
+        conversation: &str,
+        from: &From,
+        kind: &str,
+        files: &[StoredAttachment],
+        replies: &[String],
+        task_event: Option<&enclos_protocol::task_event::TaskEvent>,
+    ) -> rusqlite::Result<Option<Vec<i64>>> {
         let transaction = self.db.unchecked_transaction()?;
         let mut seqs = Vec::new();
         for (id, text) in pieces {
@@ -2168,6 +2202,15 @@ impl Store {
         if let Some((first, _)) = pieces.first() {
             for file in files {
                 self.add_attachment(file, first)?;
+            }
+        }
+        if let Some(event) = task_event {
+            let event = serde_json::to_string(event).expect("a task event serializes");
+            for (id, _) in pieces {
+                self.db.execute(
+                    "UPDATE messages SET task_event=?2 WHERE id=?1",
+                    params![id, event],
+                )?;
             }
         }
         if let Some((last, _)) = pieces.last()
@@ -2311,7 +2354,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question, m.held_task, m.suggested_replies FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question, m.held_task, m.suggested_replies, m.task_event FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -2330,7 +2373,7 @@ impl Store {
     /// The messages of conversation `id` after `since`, in order.
     pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies, task_event FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = query.query_map(params![id, since], message_row)?;
@@ -2347,7 +2390,7 @@ impl Store {
         at_most: usize,
     ) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question, held_task, suggested_replies, task_event FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
         )?;
         let rows = query.query_map(params![id, since, at_most as i64], message_row)?;
@@ -2418,11 +2461,12 @@ impl Store {
     }
 
     /// Whether group `id` holds, after `since`, a message to give member
-    /// `agent`: one that is neither its own nor a runtime's `status` line.
+    /// `agent`: one that is neither its own nor a runtime's `status` line or
+    /// task event.
     pub fn news_for(&self, id: &str, agent: &str, since: i64) -> rusqlite::Result<bool> {
         self.db.query_row(
             "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation = ?1 AND seq > ?2
-             AND kind != 'status' AND (person IS NOT NULL OR speaker IS NULL OR speaker != ?3))",
+             AND kind NOT IN ('status', 'task_event') AND (person IS NOT NULL OR speaker IS NULL OR speaker != ?3))",
             params![id, since, agent],
             |row| row.get(0),
         )
@@ -3261,10 +3305,56 @@ mod tests {
         assert_eq!(store.conversation_info("c-1").unwrap().unwrap().revision, 0);
         assert_eq!(store.set_archived("c-1", "v", true).unwrap(), Some(true));
         assert_eq!(store.since("v", 0).unwrap()[0].from, From::Agent);
+        // A message from before task events reads with none.
+        assert_eq!(store.since("v", 0).unwrap()[0].task_event, None);
         store
             .group("g-1", "lab", &["main".into(), "coder".into()], "v")
             .unwrap();
         assert_eq!(store.members("g-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_stored_task_event_that_no_longer_reads_leaves_its_message() {
+        use enclos_protocol::task_event::{TaskEvent, TaskEventKind};
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.conversation("c-1", "lab", "main", "v").unwrap();
+        let event = TaskEvent {
+            task: "t_1".into(),
+            title: "S2a".into(),
+            assignee: None,
+            event: TaskEventKind::Done,
+            state: None,
+        };
+        store
+            .add_agent_pieces(
+                &[("m-1".into(), "✔ Kanban t_1 done — S2a".into())],
+                "c-1",
+                &From::Agent,
+                "task_event",
+                &[],
+                &[],
+                Some(&event),
+            )
+            .unwrap();
+        assert_eq!(
+            store.since("v", 0).unwrap()[0].task_event.as_ref(),
+            Some(&event)
+        );
+        store
+            .db
+            .execute(
+                "UPDATE messages SET task_event = '{\"task\":' WHERE id = 'm-1'",
+                [],
+            )
+            .unwrap();
+        let [kept] = &store.since("v", 0).unwrap()[..] else {
+            panic!("one message");
+        };
+        assert_eq!(
+            (kept.kind.as_str(), &kept.task_event),
+            ("task_event", &None)
+        );
     }
 
     #[test]
