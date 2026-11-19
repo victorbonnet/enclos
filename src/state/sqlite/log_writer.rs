@@ -4,6 +4,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
+
 use super::{SqliteStateStore, netlog, probe_sources};
 use crate::model::Timestamp;
 use crate::model::net::{DeniedDestination, NetEvent};
@@ -24,7 +26,9 @@ pub struct NetLogWriter {
     writes: mpsc::Sender<Job>,
 }
 
-enum Write {
+/// A row to write: a connection as it opens, with the tag a host diagnostic
+/// run gave it, or as it closes.
+pub(super) enum Write {
     Record(NetEvent, Option<String>),
     Finish(i64, NetEvent),
 }
@@ -81,30 +85,60 @@ fn write_batches(store: &SqliteStateStore, jobs: &mpsc::Receiver<Job>) {
 
 impl SqliteStateStore {
     /// Makes `writes` in one transaction; returns each one's row and how long
-    /// the transaction held the write lock.
-    fn write_log(&self, writes: &[&Write]) -> Result<(Vec<i64>, Duration)> {
+    /// the transaction held the write lock. A connection tagged by a run the
+    /// host registered gets its provenance in the same transaction. When the
+    /// side database takes part and the transaction fails, the batch is
+    /// written again without it: provenance never costs a log row, the
+    /// batch's or another connection's (ADR 0059).
+    pub(super) fn write_log(&self, writes: &[&Write]) -> Result<(Vec<i64>, Duration)> {
         let mut conn = self.open()?;
-        // Only candidate-tagged records need the optional host-only provenance database.
-        // A missing or unreadable sidecar leaves the connection as ordinary traffic.
-        let attached = writes
-            .iter()
-            .any(|write| matches!(write, Write::Record(_, Some(_))))
-            && matches!(self.attach_probe_sources(&conn, false), Ok(true));
-        let tx = conn.transaction().map_err(self.sqlite_err())?;
-        let held = Instant::now();
-        let rows = writes
+        let tagged: Vec<_> = writes
             .iter()
             .map(|write| match write {
-                Write::Record(event, tag) => {
-                    probe_sources::record(&tx, event, tag.as_deref(), attached)
-                }
-                Write::Finish(row, event) => netlog::finish(&tx, *row, event).map(|()| *row),
+                Write::Record(event, Some(tag)) => Some((event, tag.as_str())),
+                _ => None,
             })
-            .collect::<rusqlite::Result<Vec<i64>>>()
-            .map_err(self.sqlite_err())?;
-        tx.commit().map_err(self.sqlite_err())?;
-        Ok((rows, held.elapsed()))
+            .collect();
+        let ordinary = vec![false; writes.len()];
+        let Some(probes) = self.registered_probes(&conn, &tagged) else {
+            return write_batch(&mut conn, writes, &ordinary).map_err(self.sqlite_err());
+        };
+        match write_batch(&mut conn, writes, &probes) {
+            Ok(written) => Ok(written),
+            Err(e) => {
+                eprintln!(
+                    "enclos: logging a diagnostic run's connections as ordinary: {}",
+                    self.sqlite_err()(e)
+                );
+                // A connection without the side database attached.
+                write_batch(&mut self.open()?, writes, &ordinary).map_err(self.sqlite_err())
+            }
+        }
     }
+}
+
+/// Makes `writes` in one transaction, with the provenance of each record
+/// `probes` marks; returns each one's row and how long the transaction held
+/// the write lock.
+fn write_batch(
+    conn: &mut Connection,
+    writes: &[&Write],
+    probes: &[bool],
+) -> rusqlite::Result<(Vec<i64>, Duration)> {
+    let tx = conn.transaction()?;
+    let held = Instant::now();
+    let rows = writes
+        .iter()
+        .zip(probes)
+        .map(|(write, &probe)| match write {
+            Write::Record(event, tag) => {
+                probe_sources::record(&tx, event, tag.as_deref().filter(|_| probe))
+            }
+            Write::Finish(row, event) => netlog::finish(&tx, *row, event).map(|()| *row),
+        })
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    tx.commit()?;
+    Ok((rows, held.elapsed()))
 }
 
 impl NetLogStore for NetLogWriter {

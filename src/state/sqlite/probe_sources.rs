@@ -1,11 +1,15 @@
 //! Diagnostic provenance lives beside the log, without changing its released schema.
 //! A client-supplied tag is trusted only while the host has registered that exact run.
+use super::log_writer::Write;
 use super::*;
 use std::io::ErrorKind;
 
 impl SqliteStateStore {
-    pub(super) fn attach_probe_sources(&self, conn: &Connection, create: bool) -> Result<bool> {
-        let path = self.db.with_file_name(crate::layout::PROBE_SOURCES_FILE);
+    fn probe_sources_path(&self) -> PathBuf {
+        self.db.with_file_name(crate::layout::PROBE_SOURCES_FILE)
+    }
+    fn attach_probe_sources(&self, conn: &Connection, create: bool) -> Result<bool> {
+        let path = self.probe_sources_path();
         if !path.exists() && !create {
             return Ok(false);
         }
@@ -72,21 +76,105 @@ impl SqliteStateStore {
         }
         Ok(())
     }
+    /// Records a connection as the proxy's batched writer does, as a batch
+    /// of one.
     pub(super) fn record_probe_event(&self, event: &NetEvent, tag: Option<&str>) -> Result<i64> {
-        let Some(tag) = tag else {
-            return self.record(event);
-        };
-        let mut conn = self.open()?;
-        if !matches!(self.attach_probe_sources(&conn, false), Ok(true)) {
-            return netlog::record(&conn, event).map_err(self.sqlite_err());
+        let record = Write::Record(event.clone(), tag.map(str::to_owned));
+        let (rows, _) = self.write_log(&[&record])?;
+        Ok(rows[0])
+    }
+    /// Which of a batch's records, given as each one's event and tag, a run
+    /// the host registered has tagged. The runs are read on a connection of
+    /// their own, before the log's transaction: a tag no run registered, such
+    /// as one a sandbox made up, never brings the side database and its lock
+    /// into that transaction. `None` when the side database is not attached
+    /// to `conn`; when it is, the records marked `true` get their provenance
+    /// there. A side database that cannot be read leaves every record
+    /// ordinary (ADR 0059).
+    pub(super) fn registered_probes(
+        &self,
+        conn: &Connection,
+        tagged: &[Option<(&NetEvent, &str)>],
+    ) -> Option<Vec<bool>> {
+        if tagged.iter().all(Option::is_none) {
+            return None;
         }
-        // The log row and its provenance become visible together to other connections.
-        let tx = conn.transaction().map_err(self.sqlite_err())?;
-        let row = record(&tx, event, Some(tag), true).map_err(self.sqlite_err())?;
-        tx.commit().map_err(self.sqlite_err())?;
-        Ok(row)
+        let path = self.probe_sources_path();
+        if !path.exists() {
+            return None;
+        }
+        let read = || -> rusqlite::Result<Vec<bool>> {
+            let runs = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            runs.busy_timeout(self.write_wait)?;
+            let mut registered = runs.prepare(
+                "SELECT EXISTS (SELECT 1 FROM runs WHERE tag=?1 AND sandbox=?2 AND expires>=?3)",
+            )?;
+            tagged
+                .iter()
+                .map(|record| match record {
+                    None => Ok(false),
+                    Some((event, tag)) => registered.query_row(
+                        params![tag, event.sandbox.as_str(), netlog::fixed(event.at)],
+                        |row| row.get(0),
+                    ),
+                })
+                .collect()
+        };
+        let registered = match read() {
+            Ok(registered) if registered.contains(&true) => registered,
+            Ok(_) => return None,
+            Err(e) => {
+                eprintln!(
+                    "enclos: diagnostic run metadata cannot be read: {}",
+                    self.sqlite_err()(e)
+                );
+                return None;
+            }
+        };
+        match self.attach_probe_sources(conn, false) {
+            Ok(true) => Some(registered),
+            // Attached, but no longer as it was just read: no record counts
+            // as diagnostic.
+            Ok(false) => Some(vec![false; tagged.len()]),
+            Err(e) => {
+                eprintln!("enclos: diagnostic run metadata cannot be read: {e}");
+                None
+            }
+        }
+    }
+    /// Holds the side database's write lock, which a log transaction that
+    /// writes provenance takes as it begins and keeps until both databases
+    /// have committed. SQLite commits attached databases one after the
+    /// other, so a read that did not wait for it could see a run's log row
+    /// before its provenance and count the row as ordinary. `None` when there
+    /// is nothing to wait for: no side database, or one no one can write.
+    fn settled_probe_sources(&self) -> Option<Connection> {
+        let path = self.probe_sources_path();
+        if !path.exists() {
+            return None;
+        }
+        let lock = || -> rusqlite::Result<Connection> {
+            let lock = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            lock.busy_timeout(self.write_wait)?;
+            lock.execute_batch("BEGIN IMMEDIATE")?;
+            Ok(lock)
+        };
+        match lock() {
+            Ok(lock) => Some(lock),
+            // No log transaction can write provenance there either.
+            Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly) => None,
+            Err(e) => {
+                eprintln!(
+                    "enclos: reading refusals without waiting for diagnostic run metadata: {}",
+                    self.sqlite_err()(e)
+                );
+                None
+            }
+        }
     }
     pub(super) fn user_denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        // Released, its transaction rolled back, once the read is done.
+        let _settled = self.settled_probe_sources();
         let conn = self.open()?;
         let attached = matches!(self.attach_probe_sources(&conn, false), Ok(true));
         match netlog::denied_from(&conn, sandbox, attached) {
@@ -104,15 +192,16 @@ impl SqliteStateStore {
     }
 }
 
-/// Record the row and any authenticated provenance in the caller's transaction.
+/// Records `event` in the caller's transaction and, given a `tag`, its
+/// provenance in the attached side database, while the host still has that
+/// run registered for the event's sandbox.
 pub(super) fn record(
     conn: &Connection,
     event: &NetEvent,
     tag: Option<&str>,
-    attached: bool,
 ) -> rusqlite::Result<i64> {
     let row = netlog::record(conn, event)?;
-    if attached && let Some(tag) = tag {
+    if let Some(tag) = tag {
         conn.execute("INSERT INTO probe_sources.events SELECT ?1,?2,?3 WHERE EXISTS (SELECT 1 FROM probe_sources.runs WHERE tag=?4 AND sandbox=?2 AND expires>=?3)",params![row,event.sandbox.as_str(),netlog::fixed(event.at),tag])?;
     }
     Ok(row)

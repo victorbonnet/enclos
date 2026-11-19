@@ -225,16 +225,105 @@ fn tagged_connections_keep_provenance_through_the_existing_batched_writer() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 12,
-        "diagnostic metadata does not change the Pi's released schema"
+        version,
+        crate::state::sqlite::schema::current(),
+        "diagnostic metadata does not change the released schema"
     );
+}
+
+fn probe_sources(store: &SqliteStateStore) -> Connection {
+    Connection::open(store.db.with_file_name(crate::layout::PROBE_SOURCES_FILE)).unwrap()
+}
+
+fn refused(host: &str) -> NetEvent {
+    let mut connection = event(host);
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(crate::model::net::Reason::PrivateAddress);
+    connection
+}
+
+#[test]
+fn a_side_database_that_refuses_provenance_never_costs_a_log_row() {
+    use super::Write;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&sandbox, &tag).unwrap();
+    probe_sources(&store).execute_batch("CREATE TRIGGER refuse BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'refused'); END;").unwrap();
+    let tagged = Write::Record(refused("10.0.0.1"), Some(tag));
+    let other = Write::Record(event("example.com"), None);
+    let (rows, _) = store.write_log(&[&tagged, &other]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(store.events(&sandbox, None).unwrap().len(), 2);
+    assert_eq!(
+        store.denied_for_approval(&sandbox).unwrap()[0].count,
+        1,
+        "without its provenance, the connection counts as ordinary"
+    );
+}
+
+#[test]
+fn a_forged_tag_never_waits_for_the_side_database() {
+    use super::Write;
+    let (_dir, mut store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let registered = "a".repeat(64);
+    store.begin_probe(&sandbox, &registered).unwrap();
+    store.write_wait = Duration::from_secs(1);
+    // Another writer of the side database, such as the host starting a run.
+    let writer = probe_sources(&store);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let forged = Write::Record(refused("10.0.0.1"), Some("b".repeat(64)));
+    let started = std::time::Instant::now();
+    store.write_log(&[&forged]).unwrap();
+    assert!(
+        started.elapsed() < store.write_wait,
+        "a tag no run registered leaves the side database out of the log's transaction"
+    );
+
+    // A registered run's connection waits for it, then is logged without
+    // its provenance rather than not at all.
+    let tagged = Write::Record(refused("10.0.0.1"), Some(registered));
+    store.write_log(&[&tagged]).unwrap();
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(store.events(&sandbox, None).unwrap().len(), 2);
+    assert_eq!(store.denied_for_approval(&sandbox).unwrap()[0].count, 2);
+}
+
+#[test]
+fn refusals_for_approval_wait_for_a_runs_provenance_to_commit() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    store.begin_probe(&sandbox, &"a".repeat(64)).unwrap();
+    // As a log transaction writing provenance holds it until both databases
+    // have committed.
+    let writer = probe_sources(&store);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        writer.execute_batch("ROLLBACK").unwrap();
+    });
+    let started = std::time::Instant::now();
+    store.denied_for_approval(&sandbox).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    released.join().unwrap();
 }
 
 #[test]
 fn a_failed_batch_rolls_back_both_log_rows_and_their_diagnostic_provenance() {
     use super::Write;
     use crate::model::net::Reason;
-    let (dir, store) = store();
+    let (_dir, store) = store();
     let lock = store.lock().unwrap();
     store.migrate(&lock).unwrap();
     store.put(&lock, &record("home")).unwrap();
@@ -249,8 +338,7 @@ fn a_failed_batch_rolls_back_both_log_rows_and_their_diagnostic_provenance() {
     let failing = Write::Record(event("fail.example.com"), None);
     assert!(store.write_log(&[&tagged, &failing]).is_err());
     assert!(store.events(&sandbox, None).unwrap().is_empty());
-    let marked: i64 = Connection::open(dir.path().join("probe-sources.db"))
-        .unwrap()
+    let marked: i64 = probe_sources(&store)
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(marked, 0, "no provenance survives without its log row");
