@@ -88,9 +88,10 @@ export function createChannel(sdk = {}) {
     return turn;
   }
   const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
-  // A call's app conversation: its turn's, else, for a session this process
-  // has not dispatched a message to yet (a routine delivering into it, or
-  // since a restart), the saved route whose native session key it is.
+  // A call's app conversation: its turn's, else, for a native chat this
+  // process has not dispatched a message to yet (a routine delivering into
+  // it, or since a restart), the saved route whose native session key it is.
+  // Not kept in `sessionRoutes`, which also opens tools and policy context.
   function appTurn(ctx) {
     const turn = findTurn(ctx);
     if (turn || !ctx?.sessionKey || [ctx.messageChannel, ctx.messageProvider, ctx.channel].some(c => c && c !== 'enclos')) return turn;
@@ -100,10 +101,7 @@ export function createChannel(sdk = {}) {
       for (const conversation of new Set([...Object.keys(transport.state.routes), transport.home])) {
         let key;
         try { key = active.sessionKeyFor(conversation); } catch { continue; }
-        if (key !== ctx.sessionKey) continue;
-        const found = { active, conversation };
-        sessionRoutes.set(ctx.sessionKey, found);
-        return found;
+        if (key === ctx.sessionKey) return { active, conversation };
       }
     }
     return undefined;

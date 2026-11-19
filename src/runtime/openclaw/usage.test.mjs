@@ -29,7 +29,6 @@ function answer(fields = {}) {
           modelUsage: [
             { provider: 'anthropic', model: 'claude-sonnet-5-5', count: 2, totals: totals(1000, 100, 10000, 0, 0.02) },
             { provider: 'openai', model: 'gpt-6.1', count: 3, totals: totals(1000, 200, 0, 0, 0, 3) }] } },
-      { key: 'agent:main:old', sessionId: 's3', computing: true, usage: null },
     ],
     ...fields,
   };
@@ -60,6 +59,14 @@ test('some calls unpriced make a cost mixed; a partial answer marks every count 
   const [model] = agentUsage(a).models;
   assert.deepEqual(model.cost, { usd: 0.5, kind: 'mixed' });
   assert.deepEqual(model.incomplete, ['calls', 'input', 'output', 'cache_read', 'cache_write']);
+  // Without `partial`: a cache still refreshing, or a chat not summarized yet
+  // (the gateway leaves it out of its sums), is a lower bound too.
+  const refreshing = answer({ cacheStatus: { status: 'refreshing', cachedFiles: 2, pendingFiles: 1, staleFiles: 0 } });
+  assert.ok(agentUsage(refreshing).models.every(m => m.incomplete?.length === 5));
+  const fresh = answer({ cacheStatus: { status: 'fresh', cachedFiles: 2, pendingFiles: 0, staleFiles: 0 } });
+  assert.ok(agentUsage(fresh).models.every(m => m.incomplete === undefined));
+  fresh.sessions.push({ key: 'agent:main:old', sessionId: 's3', computing: true, usage: null });
+  assert.ok(agentUsage(fresh).models.every(m => m.incomplete?.length === 5), 'a listed chat is still computing');
 });
 
 test('counts that are not whole numbers of at least 0 are unknown, and past 50 models the rest share a row', () => {

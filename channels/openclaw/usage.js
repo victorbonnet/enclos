@@ -11,7 +11,7 @@ import { message } from './protocol.js';
 
 const line = (text, maximum) => [...String(text).replace(/[\x00-\x1f\x7f-\x9f]/gu, ' ').replace(/\s+/gu, ' ').trim()].slice(0, maximum).join('');
 // Runs whose calls are counted at once: a run that never reports its usage
-// (an incognito session, an attempt skipped) is forgotten past these.
+// (an incognito native chat, an attempt skipped) is forgotten past these.
 const MAX_RUNS = 1024;
 // The bridge bounds `calls` to this.
 const MAX_CALLS = 1000;

@@ -89,9 +89,13 @@ export function agentUsage(answer) {
   if (!answer || typeof answer !== 'object' || !answer.aggregates || !Array.isArray(answer.sessions)) {
     throw new Unread('OpenClaw answered sessions.usage without its aggregates');
   }
-  // A time budget the gateway ran out of, or chats it is still summarizing:
-  // every count is then at least what is shown.
-  const partial = answer.partial != null;
+  // A time budget the gateway ran out of, chats whose summaries it has not
+  // computed yet (left out of its sums, with no `partial` said on this
+  // path) or has not refreshed: every count is then at least what is shown.
+  const cache = answer.cacheStatus;
+  const partial = answer.partial != null ||
+    (cache != null && (cache.status !== 'fresh' || cache.pendingFiles > 0 || cache.staleFiles > 0)) ||
+    answer.sessions.some(s => s?.computing === true || s?.usage?.staleSince != null || s?.usage?.refreshing === true);
   const byModel = Array.isArray(answer.aggregates.byModel) ? answer.aggregates.byModel : [];
   const chats = new Map();
   for (const session of answer.sessions) {
@@ -246,4 +250,9 @@ export async function main(argv) {
 
 // Run by the adapter's command (`node -e`, which sets this), not when a test
 // imports it.
-if (process.env.ENCLOS_OPENCLAW_USAGE === '1') await main(process.argv.slice(1));
+if (process.env.ENCLOS_OPENCLAW_USAGE === '1') {
+  await main(process.argv.slice(1));
+  // The report is written: a handle OpenClaw's client left open must not
+  // keep the usage session running.
+  process.exit(0);
+}

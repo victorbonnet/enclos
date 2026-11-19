@@ -146,12 +146,13 @@ run, with the tokens of all the attempt's calls summed (`input` uncached,
 no count of them, so the plugin counts the run's completed calls from
 `model_call_ended` and sends one report of that many calls. A call in an app
 conversation, matched by its native session key to the turn or to the saved
-conversation route, goes as `usage`; an app session it cannot match is not
-sent. Any other call of a connected agent (a routine, another channel) goes as
+conversation route, goes as `usage`; a call in an app conversation's native
+chat it cannot match to its conversation is not sent. Any other call of a connected agent (a routine, another channel) goes as
 `usage.agent` on that agent's connection, with its source (`cron`,
 `heartbeat`, or the channel). Each needs the bridge's matching hello
-capability; the plugin names `usage` and `agent_usage` once the hooks are
-registered. The model provider is OpenClaw's provider id (`anthropic`,
+capability; the plugin names `usage` and `agent_usage` when OpenClaw takes
+plugin hooks. Without `allowConversationAccess`, OpenClaw drops `llm_output`
+with a warning the plugin cannot see, so it names them and sends nothing. The model provider is OpenClaw's provider id (`anthropic`,
 `openai`). Observing a call never changes it or fails the turn. Titles and
 other utility completions do not fire the hook in that source, so they are not
 counted.
