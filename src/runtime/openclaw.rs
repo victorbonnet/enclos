@@ -11,8 +11,8 @@ use super::settings::{Held, SettingsFile, SettingsFinding, dotenv_line, names_a_
 use super::{
     AgentDeleteMode, AgentFacts, AppChannel, DiskPart, HomeFile, HomePath, Installer,
     ListenerPorts, NotRead, RuntimeAdapter, RuntimeAgentName, RuntimeFacts, RuntimeListener,
-    RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles, SecretTarget, ServiceName,
-    Unreadable, ValueAt,
+    RuntimeRequirement, RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles,
+    SecretTarget, ServiceName, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -32,6 +32,18 @@ const ENABLE_APP: &str = "set -eu\nagent=$1\n\"$HOME/bin/openclaw\" agents bind 
 
 fn at(path: &str) -> HomePath {
     HomePath::new(path).expect("a literal home-relative path")
+}
+
+/// The oldest OpenClaw the app channel's plugin loads in: the plugin's own
+/// `MINIMUM_OPENCLAW`, read from the copy of `channel.js` this enclos
+/// installs, so that the two cannot disagree (#336).
+fn minimum_openclaw() -> Option<&'static str> {
+    include_str!("../../channels/openclaw/channel.js")
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("const MINIMUM_OPENCLAW = '")?
+                .strip_suffix("';")
+        })
 }
 
 /// Provider aliases remain short even for a native id wider than AgentName.
@@ -567,6 +579,16 @@ impl RuntimeAdapter for OpenClaw {
             // Native install/link merges registration with existing plugin
             // paths; this plan never replaces the shared load-path list.
             commands: vec![SandboxCommand::from_words(&["sh", "-c", INSTALL_APP])],
+            requires: Some(RuntimeRequirement {
+                minimum: minimum_openclaw()?,
+                check: SandboxCommand::from_words(&[
+                    "sh",
+                    "-c",
+                    include_str!("openclaw/check-version"),
+                    "enclos-check-openclaw",
+                    minimum_openclaw()?,
+                ]),
+            }),
             settings: vec![
                 (format!("channels.enclos.accounts.{agent}"), account),
                 ("plugins.entries.enclos.enabled".into(), "true".into()),
@@ -1362,5 +1384,82 @@ mod tests {
         assert!(
             stdout.contains("external\n43007\ngateway\nrun\n--bind\nloopback\n--port\n43007\n")
         );
+    }
+
+    /// The app channel requires the plugin's own minimum, which its package
+    /// declares too (#336).
+    #[test]
+    fn the_app_channel_requires_the_plugins_own_minimum_openclaw() {
+        let minimum = minimum_openclaw().expect("channel.js names MINIMUM_OPENCLAW");
+        let package: Value =
+            serde_json::from_str(include_str!("../../channels/openclaw/package.json")).unwrap();
+        assert_eq!(package["openclaw"]["compat"]["minGatewayVersion"], minimum);
+        assert_eq!(
+            package["peerDependencies"]["openclaw"],
+            format!(">={minimum}")
+        );
+        let app = OpenClaw
+            .app_channel(
+                &agent("main"),
+                Path::new("/sandbox/home/.enclos-app/main.sock"),
+                Path::new("/protected/main.env"),
+                "home.lab.main",
+                "key",
+            )
+            .unwrap();
+        let requires = app.requires.expect("OpenClaw's plugin has a minimum");
+        assert_eq!(requires.minimum, minimum);
+        assert!(
+            requires
+                .check
+                .shown()
+                .ends_with(&format!(" enclos-check-openclaw {minimum}"))
+        );
+    }
+
+    /// The check refuses an OpenClaw older than the minimum, or a
+    /// prerelease of it, as the plugin's `supportsRelease` does, and one
+    /// whose version it cannot read; it never takes a failure for a pass.
+    #[test]
+    fn the_version_check_follows_the_plugins_release_rule() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let native = home.path().join("bin/openclaw");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        let check = |printed: &str, exit: i32| {
+            std::fs::write(
+                &native,
+                format!("#!/bin/sh\nprintf '%s\\n' '{printed}'\nexit {exit}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(include_str!("openclaw/check-version"))
+                .args(["enclos-check-openclaw", "2026.11.5"])
+                .env_clear()
+                .env("HOME", home.path())
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+        let too_old = Some(RuntimeRequirement::TOO_OLD);
+        for (printed, expected) in [
+            ("OpenClaw 2026.11.5 (e13cf15)", Some(0)),
+            ("2026.11.10", Some(0)),
+            ("v2026.12.0", Some(0)),
+            ("2027.1.1", Some(0)),
+            ("OpenClaw 2026.11.5+build.1", Some(0)),
+            ("OpenClaw 2026.11.3 (847611d)", too_old),
+            ("OpenClaw 2026.11.5-beta.4", too_old),
+            ("2025.99.99", too_old),
+            ("OpenClaw 2026.11", Some(1)),
+            ("OpenClaw", Some(1)),
+            ("OpenClaw 2026.x.5", Some(1)),
+        ] {
+            assert_eq!(check(printed, 0), expected, "{printed}");
+        }
+        assert_eq!(check("OpenClaw 2026.11.5", 2), Some(2));
     }
 }

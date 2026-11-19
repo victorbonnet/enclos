@@ -378,6 +378,7 @@ impl RuntimeAdapter for Hermes {
                 // token can send.
                 ("MOBILE_APP_BRIDGE_KEY".to_owned(), bridge_key.to_owned()),
             ],
+            requires: None,
         })
     }
 

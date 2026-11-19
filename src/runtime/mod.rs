@@ -590,6 +590,26 @@ pub struct AppChannel {
     /// Settings for [`RuntimeAdapter::set_setting`], in order, the channel
     /// turned on last.
     pub settings: Vec<(String, String)>,
+    /// The oldest release of the runtime the plugin loads in, and how to
+    /// tell: `None` when any release does.
+    pub requires: Option<RuntimeRequirement>,
+}
+
+/// The oldest runtime release an app channel's plugin loads in (#336).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRequirement {
+    /// That release, as the runtime names it.
+    pub minimum: &'static str,
+    /// A command that exits with [`RuntimeRequirement::TOO_OLD`] when the
+    /// installed runtime is older than `minimum`, 0 when it is not, and
+    /// otherwise when it cannot tell. `runtime configure` runs it before
+    /// anything else, so an older runtime is left as it was.
+    pub check: SandboxCommand,
+}
+
+impl RuntimeRequirement {
+    /// The exit of a check that found the runtime too old.
+    pub const TOO_OLD: i32 = 3;
 }
 
 /// A name a runtime gives one of its agents, as the runtime writes it.
