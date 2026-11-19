@@ -3009,7 +3009,14 @@ fn run_session(
                             _ => None,
                         };
                         if given.is_err() || refused.is_some() {
-                            hub.held_task_unanswered(store, &request, &said.answer);
+                            hub.held_task_unanswered(
+                                store,
+                                device,
+                                person,
+                                &request,
+                                answer.kind(),
+                                &said.answer,
+                            );
                         }
                         given?;
                         if let Some(error) = refused {

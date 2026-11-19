@@ -107,6 +107,19 @@ fn audit(store: &Store, pending: &Pending, outcome: &str) -> bool {
     }
 }
 
+/// Records a held task's answer in the bridge's log (ADR 0073): once
+/// before it is taken, which must succeed for it to be taken, then its
+/// outcome (`taken`, `conflict`, `not sent`, `unknown`). Whether it was written.
+fn log_answer(store: &Store, device: &str, person: &str, entry: &str) -> bool {
+    match store.log(Some(device), Some(person), "held_task.answer", Some(entry)) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("enclos app: cannot log a held task's answer ({entry}): {e}");
+            false
+        }
+    }
+}
+
 fn code_name(code: ErrorCode) -> String {
     serde_json::to_value(code)
         .ok()
@@ -141,13 +154,27 @@ pub(super) fn current_held_task(
         // Another person's and an unknown card read the same.
         .filter(|card| card.owner == person)
         .ok_or_else(|| (ErrorCode::NotFound, "No such held task.".to_owned()))?;
-    if card.info.state != HeldTaskState::Held {
-        return Err((
-            ErrorCode::Conflict,
-            "The task changed since its card was shown. Refresh before deciding again.".into(),
-        ));
+    // An answered card's task is still held by the runtime: its board and
+    // details stay open to the person (ADR 0073). A resume or an answer
+    // also needs the card to wait on the person (`waiting`).
+    if !matches!(
+        card.info.state,
+        HeldTaskState::Held | HeldTaskState::Answered
+    ) {
+        return Err((ErrorCode::Conflict, CHANGED.into()));
     }
     Ok(card)
+}
+
+const CHANGED: &str = "The task changed since its card was shown. Refresh before deciding again.";
+
+/// `card`, when it still waits on the person: `held`, not answered.
+fn waiting(card: StoredHeldTask) -> Result<StoredHeldTask, (ErrorCode, String)> {
+    if card.info.state == HeldTaskState::Held {
+        Ok(card)
+    } else {
+        Err((ErrorCode::Conflict, CHANGED.into()))
+    }
 }
 
 impl Hub {
@@ -379,28 +406,59 @@ impl Hub {
         request: &ResumeRequest,
         answer: &HeldTaskAnswer,
     ) -> Result<(ConversationId, AnswerMessage, HeldTaskInfo), ErrorBody> {
+        let refuse = |code, why: &str| failure(original.clone(), code, why);
         let card = self
             .held_task_authority(store, device, person, request)
-            .map_err(|(code, why)| failure(original.clone(), code, why))?;
+            .and_then(waiting)
+            .map_err(|(code, why)| refuse(code, why.as_str()))?;
         let said = answer
             .message(&card.info)
-            .map_err(|why| failure(original.clone(), ErrorCode::BadMessage, why))?;
+            .map_err(|why| refuse(ErrorCode::BadMessage, why.as_str()))?;
+        // A resume of this card on its way to the runtime: the person's
+        // answer could tell the agent the opposite of what is running.
+        let resuming = self
+            .held_tasks
+            .lock()
+            .expect("not poisoned")
+            .pending
+            .values()
+            .any(|p| p.request.agent == request.agent && p.request.task == request.task);
+        if resuming {
+            return Err(refuse(
+                ErrorCode::Conflict,
+                "A resume of this task is in progress. Refresh before answering.",
+            ));
+        }
+        // The answer goes in the card's conversation as the person's
+        // message: one that could not take it is said now, not taken.
+        let conversation = card.info.conversation.as_str();
+        let usable = store.conversation_of(conversation).and_then(|found| {
+            Ok(found.is_some_and(|(_, _, owner)| owner == person)
+                && !store.deletion_started(conversation)?)
+        });
+        match usable {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(refuse(
+                    ErrorCode::Conflict,
+                    "The agent's Home cannot take a message now. Nothing was sent.",
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "enclos app: cannot read a held task's conversation for {}: {e}",
+                    request.agent
+                );
+                return Err(refuse(ErrorCode::Internal, NOT_READ));
+            }
+        }
         // No answer the log cannot name: the agent would act on it with no
         // record of who answered.
         let entry = format!("{} {} {}", request.agent, request.task, answer.kind());
-        if let Err(e) = store.log(
-            Some(&device.id),
-            Some(person),
-            "held_task.answer",
-            Some(&entry),
-        ) {
-            eprintln!(
-                "enclos app: cannot log a held task's answer for {}: {e}",
-                request.agent
-            );
-            return Err(failure(original.clone(), ErrorCode::Internal, NOT_READ));
+        if !log_answer(store, &device.id, person, &entry) {
+            return Err(refuse(ErrorCode::Internal, NOT_READ));
         }
-        let change = store
+        let taken = store
             .answer_held_task(
                 &request.agent,
                 request.task.as_str(),
@@ -412,15 +470,14 @@ impl Hub {
                     "enclos app: cannot record a held task's answer for {}: {e}",
                     request.agent
                 );
-                failure(original.clone(), ErrorCode::Internal, NOT_READ)
-            })?
-            .ok_or_else(|| {
-                failure(
-                    original.clone(),
-                    ErrorCode::Conflict,
-                    "The task changed since its card was shown. Refresh before deciding again.",
-                )
+                log_answer(store, &device.id, person, &format!("{entry} unknown"));
+                refuse(ErrorCode::Internal, NOT_READ)
             })?;
+        let Some(change) = taken else {
+            log_answer(store, &device.id, person, &format!("{entry} conflict"));
+            return Err(refuse(ErrorCode::Conflict, CHANGED));
+        };
+        log_answer(store, &device.id, person, &format!("{entry} taken"));
         let info = change.card.info.clone();
         self.publish_held(store, vec![change]);
         Ok((card.info.conversation, said, info))
@@ -428,13 +485,22 @@ impl Hub {
 
     /// The person's message answering `request`'s card could not be stored
     /// or given to the agent: the card, still answered with `answer`, is
-    /// held again, so the person can answer once more.
+    /// held again, so the person can answer once more; logged as not sent.
     pub(super) fn held_task_unanswered(
         &self,
         store: &Store,
+        device: &Device,
+        person: &str,
         request: &ResumeRequest,
+        kind: &str,
         answer: &str,
     ) {
+        log_answer(
+            store,
+            &device.id,
+            person,
+            &format!("{} {} {kind} not sent", request.agent, request.task),
+        );
         match store.unanswer_held_task(&request.agent, request.task.as_str(), answer) {
             Ok(Some(change)) => self.publish_held(store, vec![change]),
             Ok(None) => {}
@@ -470,6 +536,7 @@ impl Hub {
         }
         let card = self
             .held_task_authority(store, device, person, &request)
+            .and_then(waiting)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         // Said only to whoever may resume the card as it is, and before the
         // channel is opened: the runtime is not asked.
@@ -558,6 +625,7 @@ impl Hub {
         // admission/audit and the actual send: no accepted revocation can slip in.
         let card = self
             .held_task_authority(store, device, person, &request)
+            .and_then(waiting)
             .map_err(|(code, why)| failure(original.clone(), code, why))?;
         if !card.info.resumable {
             return Err(failure(
@@ -1283,6 +1351,7 @@ mod tests {
                 choices: vec!["Allow one fix".into(), "Keep paused".into()],
                 recommended: Some(0),
                 settled: false,
+                asked: None,
             }),
             ..task("t1")
         };
@@ -1350,7 +1419,10 @@ mod tests {
         );
         assert_eq!(card.state, HeldTaskState::Answered);
         assert_eq!(card.answer.as_deref(), Some("Allow one fix"));
-        assert_eq!(lines(&store), ["lab/main t1 choice"]);
+        assert_eq!(
+            lines(&store),
+            ["lab/main t1 choice", "lab/main t1 choice taken"]
+        );
         // The person's devices are sent the answered card.
         let sent = std::iter::from_fn(|| rx.try_recv().ok())
             .find_map(|frame| match frame {
@@ -1364,10 +1436,48 @@ mod tests {
             code(answer(&phone, OWNER, card.revision, HeldTaskAnswer::Agent)),
             ErrorCode::Conflict
         );
-        // An answer that could not be given holds the card again.
-        hub.held_task_unanswered(&store, &resume("t1", card.revision), "Allow one fix");
+        // An answered card's board stays open: the runtime still holds it.
+        assert!(
+            hub.held_task_authority(&store, &phone, OWNER, &resume("t1", card.revision))
+                .is_ok()
+        );
+        // An answer that could not be given holds the card again, logged.
+        hub.held_task_unanswered(
+            &store,
+            &phone,
+            OWNER,
+            &resume("t1", card.revision),
+            "choice",
+            "Allow one fix",
+        );
         let again = store.held_task(AGENT, "t1").unwrap().unwrap();
         assert_eq!(again.info.state, HeldTaskState::Held);
+        assert_eq!(
+            lines(&store).last().map(String::as_str),
+            Some("lab/main t1 choice not sent")
+        );
+        // A resume of the card on its way: an answer is refused.
+        hub.held_tasks.lock().unwrap().pending.insert(
+            "held-x".into(),
+            Pending {
+                device: phone.id.clone(),
+                person: OWNER.into(),
+                connection: "c".into(),
+                original: MessageId::new("tap-r").unwrap(),
+                request: resume("t1", again.info.revision),
+                sent: again.runtime_revision.clone(),
+                started: Instant::now(),
+            },
+        );
+        assert_eq!(
+            code(answer(
+                &phone,
+                OWNER,
+                again.info.revision,
+                HeldTaskAnswer::Agent
+            )),
+            ErrorCode::Conflict
+        );
     }
 
     fn not_resumable(id: &str) -> HeldTask {

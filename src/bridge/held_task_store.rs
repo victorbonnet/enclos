@@ -88,11 +88,9 @@ fn read_card(row: &rusqlite::Row) -> rusqlite::Result<Row> {
             since: task.since,
             resume: task.resume,
             resumable: task.resumable,
-            // A device never reads `settled`: the card's state says it.
-            ask: task.ask.map(|ask| HeldTaskAsk {
-                settled: false,
-                ..ask
-            }),
+            // A device never reads `settled` (the card's state says it) or
+            // `asked`.
+            ask: task.ask.map(HeldTaskAsk::for_device),
             answer: answer.filter(|_| state == HeldTaskState::Answered),
             state,
             revision,
@@ -472,7 +470,9 @@ impl Store {
             return Ok(None);
         };
         let resumable = match card.info.state {
-            HeldTaskState::Held => card.runtime_revision == *sent,
+            // An answer taken while the resume was on its way (ADR 0073)
+            // does not hide that the person's resume is what ran.
+            HeldTaskState::Held | HeldTaskState::Answered => card.runtime_revision == *sent,
             HeldTaskState::Released => true,
             _ => false,
         };
@@ -647,6 +647,7 @@ mod tests {
                 choices: vec!["Allow one fix".into(), "Keep paused".into()],
                 recommended: Some(0),
                 settled,
+                asked: Some(1),
             }),
             ..task(id, "r")
         }
@@ -743,6 +744,39 @@ mod tests {
         let changes = store.report_held_tasks(AGENT, &home, &[]).unwrap();
         assert_eq!(changes[0].card.info.state, HeldTaskState::Released);
         assert_eq!(changes[0].card.info.answer, None);
+    }
+
+    /// The same words asked again (a new `asked`) after an answer ask the
+    /// person again; the same list sent again does not.
+    #[test]
+    fn the_same_question_asked_again_after_an_answer_asks_the_person_again() {
+        let (_dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+            .unwrap();
+        store
+            .answer_held_task(AGENT, "t1", 0, "Allow one fix")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[asked("t1", "Allow?", false)])
+                .unwrap()
+                .is_empty()
+        );
+        let first = asked("t1", "Allow?", false);
+        let again = HeldTask {
+            ask: Some(HeldTaskAsk {
+                asked: Some(2),
+                ..first.ask.clone().unwrap()
+            }),
+            ..first
+        };
+        let changes = store.report_held_tasks(AGENT, &home, &[again]).unwrap();
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].message.as_ref().unwrap().kind, "notify");
+        // A device reads neither `asked` nor `settled`.
+        assert_eq!(changes[0].card.info.ask.as_ref().unwrap().asked, None);
     }
 
     #[test]

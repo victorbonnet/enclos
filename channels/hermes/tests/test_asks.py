@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -70,29 +71,57 @@ class Store(unittest.TestCase):
         # Another process (a restart) reads the same file.
         again = asks.Asks(self.path)
         listed = again.attach([entry("t_1", 100), entry("t_2", 100)])
-        self.assertEqual(listed[0]["ask"], ask)
+        sent = dict(listed[0]["ask"])
+        self.assertIsInstance(sent.pop("asked"), int)
+        self.assertEqual(sent, ask)
         self.assertNotIn("ask", listed[1])
+
+    def test_the_same_words_asked_again_carry_a_new_stamp(self):
+        _, ask = asks.validate(GOOD)
+        self.asks.put("t_1", 100, ask)
+        first = self.asks.attach([entry("t_1", 100)])[0]["ask"]["asked"]
+        time.sleep(0.002)
+        self.asks.put("t_1", 100, ask)
+        self.assertGreater(self.asks.attach([entry("t_1", 100)])[0]["ask"]["asked"], first)
 
     def test_an_ask_is_forgotten_once_its_task_is_no_longer_held_or_held_anew(self):
         _, ask = asks.validate(GOOD)
         self.asks.put("t_1", 100, ask)
         self.asks.put("t_2", 100, ask)
-        listed = self.asks.attach([entry("t_1", 200)])
+        listed = self.asks.attach([entry("t_1", 200)], read_at=time.time() + 1)
         self.assertNotIn("ask", listed[0])
         self.assertEqual(json.loads(Path(self.path).read_text()), {})
 
-    def test_settling_marks_the_ask_or_names_the_task_when_there_was_none(self):
+    def test_an_ask_kept_after_a_reading_began_outlives_that_reading(self):
+        # A refresh read the board before the task was held anew; the agent
+        # then asked about the new hold, before the refresh attached.
+        read_at = time.time()
+        _, ask = asks.validate(GOOD)
+        self.asks.put("t_1", 200, ask)
+        listed = self.asks.attach([entry("t_1", 100)], read_at=read_at)
+        self.assertNotIn("ask", listed[0])
+        self.assertEqual(self.asks.attach([entry("t_1", 200)], read_at=read_at)[0]["ask"]["decision"],
+                         GOOD["decision"])
+
+    def test_settling_marks_the_ask_or_stands_for_the_task_when_there_was_none(self):
         _, ask = asks.validate(GOOD)
         self.asks.put("t_1", 100, ask)
         self.asks.settle("t_1", 100, "Task t_1")
-        self.asks.settle("t_2", 100, "Task t_2")
+        self.asks.settle("t_2", 100, "Task t_2", "Waiting on a reviewer.")
         listed = self.asks.attach([entry("t_1"), entry("t_2")])
-        self.assertEqual(listed[0]["ask"], {**ask, "settled": True})
-        self.assertEqual(listed[1]["ask"], {"decision": "Task t_2", "blocked": "", "choices": [], "settled": True})
+        self.assertTrue(listed[0]["ask"]["settled"])
+        self.assertEqual(listed[0]["ask"]["decision"], ask["decision"])
+        self.assertEqual(listed[1]["ask"], {"decision": "Task t_2", "blocked": "Waiting on a reviewer.",
+                                            "choices": [], "settled": True})
 
-    def test_a_file_that_does_not_read_starts_empty(self):
+    def test_a_file_that_does_not_read_is_an_error_and_is_not_written_over(self):
         Path(self.path).write_text("not json")
-        self.assertEqual(self.asks.attach([entry()]), [entry()])
+        with self.assertRaises(OSError):
+            self.asks.attach([entry()])
+        _, ask = asks.validate(GOOD)
+        with self.assertRaises(OSError):
+            self.asks.put("t_1", 100, ask)
+        self.assertEqual(Path(self.path).read_text(), "not json")
 
 
 class Board:
@@ -196,8 +225,27 @@ class List(unittest.TestCase):
         asyncio.run(run())
         # Sent when it changed only: with the ask, then settled.
         self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[0]["tasks"][0]["ask"], ask)
+        self.assertEqual(sent[0]["tasks"][0]["ask"]["decision"], ask["decision"])
         self.assertTrue(sent[1]["tasks"][0]["ask"]["settled"])
+
+    def test_asks_that_cannot_be_read_send_no_list(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        sent = []
+
+        async def write(message):
+            sent.append(message)
+            return True
+
+        manager = held_tasks.Manager("main", write, board=Board({"main": [entry("t_1", 100)]}))
+        manager.bridge_supports = True
+        path = os.path.join(folder.name, "main.sock.held-asks.json")
+        Path(path).write_text("[")
+        manager.asks = asks.Asks(path)
+        with self.assertLogs(held_tasks.logger, "ERROR"):
+            asyncio.run(manager.refresh())
+        # A list without the asks would withdraw them from the cards.
+        self.assertEqual(sent, [])
 
 
 class Hint(unittest.TestCase):

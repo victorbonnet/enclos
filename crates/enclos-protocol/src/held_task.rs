@@ -67,6 +67,12 @@ pub struct HeldTaskAsk {
     /// the plugin leg; a device's card never carries it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settled: bool,
+    /// When the agent asked, as the plugin counts it (an opaque number): a
+    /// new value is a new question even in the same words, so an agent
+    /// asking again after an answer is told apart from the same list sent
+    /// again. Only on the plugin leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<i64>,
 }
 
 impl HeldTaskAsk {
@@ -102,7 +108,18 @@ impl HeldTaskAsk {
             choices,
             recommended,
             settled: self.settled,
+            asked: self.asked,
         })
+    }
+
+    /// The ask as a device reads it: without what only the plugin leg
+    /// carries (`settled`, `asked`).
+    pub fn for_device(self) -> Self {
+        Self {
+            settled: false,
+            asked: None,
+            ..self
+        }
     }
 
     /// The same question, whether or not the agent says it was answered:
@@ -749,6 +766,7 @@ mod tests {
                     choices: vec![wide(MAX_CHOICE_CHARS); MAX_CHOICES],
                     recommended: Some(u32::MAX),
                     settled: false,
+                    asked: None,
                 }),
                 answer: Some(wide(MAX_ANSWER_CHARS)),
                 state: HeldTaskState::Released,
@@ -779,6 +797,7 @@ mod tests {
             choices: choices.iter().map(|c| (*c).to_owned()).collect(),
             recommended,
             settled: false,
+            asked: None,
         }
     }
 
@@ -846,6 +865,11 @@ mod tests {
             ..asked.clone()
         };
         assert!(asked.same_question(&settled));
+        // Asked again in the same words: another question.
+        assert!(!asked.same_question(&HeldTaskAsk {
+            asked: Some(2),
+            ..asked.clone()
+        }));
         assert!(!asked.same_question(&ask(&["A", "C"], Some(0))));
         assert!(!asked.same_question(&ask(&["A", "B"], Some(1))));
     }

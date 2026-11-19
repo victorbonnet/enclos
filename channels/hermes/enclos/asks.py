@@ -17,6 +17,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Optional
 
 from . import held_tasks, visible
@@ -56,15 +57,18 @@ class Asks:
         self._lock = threading.Lock()
 
     def _read(self) -> dict[str, Any]:
+        """The asks kept, none when there is no file yet; raises when the
+        file cannot be read, so that no write replaces the others with nothing."""
         try:
             with open(self.path, encoding="utf-8") as file:
                 data = json.load(file)
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as error:
-            logger.warning("The held tasks' asks cannot be read (%s); they start empty", error)
-            return {}
-        return data if isinstance(data, dict) else {}
+            raise OSError(f"the held tasks' asks cannot be read ({error})") from error
+        if not isinstance(data, dict):
+            raise OSError("the held tasks' asks are not a JSON object")
+        return data
 
     def _write(self, data: dict[str, Any]) -> None:
         folder = os.path.dirname(self.path) or "."
@@ -80,39 +84,53 @@ class Asks:
             raise
 
     def put(self, task: str, since: int, ask: dict[str, Any]) -> None:
-        """Keeps `ask` for `task`'s hold since `since`, replacing any earlier one."""
+        """Keeps `ask` for `task`'s hold since `since`, replacing any earlier
+        one, stamped `asked` so the same words asked again read as a new
+        question to the bridge."""
         with self._lock:
             data = self._read()
-            data[task] = {"since": since, "ask": ask}
+            now = time.time()
+            data[task] = {"since": since, "at": now, "ask": {**ask, "asked": int(now * 1000)}}
             self._write(data)
 
-    def settle(self, task: str, since: int, title: str) -> None:
+    def settle(self, task: str, since: int, title: str, reason: str = "") -> None:
         """The person answered `task`'s hold in the conversation: its ask is
-        `settled`, or, when the agent never asked, one that names the task."""
+        `settled`. When the agent never asked, the task's own title and
+        reason stand for it, as the card already shows them."""
         with self._lock:
             data = self._read()
             kept = data.get(task)
             if not isinstance(kept, dict) or kept.get("since") != since or not isinstance(kept.get("ask"), dict):
-                kept = {"since": since, "ask": {"decision": title or task, "blocked": "", "choices": []}}
+                kept = {"since": since, "at": time.time(),
+                        "ask": {"decision": title or task, "blocked": reason[:MAX_BLOCKED_CHARS], "choices": []}}
             kept["ask"]["settled"] = True
             data[task] = kept
             self._write(data)
 
-    def attach(self, held: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """`held`, the agent's held tasks as read, each with the ask kept for
-        its hold; an ask for a task no longer held, or held anew, is forgotten."""
+    def attach(self, held: list[dict[str, Any]], read_at: float = 0.0) -> list[dict[str, Any]]:
+        """`held`, the agent's held tasks as read from `read_at` on, each with
+        the ask kept for its hold. An ask for a task no longer held, or held
+        anew, is forgotten, unless it was kept after that reading began: the
+        reading may predate the hold it is for. Raises when the asks cannot
+        be read."""
         with self._lock:
             data = self._read()
             current = {entry["task"]: entry["since"] for entry in held}
+
+            def usable(value: Any) -> bool:
+                return isinstance(value, dict) and isinstance(value.get("ask"), dict)
+
+            matching = {task: value for task, value in data.items()
+                        if usable(value) and current.get(task) == value.get("since")}
             kept = {task: value for task, value in data.items()
-                    if isinstance(value, dict) and current.get(task) == value.get("since")
-                    and isinstance(value.get("ask"), dict)}
+                    if task in matching or (usable(value) and isinstance(value.get("at"), (int, float))
+                                            and value["at"] >= read_at)}
             if kept != data:
                 try:
                     self._write(kept)
                 except OSError as error:
                     logger.warning("The held tasks' asks cannot be saved (%s)", error)
-        return [{**entry, "ask": kept[entry["task"]]["ask"]} if entry["task"] in kept else entry
+        return [{**entry, "ask": matching[entry["task"]]["ask"]} if entry["task"] in matching else entry
                 for entry in held]
 
 
@@ -206,7 +224,7 @@ def register(ctx, adapters: list, current_agent: Callable[[], Optional[str]]) ->
             task = _line(args.get("task"), "the task's id", 256)
             adapter = channel()
             entry = held_now(adapter, task)
-            adapter._asks.settle(task, entry["since"], entry.get("title", ""))
+            adapter._asks.settle(task, entry["since"], entry.get("title", ""), entry.get("reason", ""))
             adapter._loop.call_soon_threadsafe(adapter._held.poke)
             return json.dumps({"status": "answered", "message": "The task's card no longer waits on the person."})
         except Exception as error:
