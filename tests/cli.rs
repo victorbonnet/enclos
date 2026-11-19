@@ -3187,7 +3187,8 @@ fn status_shows_the_version_hermes_records_and_no_release_when_lookups_are_off()
     home.init(1);
     home.run(&["sandbox", "create", "home", "--template", "assistant"])
         .ok();
-    record_hermes(&home, "home");
+    // No agent is made: the closure that makes one is not needed.
+    let _ = record_hermes(&home, "home");
     let checkout = enclos::layout::Layout::at(&home.root)
         .sandbox_home("home")
         .join(".hermes/hermes-agent");
