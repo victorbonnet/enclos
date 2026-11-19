@@ -524,8 +524,9 @@ pub(crate) fn dollars(micros: u64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
-/// Counts read at a glance: 950, 83.1k, 1.2M; `-` when not counted. The
-/// unit is chosen after rounding, so 999,950 reads 1.0M, not 1000.0k.
+/// Counts read at a glance: 950, 83.1k, 1.2M, 4.3B (billions, as tokens
+/// are counted, not giga); `-` when not counted. The unit is chosen after
+/// rounding, so 999,950 reads 1.0M, not 1000.0k.
 fn count(n: Option<u64>) -> String {
     let Some(n) = n else {
         return "-".into();
@@ -534,7 +535,7 @@ fn count(n: Option<u64>) -> String {
         return n.to_string();
     }
     let mut value = n as f64;
-    for unit in ["k", "M", "G", "T"] {
+    for unit in ["k", "M", "B", "T"] {
         value /= 1e3;
         if (value * 10.0).round() < 10_000.0 || unit == "T" {
             return format!("{value:.1}{unit}");
@@ -670,7 +671,8 @@ mod tests {
         // Rounding up to the next unit takes that unit.
         assert_eq!(count(Some(999_949)), "999.9k");
         assert_eq!(count(Some(999_950)), "1.0M");
-        assert_eq!(count(Some(999_950_000)), "1.0G");
+        assert_eq!(count(Some(999_950_000)), "1.0B");
+        assert_eq!(count(Some(4_321_000_000)), "4.3B");
         assert_eq!(count(Some(u64::MAX)), "18446744.1T");
     }
 
