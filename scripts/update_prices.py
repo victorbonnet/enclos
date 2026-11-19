@@ -9,7 +9,7 @@ Reads `model_prices_and_context_window.json` at that commit (from `--input`,
 else from raw.githubusercontent.com) and rewrites only the block between the
 GENERATED markers. Everything outside it is kept as it is, and an entry made
 by hand wins: a LiteLLM model whose id, or id without its date suffix, a hand
-entry names (as its id or one of its aliases) for the same provider is left
+entry names (as its id or one of its aliases) for the same model provider is left
 out. Each generated entry says where it came from, `litellm@<commit>`, the
 commit its rates last changed at, so a newer commit with the same rates
 changes nothing. The output depends only on the input file, the revision and
@@ -42,7 +42,7 @@ DATE_SUFFIX = re.compile(r"-(?:\d{8}|\d{4}-\d{2}-\d{2})$")
 MILLION = Decimal(1_000_000)
 # Per million tokens: drops float noise such as 3.0000000000000004.
 STEP = Decimal("0.000001")
-# LiteLLM's provider for each of enclos's, and the prefix its ids may carry.
+# LiteLLM's provider for each of enclos's model providers, and the prefix its ids may carry.
 PROVIDERS = {
     "anthropic": "anthropic",
     "openai": "openai",
@@ -104,7 +104,7 @@ def hand_names(text):
         raise Refused("the hand section is not TOML: {}".format(e))
     names = set()
     for entry in doc.get("models", []):
-        provider = entry.get("provider")
+        provider = entry.get("model_provider")
         for name in [entry.get("id")] + list(entry.get("aliases", [])):
             if isinstance(provider, str) and isinstance(name, str):
                 names.add((provider, name.lower()))
@@ -125,7 +125,7 @@ def previous(text):
     out = {}
     for e in doc.get("models", []):
         rates = tuple((f, Decimal(str(e[f])).normalize()) for f, _ in FIELDS if f in e)
-        out[(e.get("provider"), e.get("id"))] = (rates, e.get("source"))
+        out[(e.get("model_provider"), e.get("id"))] = (rates, e.get("source"))
     return out
 
 
@@ -172,7 +172,7 @@ def render(models, revision, before):
         source = kept[1] if kept and kept[0] == rates and kept[1] else "litellm@" + revision
         lines.append("")
         lines.append("[[models]]")
-        lines.append('provider = "{}"'.format(provider))
+        lines.append('model_provider = "{}"'.format(provider))
         lines.append('id = "{}"'.format(name))
         for field, value in rates:
             lines.append("{} = {}".format(field, number(value)))

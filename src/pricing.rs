@@ -6,13 +6,13 @@
 //! which wins, and a part `scripts/update_prices.py` generates from a
 //! pinned LiteLLM commit, through a reviewed pull request. enclos fetches
 //! no price when it runs. `prices.toml` in enclos's config folder, in the
-//! same format, overrides it, per provider and model.
+//! same format, overrides it, per model provider and model.
 //!
 //! The estimate is worked out when usage is read, from the list as it is
 //! then, so a corrected price applies to past usage too. A model the list
-//! does not have has an unknown cost, never $0; a provider the list marks
+//! does not have has an unknown cost, never $0; a model provider the list marks
 //! `included` is a subscription, whose tokens cost nothing in dollars but
-//! count against its limits. Rates are base rates: a provider's higher
+//! count against its limits. Rates are base rates: a model provider's higher
 //! rate for a long prompt, a batch discount, and a 1-hour cache write's
 //! dearer rate are not applied, since a runtime's records sum many calls.
 
@@ -33,21 +33,21 @@ const MAX_OVERRIDE_BYTES: u64 = 1 << 20;
 /// The most a rate may be, in dollars per million tokens: far above any
 /// model's, low enough that no estimate overflows before it saturates.
 const MAX_RATE: f64 = 1_000_000.0;
-/// The most characters of a provider's or a model's name.
+/// The most characters of a model provider's or a model's name.
 const MAX_NAME_CHARS: usize = 128;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
-    providers: BTreeMap<String, ProviderEntry>,
+    model_providers: BTreeMap<String, ModelProviderEntry>,
     #[serde(default)]
     models: Vec<ModelEntry>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProviderEntry {
+struct ModelProviderEntry {
     #[serde(default)]
     aliases: Vec<String>,
     #[serde(default)]
@@ -59,7 +59,7 @@ struct ProviderEntry {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelEntry {
-    provider: String,
+    model_provider: String,
     id: String,
     #[serde(default)]
     aliases: Vec<String>,
@@ -84,7 +84,7 @@ pub enum Origin {
 }
 
 /// A model's rates, in US dollars per million tokens. A cache rate the
-/// provider does not set apart is priced as input.
+/// model provider does not set apart is priced as input.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Rates {
     pub input: f64,
@@ -95,7 +95,7 @@ pub struct Rates {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelPrice {
-    pub provider: String,
+    pub model_provider: String,
     pub id: String,
     pub aliases: Vec<String>,
     pub rates: Rates,
@@ -106,7 +106,7 @@ pub struct ModelPrice {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ProviderInfo {
+pub struct ModelProvider {
     pub name: String,
     pub aliases: Vec<String>,
     /// A subscription: its tokens' cost is included.
@@ -119,8 +119,8 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Price<'a> {
     Rates(&'a ModelPrice),
-    /// On a subscription, the provider named.
-    Included(&'a ProviderInfo),
+    /// On a subscription, the model provider named.
+    Included(&'a ModelProvider),
     /// No price: the cost is unknown.
     Unknown,
 }
@@ -159,11 +159,11 @@ impl From<enclos_protocol::usage::UsageTokens> for Counts {
 /// place of or beside its own.
 #[derive(Debug, Clone)]
 pub struct PriceList {
-    providers: BTreeMap<String, ProviderInfo>,
-    /// Each provider's name and alias, lowercase, to its name.
+    model_providers: BTreeMap<String, ModelProvider>,
+    /// Each model provider's name and alias, lowercase, to its name.
     names: HashMap<String, String>,
     models: Vec<ModelPrice>,
-    /// `(provider, id or alias)`, lowercase, to its place in `models`.
+    /// `(model provider, id or alias)`, lowercase, to its place in `models`.
     index: HashMap<(String, String), usize>,
 }
 
@@ -181,8 +181,11 @@ pub struct Loaded {
 pub enum OverrideRead {
     /// There is none.
     Absent,
-    /// Read: this many models and providers.
-    Read { models: usize, providers: usize },
+    /// Read: this many models and model providers.
+    Read {
+        models: usize,
+        model_providers: usize,
+    },
     /// Not read, and why: the bundled list is used alone.
     Refused(String),
 }
@@ -201,7 +204,7 @@ impl PriceList {
 
     fn empty() -> PriceList {
         PriceList {
-            providers: BTreeMap::new(),
+            model_providers: BTreeMap::new(),
             names: HashMap::new(),
             models: Vec::new(),
             index: HashMap::new(),
@@ -218,11 +221,14 @@ impl PriceList {
             Ok(Some(text)) => {
                 let mut list = bundled.clone();
                 match list.add(&text, Origin::Override) {
-                    Ok((models, providers)) => {
+                    Ok((models, model_providers)) => {
                         return Loaded {
                             list,
                             override_file: path.to_owned(),
-                            override_read: OverrideRead::Read { models, providers },
+                            override_read: OverrideRead::Read {
+                                models,
+                                model_providers,
+                            },
                         };
                     }
                     Err(why) => OverrideRead::Refused(why),
@@ -237,19 +243,19 @@ impl PriceList {
         }
     }
 
-    /// Adds a file's providers and models, in place of those of the same
-    /// name: all or nothing. Returns how many models and providers it had.
+    /// Adds a file's model providers and models, in place of those of the same
+    /// name: all or nothing. Returns how many models and model providers it had.
     fn add(&mut self, text: &str, origin: Origin) -> Result<(usize, usize), String> {
         let file: File = toml::from_str(text).map_err(|e| format!("is not a price list: {e}"))?;
         let mut next = self.clone();
-        for (name, p) in &file.providers {
-            let key = checked_name(name, "a provider")?;
+        for (name, p) in &file.model_providers {
+            let key = checked_name(name, "a model provider")?;
             let mut aliases = Vec::new();
             for alias in &p.aliases {
-                aliases.push(checked_name(alias, "a provider's alias")?);
+                aliases.push(checked_name(alias, "a model provider's alias")?);
             }
-            // A provider named again replaces the earlier one, aliases too.
-            if let Some(old) = next.providers.remove(&key) {
+            // A model provider named again replaces the earlier one, aliases too.
+            if let Some(old) = next.model_providers.remove(&key) {
                 for alias in old.aliases {
                     next.names.remove(&alias.to_lowercase());
                 }
@@ -261,9 +267,9 @@ impl PriceList {
                 }
                 next.names.insert(lower, key.clone());
             }
-            next.providers.insert(
+            next.model_providers.insert(
                 key.clone(),
-                ProviderInfo {
+                ModelProvider {
                     name: key,
                     aliases,
                     included: p.included,
@@ -275,13 +281,13 @@ impl PriceList {
         let mut seen = Vec::new();
         for m in &file.models {
             let id = checked_name(&m.id, "a model")?;
-            let Some(provider) = next.names.get(&m.provider.to_lowercase()).cloned() else {
+            let Some(provider) = next.names.get(&m.model_provider.to_lowercase()).cloned() else {
                 return Err(format!(
-                    "prices {id} under provider {}, which it does not name under [providers]",
-                    m.provider
+                    "prices {id} under model provider {}, which it does not name under [model_providers]",
+                    m.model_provider
                 ));
             };
-            if next.providers[&provider].included {
+            if next.model_providers[&provider].included {
                 return Err(format!(
                     "prices {id} under {provider}, a subscription whose cost is included"
                 ));
@@ -302,7 +308,7 @@ impl PriceList {
             }
             seen.push(key);
             next.put(ModelPrice {
-                provider,
+                model_provider: provider,
                 id,
                 aliases,
                 rates,
@@ -311,10 +317,10 @@ impl PriceList {
             });
         }
         *self = next;
-        Ok((file.models.len(), file.providers.len()))
+        Ok((file.models.len(), file.model_providers.len()))
     }
 
-    /// Puts a model in, in place of the one of the same provider and id,
+    /// Puts a model in, in place of the one of the same model provider and id,
     /// and of any whose alias it now takes.
     fn put(&mut self, price: ModelPrice) {
         let names: Vec<String> = std::iter::once(&price.id)
@@ -324,7 +330,7 @@ impl PriceList {
         // The entry of this id, not one this id is an alias of.
         let same = self
             .index
-            .get(&(price.provider.clone(), price.id.to_lowercase()))
+            .get(&(price.model_provider.clone(), price.id.to_lowercase()))
             .copied()
             .filter(|&at| self.models[at].id.eq_ignore_ascii_case(&price.id));
         let at = match same {
@@ -332,7 +338,8 @@ impl PriceList {
                 // Its earlier names go: the new entry says its own.
                 let old = &self.models[at];
                 for n in std::iter::once(&old.id).chain(&old.aliases) {
-                    self.index.remove(&(old.provider.clone(), n.to_lowercase()));
+                    self.index
+                        .remove(&(old.model_provider.clone(), n.to_lowercase()));
                 }
                 self.models[at] = price.clone();
                 at
@@ -343,47 +350,47 @@ impl PriceList {
             }
         };
         for n in names {
-            self.index.insert((price.provider.clone(), n), at);
+            self.index.insert((price.model_provider.clone(), n), at);
         }
     }
 
-    pub fn providers(&self) -> impl Iterator<Item = &ProviderInfo> {
-        self.providers.values()
+    pub fn model_providers(&self) -> impl Iterator<Item = &ModelProvider> {
+        self.model_providers.values()
     }
 
     pub fn models(&self) -> &[ModelPrice] {
         &self.models
     }
 
-    /// The provider a runtime's name for it stands for.
-    pub fn provider(&self, name: &str) -> Option<&ProviderInfo> {
+    /// The model provider a runtime's name for it stands for.
+    pub fn model_provider(&self, name: &str) -> Option<&ModelProvider> {
         self.names
             .get(&name.trim().to_lowercase())
-            .and_then(|n| self.providers.get(n))
+            .and_then(|n| self.model_providers.get(n))
     }
 
-    /// What the list says of `model` as `provider` serves it, each as the
+    /// What the list says of `model` as `model provider` serves it, each as the
     /// runtime names it.
     ///
-    /// A provider the list marks `included` is a subscription, whatever
-    /// the model. Otherwise the model is looked for under the provider: as
+    /// A model provider the list marks `included` is a subscription, whatever
+    /// the model. Otherwise the model is looked for under the model provider: as
     /// named, without a date suffix (`-20260101`), and with dashes for
     /// dots (`claude-opus-4.6`). A model named with its maker
     /// (`anthropic/claude-opus-4-6`, as OpenRouter and Nous name them) is
-    /// looked for under its maker when the provider is not in the list.
-    /// Without a provider, it is looked for under each, in name order. A
-    /// provider not in the list, serving a model not named with its
+    /// looked for under its maker when the model provider is not in the list.
+    /// Without a model provider, it is looked for under each, in name order. A
+    /// model provider not in the list, serving a model not named with its
     /// maker, has no price: a model of the same name elsewhere may cost
     /// something else there.
-    pub fn find(&self, provider: Option<&str>, model: Option<&str>) -> Price<'_> {
-        let provider = provider
+    pub fn find(&self, model_provider: Option<&str>, model: Option<&str>) -> Price<'_> {
+        let provider = model_provider
             .map(|p| p.trim().to_lowercase())
             .filter(|p| !p.is_empty() && p != "auto" && p != "unknown");
         let known = provider.as_deref().and_then(|p| self.names.get(p));
         if let Some(name) = known
-            && self.providers[name].included
+            && self.model_providers[name].included
         {
-            return Price::Included(&self.providers[name]);
+            return Price::Included(&self.model_providers[name]);
         }
         let Some(model) = model
             .map(|m| m.trim().to_lowercase())
@@ -402,10 +409,10 @@ impl PriceList {
             (Some(p), _, _) => vec![p],
             (None, Some(m), _) => vec![m],
             (None, None, Some(_)) => return Price::Unknown,
-            (None, None, None) => self.providers.keys().collect(),
+            (None, None, None) => self.model_providers.keys().collect(),
         };
         for p in under {
-            if self.providers[p].included {
+            if self.model_providers[p].included {
                 continue;
             }
             for name in candidates(&bare) {
@@ -417,10 +424,15 @@ impl PriceList {
         Price::Unknown
     }
 
-    /// What `counts` of `model`, as `provider` serves it, cost.
-    pub fn cost(&self, provider: Option<&str>, model: Option<&str>, counts: Counts) -> UsageCost {
+    /// What `counts` of `model`, as `model provider` serves it, cost.
+    pub fn cost(
+        &self,
+        model_provider: Option<&str>,
+        model: Option<&str>,
+        counts: Counts,
+    ) -> UsageCost {
         let total = counts.total();
-        match self.find(provider, model) {
+        match self.find(model_provider, model) {
             Price::Included(_) => UsageCost {
                 included: total,
                 ..UsageCost::default()
@@ -555,14 +567,14 @@ mod tests {
     use super::*;
 
     const LIST: &str = r#"
-[providers.anthropic]
-[providers.openai]
+[model_providers.anthropic]
+[model_providers.openai]
 aliases = ["openai-api"]
-[providers.openai-codex]
+[model_providers.openai-codex]
 included = true
 
 [[models]]
-provider = "anthropic"
+model_provider = "anthropic"
 id = "claude-opus-5-5"
 aliases = ["claude-opus-latest"]
 input = 4.0
@@ -571,7 +583,7 @@ cache_read = 0.2
 cache_write = 5.0
 
 [[models]]
-provider = "openai"
+model_provider = "openai"
 id = "gpt-5.5"
 input = 5.0
 output = 30.0
@@ -592,7 +604,7 @@ output = 30.0
 
     fn id(price: Price<'_>) -> Option<String> {
         match price {
-            Price::Rates(p) => Some(format!("{}/{}", p.provider, p.id)),
+            Price::Rates(p) => Some(format!("{}/{}", p.model_provider, p.id)),
             Price::Included(p) => Some(format!("{} included", p.name)),
             Price::Unknown => None,
         }
@@ -602,8 +614,8 @@ output = 30.0
     fn the_bundled_list_reads_and_prices_a_known_model() {
         let list = PriceList::bundled();
         assert!(list.models().len() > 100, "{}", list.models().len());
-        assert!(list.provider("openai-codex").unwrap().included);
-        assert!(list.provider("GitHub-Copilot").unwrap().included);
+        assert!(list.model_provider("openai-codex").unwrap().included);
+        assert!(list.model_provider("GitHub-Copilot").unwrap().included);
         // Every entry names where its rates came from.
         assert!(list.models().iter().all(|m| m.source.is_some()));
         let Price::Rates(opus) = list.find(Some("anthropic"), Some("claude-opus-5-5")) else {
@@ -616,7 +628,7 @@ output = 30.0
     fn an_override_named_as_another_models_alias_is_a_model_of_its_own() {
         let mut list = list(LIST);
         list.add(
-            "[[models]]\nprovider = \"anthropic\"\nid = \"claude-opus-latest\"\ninput = 1.0\noutput = 1.0\n",
+            "[[models]]\nmodel_provider = \"anthropic\"\nid = \"claude-opus-latest\"\ninput = 1.0\noutput = 1.0\n",
             Origin::Override,
         )
         .unwrap();
@@ -641,12 +653,12 @@ output = 30.0
         assert_eq!(found(Some("anthropic"), "claude-opus-5-5-20261101"), opus);
         assert_eq!(found(Some("anthropic"), "claude-opus-5-5-2026-11-01"), opus);
         assert_eq!(found(Some("anthropic"), "claude-opus-5.5"), opus);
-        // A provider's alias.
+        // A model provider's alias.
         assert_eq!(
             found(Some("openai-api"), "gpt-5.5"),
             Some("openai/gpt-5.5".into())
         );
-        // A model of another provider is not found under this one.
+        // A model of another model provider is not found under this one.
         assert_eq!(found(Some("openai"), "claude-opus-5-5"), None);
     }
 
@@ -674,7 +686,8 @@ output = 30.0
     }
 
     #[test]
-    fn a_model_named_with_its_maker_is_priced_at_the_makers_rates_through_a_provider_not_listed() {
+    fn a_model_named_with_its_maker_is_priced_at_the_makers_rates_through_a_model_provider_not_listed()
+     {
         let list = list(LIST);
         assert_eq!(
             id(list.find(Some("openrouter"), Some("anthropic/claude-opus-5-5"))),
@@ -684,10 +697,10 @@ output = 30.0
             id(list.find(None, Some("openai/gpt-5.5"))),
             Some("openai/gpt-5.5".into())
         );
-        // A provider not listed, serving a model without its maker: unknown,
-        // whatever another provider charges for a model of that name.
+        // A model provider not listed, serving a model without its maker: unknown,
+        // whatever another model provider charges for a model of that name.
         assert_eq!(id(list.find(Some("ollama"), Some("gpt-5.5"))), None);
-        // No provider: each is looked in.
+        // No model provider: each is looked in.
         assert_eq!(
             id(list.find(None, Some("gpt-5.5"))),
             Some("openai/gpt-5.5".into())
@@ -745,7 +758,7 @@ output = 30.0
     }
 
     #[test]
-    fn an_override_replaces_a_price_adds_a_model_and_a_provider_and_says_what_it_read() {
+    fn an_override_replaces_a_price_adds_a_model_and_a_model_provider_and_says_what_it_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prices.toml");
         let absent = PriceList::load(&path);
@@ -753,16 +766,16 @@ output = 30.0
         std::fs::write(
             &path,
             r#"
-[providers.nous]
+[model_providers.nous]
 [[models]]
-provider = "nous"
+model_provider = "nous"
 id = "hermes-5"
 input = 1.0
 output = 2.0
 source = "my invoice"
 
 [[models]]
-provider = "anthropic"
+model_provider = "anthropic"
 id = "claude-opus-5-5"
 input = 3.0
 output = 15.0
@@ -774,7 +787,7 @@ output = 15.0
             loaded.override_read,
             OverrideRead::Read {
                 models: 2,
-                providers: 1
+                model_providers: 1
             }
         );
         let Price::Rates(opus) = loaded.list.find(Some("anthropic"), Some("claude-opus-5-5"))
@@ -794,7 +807,7 @@ output = 15.0
     fn an_override_that_does_not_read_leaves_the_bundled_list_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prices.toml");
-        std::fs::write(&path, "[[models]]\nprovider = \"anthropic\"\n").unwrap();
+        std::fs::write(&path, "[[models]]\nmodel_provider = \"anthropic\"\n").unwrap();
         let loaded = PriceList::load(&path);
         let OverrideRead::Refused(why) = &loaded.override_read else {
             panic!("{:?}", loaded.override_read)
@@ -823,9 +836,11 @@ output = 15.0
     }
 
     #[test]
-    fn a_list_with_a_rate_a_name_or_a_provider_it_cannot_take_is_refused_whole() {
+    fn a_list_with_a_rate_a_name_or_a_model_provider_it_cannot_take_is_refused_whole() {
         let model = |fields: &str| {
-            format!("[providers.anthropic]\n[[models]]\nprovider = \"anthropic\"\n{fields}\n")
+            format!(
+                "[model_providers.anthropic]\n[[models]]\nmodel_provider = \"anthropic\"\n{fields}\n"
+            )
         };
         assert!(refused(&model("id = \"m\"\ninput = -1.0\noutput = 1.0")).contains("rate"));
         assert!(refused(&model("id = \"m\"\ninput = inf\noutput = 1.0")).contains("rate"));
@@ -837,13 +852,15 @@ output = 15.0
                 .contains("not a price list")
         );
         let twice = model("id = \"m\"\ninput = 1.0\noutput = 1.0")
-            + "[[models]]\nprovider = \"anthropic\"\nid = \"M\"\ninput = 1.0\noutput = 1.0\n";
+            + "[[models]]\nmodel_provider = \"anthropic\"\nid = \"M\"\ninput = 1.0\noutput = 1.0\n";
         assert!(refused(&twice).contains("twice"));
-        let undeclared = "[[models]]\nprovider = \"nous\"\nid = \"m\"\ninput = 1.0\noutput = 1.0\n";
+        let undeclared =
+            "[[models]]\nmodel_provider = \"nous\"\nid = \"m\"\ninput = 1.0\noutput = 1.0\n";
         assert!(refused(undeclared).contains("does not name"));
-        let included = "[providers.sub]\nincluded = true\n[[models]]\nprovider = \"sub\"\nid = \"m\"\ninput = 1.0\noutput = 1.0\n";
+        let included = "[model_providers.sub]\nincluded = true\n[[models]]\nmodel_provider = \"sub\"\nid = \"m\"\ninput = 1.0\noutput = 1.0\n";
         assert!(refused(included).contains("subscription"));
-        let clash = "[providers.a]\naliases = [\"x\"]\n[providers.b]\naliases = [\"X\"]\n";
+        let clash =
+            "[model_providers.a]\naliases = [\"x\"]\n[model_providers.b]\naliases = [\"X\"]\n";
         assert!(refused(clash).contains("both"));
     }
 

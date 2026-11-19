@@ -3201,7 +3201,7 @@ fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() 
         .unwrap();
     assert!(codex.contains("included"), "{list}");
     let opus = home
-        .run(&["prices", "claude-opus-5-5", "--provider", "anthropic"])
+        .run(&["prices", "claude-opus-5-5", "--model-provider", "anthropic"])
         .ok()
         .stdout();
     assert!(
@@ -3209,17 +3209,17 @@ fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() 
         "{opus}"
     );
     let sub = home
-        .run(&["prices", "gpt-5.5", "--provider", "openai-codex"])
+        .run(&["prices", "gpt-5.5", "--model-provider", "openai-codex"])
         .ok()
         .stdout();
     assert!(sub.starts_with("openai-codex is a subscription"), "{sub}");
     // The user's own price wins, and says where it came from.
     std::fs::write(
         home.root.join("prices.toml"),
-        "[providers.nous]\n[[models]]\nprovider = \"nous\"\nid = \"hermes-9\"\ninput = 1.5\noutput = 3.0\n",
+        "[model_providers.nous]\n[[models]]\nmodel_provider = \"nous\"\nid = \"hermes-9\"\ninput = 1.5\noutput = 3.0\n",
     )
     .unwrap();
-    let out = home.run(&["prices", "hermes-9", "--provider", "nous", "--json"]);
+    let out = home.run(&["prices", "hermes-9", "--model-provider", "nous", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
     assert_eq!(json["price"], "rates");
     assert_eq!(json["entry"]["rates"]["input"], 1.5);
@@ -3228,7 +3228,7 @@ fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() 
     // One that does not read is said, and the bundled list used alone.
     std::fs::write(home.root.join("prices.toml"), "[[models]]\n").unwrap();
     let text = home
-        .run(&["prices", "hermes-9", "--provider", "nous"])
+        .run(&["prices", "hermes-9", "--model-provider", "nous"])
         .ok()
         .stdout();
     assert!(

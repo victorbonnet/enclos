@@ -156,7 +156,7 @@ class Sum:
     def entry(self, model, provider):
         entry = {
             "model": text(model),
-            "provider": text(provider),
+            "model_provider": text(provider),
             "chats": len(self.chats),
             "calls": self.value("calls"),
             "tokens": self.tokens(),

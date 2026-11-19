@@ -141,7 +141,7 @@ class UsageTests(unittest.TestCase):
             ('s2', 'gpt-5.5', 'title_generation', '', 1, 4, 1, 0, 0, 0, 0.0, 0.0, None),
         ]
         db.executemany('insert into session_model_usage values (' + ','.join('?' * 13) + ')', calls); db.commit()
-        models = {(m['model'], m['provider']): m for m in self.run_reader(0, 'default')['default']['models']}
+        models = {(m['model'], m['model_provider']): m for m in self.run_reader(0, 'default')['default']['models']}
         self.assertEqual(set(models), {('gpt-5.5', 'openai-codex'), ('gpt-5.5', 'openai'), ('m', None)})
         self.assertEqual(models[('gpt-5.5', 'openai-codex')]['tokens']['input'], 100)
         # s2: its title's row (4) and its counters beyond it (50 - 4).

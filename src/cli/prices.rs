@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use enclos::engine::Engine;
 use enclos::error::{Error, Result, exit};
-use enclos::pricing::{ModelPrice, Origin, OverrideRead, Price, PriceList, ProviderInfo};
+use enclos::pricing::{ModelPrice, ModelProvider, Origin, OverrideRead, Price, PriceList};
 
 #[derive(Args)]
 pub struct PricesArgs {
@@ -16,19 +16,19 @@ pub struct PricesArgs {
     model: Option<String>,
     /// The model provider that serves the model, as the runtime names it, such as anthropic or openai-codex.
     #[arg(long)]
-    provider: Option<String>,
+    model_provider: Option<String>,
 }
 
 #[derive(Serialize)]
-struct ProviderRow<'a> {
+struct ModelProviderRow<'a> {
     #[serde(flatten)]
-    provider: &'a ProviderInfo,
+    model_provider: &'a ModelProvider,
     models: usize,
 }
 
 #[derive(Serialize)]
 struct ListView<'a> {
-    providers: Vec<ProviderRow<'a>>,
+    model_providers: Vec<ModelProviderRow<'a>>,
     models: usize,
     override_file: String,
     override_read: &'a OverrideRead,
@@ -38,14 +38,14 @@ struct ListView<'a> {
 #[serde(tag = "price", rename_all = "snake_case")]
 enum Found<'a> {
     Rates { entry: &'a ModelPrice },
-    Included { provider: &'a ProviderInfo },
+    Included { model_provider: &'a ModelProvider },
     Unknown,
 }
 
 #[derive(Serialize)]
 struct ModelView<'a> {
     model: &'a str,
-    provider: Option<&'a str>,
+    model_provider: Option<&'a str>,
     #[serde(flatten)]
     found: Found<'a>,
     override_file: String,
@@ -58,16 +58,16 @@ pub fn run(engine: &Engine, args: PricesArgs) -> Result<u8> {
     match &args.model {
         None => {
             let view = ListView {
-                providers: loaded
+                model_providers: loaded
                     .list
-                    .providers()
-                    .map(|p| ProviderRow {
-                        provider: p,
+                    .model_providers()
+                    .map(|p| ModelProviderRow {
+                        model_provider: p,
                         models: loaded
                             .list
                             .models()
                             .iter()
-                            .filter(|m| m.provider == p.name)
+                            .filter(|m| m.model_provider == p.name)
                             .count(),
                     })
                     .collect(),
@@ -82,14 +82,17 @@ pub fn run(engine: &Engine, args: PricesArgs) -> Result<u8> {
             let _ = print_list(&mut std::io::stdout().lock(), &view, &loaded.list);
         }
         Some(model) => {
-            let found = match loaded.list.find(args.provider.as_deref(), Some(model)) {
+            let found = match loaded
+                .list
+                .find(args.model_provider.as_deref(), Some(model))
+            {
                 Price::Rates(entry) => Found::Rates { entry },
-                Price::Included(provider) => Found::Included { provider },
+                Price::Included(model_provider) => Found::Included { model_provider },
                 Price::Unknown => Found::Unknown,
             };
             let view = ModelView {
                 model,
-                provider: args.provider.as_deref(),
+                model_provider: args.model_provider.as_deref(),
                 found,
                 override_file,
                 override_read: &loaded.override_read,
@@ -113,10 +116,10 @@ fn json(view: &impl Serialize) -> Result<u8> {
 }
 
 fn print_list(out: &mut impl Write, view: &ListView<'_>, list: &PriceList) -> std::io::Result<()> {
-    let priced = view.providers.iter().filter(|p| p.models > 0).count();
+    let priced = view.model_providers.iter().filter(|p| p.models > 0).count();
     writeln!(
         out,
-        "enclos's price list, in US dollars per million tokens: {} models of {priced} providers.",
+        "enclos's price list, in US dollars per million tokens: {} models of {priced} model providers.",
         view.models
     )?;
     let generated: Vec<&str> = list
@@ -151,18 +154,18 @@ fn print_list(out: &mut impl Write, view: &ListView<'_>, list: &PriceList) -> st
     )?;
     writeln!(out)?;
     let mut rows = vec![vec![
-        "PROVIDER".to_owned(),
+        "MODEL PROVIDER".to_owned(),
         "MODELS".to_owned(),
         "ALSO NAMED".to_owned(),
     ]];
-    for p in &view.providers {
+    for p in &view.model_providers {
         rows.push(vec![
-            p.provider.name.clone(),
-            match p.provider.included {
+            p.model_provider.name.clone(),
+            match p.model_provider.included {
                 true => "included".to_owned(),
                 false => p.models.to_string(),
             },
-            p.provider.aliases.join(", "),
+            p.model_provider.aliases.join(", "),
         ]);
     }
     let widths: Vec<usize> = (0..3)
@@ -181,13 +184,13 @@ fn print_list(out: &mut impl Write, view: &ListView<'_>, list: &PriceList) -> st
     }
     writeln!(
         out,
-        "\n`included`: a subscription; its models' tokens count against its limits, not in dollars. `enclos prices <model> [--provider <name>]` shows a model's rates."
+        "\n`included`: a subscription; its models' tokens count against its limits, not in dollars. `enclos prices <model> [--model-provider <name>]` shows a model's rates."
     )
 }
 
 fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()> {
     let through = view
-        .provider
+        .model_provider
         .map(|p| format!(" through {p}"))
         .unwrap_or_default();
     match &view.found {
@@ -213,7 +216,7 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
                 out,
                 "{} of {}: {} per million tokens.",
                 entry.id,
-                entry.provider,
+                entry.model_provider,
                 parts.join(", ")
             )?;
             let from = entry
@@ -230,10 +233,10 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
             };
             writeln!(out, "From {from}, in {origin}.")
         }
-        Found::Included { provider } => writeln!(
+        Found::Included { model_provider } => writeln!(
             out,
             "{} is a subscription: what {}{through} uses counts against its limits, not in dollars, so its cost is included.",
-            provider.name, view.model
+            model_provider.name, view.model
         ),
         Found::Unknown => {
             writeln!(
@@ -243,7 +246,7 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
             )?;
             writeln!(
                 out,
-                "Add one to {}, in the format of the bundled list (`[providers.<name>]`, then `[[models]]` with provider, id, input and output).",
+                "Add one to {}, in the format of the bundled list (`[model_providers.<name>]`, then `[[models]]` with model_provider, id, input and output).",
                 view.override_file
             )?;
             match view.override_read {
@@ -263,8 +266,11 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
 fn override_line(file: &str, read: &OverrideRead) -> String {
     match read {
         OverrideRead::Absent => format!("Override: none ({file} would be read)."),
-        OverrideRead::Read { models, providers } => {
-            format!("Override: {file}, {models} models and {providers} providers.")
+        OverrideRead::Read {
+            models,
+            model_providers,
+        } => {
+            format!("Override: {file}, {models} models and {model_providers} model providers.")
         }
         OverrideRead::Refused(why) => {
             format!("Override: {file} was not read ({why}); the bundled list is used alone.")
@@ -289,15 +295,15 @@ fn rate(r: f64) -> String {
 mod tests {
     use super::*;
 
-    fn shown_model(model: &str, provider: Option<&str>, list: &PriceList) -> String {
-        let found = match list.find(provider, Some(model)) {
+    fn shown_model(model: &str, model_provider: Option<&str>, list: &PriceList) -> String {
+        let found = match list.find(model_provider, Some(model)) {
             Price::Rates(entry) => Found::Rates { entry },
-            Price::Included(provider) => Found::Included { provider },
+            Price::Included(model_provider) => Found::Included { model_provider },
             Price::Unknown => Found::Unknown,
         };
         let view = ModelView {
             model,
-            provider,
+            model_provider,
             found,
             override_file: "/c/enclos/prices.toml".into(),
             override_read: &OverrideRead::Absent,
@@ -340,18 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn the_list_says_how_many_models_each_provider_has_and_which_are_subscriptions() {
+    fn the_list_says_how_many_models_each_model_provider_has_and_which_are_subscriptions() {
         let list = PriceList::bundled();
         let read = OverrideRead::Refused("is not a price list".into());
         let view = ListView {
-            providers: list
-                .providers()
-                .map(|p| ProviderRow {
-                    provider: p,
+            model_providers: list
+                .model_providers()
+                .map(|p| ModelProviderRow {
+                    model_provider: p,
                     models: list
                         .models()
                         .iter()
-                        .filter(|m| m.provider == p.name)
+                        .filter(|m| m.model_provider == p.name)
                         .count(),
                 })
                 .collect(),
@@ -375,6 +381,6 @@ mod tests {
         assert!(codex.contains("included"), "{codex}");
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["override_read"]["refused"], "is not a price list");
-        assert!(json["providers"][0]["name"].is_string());
+        assert!(json["model_providers"][0]["name"].is_string());
     }
 }

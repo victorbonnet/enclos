@@ -140,13 +140,13 @@ pub const COUNTS: [&str; 6] = [
     "reasoning",
 ];
 
-/// What one agent used with one model, through one provider.
+/// What one agent used with one model, through one model provider.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelUsage {
     pub model: Option<String>,
-    /// The provider that served it, as the runtime names it; none when the
-    /// runtime does not say.
-    pub provider: Option<String>,
+    /// The model provider that served it, as the runtime names it; none
+    /// when the runtime does not say.
+    pub model_provider: Option<String>,
     /// The native chats that used it.
     pub chats: u64,
     /// Requests to the provider.
@@ -410,8 +410,11 @@ fn priced(sandboxes: &mut [SandboxUsage], list: &PriceList) -> Total {
             };
             let sum = total.get_or_insert_default();
             for m in &mut records.models {
-                m.estimate =
-                    list.cost(m.provider.as_deref(), m.model.as_deref(), m.tokens.counts());
+                m.estimate = list.cost(
+                    m.model_provider.as_deref(),
+                    m.model.as_deref(),
+                    m.tokens.counts(),
+                );
                 sum.add_model(m);
             }
         }
@@ -497,9 +500,9 @@ struct ReportAgent {
 #[serde(deny_unknown_fields)]
 struct ReportModel {
     model: Option<String>,
-    /// The provider that served it, as the runtime names it.
+    /// The model provider that served it, as the runtime names it.
     #[serde(default)]
-    provider: Option<String>,
+    model_provider: Option<String>,
     chats: u64,
     calls: Option<u64>,
     tokens: Tokens,
@@ -608,7 +611,7 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
     }
     Ok(ModelUsage {
         model: shown(m.model),
-        provider: shown(m.provider),
+        model_provider: shown(m.model_provider),
         chats: m.chats,
         calls: m.calls,
         tokens: m.tokens,
@@ -797,7 +800,7 @@ mod tests {
         assert_eq!(tokens.cache_hit(), None);
         let m = ModelUsage {
             model: None,
-            provider: None,
+            model_provider: None,
             chats: 1,
             calls: Some(2),
             tokens,
@@ -925,9 +928,9 @@ mod tests {
         AgentRecords {
             models: models
                 .into_iter()
-                .map(|(provider, model, input)| ModelUsage {
+                .map(|(model_provider, model, input)| ModelUsage {
                     model: model.map(str::to_owned),
-                    provider: provider.map(str::to_owned),
+                    model_provider: model_provider.map(str::to_owned),
                     chats: 1,
                     calls: Some(2),
                     tokens: Tokens {

@@ -606,4 +606,4 @@ enclos prices [OPTIONS] [MODEL]
 ```
 
 - `[MODEL]`: A model, as a runtime names it, to show the price of. Without it, what the list holds.
-- `--provider <PROVIDER>`: The model provider that serves the model, as the runtime names it, such as anthropic or openai-codex.
+- `--model-provider <MODEL_PROVIDER>`: The model provider that serves the model, as the runtime names it, such as anthropic or openai-codex.
