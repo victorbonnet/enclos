@@ -3200,9 +3200,21 @@ fn status_shows_the_version_hermes_records_and_no_release_when_lookups_are_off()
 
     let (_, json) = home.json(&["status"]);
     let runtime = &json["sandboxes"][0]["runtime"];
-    assert_eq!(runtime["version"], serde_json::json!({"known": "0.23.1"}), "{json}");
-    assert_eq!(runtime["latest"], serde_json::json!("not_provided"), "{json}");
-    assert_eq!(runtime["outdated"], serde_json::json!("not_provided"), "{json}");
+    assert_eq!(
+        runtime["version"],
+        serde_json::json!({"known": "0.23.1"}),
+        "{json}"
+    );
+    assert_eq!(
+        runtime["latest"],
+        serde_json::json!("not_provided"),
+        "{json}"
+    );
+    assert_eq!(
+        runtime["outdated"],
+        serde_json::json!("not_provided"),
+        "{json}"
+    );
     let text = home.run(&["status"]).ok().stdout();
     assert!(text.contains("Hermes 0.23.1"), "{text}");
     assert!(!text.contains("latest release"), "{text}");

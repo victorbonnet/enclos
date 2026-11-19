@@ -1287,7 +1287,10 @@ mod tests {
         assert_eq!(
             (rt.version, rt.login, rt.install),
             (
-                None,
+                Some(ValueAt {
+                    file: at(".hermes/hermes-agent/install-stamp.json"),
+                    keys: vec!["baseVersion".into()],
+                }),
                 Some(at(".hermes/auth.json")),
                 Some(at(".hermes/hermes-agent"))
             )

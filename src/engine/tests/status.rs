@@ -922,7 +922,14 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(s["state"], "created");
     assert_eq!(s["services"], serde_json::json!({"known": []}));
     assert_eq!(s["runtime"]["kind"], "hermes");
-    assert_eq!(s["runtime"]["version"], "not_provided");
+    // Hermes names its install stamp, and this checkout has none.
+    assert_eq!(s["runtime"]["version"], "absent");
+    // Unit tests look nothing up: a lookup refused is "cannot tell".
+    assert!(
+        s["runtime"]["latest"].get("cannot_tell").is_some(),
+        "{}",
+        s["runtime"]
+    );
     assert_eq!(
         s["runtime"]["logged_in"],
         serde_json::json!({"known": false})
@@ -1045,6 +1052,9 @@ impl RuntimeAdapter for Released {
 #[test]
 fn the_latest_release_is_kept_for_hours_a_failure_for_minutes_and_lookups_can_be_off() {
     let (dir, engine) = engine();
+    // As `enclos init` makes it: the answers are kept there.
+    std::fs::create_dir_all(engine.layout.data()).unwrap();
+    std::fs::create_dir_all(engine.layout.config_file().parent().unwrap()).unwrap();
     let answer = dir.path().join("latest.json");
     std::fs::write(&answer, r#"{"tag_name": "v0.23.2"}"#).unwrap();
     let url: &'static str = Box::leak(format!("file://{}", answer.display()).into_boxed_str());
