@@ -6,12 +6,13 @@ use std::io::Write;
 use clap::Args;
 
 use enclos::engine::{
-    AgentRecords, AgentUsage, CostKind, Engine, Fact, ModelUsage, SandboxUsage, UsageView,
+    AgentRecords, AgentUsage, CostKind, Engine, Fact, ModelUsage, SandboxUsage, Total, UsageView,
 };
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::{Actor, Since};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
+use enclos::pricing::{OverrideRead, UsageCost};
 
 #[derive(Args)]
 pub struct UsageArgs {
@@ -43,9 +44,10 @@ pub fn run(engine: &Engine, by: &Actor, args: UsageArgs) -> Result<u8> {
     Ok(exit::OK)
 }
 
-const HEAD: [&str; 12] = [
+const HEAD: [&str; 14] = [
     "AGENT",
     "MODEL",
+    "MODEL PROVIDER",
     "CHATS",
     "CALLS",
     "INPUT",
@@ -55,7 +57,8 @@ const HEAD: [&str; 12] = [
     "REASONING",
     "PER CALL",
     "CACHE HIT",
-    "COST",
+    "EST. COST",
+    "RUNTIME COST",
 ];
 
 fn print(out: &mut impl Write, view: &UsageView) -> std::io::Result<()> {
@@ -69,10 +72,37 @@ fn print(out: &mut impl Write, view: &UsageView) -> std::io::Result<()> {
         }
         print_sandbox(out, s, &since)?;
     }
+    if view.sandboxes.iter().filter(|s| s.total.is_some()).count() > 1 {
+        let t = &view.total;
+        writeln!(
+            out,
+            "\nAll sandboxes: {} tokens, {} calls, estimated {}",
+            count(Some(t.tokens.total())),
+            count(t.calls),
+            estimate(&t.estimate)
+        )?;
+    }
     writeln!(
         out,
         "\nTokens as each runtime recorded them, inside its sandbox: a guide to what an agent used, not a bill. ≥: some of its records lacked that count."
-    )
+    )?;
+    writeln!(
+        out,
+        "EST. COST: enclos's estimate from its price list (`enclos prices`), at base rates; included: on a subscription; ?: a model it has no price for. RUNTIME COST: the runtime's own figure."
+    )?;
+    match &view.prices.override_read {
+        OverrideRead::Absent => Ok(()),
+        OverrideRead::Read { .. } => writeln!(
+            out,
+            "Prices from {} override the bundled ones.",
+            view.prices.override_file.display()
+        ),
+        OverrideRead::Refused(why) => writeln!(
+            out,
+            "{} was not read ({why}): the bundled prices alone are used.",
+            view.prices.override_file.display()
+        ),
+    }
 }
 
 fn print_sandbox(out: &mut impl Write, s: &SandboxUsage, since: &str) -> std::io::Result<()> {
@@ -104,6 +134,9 @@ fn print_sandbox(out: &mut impl Write, s: &SandboxUsage, since: &str) -> std::io
         }
     }
     if rows.len() > 1 {
+        if let Some(total) = &s.total {
+            rows.push(total_row(total));
+        }
         print_table(out, &rows)?;
     }
     for note in notes {
@@ -129,6 +162,7 @@ fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
     vec![
         agent.to_owned(),
         m.model.clone().unwrap_or_else(|| "?".into()),
+        m.model_provider.clone().unwrap_or_else(|| "-".into()),
         m.chats.to_string(),
         at_least("calls", m.calls),
         at_least("input", t.input),
@@ -140,8 +174,57 @@ fn row(agent: &str, m: &ModelUsage) -> Vec<String> {
         t.cache_hit()
             .map(|h| format!("{:.0}%", h * 100.0))
             .unwrap_or_else(|| "-".into()),
+        estimate(&m.estimate),
         cost(m),
     ]
+}
+
+/// A sandbox's total, under its rows.
+fn total_row(t: &Total) -> Vec<String> {
+    let tokens = &t.tokens;
+    vec![
+        "total".to_owned(),
+        String::new(),
+        String::new(),
+        String::new(),
+        count(t.calls),
+        count(tokens.input),
+        count(tokens.cache_read),
+        count(tokens.cache_write),
+        count(tokens.output),
+        count(tokens.reasoning),
+        "-".into(),
+        tokens
+            .cache_hit()
+            .map(|h| format!("{:.0}%", h * 100.0))
+            .unwrap_or_else(|| "-".into()),
+        estimate(&t.estimate),
+        "-".into(),
+    ]
+}
+
+/// enclos's estimate, read at a glance: `~$1.24`; `≥~$1.24` when some
+/// tokens had no price; `included` for a subscription's alone; `?` when
+/// nothing could be priced in dollars.
+pub(crate) fn estimate(c: &UsageCost) -> String {
+    if c.usd_micros == 0 && (c.included > 0 || c.unpriced > 0) {
+        return match c.unpriced {
+            0 => "included".into(),
+            _ => "?".into(),
+        };
+    }
+    let at_least = if c.unpriced > 0 { "≥" } else { "" };
+    format!("{at_least}~{}", dollars(c.usd_micros))
+}
+
+/// Millionths of a dollar as dollars and cents: `$1.24`, `<$0.01` for
+/// less than half a cent but more than nothing.
+pub(crate) fn dollars(micros: u64) -> String {
+    if micros > 0 && micros < 5_000 {
+        return "<$0.01".into();
+    }
+    let cents = micros / 10_000 + u64::from(micros % 10_000 >= 5_000);
+    format!("${}.{:02}", cents / 100, cents % 100)
 }
 
 /// Counts read at a glance: 950, 83.1k, 1.2M; `-` when not counted. The
@@ -231,6 +314,7 @@ mod tests {
     fn model(name: &str, input: Option<u64>, incomplete: Vec<&'static str>) -> ModelUsage {
         ModelUsage {
             model: Some(name.into()),
+            model_provider: Some("openai-codex".into()),
             chats: 1,
             calls: Some(26),
             tokens: Tokens {
@@ -244,7 +328,18 @@ mod tests {
                 usd: Some(0.0),
                 kind: CostKind::Included,
             },
+            estimate: UsageCost {
+                included: 845_839,
+                ..UsageCost::default()
+            },
             incomplete,
+        }
+    }
+
+    fn prices() -> enclos::engine::PricesRead {
+        enclos::engine::PricesRead {
+            override_file: "/c/enclos/prices.toml".into(),
+            override_read: OverrideRead::Absent,
         }
     }
 
@@ -326,13 +421,25 @@ mod tests {
                             usage: Fact::CannotTell("state.db: locked".into()),
                         },
                     ]),
+                    total: Some(Total {
+                        calls: Some(26),
+                        tokens: model("gpt", Some(83_087), Vec::new()).tokens,
+                        estimate: UsageCost {
+                            usd_micros: 1_234_567,
+                            included: 0,
+                            unpriced: 9,
+                        },
+                    }),
                 },
                 SandboxUsage {
                     name: "spare".parse().unwrap(),
                     runtime: Some("Hermes"),
                     agents: Fact::CannotTell("not running".into()),
+                    total: None,
                 },
             ],
+            total: Total::default(),
+            prices: prices(),
         };
         let text = shown(&view);
         assert!(
@@ -350,6 +457,16 @@ mod tests {
             row.contains("762.8k") && row.contains("6.1k") && row.contains("included"),
             "{row}"
         );
+        assert!(row.contains("openai-codex"), "{row}");
+        // The sandbox's total, under its rows: some tokens unpriced.
+        let total = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("total"))
+            .unwrap();
+        assert!(total.contains("≥~$1.23"), "{total}");
+        // One sandbox with a total: no line for all of them.
+        assert!(!text.contains("All sandboxes"), "{text}");
+        assert!(text.contains("EST. COST: enclos's estimate"), "{text}");
         assert!(text.contains("  scout: no chats in this window"), "{text}");
         assert!(text.contains("  idle: never used"), "{text}");
         assert!(
@@ -380,7 +497,84 @@ mod tests {
         let view = UsageView {
             since: Timestamp::from_second(0).unwrap(),
             sandboxes: Vec::new(),
+            total: Total::default(),
+            prices: prices(),
         };
         assert_eq!(shown(&view), "No sandboxes yet.\n");
+    }
+
+    #[test]
+    fn an_estimate_reads_in_dollars_and_cents_and_says_what_it_leaves_out() {
+        let c = |usd_micros, included, unpriced| UsageCost {
+            usd_micros,
+            included,
+            unpriced,
+        };
+        assert_eq!(estimate(&c(1_234_567, 0, 0)), "~$1.23");
+        assert_eq!(estimate(&c(1_235_000, 0, 0)), "~$1.24");
+        assert_eq!(estimate(&c(1_234_567, 10, 0)), "~$1.23");
+        assert_eq!(estimate(&c(1_234_567, 0, 10)), "≥~$1.23");
+        assert_eq!(estimate(&c(0, 10, 0)), "included");
+        assert_eq!(estimate(&c(0, 10, 3)), "?");
+        assert_eq!(estimate(&c(0, 0, 3)), "?");
+        assert_eq!(estimate(&c(0, 0, 0)), "~$0.00");
+        assert_eq!(estimate(&c(4_999, 0, 0)), "~<$0.01");
+        assert_eq!(estimate(&c(5_000, 0, 0)), "~$0.01");
+        assert_eq!(dollars(123_456_789_000), "$123456.79");
+        assert_eq!(dollars(u64::MAX), "$18446744073709.55");
+    }
+
+    #[test]
+    fn several_sandboxes_with_usage_end_on_the_hosts_total_and_an_override_not_read_is_said() {
+        let sandbox = |name: &str, usd_micros| SandboxUsage {
+            name: name.parse().unwrap(),
+            runtime: Some("Hermes"),
+            agents: Fact::Known(vec![AgentUsage {
+                agent: "default".into(),
+                usage: Fact::Known(AgentRecords {
+                    models: vec![model("gpt", Some(10), Vec::new())],
+                    top: Vec::new(),
+                }),
+            }]),
+            total: Some(Total {
+                calls: Some(1),
+                tokens: Tokens {
+                    input: Some(500),
+                    ..Tokens::default()
+                },
+                estimate: UsageCost {
+                    usd_micros,
+                    ..UsageCost::default()
+                },
+            }),
+        };
+        let view = UsageView {
+            since: Timestamp::from_second(0).unwrap(),
+            sandboxes: vec![sandbox("lab", 1_000_000), sandbox("work", 2_000_000)],
+            total: Total {
+                calls: Some(2),
+                tokens: Tokens {
+                    input: Some(1_000),
+                    ..Tokens::default()
+                },
+                estimate: UsageCost {
+                    usd_micros: 3_000_000,
+                    ..UsageCost::default()
+                },
+            },
+            prices: enclos::engine::PricesRead {
+                override_file: "/c/enclos/prices.toml".into(),
+                override_read: OverrideRead::Refused("is not a price list".into()),
+            },
+        };
+        let text = shown(&view);
+        assert!(
+            text.contains("All sandboxes: 1.0k tokens, 2 calls, estimated ~$3.00"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/c/enclos/prices.toml was not read (is not a price list)"),
+            "{text}"
+        );
     }
 }

@@ -18,6 +18,7 @@ pub mod model;
 pub mod net;
 pub mod notes;
 pub mod policy;
+pub mod pricing;
 pub mod probes;
 pub mod proxy;
 pub mod relay;

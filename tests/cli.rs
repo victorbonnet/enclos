@@ -3243,6 +3243,56 @@ fn usage_without_sandboxes_says_so_and_refuses_a_bad_window() {
     );
 }
 
+#[test]
+fn prices_lists_the_bundled_list_shows_a_models_rates_and_takes_the_users_own() {
+    let home = Home::new();
+    home.init(1);
+    let list = home.run(&["prices"]).ok().stdout();
+    assert!(list.contains("enclos's price list"), "{list}");
+    assert!(list.contains("Override: none"), "{list}");
+    let codex = list
+        .lines()
+        .find(|l| l.trim_start().starts_with("openai-codex"))
+        .unwrap();
+    assert!(codex.contains("included"), "{list}");
+    let opus = home
+        .run(&["prices", "claude-opus-5-5", "--model-provider", "anthropic"])
+        .ok()
+        .stdout();
+    assert!(
+        opus.starts_with("claude-opus-5-5 of anthropic: input $"),
+        "{opus}"
+    );
+    let sub = home
+        .run(&["prices", "gpt-5.5", "--model-provider", "openai-codex"])
+        .ok()
+        .stdout();
+    assert!(sub.starts_with("openai-codex is a subscription"), "{sub}");
+    // The user's own price wins, and says where it came from.
+    std::fs::write(
+        home.root.join("prices.toml"),
+        "[model_providers.nous]\n[[models]]\nmodel_provider = \"nous\"\nid = \"hermes-9\"\ninput = 1.5\noutput = 3.0\n",
+    )
+    .unwrap();
+    let out = home.run(&["prices", "hermes-9", "--model-provider", "nous", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["price"], "rates");
+    assert_eq!(json["entry"]["rates"]["input"], 1.5);
+    assert_eq!(json["entry"]["origin"], "override");
+    assert_eq!(json["override_read"]["read"]["models"], 1);
+    // One that does not read is said, and the bundled list used alone.
+    std::fs::write(home.root.join("prices.toml"), "[[models]]\n").unwrap();
+    let text = home
+        .run(&["prices", "hermes-9", "--model-provider", "nous"])
+        .ok()
+        .stdout();
+    assert!(
+        text.starts_with("No price for hermes-9 through nous"),
+        "{text}"
+    );
+    assert!(text.contains("was not read"), "{text}");
+}
+
 // Making a sandbox needs its backend, which only macOS has on every runner.
 #[cfg(target_os = "macos")]
 #[test]

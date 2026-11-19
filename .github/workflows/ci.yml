@@ -439,6 +439,14 @@ jobs:
           python3 -I -m unittest discover -s channels/hermes/tests
           python3 -I -m unittest discover -s src/runtime/hermes/tests -v
 
+  # The price list's update script (#343), and that the list it writes reads;
+  # standard library only.
+  prices-script:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -I -m unittest discover -s scripts/tests -v
+
   # The same tests against the latest Hermes, its default branch, never
   # pinned: every test that needs a real Hermes runs (`ENCLOS_HERMES_SOURCE`,
   # and `ENCLOS_HERMES_APPROVAL_SOURCE` for the native runtime approvals),
@@ -553,7 +561,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, hermes-latest, openclaw-launchers, openclaw-channel, bridge-page]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, prices-script, hermes-latest, openclaw-launchers, openclaw-channel, bridge-page]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

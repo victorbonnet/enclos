@@ -80,8 +80,8 @@ pub use status::{
     Unlisted, human_bytes, printable_line,
 };
 pub use usage::{
-    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, REPORT_FORMAT, SandboxUsage,
-    Tokens, UsageView,
+    AgentRecords, AgentUsage, ChatUsage, Cost, CostKind, ModelUsage, PricesRead, REPORT_FORMAT,
+    SandboxUsage, Tokens, Total, UsageView,
 };
 
 use std::path::PathBuf;
