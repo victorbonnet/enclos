@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import types
+from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
@@ -109,7 +110,7 @@ def setUpModule():
     from gateway.config import PlatformConfig
 
 
-from enclos import held_tasks, protocol  # noqa: E402
+from enclos import held_tasks, protocol, task_events  # noqa: E402
 
 TOKEN = "t" * 64
 
@@ -176,6 +177,77 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         await self.adapter.send("c-1", "Done.", "m1")
         sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual(sent["text"], "Done.")
+        writer.close()
+
+    def kanban_pings(self):
+        """A board on which this agent's chat `c-1` is subscribed to a task that
+        Hermes's loop breaker routed to triage, and the plugin reading it."""
+        from test_task_events import Scratch
+        scratch = Scratch(self.dir)
+        scratch.task("t_a09759c7", title="S2a", assignee="reviewer", status="triage")
+        scratch.event("t_a09759c7", "block_loop_detected")
+        scratch.subscribe("t_a09759c7", chat_id="c-1")
+        self.adapter._pings = task_events.Recogniser(lambda: [("enclos-org", Path(scratch.path))], "enclos")
+
+    async def test_a_kanban_ping_is_a_task_event_and_the_agents_own_words_stay_its_message(self):
+        from test_task_events import TRIAGE
+        self.kanban_pings()
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["task_events"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertIn("task_events", hello["capabilities"])
+        now = asyncio.get_running_loop().time()
+        self.adapter._suggested_replies["c-1"] = suggested_replies.Pending(("m1", now), now, ["Fix it"])
+        await self.adapter.send("c-1", TRIAGE)
+        ping = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((ping["kind"], ping["text"]), ("task_event", TRIAGE))
+        self.assertEqual(ping["task_event"], {"task": "t_a09759c7", "title": "S2a", "assignee": "reviewer",
+                                              "event": "triage", "state": "queued"})
+        self.assertNotIn("suggested_replies", ping)
+        self.assertEqual(self.adapter._outbox.pending()[-1]["kind"], "task_event")
+        # The same words for a chat with no subscription, or a task the board
+        # never routed to triage: the agent's own.
+        await self.adapter.send("c-2", TRIAGE)
+        other = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(other["kind"], "notify")
+        self.assertNotIn("task_event", other)
+        await self.adapter.send("c-1", TRIAGE.replace("t_a09759c7", "t_00000000"))
+        unknown = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(unknown["kind"], "notify")
+        writer.close()
+
+    async def test_an_older_bridge_gets_a_kanban_ping_as_a_notify_then_and_on_replay(self):
+        from test_task_events import TRIAGE
+        self.kanban_pings()
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        await self.adapter.send("c-1", TRIAGE)
+        ping = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((ping["kind"], ping["text"]), ("notify", TRIAGE))
+        self.assertNotIn("task_event", ping)
+        # Kept as the line it is: unacknowledged, it goes again after the next
+        # hello, as the bridge then connected takes it.
+        self.assertEqual(self.adapter._outbox.pending()[-1]["kind"], "task_event")
+        writer.close()
+        await asyncio.sleep(0.1)
+        for capabilities, kind in (([], "notify"), (["task_events"], "task_event")):
+            reader, writer = await self.bridge()
+            writer.write(line("hello", token=TOKEN, capabilities=capabilities))
+            await writer.drain()
+            json.loads(await asyncio.wait_for(reader.readline(), 5))
+            again = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            self.assertEqual((again["id"], again["kind"]), (ping["id"], kind))
+            writer.close()
+            await asyncio.sleep(0.1)
+
+    async def test_a_hermes_without_a_board_announces_no_task_events(self):
+        self.assertIsNone(self.adapter._pings)
+        reader, writer = await self.bridge()
+        writer.write(line("hello", token=TOKEN, capabilities=["task_events"]))
+        await writer.drain()
+        hello = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertNotIn("task_events", hello["capabilities"])
         writer.close()
 
     async def test_review_replies_remain_staged_after_outbox_rejection(self):

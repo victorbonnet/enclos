@@ -114,6 +114,7 @@ fn says(group: &str, text: &str, kind: OutKind, reply_to: Option<&MessageId>) ->
         kind,
         reply_to: reply_to.cloned(),
         attachments: Vec::new(),
+        task_event: None,
     }
 }
 

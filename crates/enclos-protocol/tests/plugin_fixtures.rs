@@ -102,6 +102,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
     ),
     (
+        "message_out_task_event",
+        include_str!("fixtures/plugin/from_plugin_message_out_task_event.json"),
+    ),
+    (
         "commands",
         include_str!("fixtures/plugin/from_plugin_commands.json"),
     ),
@@ -248,6 +252,30 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(
         (kind, conversation.as_str()),
         (OutKind::Status, "home.lab.main")
+    );
+
+    // The runtime about one of its tasks: a task event, with the task.
+    let message = decode_from_plugin(fixture("message_out_task_event").as_bytes()).unwrap();
+    let FromPlugin::MessageOut {
+        kind, task_event, ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    let event = task_event.expect("a task event");
+    assert_eq!(
+        (
+            kind,
+            event.task.as_str(),
+            event.assignee.as_deref(),
+            event.event
+        ),
+        (
+            OutKind::TaskEvent,
+            "t_a09759c7",
+            Some("reviewer"),
+            enclos_protocol::task_event::TaskEventKind::Triage
+        )
     );
 
     // The bridge's hello names the agent's Home; an older one, without it, still reads.

@@ -232,6 +232,11 @@ pub enum FromPlugin {
         /// each put in the channel's `media` folder first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<OutAttachment>,
+        /// With `kind: task_event`, the task and what happened to it, read
+        /// from the runtime's state (ADR 0071, proposed). A bridge keeps the
+        /// text alone, as a `notify`, when it is missing or unusable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_event: Option<crate::task_event::TaskEvent>,
     },
     /// The agent is, or stops, working on an answer.
     #[serde(rename = "typing")]
@@ -375,6 +380,11 @@ pub enum OutKind {
     /// Not the agent speaking but its runtime, about itself: Hermes's
     /// gateway going online or shutting down. Shown as a quiet line.
     Status,
+    /// Not the agent speaking but its runtime, about one of its tasks
+    /// (Hermes's kanban ping), with `task_event`: shown as a task line.
+    /// Sent only to a bridge whose `hello` names
+    /// [`Capability::TaskEvents`]; an older one gets it as `notify`.
+    TaskEvent,
 }
 
 /// What a runtime can do; an unknown one, from a newer plugin, reads as
@@ -425,6 +435,11 @@ pub enum Capability {
     /// It reads and changes the agent's model with the runtime's own
     /// catalogue and setting (`model.request`).
     Model,
+    /// It sends its runtime's task events as `message.out` of `kind:
+    /// task_event`; a bridge that takes them names it in its `hello`, a
+    /// device that draws them in its `auth`, and each gets them as `notify`
+    /// otherwise (ADR 0071, proposed).
+    TaskEvents,
     #[serde(other)]
     Unknown,
 }
