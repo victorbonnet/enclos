@@ -94,8 +94,17 @@ pub struct UsageCost {
     /// dollars.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub included: u64,
-    /// Tokens of a model the price list has no price for: their cost is
-    /// unknown, which is not 0.
+    /// What those of them with a list price would cost if they were paid
+    /// for, in millionths of a US dollar: a measure of how heavy an agent
+    /// on a subscription is, not what it is billed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub included_usd_micros: u64,
+    /// Those of the `included` tokens whose model has no list price: what
+    /// they would cost if paid is unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub included_unpriced: u64,
+    /// Paid tokens of a model the price list has no price for: their cost
+    /// is unknown, which is not 0. Never a subscription's.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unpriced: u64,
 }
@@ -106,6 +115,12 @@ impl UsageCost {
         UsageCost {
             usd_micros: self.usd_micros.saturating_add(other.usd_micros),
             included: self.included.saturating_add(other.included),
+            included_usd_micros: self
+                .included_usd_micros
+                .saturating_add(other.included_usd_micros),
+            included_unpriced: self
+                .included_unpriced
+                .saturating_add(other.included_unpriced),
             unpriced: self.unpriced.saturating_add(other.unpriced),
         }
     }
@@ -189,7 +204,7 @@ pub struct UsageTotal {
 pub const MAX_REPORT_AGENTS: usize = 190;
 /// The most agents a report with costs lists (`usage.get`'s `cost`), whose
 /// rows are longer: the heaviest, by name.
-pub const MAX_COSTED_AGENTS: usize = 110;
+pub const MAX_COSTED_AGENTS: usize = 100;
 /// The most sandboxes a report with costs gives a total of: the heaviest.
 pub const MAX_REPORT_SANDBOXES: usize = 20;
 
@@ -314,11 +329,15 @@ mod tests {
         let a = UsageCost {
             usd_micros: 1_250_000,
             included: 0,
+            included_usd_micros: 0,
+            included_unpriced: 0,
             unpriced: 40,
         };
         let b = UsageCost {
             usd_micros: u64::MAX,
             included: 7,
+            included_usd_micros: 9,
+            included_unpriced: 2,
             unpriced: 0,
         };
         let sum = a.plus(b);

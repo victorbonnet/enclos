@@ -13,7 +13,9 @@
 # `[model_providers.<name>]` names each model provider as runtimes call
 # it, with `aliases` for its other names. One with `included = true` is a
 # subscription: its tokens count against the subscription's limits, not
-# in dollars, so their cost is "included".
+# in dollars, so their cost is "included". They are still priced at their
+# model's list price, as if paid, to show how heavy an agent is: under the
+# model provider its `priced_as` names, else under any that has the model.
 #
 # Entries above the generated block are kept by hand and win over generated
 # ones. The block is rewritten by scripts/update_prices.py from a pinned
@@ -42,9 +44,11 @@ source = "https://api-docs.deepseek.com/quick_start/pricing"
 aliases = ["mistralai"]
 source = "https://mistral.ai/pricing"
 
-# A ChatGPT subscription, through Hermes's `openai-codex` login.
+# A ChatGPT subscription, through Hermes's `openai-codex` login: OpenAI's
+# models, at OpenAI's list prices.
 [model_providers.openai-codex]
 included = true
+priced_as = "openai"
 
 # A GitHub Copilot subscription.
 [model_providers.copilot]
