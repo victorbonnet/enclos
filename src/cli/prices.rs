@@ -41,7 +41,8 @@ enum Found<'a> {
         entry: &'a ModelPrice,
     },
     Included {
-        model_provider: &'a ModelProvider,
+        /// The subscription the model was asked of, as the list names it.
+        subscription: &'a ModelProvider,
         /// The rates its tokens are priced at, as if paid; none: no list
         /// price, so what they would cost is unknown.
         list: Option<&'a ModelPrice>,
@@ -53,9 +54,9 @@ impl<'a> Found<'a> {
     fn of(list: &'a PriceList, model_provider: Option<&str>, model: &str) -> Found<'a> {
         match list.find(model_provider, Some(model)) {
             Price::Rates(entry) => Found::Rates { entry },
-            Price::Included(model_provider) => Found::Included {
-                model_provider,
-                list: list.list_price(model_provider, Some(model)),
+            Price::Included(subscription) => Found::Included {
+                subscription,
+                list: list.list_price(subscription, Some(model)),
             },
             Price::Unknown => Found::Unknown,
         }
@@ -174,9 +175,10 @@ fn print_list(out: &mut impl Write, view: &ListView<'_>, list: &PriceList) -> st
     for p in &view.model_providers {
         rows.push(vec![
             p.model_provider.name.clone(),
-            match p.model_provider.included {
-                true => "included".to_owned(),
-                false => p.models.to_string(),
+            match (p.model_provider.included, &p.model_provider.priced_as) {
+                (true, Some(other)) => format!("included, as {other}"),
+                (true, None) => "included".to_owned(),
+                (false, _) => p.models.to_string(),
             },
             p.model_provider.aliases.join(", "),
         ]);
@@ -208,14 +210,11 @@ fn print_model(out: &mut impl Write, view: &ModelView<'_>) -> std::io::Result<()
         .unwrap_or_default();
     match &view.found {
         Found::Rates { entry } => print_rates(out, entry, &view.override_file),
-        Found::Included {
-            model_provider,
-            list,
-        } => {
+        Found::Included { subscription, list } => {
             writeln!(
                 out,
                 "{} is a subscription: what {}{through} uses counts against its limits, not in dollars, so its cost is included.",
-                model_provider.name, view.model
+                subscription.name, view.model
             )?;
             match list {
                 Some(entry) => {
@@ -354,6 +353,23 @@ mod tests {
         assert_eq!(rate(0.075), "$0.075");
         assert_eq!(rate(0.0000004), "$0.00");
         assert_eq!(rate(1_000_000.0), "$1000000.00");
+    }
+
+    #[test]
+    fn a_subscription_in_json_keeps_the_name_asked_and_its_list_price_apart() {
+        let list = PriceList::bundled();
+        let view = ModelView {
+            model: "gpt-5.5",
+            model_provider: Some("chatgpt-login"),
+            found: Found::of(&list, Some("openai-codex"), "gpt-5.5"),
+            override_file: "/c/enclos/prices.toml".into(),
+            override_read: &OverrideRead::Absent,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["price"], "included");
+        assert_eq!(json["model_provider"], "chatgpt-login");
+        assert_eq!(json["subscription"]["name"], "openai-codex");
+        assert_eq!(json["list"]["model_provider"], "openai");
     }
 
     #[test]

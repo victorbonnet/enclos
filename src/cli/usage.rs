@@ -333,7 +333,7 @@ fn print_days(out: &mut impl Write, view: &DaysView) -> std::io::Result<()> {
     }
     writeln!(
         out,
-        "\nEvery person's app conversations, and the calls outside the app each agent's channel reports, kept by the hour (those outside the app for 35 days). EST. COST: enclos's estimate from its price list (`enclos prices`). A guide, not a bill."
+        "\nEvery person's app conversations, and the calls outside the app each agent's channel reports, kept by the hour (those outside the app for 35 days). EST. COST: enclos's estimate from its price list (`enclos prices`); (included): on a subscription, priced at list price as if paid. A guide, not a bill."
     )?;
     match &view.prices.override_read {
         OverrideRead::Refused(why) => writeln!(
@@ -495,17 +495,21 @@ fn total_row(t: &Total) -> Vec<String> {
 pub(crate) fn estimate(c: &UsageCost) -> String {
     let all = c.usd_micros.saturating_add(c.included_usd_micros);
     if all == 0 && (c.included > 0 || c.unpriced > 0) {
-        // A subscription's tokens with no list price are unpriced too.
-        return match c.included > 0 && c.unpriced <= c.included {
-            true => "included".into(),
-            false => "?".into(),
+        // Paid tokens with no price: unknown; a subscription's alone: included.
+        return match c.unpriced {
+            0 => "included".into(),
+            _ => "?".into(),
         };
     }
-    let at_least = if c.unpriced > 0 { "≥" } else { "" };
-    let included = match (c.included_usd_micros, c.usd_micros) {
-        (0, _) => String::new(),
-        (_, 0) => " (included)".into(),
-        (part, _) => format!(" (~{} included)", dollars(part)),
+    let at_least = match c.unpriced > 0 || c.included_unpriced > 0 {
+        true => "≥",
+        false => "",
+    };
+    // All of it on a subscription only when no paid token is unknown.
+    let included = match c.included_usd_micros {
+        0 => String::new(),
+        _ if c.usd_micros == 0 && c.unpriced == 0 => " (included)".into(),
+        part => format!(" (~{} included)", dollars(part)),
     };
     format!("{at_least}~{}{included}", dollars(all))
 }
@@ -923,32 +927,48 @@ mod tests {
         let c = |usd_micros, included, unpriced| UsageCost {
             usd_micros,
             included,
-            included_usd_micros: 0,
             unpriced,
+            ..UsageCost::default()
         };
         assert_eq!(estimate(&c(1_234_567, 0, 0)), "~$1.23");
         assert_eq!(estimate(&c(1_235_000, 0, 0)), "~$1.24");
         assert_eq!(estimate(&c(1_234_567, 10, 0)), "~$1.23");
         assert_eq!(estimate(&c(1_234_567, 0, 10)), "≥~$1.23");
-        // A subscription's tokens with no list price: included, unpriced too.
-        assert_eq!(estimate(&c(0, 10, 10)), "included");
         assert_eq!(estimate(&c(0, 10, 0)), "included");
-        // More unpriced than on the subscription: some paid, unknown.
-        assert_eq!(estimate(&c(0, 10, 13)), "?");
+        // Paid tokens with no price beside a subscription's: unknown.
+        assert_eq!(estimate(&c(0, 10, 3)), "?");
         assert_eq!(estimate(&c(0, 0, 3)), "?");
+        // A subscription's tokens with no list price: included.
+        let no_list = UsageCost {
+            included: 10,
+            included_unpriced: 10,
+            ..UsageCost::default()
+        };
+        assert_eq!(estimate(&no_list), "included");
         // A subscription priced at list price, as if paid.
         let sub = |usd_micros, included_usd_micros, unpriced| UsageCost {
             usd_micros,
             included: 1_000,
             included_usd_micros,
             unpriced,
+            ..UsageCost::default()
         };
         assert_eq!(estimate(&sub(0, 12_400_000, 0)), "~$12.40 (included)");
         assert_eq!(
             estimate(&sub(1_240_000, 12_400_000, 0)),
             "~$13.64 (~$12.40 included)"
         );
-        assert_eq!(estimate(&sub(0, 12_400_000, 7)), "≥~$12.40 (included)");
+        // Paid tokens with no price beside it: not all included, at least.
+        assert_eq!(
+            estimate(&sub(0, 12_400_000, 7)),
+            "≥~$12.40 (~$12.40 included)"
+        );
+        // Some of the subscription's tokens with no list price: at least.
+        let part = UsageCost {
+            included_unpriced: 5,
+            ..sub(0, 12_400_000, 0)
+        };
+        assert_eq!(estimate(&part), "≥~$12.40 (included)");
         assert_eq!(estimate(&c(0, 0, 0)), "~$0.00");
         assert_eq!(estimate(&c(4_999, 0, 0)), "~<$0.01");
         assert_eq!(estimate(&c(5_000, 0, 0)), "~$0.01");

@@ -1629,6 +1629,7 @@ mod usage_tests {
             usd_micros: 1_250_000,
             included: 0,
             included_usd_micros: 0,
+            included_unpriced: 0,
             unpriced: 12,
         };
         let total = UsageTotal {
@@ -1689,6 +1690,7 @@ mod usage_tests {
         usd_micros: u64::MAX,
         included: u64::MAX,
         included_usd_micros: u64::MAX,
+        included_unpriced: u64::MAX,
         unpriced: u64::MAX,
     };
 

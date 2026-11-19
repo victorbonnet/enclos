@@ -264,11 +264,14 @@ impl PriceList {
             for alias in &p.aliases {
                 aliases.push(checked_name(alias, "a model provider's alias")?);
             }
-            // A model provider named again replaces the earlier one, aliases too.
+            // A model provider named again replaces the earlier one, aliases
+            // too, but keeps what it is priced as unless it says another.
+            let mut kept_priced_as = None;
             if let Some(old) = next.model_providers.remove(&key) {
                 for alias in old.aliases {
                     next.names.remove(&alias.to_lowercase());
                 }
+                kept_priced_as = old.priced_as;
             }
             for n in std::iter::once(&key).chain(&aliases) {
                 let lower = n.to_lowercase();
@@ -283,11 +286,11 @@ impl PriceList {
                     name: key,
                     aliases,
                     included: p.included,
-                    priced_as: p
-                        .priced_as
-                        .as_deref()
-                        .map(|n| checked_name(n, "a model provider's `priced_as`"))
-                        .transpose()?,
+                    priced_as: match p.priced_as.as_deref() {
+                        Some(n) => Some(checked_name(n, "a model provider's `priced_as`")?),
+                        None if p.included => kept_priced_as,
+                        None => None,
+                    },
                     source: p.source.clone(),
                     origin,
                 },
@@ -356,7 +359,10 @@ impl PriceList {
             if let Some(target) = &p.priced_as
                 && next.model_providers[target].included
             {
-                return Err(format!("prices {} as {target}, a subscription too", p.name));
+                return Err(format!(
+                    "marks {target} as a subscription, but {} is priced as {target}: name another for it with `priced_as`",
+                    p.name
+                ));
             }
         }
         *self = next;
@@ -479,7 +485,7 @@ impl PriceList {
 
     /// What `counts` of `model`, as `model provider` serves it, cost. On a
     /// subscription, its tokens are included and priced at the model's list
-    /// price too; with none, they are unpriced as well.
+    /// price too; with none, they count among `included_unpriced`.
     pub fn cost(
         &self,
         model_provider: Option<&str>,
@@ -496,7 +502,7 @@ impl PriceList {
                 },
                 None => UsageCost {
                     included: total,
-                    unpriced: total,
+                    included_unpriced: total,
                     ..UsageCost::default()
                 },
             },
@@ -761,9 +767,10 @@ output = 30.0
             (
                 unknown.included,
                 unknown.included_usd_micros,
+                unknown.included_unpriced,
                 unknown.unpriced
             ),
-            (4, 0, 4)
+            (4, 0, 4, 0)
         );
     }
 
@@ -788,6 +795,16 @@ output = 30.0
         // The bundled openai-codex: OpenAI's.
         let bundled = PriceList::bundled();
         let codex = bundled.model_provider("openai-codex").unwrap();
+        assert_eq!(codex.priced_as.as_deref(), Some("openai"));
+        // Named again in an override, for an alias: still priced as OpenAI.
+        let mut again = PriceList::bundled();
+        again
+            .add(
+                "[model_providers.openai-codex]\nincluded = true\naliases = [\"chatgpt\"]\n",
+                Origin::Override,
+            )
+            .unwrap();
+        let codex = again.model_provider("chatgpt").unwrap();
         assert_eq!(codex.priced_as.as_deref(), Some("openai"));
     }
 
@@ -973,7 +990,7 @@ output = 15.0
         let nowhere = "[model_providers.s]\nincluded = true\npriced_as = \"z\"\n";
         assert!(refused(nowhere).contains("does not name"));
         let chained = "[model_providers.s]\nincluded = true\npriced_as = \"t\"\n[model_providers.t]\nincluded = true\n";
-        assert!(refused(chained).contains("subscription too"));
+        assert!(refused(chained).contains("marks t as a subscription"));
     }
 
     #[test]
