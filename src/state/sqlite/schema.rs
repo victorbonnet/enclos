@@ -114,6 +114,14 @@ pub const MIGRATIONS: &[&str] = &[
         at      TEXT NOT NULL,
         PRIMARY KEY (sandbox, field)
     ) STRICT;",
+    // 13: the version each sandbox's runtime last reported, for a runtime
+    // whose home holds none enclos reads (ADR 0074, proposed)
+    "CREATE TABLE runtime_versions (
+        sandbox TEXT PRIMARY KEY REFERENCES sandboxes (name) ON DELETE CASCADE,
+        runtime TEXT NOT NULL,
+        version TEXT NOT NULL,
+        at      TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.

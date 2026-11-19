@@ -427,7 +427,7 @@ fn priced(sandboxes: &mut [SandboxUsage], list: &PriceList) -> Total {
 }
 
 /// Removes the report once read, or when the read failed.
-struct Removed(PathBuf);
+pub(super) struct Removed(pub(super) PathBuf);
 
 impl Drop for Removed {
     fn drop(&mut self) {
@@ -441,7 +441,7 @@ impl Drop for Removed {
 
 /// The report's text: a plain file in the sandbox home, not a link, of at
 /// most `MAX_REPORT_BYTES`.
-fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> {
+pub(super) fn read_report(path: &Path, home: &Path) -> std::result::Result<String, String> {
     let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits();
     let file = OpenOptions::new()
         .read(true)

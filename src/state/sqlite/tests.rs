@@ -1121,6 +1121,70 @@ fn reports_a_corrupt_agent_or_runtime() {
 }
 
 #[test]
+fn a_runtime_version_is_replaced_forgotten_and_goes_with_its_sandbox() {
+    use crate::model::runtime::{RuntimeKind, RuntimeVersion};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let at = now();
+    let v = |s: &str| RuntimeVersion::new(s).unwrap();
+    assert_eq!(store.runtime_version(&name).unwrap(), None);
+
+    let claw = RuntimeKind::OpenClaw;
+    store
+        .put_runtime_version(&lock, &name, claw, &v("2026.11.3"), at)
+        .unwrap();
+    store
+        .put_runtime_version(&lock, &name, claw, &v("2026.11.5"), at)
+        .unwrap();
+    assert_eq!(
+        store.runtime_version(&name).unwrap(),
+        Some((claw, v("2026.11.5")))
+    );
+    // A record of the sandbox written again keeps it: only removal goes.
+    store.put(&lock, &record("home")).unwrap();
+    assert!(store.runtime_version(&name).unwrap().is_some());
+
+    assert!(store.forget_runtime_version(&lock, &name).unwrap());
+    assert!(!store.forget_runtime_version(&lock, &name).unwrap());
+    assert_eq!(store.runtime_version(&name).unwrap(), None);
+
+    store
+        .put_runtime_version(&lock, &name, claw, &v("2026.11.5"), at)
+        .unwrap();
+    store.remove(&lock, &name).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    assert_eq!(store.runtime_version(&name).unwrap(), None);
+}
+
+#[test]
+fn reports_a_corrupt_runtime_version() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    for (runtime, version) in [("claude", "1.0"), ("openclaw", "1.0; rm -rf ~")] {
+        conn.execute(
+            "INSERT INTO runtime_versions (sandbox, runtime, version, at) VALUES ('home', ?1, ?2, 'x')
+             ON CONFLICT (sandbox) DO UPDATE SET runtime = ?1, version = ?2",
+            params![runtime, version],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                store.runtime_version(&name),
+                Err(StateError::Corrupt { .. })
+            ),
+            "{runtime} {version}"
+        );
+    }
+}
+
+#[test]
 fn diagnostic_provenance_excludes_only_host_registered_probe_connections() {
     use crate::model::net::{NetEvent, Reason, Verdict};
     let (dir, store) = store();

@@ -15,6 +15,7 @@ use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
@@ -226,6 +227,25 @@ pub trait StateStore: NetLogStore {
     ) -> Result<()>;
     /// The sandbox's acceptances, by field.
     fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>>;
+
+    /// Records the version the sandbox's runtime reported (ADR 0074,
+    /// proposed), in place of what it reported before.
+    fn put_runtime_version(
+        &self,
+        lock: &StateLock,
+        sandbox: &SandboxName,
+        runtime: RuntimeKind,
+        version: &RuntimeVersion,
+        at: Timestamp,
+    ) -> Result<()>;
+    /// Forgets what the sandbox's runtime reported, once it may no longer
+    /// be the version installed. Whether there was a version to forget.
+    fn forget_runtime_version(&self, lock: &StateLock, sandbox: &SandboxName) -> Result<bool>;
+    /// The version the sandbox's runtime last reported, and which runtime.
+    fn runtime_version(
+        &self,
+        sandbox: &SandboxName,
+    ) -> Result<Option<(RuntimeKind, RuntimeVersion)>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections

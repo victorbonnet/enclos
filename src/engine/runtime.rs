@@ -3,18 +3,21 @@
 //! `staging.rs`, and a runtime's agents are in `agents.rs`. Logging it in is
 //! the runtime's own command, through `enclos connect` (ADR 0024).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
 use super::service::STOP_GRACE;
 use super::session::{END_WAIT, SessionEnd, spoken};
+use super::usage::{Removed, read_report};
+use crate::bridge::ids::new_id;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
+use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
-use crate::model::runtime::RuntimeKind;
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::policy::file::PolicyFile;
 use crate::runtime::{RuntimeAdapter, adapter};
@@ -41,6 +44,10 @@ pub struct InstallEnd {
     /// The install's time limit, when its installer was still running then
     /// and was stopped: the install failed.
     pub stopped_after: Option<Duration>,
+    /// After an install, the version the runtime reported and enclos
+    /// recorded, for a runtime whose home holds none enclos reads (ADR
+    /// 0074, proposed); or why it was not recorded. None when not asked.
+    pub version: Option<std::result::Result<RuntimeVersion, String>>,
 }
 
 /// How long an install whose installer runs past its time limit
@@ -51,6 +58,12 @@ pub struct InstallEnd {
 /// to spare.
 pub const INSTALL_STOP_TIME: Duration =
     Duration::from_secs(4 * STOP_GRACE.as_secs() + END_WAIT.as_secs() + 60);
+
+/// How long a runtime's version command may run after an install: it
+/// answers at once, or something is wrong. Within an install's time limit,
+/// it is stopped at that limit too, so the install still ends within
+/// [`INSTALL_STOP_TIME`] of it.
+pub const VERSION_TIME: Duration = Duration::from_secs(30);
 
 impl InstallEnd {
     /// How the installer ended, as a person reads it after "the installer".
@@ -217,6 +230,7 @@ impl Engine {
                 policy: 0,
                 login: runtime.login(),
                 stopped_after,
+                version: None,
             };
             let why = format!("the installer {}", failed.ended());
             (failed.policy, failed.recorded) = self.undo_install(by, name, kind, &why)?;
@@ -244,6 +258,9 @@ impl Engine {
                     })
             },
         )?;
+        let reported = self
+            .record_reported_version(by, name, runtime, deadline)
+            .transpose();
         Ok(Planned::Done(InstallEnd {
             kind,
             end,
@@ -252,7 +269,108 @@ impl Engine {
             policy: version.version,
             login: runtime.login(),
             stopped_after: None,
+            version: reported,
         }))
+    }
+
+    /// Asks the runtime its version, with its own command in the sandbox,
+    /// and records it (ADR 0074, proposed), for a runtime whose home holds
+    /// none enclos reads: none for another. The command is stopped after
+    /// [`VERSION_TIME`], or at `deadline`, the install's, if sooner. When
+    /// it cannot tell, the version recorded before is forgotten, as it may
+    /// be the one this install replaced; and why is given.
+    pub(super) fn record_reported_version(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Option<RuntimeVersion>, String> {
+        let kind = runtime.kind();
+        let target = Some(format!("{name} {kind}"));
+        let version = match self.ask_version(by, name, runtime, deadline) {
+            Ok(None) => return Ok(None),
+            Ok(Some(version)) => version,
+            Err(why) => {
+                let forgot = self.write(
+                    by,
+                    "runtime version",
+                    target,
+                    |_| format!("not reported: {why}"),
+                    |lock| {
+                        self.state
+                            .forget_runtime_version(lock, name)
+                            .map_err(Into::into)
+                    },
+                );
+                return Err(match forgot {
+                    Ok(_) => why,
+                    Err(e) => format!(
+                        "{why}; and the version recorded before could not be forgotten, so `enclos status` may show it: {e}"
+                    ),
+                });
+            }
+        };
+        self.write(
+            by,
+            "runtime version",
+            target,
+            |_| format!("reported {version}"),
+            |lock| {
+                self.state
+                    .put_runtime_version(lock, name, kind, &version, now())?;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(version))
+    }
+
+    /// What the runtime's version command reports, read from its report
+    /// in the home, which it writes, as a usage report is read.
+    fn ask_version(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Option<RuntimeVersion>, String> {
+        let home = self.sandbox_home(name);
+        let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
+        let report = home.join(format!(".enclos-version-{id}"));
+        let Some(command) = runtime.version_command(&report) else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let stop = deadline.map_or(now + VERSION_TIME, |d| d.min(now + VERSION_TIME));
+        if stop <= now {
+            return Err("the install's time limit left no time to ask its version".into());
+        }
+        let _remove = Removed(report.clone());
+        let (ended, stopped) = self
+            .run_exec_in_sandbox_within(by, name, command, "runtime version", stop)
+            .map_err(|e| e.to_string())?;
+        match (stopped, ended.signal) {
+            (true, _) => {
+                return Err(format!(
+                    "its version command did not answer within {} and was stopped",
+                    spoken(stop - now)
+                ));
+            }
+            (false, Some(signal)) => {
+                return Err(format!("its version command was ended by signal {signal}"));
+            }
+            (false, None) if ended.exit != 0 => {
+                return Err(format!("its version command exited with {}", ended.exit));
+            }
+            (false, None) => {}
+        }
+        let text =
+            read_report(&report, &home).map_err(|why| format!("its version report {why}"))?;
+        let version = runtime.reported_version(&text).and_then(|v| {
+            RuntimeVersion::new(&v).ok_or_else(|| "it reported no version enclos reads".to_owned())
+        })?;
+        Ok(Some(version))
     }
 
     fn plan_install(
@@ -405,6 +523,11 @@ impl InstallPlan {
         changes.push(format!(
             "run the installer in sandbox {name} under that policy, in this terminal, and record {kind} as its runtime if the installer exits 0"
         ));
+        if runtime.version_command(Path::new("")).is_some() {
+            changes.push(format!(
+                "then ask {kind} its version in sandbox {name}, and record it for `enclos status`"
+            ));
+        }
         Plan {
             changes,
             ..Plan::default()
