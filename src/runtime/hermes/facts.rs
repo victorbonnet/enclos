@@ -1,5 +1,6 @@
-//! Hermes's small YAML fact reader. The engine supplies bounded text; this
-//! module knows Hermes's selectors and refuses values it cannot interpret.
+//! Hermes's small YAML fact reader, and the JSON of its install stamp and
+//! of its latest release. The engine supplies bounded text; this module
+//! knows Hermes's selectors and refuses values it cannot interpret.
 
 use super::ValueAt;
 
@@ -14,6 +15,42 @@ pub(super) fn value(at: &ValueAt, text: &str) -> Result<Option<String>, String> 
         }
     }
     Ok(None)
+}
+
+/// A string of Hermes's install stamp, a JSON object. `0.0.0` is what
+/// Hermes reads when it has no version, so it is none.
+pub(super) fn stamp_value(at: &ValueAt, text: &str) -> Result<Option<String>, String> {
+    let stamp: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| "the install stamp is not JSON".to_owned())?;
+    for key in &at.keys {
+        match stamp.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(s)) if s == "0.0.0" => return Ok(None),
+            Some(serde_json::Value::String(s)) => return Ok(Some(s.clone())),
+            Some(_) => return Err(format!("`{key}` in the install stamp is not text")),
+        }
+    }
+    Ok(None)
+}
+
+/// The tag of the release GitHub names as Hermes's latest, when it is a
+/// stable one (`vX.Y.Z`), as Hermes's installer checks it.
+pub(super) fn release_tag(answer: &str) -> Result<String, String> {
+    let release: serde_json::Value = serde_json::from_str(answer)
+        .map_err(|_| "GitHub's answer for the latest release is not JSON".to_owned())?;
+    let tag = release
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("GitHub's answer for the latest release has no tag")?;
+    let numbers: Vec<&str> = tag.strip_prefix('v').unwrap_or("").split('.').collect();
+    let stable = numbers.len() == 3
+        && numbers
+            .iter()
+            .all(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()));
+    match stable {
+        true => Ok(tag.to_owned()),
+        false => Err("the latest release's tag is not a stable release's".to_owned()),
+    }
 }
 
 /// What [`yaml_value`] found.
@@ -229,6 +266,33 @@ pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_stamp_gives_the_base_version_and_its_placeholder_is_none() {
+        let at = ValueAt {
+            file: crate::runtime::HomePath::new(".hermes/hermes-agent/install-stamp.json").unwrap(),
+            keys: vec!["baseVersion".into()],
+        };
+        // As Hermes's installer wrote it on a Mac, 2026-11-13.
+        let stamp = r#"{"schemaVersion": 2, "commit": "3b42157", "source": "git",
+            "baseVersion": "0.23.1", "displayVersion": "0.23.1", "distance": 0}"#;
+        assert_eq!(stamp_value(&at, stamp), Ok(Some("0.23.1".into())));
+        assert_eq!(stamp_value(&at, r#"{"baseVersion": "0.0.0"}"#), Ok(None));
+        assert_eq!(stamp_value(&at, r#"{"source": "git"}"#), Ok(None));
+        assert!(stamp_value(&at, r#"{"baseVersion": 23}"#).is_err());
+        assert!(stamp_value(&at, "baseVersion: 0.23.1").is_err());
+    }
+
+    #[test]
+    fn only_a_stable_release_tag_is_the_latest_release() {
+        let answer = |tag: &str| format!(r#"{{"tag_name": "{tag}", "name": "Hermes"}}"#);
+        assert_eq!(release_tag(&answer("v0.23.2")), Ok("v0.23.2".into()));
+        for tag in ["v0.24.0-rc.1", "0.23.2", "v0.23", "canary", "v1.2.3.4"] {
+            assert!(release_tag(&answer(tag)).is_err(), "{tag}");
+        }
+        assert!(release_tag(r#"{"message": "API rate limit exceeded"}"#).is_err());
+        assert!(release_tag("<html>").is_err());
+    }
 
     #[test]
     fn yaml_values_are_found_by_dotted_key_and_anything_unsure_says_so() {

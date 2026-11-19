@@ -5479,6 +5479,141 @@ fn report_left(lab: &Lab) -> bool {
         })
 }
 
+/// The test runtime, reporting its version with `body`, run by `sh` with
+/// the report's path as `$1`, read as OpenClaw reads its own.
+struct Reporting {
+    inner: TestRuntime,
+    body: &'static str,
+}
+
+impl RuntimeAdapter for Reporting {
+    fn kind(&self) -> RuntimeKind {
+        RuntimeKind::OpenClaw
+    }
+    fn version(&self) -> &'static str {
+        self.inner.version()
+    }
+    fn endpoints(&self) -> &'static str {
+        self.inner.endpoints()
+    }
+    fn installer(&self) -> crate::runtime::Installer {
+        self.inner.installer()
+    }
+    fn home_files(&self, backend: BackendKind) -> Vec<crate::runtime::HomeFile> {
+        self.inner.home_files(backend)
+    }
+    fn login(&self) -> String {
+        self.inner.login()
+    }
+    fn create_agent(&self, name: &AgentName) -> SandboxCommand {
+        self.inner.create_agent(name)
+    }
+    fn agent_files(&self, name: &AgentName) -> String {
+        self.inner.agent_files(name)
+    }
+    fn talk(&self, agent: &AgentName) -> String {
+        self.inner.talk(agent)
+    }
+    fn services(&self) -> Vec<crate::runtime::RuntimeService> {
+        self.inner.services()
+    }
+    fn agents_in(
+        &self,
+        home: &Path,
+    ) -> std::result::Result<Vec<RuntimeAgentName>, crate::runtime::Unreadable> {
+        self.inner.agents_in(home)
+    }
+    fn version_command(&self, report: &Path) -> Option<SandboxCommand> {
+        let words = vec![
+            "sh".into(),
+            "-c".into(),
+            self.body.into(),
+            "sh".into(),
+            report.into(),
+        ];
+        Some(SandboxCommand::new(words))
+    }
+    fn reported_version(&self, text: &str) -> std::result::Result<String, String> {
+        crate::runtime::openclaw::OpenClaw.reported_version(text)
+    }
+}
+
+fn version_report_left(lab: &Lab) -> bool {
+    std::fs::read_dir(&lab.home)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".enclos-version-")
+        })
+}
+
+#[test]
+fn a_reported_version_is_recorded_and_one_that_cannot_be_read_forgets_the_old() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let reporting = |body| Reporting {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        body,
+    };
+    let record = |body, deadline| {
+        lab.engine
+            .record_reported_version(&alice(), &lab.name, &reporting(body), deadline)
+    };
+    let recorded = || lab.engine.state.runtime_version(&lab.name).unwrap();
+    let v = |s: &str| crate::model::runtime::RuntimeVersion::new(s).unwrap();
+
+    // A runtime that reports no version is not asked.
+    let plain = TestRuntime::new(lab._dir.path(), INSTALLS);
+    let none = lab
+        .engine
+        .record_reported_version(&alice(), &lab.name, &plain, None);
+    assert_eq!(none, Ok(None));
+
+    let said = "echo 1 plugin loaded > \"$1\"; echo 'OpenClaw 2026.11.5 (3f2a1b0)' >> \"$1\"";
+    assert_eq!(record(said, None), Ok(Some(v("2026.11.5"))));
+    assert_eq!(recorded(), Some((RuntimeKind::OpenClaw, v("2026.11.5"))));
+    assert!(!version_report_left(&lab));
+    assert!(lab.audit().contains("reported 2026.11.5"));
+
+    // It fails: what was recorded may be the version it replaced.
+    assert_eq!(
+        record("exit 3", None),
+        Err("its version command exited with 3".into())
+    );
+    assert_eq!(recorded(), None);
+    assert!(
+        lab.audit()
+            .contains("not reported: its version command exited with 3")
+    );
+
+    record(said, None).unwrap();
+    let Err(why) = record("echo 1 plugin loaded > \"$1\"", None) else {
+        panic!("read a version from no version")
+    };
+    assert!(why.contains("printed no version"), "{why}");
+    assert_eq!(recorded(), None);
+    assert!(!version_report_left(&lab));
+
+    // It does not answer: stopped at its deadline.
+    record(said, None).unwrap();
+    let soon = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let Err(why) = record("sleep 60", Some(soon)) else {
+        panic!("waited for a command that does not answer")
+    };
+    assert!(why.contains("did not answer within"), "{why}");
+    assert_eq!(recorded(), None);
+
+    // No time left within the install's limit: not asked at all.
+    let past = std::time::Instant::now();
+    assert_eq!(
+        record(said, Some(past)),
+        Err("the install's time limit left no time to ask its version".into())
+    );
+}
+
 #[test]
 fn a_usage_reader_that_fails_says_how_and_leaves_no_report() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
