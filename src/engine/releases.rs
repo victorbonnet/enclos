@@ -125,6 +125,8 @@ impl Engine {
     /// provided when the runtime names no release or the host turned
     /// lookups off; "cannot tell" when the lookup failed, or when
     /// `config.toml` cannot say whether lookups are on, never "up to date".
+    /// Callers go through [`Releases`]; tests ask for one runtime.
+    #[cfg(test)]
     pub(super) fn latest_release(
         &self,
         runtime: &dyn RuntimeAdapter,
