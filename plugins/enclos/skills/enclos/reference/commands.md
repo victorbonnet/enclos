@@ -584,9 +584,9 @@ enclos status [OPTIONS] [SANDBOX]
 
 ### `enclos usage`
 
-What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them.
+What each agent used of its model providers: tokens in and out, cache, cost, as its runtime recorded them, and enclos's estimate of the cost.
 
-Reads the runtime's records inside the sandbox, as an exec session. In JSON, each count the runtime does not keep is `null`, and each read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or `"not_provided"`.
+Reads the runtime's records inside the sandbox, as an exec session, and prices them with enclos's price list (`enclos prices`). In JSON, each count the runtime does not keep is `null`, each read is `{"known": …}`, `"absent"`, `{"cannot_tell": why}` or `"not_provided"`, and each estimate is in millionths of a dollar.
 
 ```text
 enclos usage [OPTIONS] [SANDBOX]
@@ -594,3 +594,16 @@ enclos usage [OPTIONS] [SANDBOX]
 
 - `[SANDBOX]`: Only this sandbox, read even when it is not running. Without it, every running sandbox.
 - `--since <DURATION>`: Native chats active in this past window, such as 24h or 30d; each counts whole. Default: `7d`.
+
+### `enclos prices`
+
+What a model's tokens cost, from the price list enclos estimates cost from.
+
+The list ships inside enclos, in US dollars per million tokens; `prices.toml` in enclos's config folder, in the same format, overrides it. enclos fetches no price when it runs.
+
+```text
+enclos prices [OPTIONS] [MODEL]
+```
+
+- `[MODEL]`: A model, as a runtime names it, to show the price of. Without it, what the list holds.
+- `--provider <PROVIDER>`: The model provider that serves the model, as the runtime names it, such as anthropic or openai-codex.

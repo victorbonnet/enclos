@@ -12,6 +12,7 @@ pub mod launch;
 pub mod net;
 pub mod output;
 pub mod policy;
+pub mod prices;
 pub mod proxy;
 #[cfg(test)]
 mod reference;

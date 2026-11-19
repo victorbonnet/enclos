@@ -76,6 +76,49 @@ impl UsageTokens {
     }
 }
 
+/// What usage cost, as the host estimates it from its price list (issue
+/// #343): the dollars of the tokens it has a price for, and how many
+/// tokens it could not price in dollars. An estimate, never a bill. Each
+/// part adds up, so the cost of a sandbox or a day is the sum of its
+/// agents' or hours'.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCost {
+    /// Millionths of a US dollar, for the tokens priced: whole, so sums
+    /// are exact. A rate per million tokens times a count of tokens is a
+    /// count of millionths of a dollar.
+    #[serde(default)]
+    pub usd_micros: u64,
+    /// Tokens on a subscription: they count against its limits, not in
+    /// dollars.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub included: u64,
+    /// Tokens of a model the price list has no price for: their cost is
+    /// unknown, which is not 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unpriced: u64,
+}
+
+impl UsageCost {
+    /// The sum of both, each part stopping at the most it can hold.
+    pub fn plus(self, other: UsageCost) -> UsageCost {
+        UsageCost {
+            usd_micros: self.usd_micros.saturating_add(other.usd_micros),
+            included: self.included.saturating_add(other.included),
+            unpriced: self.unpriced.saturating_add(other.unpriced),
+        }
+    }
+
+    /// Whether nothing was used: no dollars, and no token left unpriced or
+    /// on a subscription.
+    pub fn is_nothing(&self) -> bool {
+        *self == UsageCost::default()
+    }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 fn one() -> u32 {
     1
 }
@@ -229,5 +272,31 @@ mod tests {
             serde_json::to_string(&call).unwrap(),
             r#"{"conversation":"c1","tokens":{"input":3,"output":4}}"#
         );
+    }
+
+    #[test]
+    fn a_cost_adds_up_part_by_part_and_writes_only_the_parts_it_has() {
+        let a = UsageCost {
+            usd_micros: 1_250_000,
+            included: 0,
+            unpriced: 40,
+        };
+        let b = UsageCost {
+            usd_micros: u64::MAX,
+            included: 7,
+            unpriced: 0,
+        };
+        let sum = a.plus(b);
+        assert_eq!(
+            (sum.usd_micros, sum.included, sum.unpriced),
+            (u64::MAX, 7, 40)
+        );
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"usd_micros":1250000,"unpriced":40}"#
+        );
+        let read: UsageCost = serde_json::from_str(r#"{"included":3}"#).unwrap();
+        assert_eq!(read.usd_micros, 0);
+        assert!(UsageCost::default().is_nothing() && !read.is_nothing());
     }
 }

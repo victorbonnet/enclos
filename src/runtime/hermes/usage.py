@@ -89,6 +89,14 @@ def money_of(actual, estimated):
     return amount(actual) if amount(actual) else amount(estimated)
 
 
+def provider_of(value):
+    """The provider Hermes billed a call through (`billing_provider`), or None
+    when it does not say: its empty default, or nothing stored."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
 def cost_kind(statuses):
     kinds = {s if s in COST_KINDS else "unknown" for s in statuses}
     if not kinds:
@@ -145,9 +153,10 @@ class Sum:
     def tokens(self):
         return {t: self.value(t) for t in TOKENS}
 
-    def entry(self, model):
+    def entry(self, model, provider):
         entry = {
             "model": text(model),
+            "provider": text(provider),
             "chats": len(self.chats),
             "calls": self.value("calls"),
             "tokens": self.tokens(),
@@ -184,8 +193,8 @@ def read_agent(path, since):
             col(chats_kept, "last_activity_at", "s."), col(chats_kept, "ended_at", "s.")
         )
         chats = db.execute(
-            "SELECT s.id, {model}, {source}, {title}, s.started_at, {fields}, {actual}, {estimated}, {status} "
-            "FROM sessions s WHERE {when} >= ?".format(
+            "SELECT s.id, {model}, {source}, {title}, s.started_at, {fields}, {actual}, {estimated}, {status}, "
+            "{provider} FROM sessions s WHERE {when} >= ?".format(
                 model=col(chats_kept, "model", "s."),
                 source=col(chats_kept, "source", "s."),
                 title=col(chats_kept, "title", "s."),
@@ -193,6 +202,7 @@ def read_agent(path, since):
                 actual=col(chats_kept, "actual_cost_usd", "s."),
                 estimated=col(chats_kept, "estimated_cost_usd", "s."),
                 status=col(chats_kept, "cost_status", "s."),
+                provider=col(chats_kept, "billing_provider", "s."),
                 when=when,
             ),
             (since,),
@@ -200,13 +210,14 @@ def read_agent(path, since):
         calls = []
         if rows_kept:
             calls = db.execute(
-                "SELECT u.session_id, u.model, {fields}, {actual}, {estimated}, {status} "
+                "SELECT u.session_id, u.model, {fields}, {actual}, {estimated}, {status}, {provider} "
                 "FROM session_model_usage u JOIN sessions s ON s.id = u.session_id "
                 "WHERE {when} >= ?".format(
                     fields=", ".join(col(rows_kept, COLUMNS[f], "u.") for f in FIELDS),
                     actual=col(rows_kept, "actual_cost_usd", "u."),
                     estimated=col(rows_kept, "estimated_cost_usd", "u."),
                     status=col(rows_kept, "cost_status", "u."),
+                    provider=col(rows_kept, "billing_provider", "u."),
                     when=when,
                 ),
                 (since,),
@@ -221,12 +232,15 @@ def read_agent(path, since):
     # A background call's row has no cost status of its own; it went through
     # its chat's provider, so it takes its chat's.
     chat_status = {row[0]: row[13] for row in chats}
+    # Likewise its provider, when the row does not name one.
+    chat_provider = {row[0]: provider_of(row[14]) for row in chats}
     for row in calls:
         sid, model = row[0], row[1]
         values = dict(zip(FIELDS, row[2:8]))
         money = money_of(row[8], row[9])
         status = row[10] if row[10] is not None else chat_status.get(sid)
-        models.setdefault(model, Sum(kept)).add(sid, values, money, status)
+        provider = provider_of(row[11]) or chat_provider.get(sid)
+        models.setdefault((model, provider), Sum(kept)).add(sid, values, money, status)
         by_chat.setdefault(sid, Sum(kept)).add(sid, values, money, status)
         seen = attributed.setdefault(sid, dict.fromkeys(FIELDS, 0) | {"money": 0.0})
         for f in FIELDS:
@@ -254,7 +268,7 @@ def read_agent(path, since):
                 rest = None
         chat = by_chat.setdefault(sid, Sum(kept))
         if rest is not None:
-            models.setdefault(model, Sum(kept)).add(sid, rest, rest_money, status)
+            models.setdefault((model, provider_of(row[14])), Sum(kept)).add(sid, rest, rest_money, status)
             chat.add(sid, rest, rest_money, status)
         listed.append(
             {
@@ -269,7 +283,7 @@ def read_agent(path, since):
         )
 
     ordered = sorted(models.items(), key=lambda m: -m[1].total())
-    report = [s.entry(model) for model, s in ordered[:MAX_MODELS]]
+    report = [s.entry(model, provider) for (model, provider), s in ordered[:MAX_MODELS]]
     if len(ordered) > MAX_MODELS:
         # The rest in one row, so the agent's totals stay whole.
         rest = Sum(kept)
@@ -283,7 +297,7 @@ def read_agent(path, since):
                     rest.values[f] = min(rest.values[f] + s.values[f], MAX_COUNT)
             if s.cost is not None:
                 rest.cost = (rest.cost or 0.0) + s.cost
-        report = report[: MAX_MODELS - 1] + [rest.entry("{} other models".format(len(ordered) - MAX_MODELS + 1))]
+        report = report[: MAX_MODELS - 1] + [rest.entry("{} other models".format(len(ordered) - MAX_MODELS + 1), None)]
     listed.sort(key=lambda c: -sum(c["tokens"][t] or 0 for t in SENT))
     return {"found": True, "models": report, "top": listed[:TOP_CHATS]}
 

@@ -263,6 +263,12 @@ impl Layout {
         self.config.join("config.toml")
     }
 
+    /// The user's price list (issue #343): entries that override or add to
+    /// the one enclos ships. Optional.
+    pub fn prices_file(&self) -> PathBuf {
+        self.config.join("prices.toml")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.data.join("state.db")
     }
