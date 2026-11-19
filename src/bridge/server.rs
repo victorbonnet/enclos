@@ -287,6 +287,42 @@ impl Drop for Waiting {
 }
 
 impl Hub {
+    /// Looks the runtimes' latest releases up on a thread of its own, as a
+    /// lookup may wait on the network, then sends `person`'s devices the
+    /// sandboxes again with them (ADR 0074, proposed). Nothing when another
+    /// lookup runs already: its list follows.
+    fn look_up_releases(self: &Arc<Self>, person: &str) {
+        let hub = Arc::clone(self);
+        let person = person.to_owned();
+        std::thread::spawn(move || {
+            let Some(host) = hub.provisioning.as_ref() else {
+                return;
+            };
+            match host.sandboxes_looked_up() {
+                Some(Ok(listed)) => {
+                    hub.log_release_notes(&person, &listed.notes);
+                    let sandboxes = listed.sandboxes;
+                    hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
+                }
+                // The device keeps the list it has; the host's log says why.
+                Some(Err(why)) => hub.log_release_notes(&person, &[why]),
+                // Another lookup runs: its list follows.
+                None => {}
+            }
+        });
+    }
+
+    /// What went wrong listing the sandboxes with their runtimes' latest
+    /// releases, in the bridge's log, which `enclos app log` shows.
+    fn log_release_notes(&self, person: &str, notes: &[String]) {
+        let Ok(store) = self.store() else {
+            return;
+        };
+        for note in notes {
+            let _ = store.log(None, Some(person), "runtime releases", Some(note));
+        }
+    }
+
     fn begin(
         self: &Arc<Self>,
         store: &Store,
@@ -366,12 +402,14 @@ impl Hub {
                 .expect("not poisoned")
                 .remove(&sandbox);
             hub.deliver(&person, response);
-            if let Ok(sandboxes) = hub
+            if let Ok(listed) = hub
                 .provisioning
                 .as_ref()
                 .expect("provisioning request checked")
                 .sandboxes()
             {
+                hub.log_release_notes(&person, &listed.notes);
+                let sandboxes = listed.sandboxes;
                 hub.deliver_fitting(&person, ToDevice::SandboxesList { sandboxes });
             }
             if let Ok(store) = hub.store() {
@@ -3258,10 +3296,20 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(policy::fitting(
-                                ToDevice::SandboxesList { sandboxes },
-                                &message.id,
-                            ))?,
+                            Ok(listed) => {
+                                hub.log_release_notes(person, &listed.notes);
+                                link.send(policy::fitting(
+                                    ToDevice::SandboxesList {
+                                        sandboxes: listed.sandboxes,
+                                    },
+                                    &message.id,
+                                ))?;
+                                // At once with what is kept; a fresh list
+                                // follows the lookup.
+                                if listed.lookup_due {
+                                    hub.look_up_releases(person);
+                                }
+                            }
                             Err(why) => link.send(operation_failed(message.id, &why))?,
                         }
                         continue;
@@ -5396,6 +5444,59 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             device.receive(),
             Some(ToDevice::SandboxesList { .. })
         ));
+    }
+
+    /// The list comes at once with the version installed; the releases are
+    /// looked up on a thread of their own, and a fresh list follows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxes_request_answers_at_once_then_again_once_releases_are_looked_up() {
+        use crate::state::StateStore;
+        let folder = tempfile::tempdir().unwrap();
+        let layout = provisioning_state(folder.path());
+        let store = crate::state::sqlite::SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
+        let lock = store.lock().unwrap();
+        let name = "lab".parse().unwrap();
+        let mut record = store.get(&name).unwrap().unwrap();
+        record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+        store.put(&lock, &record).unwrap();
+        drop(lock);
+        let checkout = layout.sandbox_home("lab").join(".hermes/hermes-agent");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join("install-stamp.json"),
+            r#"{"baseVersion": "0.23.1"}"#,
+        )
+        .unwrap();
+        let bridge = bridge_serving(
+            folder.path(),
+            SILENCE,
+            Host::new(layout.clone(), "/unused/enclos".into()),
+        );
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut device, _) = connect(&bridge, &phone);
+        device.send("list", FromDevice::Sandboxes);
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { sandboxes })
+                if sandboxes[0].runtime_version.as_deref() == Some("0.23.1")
+                    && sandboxes[0].runtime_release.is_none()
+        ));
+        // Unit tests look nothing up, so the lookup fails and is kept as
+        // failed; the fresh list says no release.
+        assert!(matches!(
+            device.receive(),
+            Some(ToDevice::SandboxesList { sandboxes }) if sandboxes[0].runtime_release.is_none()
+        ));
+        assert!(eventually(|| layout.runtime_releases().exists()));
     }
 
     #[cfg(target_os = "macos")]
