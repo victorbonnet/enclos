@@ -33,8 +33,9 @@ pub const INSTALLER_URL: &str = "https://hermes-agent.nousresearch.com/install.s
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
 
-/// The stamp Hermes's installer and updater write beside the checkout,
-/// which Hermes reads for its own version (`baseVersion`).
+/// The stamp Hermes's installer writes beside the checkout, which Hermes
+/// reads for its own version (`baseVersion`). That `hermes update`
+/// rewrites it is to verify (design §14).
 const INSTALL_STAMP: &str = ".hermes/hermes-agent/install-stamp.json";
 
 /// Hermes's latest stable release, the one its installer installs by
@@ -43,7 +44,9 @@ const LATEST_RELEASE: &str =
     "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest";
 
 /// The Hermes releases enclos's runtime tests passed with before this
-/// enclos release (ADR 0074, proposed): CI's Hermes tests, run against each.
+/// enclos release (ADR 0074, proposed). CI tests Hermes's default branch,
+/// not a release: each release here had CI's Hermes tests run against it
+/// outside CI, 0.23.2 with enclos 334ea6c5 on 2026-11-19 (369 passed).
 const CHECKED_RELEASES: &[&str] = &["0.23.2"];
 
 // The mobile app's channel plugin (`channels/hermes/enclos/`), carried by

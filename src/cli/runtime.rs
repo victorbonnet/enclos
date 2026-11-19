@@ -139,8 +139,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
                 "installed": end.installed,
                 "session": output::session(&end.end),
                 "recorded": end.recorded.map(|k| k.to_string()),
-                "version": end.version.as_ref().and_then(|v| v.as_ref().ok()).map(|v| v.to_string()),
-                "version_unrecorded": end.version.as_ref().and_then(|v| v.as_ref().err()),
+                "runtime_version": end.version.as_ref().and_then(|v| v.as_ref().ok()).map(|v| v.to_string()),
+                "runtime_version_unrecorded": end.version.as_ref().and_then(|v| v.as_ref().err()),
                 "policy_version": end.policy,
                 "login": format!("enclos connect {sandbox} -- {}", end.login),
             }),
@@ -169,7 +169,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     );
     if let Some(Err(why)) = &end.version {
         eprintln!(
-            "enclos: {shown}'s version is not recorded, so `enclos status` cannot say whether it is outdated: {why}."
+            "enclos: {shown}'s version is not recorded, so `enclos status` cannot say whether it is outdated until the next install records it: {why}."
         );
     }
     Ok(exit::OK)

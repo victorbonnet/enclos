@@ -59,6 +59,12 @@ pub struct InstallEnd {
 pub const INSTALL_STOP_TIME: Duration =
     Duration::from_secs(4 * STOP_GRACE.as_secs() + END_WAIT.as_secs() + 60);
 
+/// How long a runtime's version command may run after an install: it
+/// answers at once, or something is wrong. Within an install's time limit,
+/// it is stopped at that limit too, so the install still ends within
+/// [`INSTALL_STOP_TIME`] of it.
+pub const VERSION_TIME: Duration = Duration::from_secs(30);
+
 impl InstallEnd {
     /// How the installer ended, as a person reads it after "the installer".
     pub fn ended(&self) -> String {
@@ -252,7 +258,9 @@ impl Engine {
                     })
             },
         )?;
-        let reported = self.record_reported_version(by, name, runtime).transpose();
+        let reported = self
+            .record_reported_version(by, name, runtime, deadline)
+            .transpose();
         Ok(Planned::Done(InstallEnd {
             kind,
             end,
@@ -267,36 +275,46 @@ impl Engine {
 
     /// Asks the runtime its version, with its own command in the sandbox,
     /// and records it (ADR 0074, proposed), for a runtime whose home holds
-    /// none enclos reads: none for another. Why not, when it could not.
+    /// none enclos reads: none for another. The command is stopped after
+    /// [`VERSION_TIME`], or at `deadline`, the install's, if sooner. When
+    /// it cannot tell, the version recorded before is forgotten, as it may
+    /// be the one this install replaced; and why is given.
     pub(super) fn record_reported_version(
         &self,
         by: &Actor,
         name: &SandboxName,
         runtime: &dyn RuntimeAdapter,
+        deadline: Option<Instant>,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
-        let home = self.sandbox_home(name);
-        let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
-        let report = home.join(format!(".enclos-version-{id}"));
-        let Some(command) = runtime.version_command(&report) else {
-            return Ok(None);
-        };
-        let _remove = Removed(report.clone());
-        let ended = self
-            .run_exec_in_sandbox(by, name, command, "runtime version")
-            .map_err(|e| e.to_string())?;
-        if ended.exit != 0 || ended.signal.is_some() {
-            return Err(format!("its version command exited with {}", ended.exit));
-        }
-        let text =
-            read_report(&report, &home).map_err(|why| format!("its version report {why}"))?;
-        let version = runtime.reported_version(&text).and_then(|v| {
-            RuntimeVersion::new(&v).ok_or_else(|| "it reported no version enclos reads".to_owned())
-        })?;
         let kind = runtime.kind();
+        let target = Some(format!("{name} {kind}"));
+        let version = match self.ask_version(by, name, runtime, deadline) {
+            Ok(None) => return Ok(None),
+            Ok(Some(version)) => version,
+            Err(why) => {
+                let forgot = self.write(
+                    by,
+                    "runtime version",
+                    target,
+                    |_| format!("not reported: {why}"),
+                    |lock| {
+                        self.state
+                            .forget_runtime_version(lock, name)
+                            .map_err(Into::into)
+                    },
+                );
+                return Err(match forgot {
+                    Ok(_) => why,
+                    Err(e) => format!(
+                        "{why}; and the version recorded before could not be forgotten, so `enclos status` may show it: {e}"
+                    ),
+                });
+            }
+        };
         self.write(
             by,
             "runtime version",
-            Some(format!("{name} {kind}")),
+            target,
             |_| format!("reported {version}"),
             |lock| {
                 self.state
@@ -305,6 +323,53 @@ impl Engine {
             },
         )
         .map_err(|e| e.to_string())?;
+        Ok(Some(version))
+    }
+
+    /// What the runtime's version command reports, read from its report
+    /// in the home, which it writes, as a usage report is read.
+    fn ask_version(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Option<RuntimeVersion>, String> {
+        let home = self.sandbox_home(name);
+        let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
+        let report = home.join(format!(".enclos-version-{id}"));
+        let Some(command) = runtime.version_command(&report) else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let stop = deadline.map_or(now + VERSION_TIME, |d| d.min(now + VERSION_TIME));
+        if stop <= now {
+            return Err("the install's time limit left no time to ask its version".into());
+        }
+        let _remove = Removed(report.clone());
+        let (ended, stopped) = self
+            .run_exec_in_sandbox_within(by, name, command, "runtime version", stop)
+            .map_err(|e| e.to_string())?;
+        match (stopped, ended.signal) {
+            (true, _) => {
+                return Err(format!(
+                    "its version command did not answer within {} and was stopped",
+                    spoken(stop - now)
+                ));
+            }
+            (false, Some(signal)) => {
+                return Err(format!("its version command was ended by signal {signal}"));
+            }
+            (false, None) if ended.exit != 0 => {
+                return Err(format!("its version command exited with {}", ended.exit));
+            }
+            (false, None) => {}
+        }
+        let text =
+            read_report(&report, &home).map_err(|why| format!("its version report {why}"))?;
+        let version = runtime.reported_version(&text).and_then(|v| {
+            RuntimeVersion::new(&v).ok_or_else(|| "it reported no version enclos reads".to_owned())
+        })?;
         Ok(Some(version))
     }
 

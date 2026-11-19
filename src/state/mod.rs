@@ -238,6 +238,9 @@ pub trait StateStore: NetLogStore {
         version: &RuntimeVersion,
         at: Timestamp,
     ) -> Result<()>;
+    /// Forgets what the sandbox's runtime reported, once it may no longer
+    /// be the version installed. Whether there was a version to forget.
+    fn forget_runtime_version(&self, lock: &StateLock, sandbox: &SandboxName) -> Result<bool>;
     /// The version the sandbox's runtime last reported, and which runtime.
     fn runtime_version(
         &self,

@@ -62,8 +62,9 @@ impl FromStr for RuntimeKind {
 /// A runtime's version as the runtime names it, such as `0.23.2` or
 /// `2026.11.5` (ADR 0074, proposed): letters, digits, dots, hyphens and
 /// plus signs, at most 64 of them, starting with a digit, without the `v`
-/// of a release tag. What a runtime or a release lookup says is checked
-/// against this before enclos prints or records it.
+/// of a release tag. What a runtime reports or a release lookup says is
+/// checked against this before enclos records, keeps or compares it; a
+/// version read from a home file is shown as other home facts are.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeVersion(String);
 
@@ -85,10 +86,14 @@ impl RuntimeVersion {
     }
 
     /// Whether this version is newer than `other`, compared number by
-    /// number between the dots, a missing number counting as 0. None when
-    /// either has a part that is not a number, such as `2026.11.5-beta.1`:
-    /// enclos does not guess how a runtime orders those.
+    /// number between the dots, a missing number counting as 0. Not newer
+    /// when they are the same. None when they differ and either has a part
+    /// that is not a number, such as `2026.11.5-beta.1`: enclos does not
+    /// guess how a runtime orders those.
     pub fn newer_than(&self, other: &RuntimeVersion) -> Option<bool> {
+        if self == other {
+            return Some(false);
+        }
         let numbers = |v: &RuntimeVersion| -> Option<Vec<u64>> {
             v.0.split('.').map(|part| part.parse().ok()).collect()
         };
@@ -143,6 +148,8 @@ mod tests {
         assert_eq!(v("2026.11.5").newer_than(&v("2026.11")), Some(true));
         assert_eq!(v("2026.11.0").newer_than(&v("2026.11")), Some(false));
         assert_eq!(v("2026.11.5-beta.1").newer_than(&v("2026.11.4")), None);
+        let beta = v("2026.11.5-beta.1");
+        assert_eq!(beta.newer_than(&beta.clone()), Some(false));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! A runtime's latest release, looked up on the host (ADR 0074, proposed):
 //! the release its installer installs by default, and whether this enclos
-//! was checked with it. The answer is kept in `runtime-releases.json` for a
-//! while, so `status` reaches the network at most that often; a host turns
-//! lookups off with `runtime_releases = false` in `config.toml`.
+//! was checked with it. The answer is kept in `runtime-releases.json`: six
+//! hours for a release, half an hour after a failed lookup, so `status`
+//! reaches the network at most that often for each runtime while the file
+//! can be written. A host turns lookups off with `runtime_releases = false`
+//! in `config.toml`; a value enclos cannot read there turns them off too,
+//! and `status` says why.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::io::ErrorKind;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +18,9 @@ use super::Engine;
 use super::staging::{DownloadFailed, LOOKUP_MAX_BYTES};
 use super::status::Fact;
 use crate::config;
+use crate::layout::LayoutError;
 use crate::model::Timestamp;
-use crate::model::runtime::RuntimeVersion;
+use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::runtime::RuntimeAdapter;
 
 /// How long a release looked up is kept, in seconds.
@@ -54,11 +60,32 @@ impl Lookup {
     }
 }
 
+/// The latest releases one `status` found, by runtime: each runtime is
+/// looked up once for all its sandboxes, even when nothing can be kept.
+#[derive(Default)]
+pub(super) struct Releases(RefCell<HashMap<RuntimeKind, Fact<LatestRelease>>>);
+
+impl Releases {
+    pub(super) fn of(
+        &self,
+        engine: &Engine,
+        runtime: &dyn RuntimeAdapter,
+        now: Timestamp,
+    ) -> Fact<LatestRelease> {
+        if let Some(found) = self.0.borrow().get(&runtime.kind()) {
+            return found.clone();
+        }
+        let found = engine.latest_release(runtime, now);
+        self.0.borrow_mut().insert(runtime.kind(), found.clone());
+        found
+    }
+}
+
 impl Engine {
     /// The latest release of `runtime`, as kept or looked up now. Not
     /// provided when the runtime names no release or the host turned
-    /// lookups off; "cannot tell" when the lookup failed, never "up to
-    /// date".
+    /// lookups off; "cannot tell" when the lookup failed, or when
+    /// `config.toml` cannot say whether lookups are on, never "up to date".
     pub(super) fn latest_release(
         &self,
         runtime: &dyn RuntimeAdapter,
@@ -67,12 +94,17 @@ impl Engine {
         let Some(url) = runtime.release_source() else {
             return Fact::NotProvided;
         };
-        let turned_off = self
-            .layout
-            .read_config()
-            .is_ok_and(|text| !config::looks_up_releases(&text));
-        if turned_off {
-            return Fact::NotProvided;
+        // No `config.toml` is the default, lookups on; one enclos cannot
+        // read looks nothing up.
+        let on = match self.layout.read_config() {
+            Ok(text) => config::looks_up_releases(&text),
+            Err(LayoutError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e.to_string()),
+        };
+        match on {
+            Ok(true) => {}
+            Ok(false) => return Fact::NotProvided,
+            Err(why) => return Fact::CannotTell(format!("nothing was looked up: {why}")),
         }
         let path = self.layout.runtime_releases();
         let mut kept = read_kept(&path);
@@ -94,8 +126,13 @@ impl Engine {
                     },
                 };
                 kept.insert(kind.to_owned(), lookup.clone());
-                // Not kept, it is looked up again next time: nothing lost.
-                let _ = write_kept(&path, &kept);
+                // Not kept, each `status` would wait on the network: said.
+                if let Err(e) = write_kept(&path, &kept) {
+                    eprintln!(
+                        "enclos: cannot keep the runtime releases looked up in {}: {e}; each `enclos status` looks them up again",
+                        path.display()
+                    );
+                }
                 lookup
             }
         };
@@ -143,23 +180,35 @@ fn read_answer(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "the answer is not text".into())
 }
 
-/// What is kept, by runtime. A file missing or unreadable keeps nothing.
+/// What is kept, by runtime. A missing file keeps nothing, and so does one
+/// that does not parse, which the next lookup replaces; one that cannot be
+/// read is said, since the next write may fail the same way.
 fn read_kept(path: &Path) -> BTreeMap<String, Lookup> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(e) if e.kind() == ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => {
+            eprintln!(
+                "enclos: cannot read the runtime releases kept in {}: {e}",
+                path.display()
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Writes what is kept in place of the file, whole: another `status` reads
-/// the old file or the new one, never part of one.
+/// the old file or the new one, never part of one. A partial file left by
+/// a failed write or rename is removed.
 fn write_kept(path: &Path, kept: &BTreeMap<String, Lookup>) -> std::io::Result<()> {
     let text = serde_json::to_vec_pretty(kept).map_err(std::io::Error::other)?;
     let partial = path.with_extension(format!("json.{}", std::process::id()));
-    std::fs::write(&partial, text)?;
-    std::fs::rename(&partial, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&partial);
-    })
+    std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .inspect_err(|_| {
+            // Gone already, or never made: nothing more to do.
+            let _ = std::fs::remove_file(&partial);
+        })
 }
 
 #[cfg(test)]

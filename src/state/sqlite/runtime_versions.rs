@@ -30,6 +30,15 @@ pub fn put(
     Ok(())
 }
 
+/// Forgets what `sandbox`'s runtime reported; whether there was a row.
+pub fn remove(conn: &Connection, sandbox: &SandboxName) -> rusqlite::Result<bool> {
+    let removed = conn.execute(
+        "DELETE FROM runtime_versions WHERE sandbox = ?1",
+        params![sandbox.as_str()],
+    )?;
+    Ok(removed > 0)
+}
+
 pub fn get(
     conn: &Connection,
     sandbox: &SandboxName,

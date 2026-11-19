@@ -851,10 +851,25 @@ impl RuntimeAdapter for OpenClaw {
         ]))
     }
     fn reported_version(&self, text: &str) -> Result<String, String> {
-        // `OpenClaw 2026.11.5 (abc1234)` or the version alone: the first
-        // word that starts with a digit.
-        text.split_whitespace()
-            .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+        // `OpenClaw 2026.11.5 (abc1234)` or the version alone: the word
+        // after `OpenClaw`, else the first dotted one such as `2026.11.5`,
+        // so a line printed before it, such as `1 plugin loaded`, is not
+        // taken for the version.
+        let dotted = |w: &&str| {
+            let w = w.strip_prefix('v').unwrap_or(w);
+            w.starts_with(|c: char| c.is_ascii_digit())
+                && w.split('.')
+                    .take(2)
+                    .all(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+                && w.contains('.')
+        };
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let named = words
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("openclaw") && dotted(&pair[1]))
+            .map(|pair| pair[1]);
+        named
+            .or_else(|| words.iter().copied().find(|w| dotted(w)))
             .map(str::to_owned)
             .ok_or_else(|| "`openclaw --version` printed no version".to_owned())
     }
@@ -946,6 +961,15 @@ mod tests {
             Ok("2026.11.5".into())
         );
         assert_eq!(reported("2026.11.5\n"), Ok("2026.11.5".into()));
+        assert_eq!(
+            reported("1 plugin loaded\nOpenClaw 2026.11.5\n"),
+            Ok("2026.11.5".into())
+        );
+        assert_eq!(
+            reported("3 warnings\n2026.11.6 (beta)\n"),
+            Ok("2026.11.6".into())
+        );
+        assert!(reported("1 plugin loaded\n").is_err());
         assert!(reported("").is_err());
     }
 

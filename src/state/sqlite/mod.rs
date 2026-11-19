@@ -644,6 +644,11 @@ impl StateStore for SqliteStateStore {
         runtime_versions::put(&conn, sandbox, runtime, version, at).map_err(self.sqlite_err())
     }
 
+    fn forget_runtime_version(&self, _lock: &StateLock, sandbox: &SandboxName) -> Result<bool> {
+        let conn = self.open()?;
+        runtime_versions::remove(&conn, sandbox).map_err(self.sqlite_err())
+    }
+
     fn runtime_version(
         &self,
         sandbox: &SandboxName,

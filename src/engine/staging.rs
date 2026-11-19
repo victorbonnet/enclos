@@ -26,9 +26,10 @@ pub trait Downloader {
     fn download(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed>;
 
     /// Downloads a small answer, such as a runtime's latest release (ADR
-    /// 0074, proposed), for a command a person waits on: like `download`,
-    /// within [`LOOKUP_TIME`] and [`LOOKUP_MAX_BYTES`], and saying nothing
-    /// on the terminal.
+    /// 0074, proposed), for a command a person waits on. [`Curl`] keeps it
+    /// within [`LOOKUP_TIME`] and [`LOOKUP_MAX_BYTES`], says nothing on the
+    /// terminal, and puts why it failed in the error; this default, for the
+    /// tests' downloaders, is `download`.
     fn lookup(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed> {
         self.download(url, to)
     }
@@ -77,32 +78,45 @@ impl Downloader for Curl {
                 "unit tests look nothing up on the network".into(),
             ));
         }
-        let status = Command::new("/usr/bin/curl")
-            .args(limited_args(
-                url,
-                to,
-                LOOKUP_TIME.as_secs(),
-                LOOKUP_MAX_BYTES,
-            ))
+        // Its output is the HTTP status alone (`--write-out`); what it says
+        // on its error stream is left out, as the reason is made from both.
+        let out = Command::new("/usr/bin/curl")
+            .args(lookup_args(url, to))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .output()
             .map_err(|e| DownloadFailed::NotRun(format!("cannot run curl: {e}")))?;
-        match status.code() {
-            _ if status.success() => Ok(()),
-            Some(1) => Err(DownloadFailed::NotHttps),
-            Some(code) => Err(DownloadFailed::Ended(curl_failure(code))),
-            None => Err(DownloadFailed::Ended(status.to_string())),
+        let http = String::from_utf8_lossy(&out.stdout);
+        match out.status.code() {
+            _ if out.status.success() => Ok(()),
+            Some(code) => Err(DownloadFailed::Ended(curl_failure(code, http.trim()))),
+            None => Err(DownloadFailed::Ended(out.status.to_string())),
         }
     }
 }
 
-/// What curl's exit `code` means, for the failures a lookup meets.
-fn curl_failure(code: i32) -> String {
+/// What curl runs with for a lookup: as an installer's download, within
+/// the lookup's time and size, printing the HTTP status it got.
+fn lookup_args(url: &str, to: &Path) -> Vec<OsString> {
+    let mut args = limited_args(url, to, LOOKUP_TIME.as_secs(), LOOKUP_MAX_BYTES);
+    args.extend(["--write-out".into(), "%{http_code}".into()]);
+    args
+}
+
+/// Why a lookup failed, from curl's exit `code` and the HTTP status it
+/// printed (`000` without an answer).
+fn curl_failure(code: i32, http: &str) -> String {
+    let answered = http.len() == 3 && http.bytes().all(|b| b.is_ascii_digit()) && http != "000";
     match code {
+        // `--proto` refused the address or a redirect, or the answer was
+        // not HTTP at all: curl does not tell them apart by its code.
+        1 => "curl refused the address or a redirect, or did not understand the answer".into(),
         6 => "the host name did not resolve".into(),
         7 => "the server could not be reached".into(),
+        22 if answered && matches!(http, "403" | "429") => {
+            format!("the server answered HTTP {http}, likely its limit on lookups for now")
+        }
+        22 if answered => format!("the server answered HTTP {http}"),
         22 => "the server answered with an error".into(),
         28 => format!("no answer within {} seconds", LOOKUP_TIME.as_secs()),
         35 | 60 => "the TLS connection failed".into(),
@@ -498,6 +512,36 @@ mod tests {
             assert!(pair("-o", "/tmp/x.part"), "{args:?}");
             assert_eq!(args.last(), Some(&url));
         }
+    }
+
+    #[test]
+    fn a_lookup_stays_on_https_within_its_time_and_size_and_prints_the_http_status() {
+        let url = "https://registry.npmjs.org/openclaw/latest";
+        let args = lookup_args(url, Path::new("/tmp/answer"));
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args[0], "-q", "{args:?}");
+        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+        assert!(pair("--proto", "=https"), "{args:?}");
+        assert!(pair("--proto-redir", "=https"), "{args:?}");
+        assert!(pair("--max-time", "10"), "{args:?}");
+        assert!(pair("--max-filesize", "1048576"), "{args:?}");
+        assert!(pair("-o", "/tmp/answer"), "{args:?}");
+        assert!(pair("--write-out", "%{http_code}"), "{args:?}");
+        assert!(args.contains(&url), "{args:?}");
+    }
+
+    #[test]
+    fn a_failed_lookup_says_what_the_server_answered() {
+        assert_eq!(curl_failure(22, "404"), "the server answered HTTP 404");
+        assert_eq!(
+            curl_failure(22, "403"),
+            "the server answered HTTP 403, likely its limit on lookups for now"
+        );
+        assert_eq!(curl_failure(22, "000"), "the server answered with an error");
+        assert_eq!(curl_failure(28, "000"), "no answer within 10 seconds");
+        assert_eq!(curl_failure(6, ""), "the host name did not resolve");
+        assert!(curl_failure(1, "000").starts_with("curl refused the address"));
+        assert_eq!(curl_failure(56, "000"), "curl exited with 56");
     }
 
     #[test]

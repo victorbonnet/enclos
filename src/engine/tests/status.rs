@@ -1100,4 +1100,66 @@ fn the_latest_release_is_kept_for_hours_a_failure_for_minutes_and_lookups_can_be
         Fact::NotProvided
     );
     assert_eq!(engine.latest_release(&Bare, later(30)), Fact::NotProvided);
+
+    // Written wrong, it looks nothing up either, and says why.
+    std::fs::write(&answer, r#"{"tag_name": "v0.23.9"}"#).unwrap();
+    std::fs::write(
+        engine.layout.config_file(),
+        "runtime_releases = \"false\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        engine.latest_release(&runtime, later(60)),
+        Fact::CannotTell(
+            "nothing was looked up: `runtime_releases` in config.toml is string, not true or false"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn status_shows_the_version_an_openclaw_sandbox_reported_and_none_of_another_runtime() {
+    let (_dir, engine, name) = with_runtime();
+    let set = |kind: Option<RuntimeKind>| {
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::OpenClaw);
+                    engine.state.put(lock, &record)?;
+                    match kind {
+                        Some(kind) => {
+                            let version = crate::model::runtime::RuntimeVersion::new("2026.11.5");
+                            engine.state.put_runtime_version(
+                                lock,
+                                &name,
+                                kind,
+                                &version.unwrap(),
+                                crate::model::now(),
+                            )?;
+                        }
+                        None => {
+                            engine.state.forget_runtime_version(lock, &name)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    };
+    let version = || {
+        let json = serde_json::to_value(engine.status(None).unwrap()).unwrap();
+        json["sandboxes"][0]["runtime"]["version"].clone()
+    };
+    set(None);
+    assert_eq!(version(), "absent");
+    set(Some(RuntimeKind::OpenClaw));
+    assert_eq!(version(), serde_json::json!({"known": "2026.11.5"}));
+    // Reported by another runtime than the one recorded: not this one's.
+    set(Some(RuntimeKind::Hermes));
+    assert_eq!(version(), "absent");
 }

@@ -1,8 +1,9 @@
 //! `enclos status`: what is on this host, what it costs on disk, and what
 //! the user could do about it (issue #29). A read: no lock, no audit
 //! entry, and nothing runs in a sandbox, so it works on stopped ones. It
-//! may look up each runtime's latest release on the network, at most every
-//! few hours (`releases.rs`).
+//! may look up each runtime's latest release on the network, once per
+//! runtime, and writes only what it keeps of the answer
+//! (`runtime-releases.json`, `releases.rs`).
 //!
 //! Facts come from enclos's own records (trusted), from the service
 //! manager, and from the sandbox home, which the sandbox writes. The
@@ -21,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
+use super::releases::Releases;
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -61,10 +63,12 @@ impl Engine {
         let mut sandboxes = Vec::new();
         let mut unlisted = Vec::new();
         let dashboard_services = super::listener::HostServices::default();
+        let releases = Releases::default();
         for record in records {
             let name = record.name.clone();
             let runtime = record.runtime.map(adapter);
-            match self.sandbox_status_in(record, runtime.as_deref(), now, &dashboard_services) {
+            let seen = (&dashboard_services, &releases);
+            match self.sandbox_status_in(record, runtime.as_deref(), now, seen) {
                 Ok(s) => sandboxes.push(s),
                 Err(e) => unlisted.push(Unlisted {
                     name,
@@ -92,21 +96,24 @@ impl Engine {
         runtime: Option<&dyn RuntimeAdapter>,
         now: Timestamp,
     ) -> Result<SandboxStatus> {
-        self.sandbox_status_in(
-            record,
-            runtime,
-            now,
+        let seen = (
             &super::listener::HostServices::default(),
-        )
+            &Releases::default(),
+        );
+        self.sandbox_status_in(record, runtime, now, seen)
     }
 
+    /// One sandbox's status. `seen` holds what this `status` already asked
+    /// of the host: its services, and each runtime's latest release, looked
+    /// up once whatever sandboxes have that runtime.
     fn sandbox_status_in(
         &self,
         record: SandboxRecord,
         runtime: Option<&dyn RuntimeAdapter>,
         now: Timestamp,
-        dashboard_services: &super::listener::HostServices,
+        seen: (&super::listener::HostServices, &Releases),
     ) -> Result<SandboxStatus> {
+        let (dashboard_services, releases) = seen;
         let name = record.name.clone();
         let dir = self.layout.sandbox_dir(name.as_str());
         let home = self.layout.sandbox_home(name.as_str());
@@ -189,7 +196,7 @@ impl Engine {
                         Some(at) => read_value(&home, &at, rt),
                         None => self.reported_version(&name, rt),
                     };
-                    let latest = self.latest_release(rt, now);
+                    let latest = releases.of(self, rt, now);
                     Some(RuntimeStatus {
                         kind,
                         name: kind.display_name(),
@@ -446,6 +453,54 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
 mod tests {
     use super::*;
     use crate::lifecycle::marker::spawn_unmarked;
+
+    #[test]
+    fn outdated_is_known_only_when_both_versions_are_known_and_ordered() {
+        let installed = |v: &str| Fact::Known(v.to_owned());
+        let latest = |v: &str| {
+            Fact::Known(LatestRelease {
+                version: v.to_owned(),
+                checked: false,
+            })
+        };
+        assert_eq!(
+            outdated(&installed("0.23.1"), &latest("0.23.2")),
+            Fact::Known(true)
+        );
+        assert_eq!(
+            outdated(&installed("0.23.2"), &latest("0.23.2")),
+            Fact::Known(false)
+        );
+        assert_eq!(
+            outdated(&installed("0.24.0"), &latest("0.23.2")),
+            Fact::Known(false)
+        );
+        assert_eq!(
+            outdated(&installed("2026.11.5-beta.1"), &latest("2026.11.5-beta.1")),
+            Fact::Known(false)
+        );
+        assert_eq!(
+            outdated(&installed("2026.11.5-beta.1"), &latest("2026.11.5")),
+            Fact::CannotTell("enclos cannot order versions 2026.11.5-beta.1 and 2026.11.5".into())
+        );
+        assert_eq!(
+            outdated(&Fact::Absent, &latest("0.23.2")),
+            Fact::CannotTell("the version installed is not known".into())
+        );
+        assert_eq!(
+            outdated(&installed("0.23.1"), &Fact::CannotTell("offline".into())),
+            Fact::CannotTell("the latest release is not known".into())
+        );
+        assert_eq!(
+            outdated(&installed("0.23.1"), &Fact::NotProvided),
+            Fact::NotProvided
+        );
+        // What the sandbox wrote in its home is not a version: no order.
+        assert!(matches!(
+            outdated(&installed("0.23\u{1b}[31m"), &latest("0.23.2")),
+            Fact::CannotTell(_)
+        ));
+    }
 
     /// A running session of `kind` whose root is `root`.
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
