@@ -395,6 +395,14 @@ pub trait RuntimeAdapter {
     fn agent_delete_mode(&self) -> AgentDeleteMode {
         AgentDeleteMode::PauseRuntime
     }
+    /// Whether `runtime configure` stops the runtime's installed services
+    /// while its commands run in a sandbox of `backend`, then installs them
+    /// again: for a runtime whose running service refuses those commands
+    /// from a session there. The default, for a runtime that takes its
+    /// settings while it runs, stops nothing.
+    fn configure_pauses(&self, _backend: BackendKind) -> bool {
+        false
+    }
     /// The runtime's own command that finishes a delete of `name` which
     /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
     /// rm` when that command failed after the runtime stopped listing the

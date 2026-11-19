@@ -275,6 +275,16 @@ impl RuntimeAdapter for OpenClaw {
     fn agent_delete_mode(&self) -> AgentDeleteMode {
         AgentDeleteMode::RuntimeService
     }
+    fn configure_pauses(&self, backend: BackendKind) -> bool {
+        // While its gateway runs, OpenClaw admits a config or plugin write
+        // only from the gateway's own PID namespace, which it forwards to
+        // the gateway, and refuses one from another, whatever its owner
+        // heartbeat says; a clean stop releases the gateway's lock at once
+        // (read in 2026.11.5's `local-state-owner` and `gateway-state-owner`,
+        // #337). A session of any backend but Seatbelt has a PID namespace
+        // of its own (ADR 0039), so there the gateway stops meanwhile.
+        backend != BackendKind::Seatbelt
+    }
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
         Some(SandboxCommand::from_words(&[
             "enclos-openclaw-agent",

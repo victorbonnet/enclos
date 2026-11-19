@@ -105,6 +105,7 @@ pub(super) struct TestRuntime {
     url: String,
     pub(super) sha256: String,
     delete_mode: AgentDeleteMode,
+    configure_pauses: bool,
 }
 
 impl TestRuntime {
@@ -117,6 +118,7 @@ impl TestRuntime {
             url: format!("file://{}", installer.display()),
             sha256,
             delete_mode: AgentDeleteMode::PauseRuntime,
+            configure_pauses: false,
         }
     }
 }
@@ -151,6 +153,27 @@ impl RuntimeAdapter for TestRuntime {
     }
     fn agent_delete_mode(&self) -> AgentDeleteMode {
         self.delete_mode
+    }
+    fn configure_pauses(&self, _backend: BackendKind) -> bool {
+        self.configure_pauses
+    }
+    fn agent_secrets_source(
+        &self,
+        agent: &RuntimeAgentName,
+        file: &Path,
+    ) -> Option<Vec<SandboxCommand>> {
+        Hermes.agent_secrets_source(agent, file)
+    }
+    fn reads_agent_secrets(&self, text: &str, file: &Path) -> bool {
+        Hermes.reads_agent_secrets(text, file)
+    }
+    fn set_setting(
+        &self,
+        agent: &RuntimeAgentName,
+        key: &str,
+        value: &str,
+    ) -> Option<SandboxCommand> {
+        Hermes.set_setting(agent, key, value)
     }
     fn agent_facts(&self, agent: &RuntimeAgentName) -> crate::runtime::AgentFacts {
         Hermes.agent_facts(agent)
@@ -5753,4 +5776,99 @@ fn a_native_delete_keeps_the_service_it_calls_and_refuses_without_it() {
     assert!(lab.home.join(".hermes/profiles/reader").exists());
     assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
     assert!(fake.started.borrow().is_empty());
+}
+
+/// A runtime whose running service refuses its commands from a session,
+/// as OpenClaw's gateway does on bubblewrap (#337): with the sandbox
+/// stopped, `runtime configure` has nothing to stop or ask; started, its
+/// plan and its confirmation say the service stops, asking runs nothing,
+/// and confirmed, the service stops before the runtime's commands run and
+/// is installed again after them.
+#[test]
+fn configure_stops_a_service_that_refuses_its_commands_meanwhile() {
+    use crate::runtime::ServiceName;
+    use crate::service::ServiceLabel;
+    use crate::service::fake::FakeServices;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let log = lab.home.join("hermes-calls");
+    let count = |log: &Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+    runtime.configure_pauses = true;
+    let configure = |confirm, runtime: &TestRuntime| {
+        lab.engine
+            .configure_agent_with(&alice(), &lab.name, None, None, &[], confirm, runtime)
+    };
+
+    // Stopped: nothing to stop, nothing asked.
+    done(configure(Confirm::Ask, &runtime).unwrap());
+    assert!(fake.stopped.borrow().is_empty());
+    assert!(!lab.audit().contains("services remove"));
+
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let Planned::DryRun(plan) = configure(Confirm::DryRun, &runtime).unwrap() else {
+        panic!("a dry run set the agent up");
+    };
+    assert_eq!(
+        plan.changes.first(),
+        Some(&format!(
+            "stop service {gateway}, which ends a chat in progress"
+        ))
+    );
+    assert_eq!(
+        plan.changes.last(),
+        Some(&format!("install service {gateway} again"))
+    );
+    let before = count(&log);
+    let err = configure(Confirm::Ask, &runtime).unwrap_err();
+    assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+    assert!(
+        err.to_string().starts_with(
+            "setting up agent home/default, which stops the sandbox's service gateway while Hermes's commands run and so ends a chat in progress, needs confirmation"
+        ),
+        "{err}"
+    );
+    assert_eq!(count(&log), before);
+    assert!(fake.stopped.borrow().is_empty());
+
+    // Confirmed: the runtime's commands run between the stop and the start.
+    let seen: Rc<RefCell<Vec<(&str, usize)>>> = Rc::default();
+    for (hook, what) in [(&fake.on_stop, "stop"), (&fake.on_start, "start")] {
+        let (seen, log) = (Rc::clone(&seen), log.clone());
+        *hook.borrow_mut() = Some(Box::new(move |l: &ServiceLabel| {
+            if l.service() == "gateway" {
+                seen.borrow_mut().push((what, count(&log)));
+            }
+        }));
+    }
+    done(configure(Confirm::Yes, &runtime).unwrap());
+    let after = count(&log);
+    assert!(after > before, "the runtime's commands ran");
+    assert_eq!(*seen.borrow(), [("stop", before), ("start", after)]);
+    assert_eq!(*fake.stopped.borrow(), std::slice::from_ref(&gateway));
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert!(
+        lab.audit().contains("for runtime configure home/default"),
+        "{}",
+        lab.audit()
+    );
+
+    // A runtime that takes its settings while it runs: nothing stops.
+    runtime.configure_pauses = false;
+    fake.stopped.borrow_mut().clear();
+    done(configure(Confirm::Ask, &runtime).unwrap());
+    assert!(fake.stopped.borrow().is_empty());
 }
