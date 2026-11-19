@@ -550,7 +550,7 @@ mod tests {
         };
         let view = UsageView {
             since: Timestamp::from_second(0).unwrap(),
-            sandboxes: vec![sandbox("a", 1_000_000), sandbox("b", 2_000_000)],
+            sandboxes: vec![sandbox("lab", 1_000_000), sandbox("work", 2_000_000)],
             total: Total {
                 calls: Some(2),
                 tokens: Tokens {
