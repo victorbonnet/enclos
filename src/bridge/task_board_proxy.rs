@@ -224,11 +224,13 @@ fn bad_dashboard(client: &mut TcpStream) -> io::Result<()> {
 }
 
 /// Opens the held task's details once the board has drawn its card. Hermes's
-/// Kanban page opens a task only when its card is tapped, and keeps no URL or
-/// stored setting for one; each card carries `data-task-id`. The card is
-/// tapped once, so a person who closes the details stays on the board. A task
-/// the board does not show (a filter hides it) leaves the board as it is.
-const OPEN_TASK: &str = "(function(){var id=TASK,done=false,seen;function open(){var c=document.querySelectorAll('.hermes-kanban-card[data-task-id]');for(var i=0;i<c.length;i++){if(c[i].getAttribute('data-task-id')===id){done=true;c[i].scrollIntoView({block:'center',inline:'center'});c[i].click();return true}}return false}function watch(){if(open())return;seen=new MutationObserver(function(){if(!done&&open())seen.disconnect()});seen.observe(document.body,{childList:true,subtree:true});setTimeout(function(){seen.disconnect()},30000)}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',watch);else watch()})()";
+/// Kanban page (0.23.2's bundle) keeps the open task in page state only, with
+/// no URL or stored setting for it; each card is a `.hermes-kanban-card` with
+/// `data-task-id`. The card is
+/// tapped once, so a person who closes the details stays on the board. When
+/// no card with that id is drawn within 30 seconds (a filter hides it, or the
+/// board is slow), the page stays on the board. `open_task.test.mjs` runs it.
+const OPEN_TASK: &str = include_str!("open_task.js");
 
 fn rewrite_body(route: Route, raw: &[u8], board: &str, task: &str) -> io::Result<Vec<u8>> {
     if route == Route::Document {
@@ -237,7 +239,7 @@ fn rewrite_body(route: Route, raw: &[u8], board: &str, task: &str) -> io::Result
         // Hermes initializes Kanban from localStorage, not the URL. Seed
         // the board selected by the held task before the bundle starts.
         let mut script = format!(
-            "try{{localStorage.setItem('hermes.kanban.selectedBoard','{board}')}}catch{{}}"
+            "try{{localStorage.setItem('hermes.kanban.selectedBoard','{board}')}}catch{{}}\n"
         );
         // Only an id of the characters a path component allows is written
         // into the script, so it cannot end the string or the element.
@@ -615,34 +617,69 @@ mod tests {
         )
         .unwrap();
         let document = String::from_utf8(document).unwrap();
-        assert!(
-            document.starts_with("<html><head><script>try{localStorage.setItem('hermes.kanban.selectedBoard','reviews')}catch{}(function(){var id='t1',"),
-            "{document}"
+        let script = format!(
+            "<html><head><script>{SEED}{}</script><script src=\"kanban.js\"></script></head></html>",
+            OPEN_TASK.replace("TASK", "'t1'")
         );
-        assert!(
-            document.ends_with("})()</script><script src=\"kanban.js\"></script></head></html>")
-        );
+        assert_eq!(document, script);
     }
+
+    const SEED: &str =
+        "try{localStorage.setItem('hermes.kanban.selectedBoard','reviews')}catch{}\n";
 
     #[test]
     fn the_page_opens_only_a_task_id_that_cannot_leave_its_script() {
+        assert_eq!(OPEN_TASK.matches("TASK").count(), 1);
         for task in ["t_ab12", "a.b-c@d"] {
             let document =
                 rewrite_body(Route::Document, b"<head></head>", "reviews", task).unwrap();
             assert!(
                 String::from_utf8(document)
                     .unwrap()
-                    .contains(&format!("var id='{task}',"))
+                    .contains(&format!("var id = '{task}',"))
             );
         }
-        for task in ["", "..", "t'1", "t</script>", "t\\1", "t 1"] {
+        for task in [
+            "",
+            ".",
+            "..",
+            "t'1",
+            "t</script>",
+            "t\\1",
+            "t 1",
+            "t\u{2028}1",
+        ] {
             let document =
                 rewrite_body(Route::Document, b"<head></head>", "reviews", task).unwrap();
             assert_eq!(
-                document,
-                b"<head><script>try{localStorage.setItem('hermes.kanban.selectedBoard','reviews')}catch{}</script></head>",
+                String::from_utf8(document).unwrap(),
+                format!("<head><script>{SEED}</script></head>"),
                 "{task:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_relayed_page_opens_the_held_task_under_a_policy_that_runs_it() {
+        let result = relay(
+            "GET",
+            "/kanban",
+            &[],
+            Some(
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: 26\r\n\r\n<html><head></head></html>",
+            ),
+            |_| unreachable!(),
+        );
+        let (head, body) = result.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(
+            head.contains("script-src 'self' 'unsafe-inline';"),
+            "{head}"
+        );
+        let length = format!("Content-Length: {}", body.len());
+        assert!(head.split("\r\n").any(|line| line == length), "{head}");
+        assert!(body.starts_with(&format!("<html><head><script>{SEED}")));
+        assert!(body.contains("var id = 't1',"), "{body}");
+        assert!(body.ends_with("</script></head></html>"));
     }
 }

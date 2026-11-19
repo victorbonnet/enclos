@@ -511,6 +511,19 @@ jobs:
       - name: OpenClaw transfer tests
         run: python3 -I -m unittest discover -s src/runtime/openclaw/tests
 
+  # The script the bridge adds to a runtime's task board page (`open_task.js`),
+  # run against a stand-in page.
+  bridge-page:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: node --test src/bridge/*.test.mjs
+
   # The exact native SDK is the channel's tested contract. Install it only in
   # a disposable prefix; no package lifecycle scripts or onboarding run.
   openclaw-channel:
@@ -540,7 +553,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, hermes-latest, openclaw-launchers, openclaw-channel]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin, hermes-latest, openclaw-launchers, openclaw-channel, bridge-page]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

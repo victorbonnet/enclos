@@ -68,10 +68,10 @@ HOME_ANSWER = (
     "Hermes's own notices land there. There is nothing to set."
 )
 
-# Hermes's notices about itself (gateway online, shutting down, restarting,
-# no home channel, and the summary of its post-turn self-improvement review,
-# such as a skill it patched), by their keys in its translations, sent as
-# `status`:
+# Hermes's own notices (gateway online, shutting down, restarting, no home
+# channel, and the summary of its self-improvement review after a turn or a
+# `/review` or `/refine`, such as a skill it patched), by their keys in its
+# translations, sent as `status`.
 # Hermes marks them as such for Discord only, so they are told by their
 # text, in the gateway's own language.
 NOTICE_KEYS = (
