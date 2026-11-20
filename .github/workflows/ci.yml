@@ -548,13 +548,21 @@ jobs:
           check-latest: true
       - name: Check generated channel JavaScript
         run: node channels/openclaw/scripts/build.mjs --check
+      # The version is the channel's `TESTED_OPENCLAW`, so moving to a new
+      # OpenClaw release edits no workflow.
       - name: Install the supported public SDK without running package scripts
         shell: bash
         run: |
+          version=$(sed -n "s/^export const TESTED_OPENCLAW = '\([0-9][0-9.]*\)';\$/\1/p" channels/openclaw/channel.js)
+          if [ -z "$version" ]; then
+            echo "::error::No TESTED_OPENCLAW version found in channels/openclaw/channel.js"
+            exit 1
+          fi
+          echo "OpenClaw $version"
           sdk_prefix="$RUNNER_TEMP/enclos-openclaw-sdk"
           npm install --prefix "$sdk_prefix" --cache "$RUNNER_TEMP/enclos-openclaw-npm-cache" \
             --registry=https://registry.npmjs.org --ignore-scripts --omit=dev \
-            --no-audit --no-fund --package-lock=false openclaw@2026.11.5
+            --no-audit --no-fund --package-lock=false "openclaw@$version"
           echo "ENCLOS_OPENCLAW_PACKAGE=$sdk_prefix/node_modules/openclaw" >>"$GITHUB_ENV"
       - name: Channel tests including installed SDK probes
         run: node --test channels/openclaw/tests/*.test.js
