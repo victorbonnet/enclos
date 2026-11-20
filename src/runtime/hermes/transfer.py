@@ -82,9 +82,25 @@ class LimitedOutput:
     def tell(self): return self.size
 
 
-# Main's tools.tool_result_storage renders prune pointers as a whitespace-free
-# display-home path. Keep only that native archive namespace, never all cache.
-PRUNED_POINTER = re.compile(r'[^\s"<>]*cache/pruned/[^\s"<>]+')
+# tools.tool_result_storage._with_pointer emits an inline suffix or a
+# standalone text part; archive_list_for_summary appends a headed bullet list.
+# Bare cache paths in conversation prose are not durable pointers. Capture the
+# whole token before validating, so malformed real pointers cannot be truncated
+# to a safe-looking filename.
+PRUNED_POINTER = re.compile(r'(?: — full result: |^full result: )([^\s"<>]+)')
+ARCHIVE_LIST_HEADING = 'Archived tool output (exact originals; read_file a path to recover one):'
+
+
+def native_archive_paths(text):
+    yield from (match.group(1) for match in PRUNED_POINTER.finditer(text))
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != ARCHIVE_LIST_HEADING: continue
+        for bullet in lines[index + 1:]:
+            if not bullet.startswith('- '): break
+            yield bullet[2:]
+
+
 PRUNED_NAME = re.compile(r'[A-Za-z0-9_.-]+')
 
 
@@ -105,8 +121,9 @@ def archive_pointers(text, origin):
                 for child in item.values(): yield from strings(child)
         return [pair for child in strings(value) for pair in archive_pointers(child, origin)]
     result = []
-    for match in PRUNED_POINTER.finditer(text):
-        pointer = match.group()
+    for pointer in native_archive_paths(text):
+        if 'cache/pruned/' not in pointer:
+            continue
         prefix, filename = pointer.rsplit('cache/pruned/', 1)
         if (not PRUNED_NAME.fullmatch(filename) or filename in {'.', '..'}
                 or prefix not in {str(origin) + '/', '~/' + '/'.join(origin.parts[origin.parts.index('.hermes'):]) + '/'}):

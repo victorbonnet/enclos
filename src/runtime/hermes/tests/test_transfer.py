@@ -7,6 +7,7 @@ import sqlite3
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('transfer', Path(__file__).parents[1] / 'transfer.py')
 transfer = importlib.util.module_from_spec(spec); spec.loader.exec_module(transfer)
@@ -18,6 +19,71 @@ class TransferTests(unittest.TestCase):
         self.source.mkdir(); self.dest.mkdir(); self.profile = self.source / '.hermes/profiles/main'; self.profile.mkdir(parents=True)
         (self.profile / 'config.yaml').write_text('model: test\ncwd: ' + str(self.source / 'project') + '\n')
         self.archive = self.base / 'agent.tar.gz'
+    def prose_rows(self):
+        prose = [
+            'Please explain how cache/pruned/example.txt is used.',
+            'The path "cache/pruned/example.txt" is an example.',
+            '`cache/pruned/example.txt`',
+            '```python\npath = "cache/pruned/example.txt"\n```',
+            str(self.profile / 'cache/pruned/example.txt'),
+            'Explain "' + str(self.profile / 'cache/pruned/example.txt') + '".',
+            '`' + str(self.profile / 'cache/pruned/example.txt') + '`, please.',
+            '(' + str(self.profile / 'cache/pruned/example.txt') + ') is an example.',
+        ]
+        return [(text, api) for text in prose for api in (
+            text, json.dumps([{'type': 'text', 'text': text}]),
+            '\x00json:' + json.dumps({'content': [{'text': text}]}))]
+
+    def write_prose(self):
+        rows = self.prose_rows()
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table messages(content text, api_content text)')
+            db.executemany('insert into messages values (?,?)', rows)
+        return rows
+
+    def assert_prose_restore(self, rows):
+        transfer.restore(self.dest, 'renamed', self.archive)
+        with sqlite3.connect(self.dest / '.hermes/profiles/renamed/state.db') as db:
+            self.assertEqual(db.execute('select content, api_content from messages').fetchall(), rows)
+
+    def test_incidental_prose_roundtrip(self):
+        rows = self.write_prose()
+        transfer.export(self.source, 'main', self.archive)
+        self.assert_prose_restore(rows)
+
+    def test_original_base_archive_with_prose_restores(self):
+        rows = self.write_prose()
+        # The original hermes-data-v1 export contains the manifest and raw
+        # profile files, with no selected cache members. Build that format
+        # directly so this regression also runs in shallow/source-only CI.
+        metadata = json.dumps({'format': transfer.FORMAT, 'home': str(self.source),
+                               'profile': str(self.profile), 'agent': 'main'}).encode()
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            manifest = tarfile.TarInfo('manifest.json'); manifest.size = len(metadata)
+            archive.addfile(manifest, io.BytesIO(metadata))
+            for filename in ('config.yaml', 'state.db'):
+                archive.add(self.profile / filename, arcname='profile/' + filename)
+        self.assert_prose_restore(rows)
+
+    def test_native_list_and_summary_pointer_forms(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        path = str(cache / 'original.txt'); (cache / 'original.txt').write_text('exact original')
+        heading = 'Archived tool output (exact originals; read_file a path to recover one):'
+        forms = [json.dumps([{'type': 'text', 'text': 'full result: ' + path}]),
+                 '\x00json:' + json.dumps([{'type': 'text', 'text': 'full result: ' + path}]),
+                 'summary\n\n' + heading + '\n- ' + path]
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table messages(content text, api_content text)')
+            db.executemany('insert into messages values (?,?)', [(f, json.dumps({'content': f})) for f in forms])
+        transfer.export(self.source, 'main', self.archive)
+        transfer.restore(self.dest, 'renamed', self.archive)
+        target = self.dest / '.hermes/profiles/renamed'
+        self.assertEqual((target / 'cache/pruned/original.txt').read_text(), 'exact original')
+        with sqlite3.connect(target / 'state.db') as db:
+            for content, api in db.execute('select * from messages'):
+                self.assertNotIn(str(self.profile), content + api)
+                self.assertIn(str(target), content)
+
     def test_referenced_pruned_archives_roundtrip_from_wal(self):
         cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
         (cache / 'active.txt').write_text('full active output')
@@ -59,9 +125,62 @@ class TransferTests(unittest.TestCase):
                 with sqlite3.connect(self.profile / 'state.db') as db:
                     db.execute('create table if not exists messages(content text)')
                     db.execute('delete from messages')
-                    db.execute('insert into messages values (?)', (pointer,))
+                    db.execute('insert into messages values (?)', ('short — full result: ' + pointer,))
                 with self.assertRaises(ValueError): transfer.export(self.source, 'main', self.archive)
                 self.assertFalse(self.archive.exists())
+
+    def test_archive_discovery_uses_exported_snapshot(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        (cache / 'original.txt').write_text('snapshot original')
+        original = 'short — full result: ' + str(cache / 'original.txt')
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table messages(content text)')
+            db.execute('insert into messages values (?)', (original,))
+        read_rows = transfer.message_archive_rows
+        def concurrent_write(snapshot):
+            self.assertNotEqual(snapshot, self.profile / 'state.db')
+            with sqlite3.connect(self.profile / 'state.db') as db:
+                db.execute('update messages set content=?', ('short — full result: ' + str(cache / 'missing.txt'),))
+            return read_rows(snapshot)
+        with patch.object(transfer, 'message_archive_rows', concurrent_write):
+            transfer.export(self.source, 'main', self.archive)
+        transfer.restore(self.dest, 'renamed', self.archive)
+        target = self.dest / '.hermes/profiles/renamed'
+        with sqlite3.connect(target / 'state.db') as db:
+            self.assertEqual(db.execute('select content from messages').fetchone()[0],
+                             'short — full result: ' + str(target / 'cache/pruned/original.txt'))
+
+    def test_native_forms_keep_strict_path_validation(self):
+        heading = 'Archived tool output (exact originals; read_file a path to recover one):'
+        for path in ('/outside/cache/pruned/x.txt',
+                     str(self.profile / 'cache/pruned/../secret'),
+                     '~/.hermes/profiles/another/cache/pruned/x.txt',
+                     str(self.profile / 'cache/pruned/x.txt') + '/child',
+                     str(self.profile / 'cache/pruned/x.txt') + '`'):
+            for form in ('short — full result: ' + path, 'full result: ' + path,
+                         'summary\n\n' + heading + '\n- ' + path):
+                for text in (form, json.dumps([{'text': form}]),
+                             '\x00json:' + json.dumps({'content': form})):
+                    with self.subTest(text=text), self.assertRaises(ValueError):
+                        transfer.archive_pointers(text, self.profile)
+
+    def test_missing_summary_original_refuses_restore_without_publication(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        (cache / 'original.txt').write_text('exact')
+        pointer = 'summary\n\nArchived tool output (exact originals; read_file a path to recover one):\n- ' + str(cache / 'original.txt')
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table messages(content text)')
+            db.execute('insert into messages values (?)', (pointer,))
+        transfer.export(self.source, 'main', self.archive)
+        broken = self.base / 'broken.tgz'
+        with tarfile.open(self.archive) as src, tarfile.open(broken, 'w:gz') as dst:
+            for item in src:
+                if item.name != 'profile/cache/pruned/original.txt':
+                    dst.addfile(item, src.extractfile(item))
+        with self.assertRaisesRegex(ValueError, 'missing durable archive'):
+            transfer.restore(self.dest, 'renamed', broken)
+        self.assertFalse((self.dest / '.hermes/profiles/renamed').exists())
+        self.assertFalse((self.dest / '.local/bin/renamed').exists())
 
     def test_restore_rejects_unreferenced_or_other_cache_entries(self):
         transfer.export(self.source, 'main', self.archive)
