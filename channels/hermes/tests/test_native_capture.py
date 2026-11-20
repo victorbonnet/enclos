@@ -14,7 +14,9 @@ class PublicCapture(unittest.TestCase):
                 self.fail(f"Named Hermes source is missing: {source}")
             self.skipTest("Optional installed Hermes source absent")
         script = r'''
-import os, tempfile, faulthandler
+import os, tempfile, faulthandler, sys, types
+sys.modules["gateway.run"] = types.ModuleType("gateway.run")
+from native_source_fixture import verify
 faulthandler.dump_traceback_later(15, exit=True)
 from pathlib import Path
 with tempfile.TemporaryDirectory() as temporary:
@@ -25,15 +27,15 @@ with tempfile.TemporaryDirectory() as temporary:
     assert decide_image_input_mode('fixture', 'sees', cfg) == 'native'
     assert decide_image_input_mode('fixture', 'blind', cfg) == 'text'
     from gateway.session_ingress_media import capture_native_media, release_admission_media, sweep_settled_media
-    from hermes_state import SessionDB
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, cancel_session_input
+    from native_storage_fixture import (SessionDB, create_session, admit_session_input,
+        begin_runtime_epoch, cancel_session_input)
     stage = Path(temporary) / 'staging.txt'
     stage.write_bytes(b'original immutable bytes')
     media = capture_native_media([stage])
     captured = Path(media[0]['path'])
     assert captured != stage and captured.read_bytes() == stage.read_bytes()
-    db = SessionDB(db_path=Path(temporary) / 'state.db')
-    db.create_session('s', source='test')
+    db = SessionDB(Path(temporary) / 'state.db')
+    create_session(db, 's')
     epoch = begin_runtime_epoch(db, instance_id='fixture')
     row = admit_session_input(db, epoch=epoch, principal_id='p', session_id='s', request_id='delivery',
         payload={'text': 'read', 'attachments_v1': {'media': media, 'media_types': ['text/plain']}})
@@ -48,8 +50,9 @@ with tempfile.TemporaryDirectory() as temporary:
     release_admission_media(db, row['admission_id'])
     assert not captured.exists()
     db.close()
+    verify()
 ''' 
-        env = dict(os.environ, PYTHONPATH=str(source))
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(source), str(Path(__file__).parent.resolve())]))
         result = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True, timeout=25)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

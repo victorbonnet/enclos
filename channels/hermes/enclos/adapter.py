@@ -611,7 +611,11 @@ class EnclosAdapter(BasePlatformAdapter):
                 self._incoming.release(paths)
                 raise FileAdmissionRefused() from error
             except Exception as error:
-                from hermes_state_runtime import RuntimeStoreError
+                from importlib.util import find_spec
+                if find_spec("persistence_assembly") is not None:
+                    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
+                else:
+                    from hermes_state_runtime import RuntimeStoreError
                 if isinstance(error, RuntimeStoreError) and not native_write_started.get():
                     self._incoming.release(paths)
                     raise FileAdmissionRefused() from error

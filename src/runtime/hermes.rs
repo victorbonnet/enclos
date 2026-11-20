@@ -74,6 +74,8 @@ const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.
 const APP_PLUGIN_TASK_EVENTS: &str = include_str!("../../channels/hermes/enclos/task_events.py");
 const APP_PLUGIN_SUGGESTED_REPLIES: &str =
     include_str!("../../channels/hermes/enclos/suggested_replies.py");
+const APP_PLUGIN_IMAGE_ELIGIBILITY: &str =
+    include_str!("../../channels/hermes/enclos/image_eligibility.py");
 const APP_PLUGIN_INCOMING: &str = include_str!("../../channels/hermes/enclos/incoming.py");
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
@@ -369,6 +371,7 @@ impl RuntimeAdapter for Hermes {
                 file("task_events.py", APP_PLUGIN_TASK_EVENTS)?,
                 file("suggested_replies.py", APP_PLUGIN_SUGGESTED_REPLIES)?,
                 file("incoming.py", APP_PLUGIN_INCOMING)?,
+                file("image_eligibility.py", APP_PLUGIN_IMAGE_ELIGIBILITY)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
@@ -1398,6 +1401,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/task_events.py",
                 ".hermes/profiles/main/plugins/enclos/suggested_replies.py",
                 ".hermes/profiles/main/plugins/enclos/incoming.py",
+                ".hermes/profiles/main/plugins/enclos/image_eligibility.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );
@@ -1448,6 +1452,41 @@ mod tests {
         assert_eq!(
             app.files[0].0.as_path(),
             Path::new(".hermes/plugins/enclos/plugin.yaml")
+        );
+    }
+
+    #[test]
+    fn emitted_app_plugin_imports_with_test_owned_gateway_interfaces() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = Hermes
+            .app_channel(
+                &RuntimeAgentName::new("default").unwrap(),
+                Path::new("/fixture/main.sock"),
+                Path::new("/fixture/token"),
+                "home.fixture",
+                "fixture-key",
+            )
+            .unwrap();
+        for (place, contents) in app.files {
+            let path = temporary.path().join(place.as_path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("channels/hermes/tests/bundled_plugin_fixture.py"),
+            )
+            .arg(temporary.path().join(".hermes/plugins"))
+            .env("HERMES_HOME", temporary.path())
+            .env_remove("HERMES_PROFILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

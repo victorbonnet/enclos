@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+# Block bootstrap before importing runtime-facing test helpers.
+sys.modules.setdefault("gateway.run", types.ModuleType("gateway.run"))
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from test_adapter import _hermes_stand_ins  # noqa: E402

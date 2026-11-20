@@ -12,14 +12,15 @@ from unittest.mock import patch
 
 # Fail closed if any dependency starts importing the bootstrap module.
 sys.modules['gateway.run'] = ModuleType('gateway.run')
+from native_source_fixture import verify
 from enclos.adapter import EnclosAdapter
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 from gateway.session_authority import SessionAuthority
 from gateway.session_contract import SessionActor
 from gateway.platforms import webhook_ingress
-from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, get_session_admission
+from native_storage_fixture import (CURRENT, SessionDB, begin_runtime_epoch,
+    get_session_admission, RuntimeStoreError)
 
 async def main(root):
     db = SessionDB(root / 'state.db')
@@ -31,7 +32,7 @@ async def main(root):
         _adapter_flag=lambda *a: False, _adapter_profile_for_source=lambda s: None,
         _is_user_authorized_for_source=lambda *a, **kw: True,
         _session_key_for_source=store._generate_session_key, _adapter_for_source=lambda s: adapter, _is_session_running=lambda k: False)
-    authority = SessionAuthority(runner, profile_id='fixture', instance_id='test', db=db,
+    authority = SessionAuthority(runner, profile_id='fixture', instance_id='test', **({'persistence': db} if CURRENT else {'db': db}),
         epoch=begin_runtime_epoch(db, instance_id='test'))
     runner.session_authority = authority
     # Only execution scheduling is held; admission and ledger are unmodified.
@@ -39,10 +40,13 @@ async def main(root):
     async def scope(a, event):
         assert a is adapter
         yield authority
+    releases = []
     receipts = []
     scheduled = []
     authority._schedule = scheduled.append
+    written = []
     async def write(message):
+        written.append(message)
         return True  # ACK may be lost; the next delivery uses a fresh plugin cache.
     events = []
     async def admit(event):
@@ -54,7 +58,7 @@ async def main(root):
         chat_id=kw['chat_id'], user_id=kw['user_id'])
     adapter._interrupts = SimpleNamespace(admit=lambda e: None, complete=lambda e: None)
     adapter._incoming = SimpleNamespace(captured=lambda paths, r: receipts.append(r),
-        release=lambda paths: None, admit=lambda paths: None, admission_ended=lambda paths: None)
+        release=lambda paths: releases.append(paths), admit=lambda paths: None, admission_ended=lambda paths: None)
     adapter._last_in = {}
     message = dict(id='delivery', text='read', conversation='c', person='u')
     class ReceivedTime:
@@ -81,13 +85,19 @@ async def main(root):
         path = await deliver('retry', b'actual producer bytes')
         assert len(receipts) == 2 and receipts[1].admission_id == receipt.admission_id
         assert receipts[1].ref == receipt.ref
-        from hermes_state_runtime import RuntimeStoreError
         try:
             await deliver('changed', b'changed bytes')
         except RuntimeStoreError as error:
             assert error.reason == 'admission_conflict', error
         else:
             raise AssertionError('same request with changed bytes must conflict')
+    # The real authority refuses before native writes when retiring.
+    authority.retiring = True
+    with patch.object(webhook_ingress, 'producer_scope', scope):
+        await deliver('refused', b'precommit')
+    assert written[-1]['type'] == 'error' and written[-1]['of'] == 'delivery', written[-1]
+    assert releases and Path(releases[-1][0]).read_bytes() == b'precommit'
+    authority.retiring = False
     import sqlite3
     with sqlite3.connect(root / 'state.db') as conn:
         assert conn.execute('SELECT COUNT(*) FROM session_admissions').fetchone()[0] == 1
@@ -155,3 +165,5 @@ with patch('hermes_cli.config.load_config', return_value=cfg):
     selected[0] = None
     assert not image_eligibility.available(adapter, source)
 assert all(value is source for value in seen)
+
+verify()

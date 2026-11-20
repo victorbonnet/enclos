@@ -876,3 +876,43 @@ fn delayed_file_settlement(refuse: bool) {
     let later = texts.iter().position(|text| *text == "later").unwrap();
     assert!(file < later);
 }
+
+#[test]
+fn committed_upload_is_forwarded_before_rename_without_terminal_failure() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let got = files_plugin(&socket, true);
+    let (bridge, mut device) = ready(folder.path(), socket);
+    let (committed, reached) = std::sync::mpsc::channel();
+    let (resume, released) = std::sync::mpsc::channel();
+    let released = Mutex::new(released);
+    *bridge.hub.upload_committed.lock().unwrap() = Some(Box::new(move || {
+        committed.send(()).unwrap();
+        released.lock().unwrap().recv().unwrap();
+    }));
+    begin(
+        &mut device,
+        "window",
+        "c-1",
+        "read",
+        &[file("note.txt", "text/plain", 3)],
+    );
+    send_all(&mut device, "window", &[b"abc".to_vec()]);
+    reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    let store = Store::open(&bridge.store).unwrap();
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(answer_to(&mut device, "window"), None);
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |frame| matches!(frame, FromBridge::MessagePart(p) if p.data.bytes() == b"abc")
+    )));
+    assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+    assert!(
+        !store
+            .messages_after("c-1", 0)
+            .unwrap()
+            .iter()
+            .any(|m| m.kind == "status")
+    );
+    assert_eq!(incoming_left(&bridge), 0);
+}

@@ -278,6 +278,10 @@ fn finish(
     if let Added::New(seq) = added {
         // Recorded: one not moved now is moved when the bridge starts again
         u.kept = true;
+        #[cfg(test)]
+        if let Some(scheduler) = hub.upload_committed.lock().unwrap().as_ref() {
+            scheduler();
+        }
         let media = hub.media();
         for (id, copy) in &u.copies {
             if let Err(e) = std::fs::rename(copy, media.join(id)) {
@@ -395,7 +399,12 @@ pub(super) fn stored_files(
         let size = u64::try_from(a.size).map_err(|e| e.to_string())?;
         let file = IncomingFile::new(a.name, a.mime, size).map_err(|e| e.to_string())?;
         // The id is the bridge's own (a UUID), never a path from a device
-        let opened = std::fs::File::open(hub.media().join(&a.id)).map_err(|e| e.to_string())?;
+        // Commit precedes rename. Open staging first: an atomic rename
+        // between these opens leaves the same owned bytes at the final path.
+        let media = hub.media();
+        let opened = std::fs::File::open(media.join(INCOMING).join(&a.id))
+            .or_else(|_| std::fs::File::open(media.join(&a.id)))
+            .map_err(|e| e.to_string())?;
         if opened.metadata().map_err(|e| e.to_string())?.len() != size {
             return Err(format!("file {} is not its recorded size", a.id));
         }

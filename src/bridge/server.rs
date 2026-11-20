@@ -232,6 +232,8 @@ struct Hub {
     opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Whether a pass of [`Hub::open_plugins`] runs: one at a time.
     opening_all: AtomicBool,
+    #[cfg(test)]
+    upload_committed: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
@@ -525,6 +527,8 @@ impl Hub {
             deletion_jobs: Mutex::new(HashSet::new()),
             opening: Mutex::new(HashMap::new()),
             opening_all: AtomicBool::new(false),
+            #[cfg(test)]
+            upload_committed: Mutex::new(None),
             questions: Mutex::new(Default::default()),
             open_items: Mutex::new(HashMap::new()),
             open_item_devices: Mutex::new(HashSet::new()),
