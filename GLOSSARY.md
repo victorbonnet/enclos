@@ -36,6 +36,10 @@ _Avoid_: tool approval or command approval (a runtime approval is a runtime's ow
 A runtime's request for a person's decision before an operation continues, with the operation and the consents it allows, such as once, for the session or always, supplied by that runtime. It changes no sandbox policy.
 _Avoid_: policy request, question (a request for information), command approval
 
+**Command confirmation**:
+A runtime's request that a person confirm a command they gave it before it runs, such as Hermes's before `/new` discards a conversation. It grants the agent nothing and changes no access, so it is not a runtime approval.
+_Avoid_: runtime approval (an operation of the agent's), slash confirm
+
 **Signed decision**:
 A person's decision on a runtime approval as the bridge passes it to the agent's channel plugin, signed with a key no sandbox reads, which the plugin acts on alone.
 _Avoid_: approval token, typed approval

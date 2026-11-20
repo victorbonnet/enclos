@@ -66,6 +66,8 @@ const APP_PLUGIN_LINES: &str = include_str!("../../channels/hermes/enclos/lines.
 const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
 const APP_PLUGIN_RUNTIME_APPROVALS: &str =
     include_str!("../../channels/hermes/enclos/runtime_approvals.py");
+const APP_PLUGIN_SLASH_CONFIRMS: &str =
+    include_str!("../../channels/hermes/enclos/slash_confirms.py");
 const APP_PLUGIN_DECISIONS: &str = include_str!("../../channels/hermes/enclos/decisions.py");
 const APP_PLUGIN_HELD_TASKS: &str = include_str!("../../channels/hermes/enclos/held_tasks.py");
 const APP_PLUGIN_ASKS: &str = include_str!("../../channels/hermes/enclos/asks.py");
@@ -360,6 +362,7 @@ impl RuntimeAdapter for Hermes {
                 file("lines.py", APP_PLUGIN_LINES)?,
                 file("questions.py", APP_PLUGIN_QUESTIONS)?,
                 file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
+                file("slash_confirms.py", APP_PLUGIN_SLASH_CONFIRMS)?,
                 file("decisions.py", APP_PLUGIN_DECISIONS)?,
                 file("held_tasks.py", APP_PLUGIN_HELD_TASKS)?,
                 file("asks.py", APP_PLUGIN_ASKS)?,
@@ -1388,6 +1391,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/lines.py",
                 ".hermes/profiles/main/plugins/enclos/questions.py",
                 ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
+                ".hermes/profiles/main/plugins/enclos/slash_confirms.py",
                 ".hermes/profiles/main/plugins/enclos/decisions.py",
                 ".hermes/profiles/main/plugins/enclos/held_tasks.py",
                 ".hermes/profiles/main/plugins/enclos/asks.py",

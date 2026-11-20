@@ -279,6 +279,58 @@ class RuntimeApprovalRefusals(unittest.IsolatedAsyncioTestCase):
             protocol.decode_from_bridge(protocol.encode_line(protocol._message("message.in", host="yes", **base)))
 
 
+def hermes_words(words=None, blocked=()):
+    """Hermes's bare-word approval replies (`gateway.run_busy`) and its approval queue
+    (`tools.approval`), with the session keys in `blocked` waiting on an approval."""
+    busy = types.ModuleType("gateway.run_busy")
+
+    class GatewayBusySessionMixin:
+        def _plaintext_approval_words(self):
+            return dict.fromkeys(words if words is not None else ("yes", "always", "👍", "tak"), ("approve", ""))
+    busy.GatewayBusySessionMixin = GatewayBusySessionMixin
+    approval = types.ModuleType("tools.approval")
+    approval.has_blocking_approval = lambda key: key in blocked
+    tools = types.ModuleType("tools")
+    tools.approval = approval
+    return {"gateway": types.ModuleType("gateway"), "gateway.run_busy": busy, "tools": tools,
+            "tools.approval": approval}
+
+
+class BareApprovalWords(unittest.TestCase):
+    """While a runtime approval blocks a session, Hermes reads a bare word as a decision
+    on it (`gateway/run_busy.py`, `_route_plaintext_approval_while_busy`)."""
+
+    def event(self, text):
+        return types.SimpleNamespace(text=text)
+
+    def test_a_word_of_hermess_list_is_one_only_while_an_approval_blocks_its_session(self):
+        keys = Mock(return_value={"s-1"})
+        with patch.dict(sys.modules, hermes_words(blocked={"s-1"})):
+            for text in ("yes", " Always\n", "👍", "TAK"):
+                self.assertTrue(runtime_approvals.approval_word(self.event(text), keys), text)
+            for text in ("yes please", "no", "", "y"):
+                self.assertFalse(runtime_approvals.approval_word(self.event(text), keys), text)
+            self.assertFalse(runtime_approvals.approval_word(self.event("yes"), lambda: {"s-2", None}))
+        # Only a word asks which session it goes to.
+        keys.reset_mock()
+        with patch.dict(sys.modules, hermes_words(blocked={"s-1"})):
+            runtime_approvals.approval_word(self.event("hello"), keys)
+        keys.assert_not_called()
+
+    def test_hermess_list_unreadable_while_an_approval_blocks_refuses_the_english_one(self):
+        modules = {**hermes_words(blocked={"s-1"}), "gateway.run_busy": None}
+        with patch.dict(sys.modules, modules), patch.object(runtime_approvals, "_warned_words", False):
+            with self.assertLogs(runtime_approvals.logger, "WARNING") as logs:
+                for text in ("okay", "approve session", "👎", "n"):
+                    self.assertTrue(runtime_approvals.approval_word(self.event(text), lambda: {"s-1"}), text)
+            self.assertEqual(len(logs.records), 1)
+            self.assertFalse(runtime_approvals.approval_word(self.event("tak"), lambda: {"s-1"}))
+
+    def test_a_hermes_without_its_approval_queue_reads_no_word_as_a_decision(self):
+        with patch.dict(sys.modules, {**hermes_words(), "tools.approval": None}):
+            self.assertFalse(runtime_approvals.approval_word(self.event("yes"), lambda: {"s-1"}))
+
+
 class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
     async def test_an_approval_command_from_anyone_never_reaches_hermes(self):
         config = types.ModuleType("gateway.config")
@@ -336,6 +388,20 @@ class AdapterApprovalCommands(unittest.IsolatedAsyncioTestCase):
             for fields in passed:
                 await adapter._on_message(protocol._message("message.in", conversation="c", person="p", **fields))
             self.assertEqual(adapter.handle_message.await_count, len(passed))
+            # A bare word is refused while an approval Hermes sent to this conversation
+            # blocks its session, and only then.
+            adapter._approval_seen("c", "s-1")
+            with patch.dict(sys.modules, hermes_words(blocked={"s-1"})):
+                message = protocol._message("message.in", conversation="c", person="p", text="Yes ")
+                await adapter._on_message(message)
+                self.assertEqual(adapter.handle_message.await_count, len(passed))
+                self.assertEqual(adapter.send.await_args.args[1], runtime_approvals.TYPED_WORD)
+                self.assertEqual(adapter._write.call_args.args[0]["of"], message["id"])
+                await adapter._on_message(protocol._message("message.in", conversation="d", person="p", text="yes"))
+                await adapter._on_message(protocol._message("message.in", conversation="c", person="p", text="yes please"))
+            with patch.dict(sys.modules, hermes_words(blocked=())):
+                await adapter._on_message(protocol._message("message.in", conversation="c", person="p", text="yes"))
+            self.assertEqual(adapter.handle_message.await_count, len(passed) + 3)
             error = protocol.error("not_allowed", "Only the host's person decides.", "ask-1")
             await adapter._on_line(protocol.encode_line(error))
             adapter._questions.refused.assert_awaited_once_with("ask-1", "not_allowed")
@@ -698,6 +764,94 @@ class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
 
     def updates(self):
         return [m for m in self.adapter._outbox.pending() if m["type"] == "question.update"]
+
+    def busy_runner(self):
+        """Hermes's routing of a message that arrives while its session's turn runs
+        (`gateway/run_busy.py`) and its `/approve` and `/deny` handlers, without a
+        gateway: Hermes's own tests drive these mixins on a bare runner too."""
+        from gateway.run_busy import GatewayBusySessionMixin
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        class Runner(GatewayBusySessionMixin, GatewaySlashCommandsMixin):
+            pass
+        runner = object.__new__(Runner)
+        # Conversation `c` is the session waiting on the approval.
+        runner._session_key_for_source = lambda source: self.scope if source.chat_id == "c" else f"other-{source.chat_id}"
+        runner._delivery_adapter_for = lambda source: None
+        return runner
+
+    def wire_message_path(self):
+        """The adapter's `_on_message`, with Hermes's busy routing as what it hands a
+        message to: a word that reaches Hermes while the approval blocks decides it."""
+        runner = self.busy_runner()
+        self.adapter._seen = collections.OrderedDict()
+        self.adapter._last_in = {}
+        self.adapter._suggested_replies = {}
+        self.adapter._interrupts = types.SimpleNamespace(admit=lambda event: None, complete=lambda event: None)
+        self.routed = []
+
+        async def handle_message(event):
+            self.routed.append(event.text)
+            await runner._route_plaintext_approval_while_busy(event, runner._session_key_for_source(event.source))
+        self.adapter.handle_message = handle_message
+
+    def message_in(self, text, conversation="c"):
+        return protocol._message("message.in", conversation=conversation, person="person@example.com", text=text)
+
+    async def test_hermes_reads_a_bare_word_as_a_decision_while_an_approval_blocks(self):
+        # Why the channel refuses such a word (ADR 0060): Hermes rewrites it to
+        # `/approve` and decides the waiting approval, with no signature.
+        card, result, worker = await self.start()
+        event_module = importlib.import_module("gateway.platforms.event")
+        source = self.adapter.build_source(chat_id="c", chat_name="c", chat_type="dm",
+                                           user_id="person@example.com", user_name="person@example.com")
+        event = event_module.MessageEvent(text="yes", message_type=event_module.MessageType.TEXT,
+                                          source=source, message_id="m")
+        self.assertTrue(event.allow_gateway_control)
+        self.assertTrue(await self.busy_runner()._route_plaintext_approval_while_busy(event, self.scope))
+        await asyncio.to_thread(worker.join, 2)
+        self.assertEqual(result["decision"]["choice"], "once")
+
+    async def test_a_bare_approval_word_never_decides_while_an_approval_blocks(self):
+        card, result, worker = await self.start()
+        self.wire_message_path()
+        for text in ("yes", " Always ", "\N{THUMBS UP SIGN}", "approve session", "no"):
+            message = self.message_in(text)
+            await self.adapter._on_message(message)
+            acked = self.adapter._write.call_args.args[0]
+            self.assertEqual((acked["type"], acked["of"]), ("ack", message["id"]))
+        self.assertEqual(self.routed, [])
+        self.assertTrue(worker.is_alive())
+        self.assertEqual([m["text"] for m in self.adapter._outbox.pending() if m["type"] == "message.out"][-1],
+                         runtime_approvals.TYPED_WORD)
+        # Anything else, and a word in another conversation, is the person's message.
+        await self.adapter._on_message(self.message_in("yes please"))
+        await self.adapter._on_message(self.message_in("yes", conversation="elsewhere"))
+        self.assertEqual(self.routed, ["yes please", "yes"])
+        self.assertTrue(worker.is_alive())
+        # The card's signed decision is the way, and once nothing blocks, a word passes.
+        await self.manager.answer(self.answer(card, "deny"))
+        await asyncio.to_thread(worker.join, 2)
+        self.assertEqual(result["decision"]["choice"], "deny")
+        await self.adapter._on_message(self.message_in("yes"))
+        self.assertEqual(self.routed, ["yes please", "yes", "yes"])
+
+    async def test_a_bare_word_is_refused_by_the_key_hermess_adapter_derives_too(self):
+        # A blocking approval whose prompt this channel never saw: the session key
+        # Hermes's adapter derives for the conversation still finds it.
+        event_module = importlib.import_module("gateway.platforms.event")
+        source = self.adapter.build_source(chat_id="c", chat_name="c", chat_type="dm",
+                                           user_id="person@example.com", user_name="person@example.com")
+        self.scope = self.adapter._event_session_key(event_module.MessageEvent(
+            text="", message_type=event_module.MessageType.TEXT, source=source, message_id="m"))
+        card, result, worker = await self.start()
+        self.adapter._approval_sessions = None
+        self.wire_message_path()
+        await self.adapter._on_message(self.message_in("ok"))
+        self.assertEqual(self.routed, [])
+        self.assertTrue(worker.is_alive())
+        await self.manager.answer(self.answer(card, "deny"))
+        await asyncio.to_thread(worker.join, 2)
 
     async def test_own_exact_decision_unblocks_native_wait_with_correlated_receipt(self):
         card, result, worker = await self.start()

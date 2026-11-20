@@ -1,6 +1,7 @@
 """Exact Hermes approval bindings; durable cards and receipts stay in questions.Manager."""
 
 import inspect
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -57,6 +58,65 @@ def approval_command(event):
     except ImportError:
         pass
     return name in APPROVAL_COMMANDS
+
+
+# While a runtime approval blocks a session, Hermes reads a bare word as a decision on
+# it: its busy path (`gateway/run_busy.py`, `_route_plaintext_approval_while_busy`)
+# rewrites "yes", "always", "👍", "no"... into `/approve [always|session]` or `/deny`
+# and runs it. The channel refuses those words as it refuses the commands, while an
+# approval blocks the message's session; any other time they pass on untouched.
+TYPED_WORD = ("A runtime approval is waiting, and it is decided with the enclos app's buttons, so this "
+              "reply was not passed to the agent.")
+# Hermes's English words (`approval.inputs.approve`, `deny`, `always`, `session`, and its
+# thumbs), refused when its own list cannot be read: an approval blocks, so fail closed.
+ENGLISH_WORDS = frozenset((
+    "approve", "yes", "ok", "okay", "confirm", "y", "deny", "no", "reject", "cancel", "n",
+    "always", "approve always", "always approve", "session", "approve session", "session approve",
+    "\N{THUMBS UP SIGN}", "\N{THUMBS DOWN SIGN}"))
+logger = logging.getLogger(__name__)
+_warned_words = False
+
+
+def approval_words():
+    """The words Hermes reads as a decision while an approval blocks, from its own list
+    (`GatewayBusySessionMixin._plaintext_approval_words`: English and the active
+    language's `approval.inputs.*`, and the thumbs); `ENGLISH_WORDS` when it cannot be
+    read, said once in the log."""
+    global _warned_words
+    try:
+        from gateway.run_busy import GatewayBusySessionMixin
+        words = GatewayBusySessionMixin._plaintext_approval_words(GatewayBusySessionMixin)
+        if isinstance(words, dict) and words:
+            return frozenset(words)
+    except Exception:
+        pass
+    if not _warned_words:
+        _warned_words = True
+        logger.warning("Hermes's bare-word approval replies could not be read: while a runtime approval "
+                       "waits, the English ones are refused")
+    return ENGLISH_WORDS
+
+
+def blocking(session_keys):
+    """Whether a runtime approval blocks one of `session_keys` (Hermes's
+    `tools.approval.has_blocking_approval`, the test its busy path makes). A Hermes
+    without it has no bare-word decisions either."""
+    try:
+        from tools.approval import has_blocking_approval
+    except ImportError:
+        return False
+    return any(has_blocking_approval(key) for key in session_keys if key)
+
+
+def approval_word(event, session_keys):
+    """Whether Hermes would read `event` as a decision on a runtime approval: a bare
+    approval word, normalised as Hermes does (`.strip().lower()`), while an approval
+    blocks its session. `session_keys` is a callable giving the keys that session may
+    have, asked only for such a word."""
+    text = (getattr(event, "text", None) or "").strip().lower()
+    if not text or text not in approval_words():
+        return False
+    return blocking(session_keys())
 
 
 MAX_PATTERNS = 16
