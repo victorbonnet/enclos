@@ -130,8 +130,10 @@ pub struct Cost {
     pub kind: CostKind,
 }
 
-/// The counts a usage report names: requests, then each kind of token.
-pub const COUNTS: [&str; 6] = [
+/// The counts a usage report names: native chats, requests, then each kind
+/// of token.
+pub const COUNTS: [&str; 7] = [
+    "chats",
     "calls",
     "input",
     "output",
@@ -719,6 +721,36 @@ mod tests {
         assert!(matches!(agents[2].usage, Fact::CannotTell(_)));
     }
 
+    /// The OpenClaw reader's report, as `usage.test.mjs` checks the reader
+    /// writes it, is taken whole (#348).
+    #[test]
+    fn the_openclaw_readers_report_is_taken() {
+        let agents = agents(
+            include_str!("../runtime/openclaw/usage-report.json"),
+            &["main", "scout", "writer"],
+        );
+        let Fact::Known(main) = &agents[0].usage else {
+            panic!("{agents:?}")
+        };
+        assert_eq!(main.models.len(), 2);
+        assert_eq!(main.models[0].model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(main.models[0].tokens.reasoning, None);
+        assert_eq!(main.models[0].cost.kind, CostKind::Estimated);
+        assert_eq!(main.models[1].cost.kind, CostKind::Unknown);
+        assert_eq!(main.top.len(), 2);
+        assert!(
+            matches!(&agents[1].usage, Fact::CannotTell(why) if why.contains("INVALID_REQUEST"))
+        );
+        let Fact::Known(writer) = &agents[2].usage else {
+            panic!("{agents:?}")
+        };
+        assert_eq!(writer.models[0].cost.kind, CostKind::Mixed);
+        assert_eq!(
+            writer.models[0].incomplete,
+            ["calls", "input", "output", "cache_read", "cache_write"]
+        );
+    }
+
     #[test]
     fn a_report_naming_an_agent_not_asked_for_is_refused() {
         let other = REPORT.replace("\"scout\"", "\"intruder\"");
@@ -785,6 +817,13 @@ mod tests {
         assert_eq!(m.incomplete, ["input", "calls"]);
         assert!(m.at_least("input") && !m.at_least("output"));
         assert_eq!(m.per_call(), None);
+        // A runtime that counts chats among those it lists says so.
+        let row = model_row(r#","incomplete":["chats"]"#);
+        let listed = super::tests::agents(&with_models(&[row]), &["default"]);
+        let Fact::Known(records) = &listed[0].usage else {
+            panic!("{listed:?}")
+        };
+        assert!(records.models[0].at_least("chats") && !records.models[0].at_least("calls"));
         let unknown = model_row(r#","incomplete":["joules"]"#);
         assert!(refused(&with_models(&[unknown])).contains("does not have"));
     }

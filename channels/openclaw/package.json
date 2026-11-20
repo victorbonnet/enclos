@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "files": ["index.js", "channel.js", "transport.js", "protocol.js", "features.js", "activity.js", "media.js", "routines.js", "model.js", "native-titles.js", "native-approvals.js", "native-turns.js", "openclaw.plugin.json"],
+  "files": ["index.js", "channel.js", "transport.js", "protocol.js", "features.js", "activity.js", "media.js", "routines.js", "model.js", "native-titles.js", "native-approvals.js", "native-turns.js", "usage.js", "host-messages.js", "openclaw.plugin.json"],
   "scripts": { "build": "node scripts/build.mjs", "test": "node --test tests/*.test.js" },
   "peerDependencies": { "openclaw": ">=2026.11.5" },
   "peerDependenciesMeta": { "openclaw": { "optional": true } },

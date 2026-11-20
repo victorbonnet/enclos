@@ -14,6 +14,7 @@ fn agent_text(text: &str) -> ConversationMessage {
         seq: 0,
         question: None,
         held_task: None,
+        task_event: None,
         attachments: Vec::new(),
     }
 }
@@ -3812,6 +3813,7 @@ fn agent_says(text: &str) -> ConversationMessage {
         suggested_replies: Vec::new(),
         question: None,
         held_task: None,
+        task_event: None,
         conversation: ConversationId::new("c-1").unwrap(),
         agent: "lab/main".to_owned(),
         from: "agent".to_owned(),
@@ -4184,6 +4186,9 @@ fn a_policy_or_list_too_large_for_one_message_is_answered_with_why() {
             sandbox: format!("sandbox-{n}"),
             runtime: Some("hermes".into()),
             state: "running".into(),
+            runtime_version: None,
+            runtime_release: None,
+            runtime_outdated: None,
         })
         .collect();
     assert!(matches!(
@@ -4841,6 +4846,30 @@ fn a_runtime_status_line_is_not_pushed() {
     };
     agent_stores(&hub, &home, "m-1", status).unwrap();
     assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn a_runtime_task_event_is_not_pushed_and_is_one_line() {
+    let (dir, home, _inbox, _media) = folders();
+    let (hub, queue) = queued_hub(dir.path(), &[]);
+    let event = enclos_protocol::task_event::TaskEvent {
+        task: "t_1".into(),
+        title: "Ship it".into(),
+        assignee: Some("lab/engineer".into()),
+        event: enclos_protocol::task_event::TaskEventKind::Done,
+        state: None,
+    };
+    let line = ConversationMessage {
+        kind: "task_event".to_owned(),
+        task_event: Some(event.clone()),
+        ..agent_says(&"✔ Kanban t_1 done — Ship it ".repeat(5_000))
+    };
+    agent_stores(&hub, &home, "m-1", line).unwrap();
+    assert!(queue.try_recv().is_err());
+    // Too long for one device message, it is cut, not repeated.
+    let kept = hub.store().unwrap().since("alice@example.com", 0).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].task_event.as_ref(), Some(&event));
 }
 
 #[test]

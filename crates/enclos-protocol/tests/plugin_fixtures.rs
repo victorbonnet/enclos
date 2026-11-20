@@ -102,6 +102,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
     ),
     (
+        "message_out_task_event",
+        include_str!("fixtures/plugin/from_plugin_message_out_task_event.json"),
+    ),
+    (
         "commands",
         include_str!("fixtures/plugin/from_plugin_commands.json"),
     ),
@@ -192,6 +196,25 @@ fn every_fixture_from_a_plugin_round_trips() {
 }
 
 #[test]
+fn a_task_event_that_does_not_parse_leaves_its_message_read() {
+    // Not in FROM_PLUGIN: the unusable task event is dropped, so it does not
+    // encode back to the fixture.
+    let fixture = include_str!("fixtures/plugin/from_plugin_message_out_task_event_malformed.json");
+    let message = decode_from_plugin(fixture.trim().as_bytes()).expect("still a message");
+    let FromPlugin::MessageOut {
+        kind,
+        task_event,
+        text,
+        ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!((kind, task_event), (OutKind::TaskEvent, None));
+    assert!(text.contains("Kanban t_a09759c7"));
+}
+
+#[test]
 fn a_message_reads_as_its_fields_say() {
     let message = decode_from_bridge(FROM_BRIDGE[1].1.as_bytes()).unwrap();
     let FromBridge::MessageIn {
@@ -200,6 +223,7 @@ fn a_message_reads_as_its_fields_say() {
         text,
         host,
         files,
+        signed,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
@@ -212,6 +236,7 @@ fn a_message_reads_as_its_fields_say() {
         host, None,
         "a message.in without host comes from an older bridge"
     );
+    assert_eq!(signed, None, "an unsigned message.in grants nothing");
 
     let message = decode_from_plugin(FROM_PLUGIN[2].1.as_bytes()).unwrap();
     let FromPlugin::MessageOut { kind, reply_to, .. } = message.body else {
@@ -250,6 +275,30 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(
         (kind, conversation.as_str()),
         (OutKind::Status, "home.lab.main")
+    );
+
+    // The runtime about one of its tasks: a task event, with the task.
+    let message = decode_from_plugin(fixture("message_out_task_event").as_bytes()).unwrap();
+    let FromPlugin::MessageOut {
+        kind, task_event, ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    let event = task_event.expect("a task event");
+    assert_eq!(
+        (
+            kind,
+            event.task.as_str(),
+            event.assignee.as_deref(),
+            event.event
+        ),
+        (
+            OutKind::TaskEvent,
+            "t_a09759c7",
+            Some("reviewer"),
+            enclos_protocol::task_event::TaskEventKind::Triage
+        )
     );
 
     // The bridge's hello names the agent's Home; an older one, without it, still reads.
@@ -326,6 +375,26 @@ fn a_message_reads_as_its_fields_say() {
         ),
         ("image/png", "unicorn.png", 1_962_976)
     );
+}
+
+#[test]
+fn a_message_in_carries_files_or_a_signature_each_optional() {
+    // With files (ADR 0076), as the bridge sends them, unsigned.
+    let with_files = br#"{"v":1,"id":"m-1","type":"message.in","conversation":"c-42","person":"alice@example.com","text":"look","host":true,"files":[{"name":"a.txt","mime":"text/plain","size":2}]}"#;
+    let message = decode_from_bridge(with_files).unwrap();
+    let FromBridge::MessageIn { files, signed, .. } = &message.body else {
+        panic!("not a message.in: {:?}", message.body);
+    };
+    assert_eq!((files.len(), signed), (1, &None));
+    assert_eq!(json(&encode_line(&message)), json(with_files));
+    // Signed (ADR 0077), with no files.
+    let signed_only = br#"{"v":1,"id":"m-2","type":"message.in","conversation":"c-42","person":"alice@example.com","text":"hi","host":true,"signed":{"at":1767225600,"sig":"AAAA"}}"#;
+    let message = decode_from_bridge(signed_only).unwrap();
+    let FromBridge::MessageIn { files, signed, .. } = &message.body else {
+        panic!("not a message.in: {:?}", message.body);
+    };
+    assert!(files.is_empty() && signed.is_some());
+    assert_eq!(json(&encode_line(&message)), json(signed_only));
 }
 
 #[test]

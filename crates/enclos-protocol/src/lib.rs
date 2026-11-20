@@ -12,6 +12,8 @@
 //!   plugin.
 //! - [`held_task`]: a runtime's held tasks, on both legs.
 //! - [`task`]: tasks and agent activity, as a runtime reports them.
+//! - [`task_event`]: a change of a task its runtime announces to a
+//!   conversation, shown as a task line.
 //! - [`visible`]: text checked for hidden characters before a person
 //!   reads it.
 
@@ -36,6 +38,7 @@ pub mod routine;
 pub mod suggested_replies;
 pub mod task;
 pub mod task_detail;
+pub mod task_event;
 pub mod usage;
 pub mod visible;
 

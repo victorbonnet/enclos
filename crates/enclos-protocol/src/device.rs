@@ -842,6 +842,27 @@ pub struct SandboxInfo {
     pub sandbox: String,
     pub runtime: Option<String>,
     pub state: String,
+    /// The version of its runtime installed, when the host knows it (ADR
+    /// 0074, proposed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    /// Its runtime's latest release, when the host has one kept, however
+    /// old: none when it has none, its lookups failed, or they are off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_release: Option<RuntimeRelease>,
+    /// Whether `runtime_release` is newer than `runtime_version`: none
+    /// when the host cannot tell, such as when it does not know either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_outdated: Option<bool>,
+}
+
+/// A runtime's latest release: the one its installer installs by default
+/// (ADR 0074, proposed). The same for every sandbox of that runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRelease {
+    pub version: String,
+    /// Whether this host's enclos was checked with it.
+    pub checked: bool,
 }
 
 /// A runtime this host can install.
@@ -866,7 +887,9 @@ pub struct ConversationMessage {
     /// `agent`, or the person who wrote it.
     pub from: String,
     pub text: String,
-    /// `message` for a person's, `reply` or `notify` for the agent's.
+    /// `message` for a person's; `reply` or `notify` for the agent's;
+    /// `status` for its runtime about itself; `question` for a question's
+    /// readable text; `task_event` for its runtime about one of its tasks.
     pub kind: String,
     /// Seconds since the Unix epoch.
     pub time: i64,
@@ -878,6 +901,11 @@ pub struct ConversationMessage {
     /// metadata arrives in a separate `held_task` frame before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_task: Option<HeldTaskId>,
+    /// With `kind: task_event`, the task and what happened to it: only to a
+    /// device whose `auth` names `task_events`; another gets the message as
+    /// `notify`, its text alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_event: Option<crate::task_event::TaskEvent>,
     /// Its files, which the device fetches with `attachment.get`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -952,6 +980,7 @@ mod tests {
             suggested_replies: Vec::new(),
             question: None,
             held_task: None,
+            task_event: None,
             conversation: ConversationId::new("c-1").unwrap(),
             agent: "lab/main".into(),
             from: "agent".into(),
@@ -1248,6 +1277,7 @@ mod tests {
             seq: 7,
             question: None,
             held_task: None,
+            task_event: None,
             attachments: vec![Attachment {
                 id: "a-1".into(),
                 mime: "image/png".into(),
@@ -1414,11 +1444,27 @@ mod tests {
                 capabilities: vec!["sandboxes".into()],
             },
             ToDevice::SandboxesList {
-                sandboxes: vec![SandboxInfo {
-                    sandbox: "lab".into(),
-                    runtime: None,
-                    state: "created".into(),
-                }],
+                sandboxes: vec![
+                    SandboxInfo {
+                        sandbox: "lab".into(),
+                        runtime: None,
+                        state: "created".into(),
+                        runtime_version: None,
+                        runtime_release: None,
+                        runtime_outdated: None,
+                    },
+                    SandboxInfo {
+                        sandbox: "home".into(),
+                        runtime: Some("hermes".into()),
+                        state: "running".into(),
+                        runtime_version: Some("0.23.1".into()),
+                        runtime_release: Some(RuntimeRelease {
+                            version: "0.23.2".into(),
+                            checked: true,
+                        }),
+                        runtime_outdated: Some(true),
+                    },
+                ],
             },
             ToDevice::RuntimesList {
                 runtimes: vec![RuntimeInfo {
@@ -1462,6 +1508,20 @@ mod tests {
             decode_from_device(br#"{"v":1,"id":"m","type":"sandbox.create","sandbox":"lab"}"#)
                 .is_err(),
             "creation must explicitly select a policy template"
+        );
+        // An older bridge's list reads, with no versions; what the host does
+        // not know is left out, not sent as null (ADR 0074, proposed).
+        let older = br#"{"v":1,"id":"m","type":"sandboxes.list","sandboxes":[{"sandbox":"lab","runtime":"hermes","state":"running"}]}"#;
+        let ToDevice::SandboxesList { sandboxes } = decode_to_device(older).unwrap().body else {
+            panic!("a sandboxes.list")
+        };
+        assert_eq!(sandboxes[0].runtime_version, None);
+        assert_eq!(sandboxes[0].runtime_release, None);
+        assert_eq!(sandboxes[0].runtime_outdated, None);
+        let sent = serde_json::to_value(&sandboxes[0]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"sandbox": "lab", "runtime": "hermes", "state": "running"})
         );
     }
 

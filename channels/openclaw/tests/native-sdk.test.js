@@ -23,6 +23,18 @@ if (installed) {
   process.env.OPENCLAW_CONFIG_PATH = path.join(state, 'openclaw.json');
   after(() => rmSync(state, { recursive: true, force: true }));
 }
+test('the installed package exports what enclos usage\'s reader loads from it (#348)', { skip: !installed }, async () => {
+  // As `src/runtime/openclaw/usage.mjs` resolves them: through the package's
+  // own exports, from its package.json.
+  const { createRequire } = await import('node:module');
+  const require = createRequire(path.join(installed, 'package.json'));
+  for (const [subpath, name] of [['config-mutation', 'readConfigFileSnapshotForWrite'],
+    ['secret-input-runtime', 'resolveConfiguredSecretInputString'], ['gateway-runtime', 'callGatewayFromCli']]) {
+    const sdk = await import(pathToFileURL(require.resolve(`openclaw/plugin-sdk/${subpath}`)));
+    assert.equal(typeof sdk[name], 'function', `${subpath} ${name}`);
+  }
+});
+
 test('the installed public SDK registers the package and builds isolated session keys', { skip: !installed }, async () => {
   assert.equal(JSON.parse(readFileSync(path.join(installed, 'package.json'))).version, TESTED_OPENCLAW);
   const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/channel-core.js')));

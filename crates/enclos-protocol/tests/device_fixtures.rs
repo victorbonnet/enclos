@@ -46,6 +46,10 @@ const TO_DEVICE: &[(&str, &str)] = &[
         include_str!("fixtures/device/to_device_message_suggested_replies.json"),
     ),
     (
+        "to_device_message_task_event",
+        include_str!("fixtures/device/to_device_message_task_event.json"),
+    ),
+    (
         "model_options",
         include_str!("fixtures/device/to_device_model_options.json"),
     ),
@@ -145,4 +149,42 @@ fn the_fixtures_read_as_their_fields_say() {
         panic!("a resume");
     };
     assert_eq!(revision, held_task.revision);
+}
+
+#[test]
+fn a_task_event_reads_as_its_task_and_an_older_message_has_none() {
+    let fixture = |name: &str| {
+        TO_DEVICE
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no fixture {name}"))
+            .1
+    };
+    let ToDevice::Message(line) =
+        decode_to_device(fixture("to_device_message_task_event").trim().as_bytes())
+            .unwrap()
+            .body
+    else {
+        panic!("a message");
+    };
+    let event = line.task_event.expect("a task event");
+    assert_eq!(
+        (
+            line.kind.as_str(),
+            event.task.as_str(),
+            event.assignee.as_deref()
+        ),
+        ("task_event", "t_a09759c7", Some("lab/reviewer"))
+    );
+    let ToDevice::Message(older) = decode_to_device(
+        fixture("to_device_message_suggested_replies")
+            .trim()
+            .as_bytes(),
+    )
+    .unwrap()
+    .body
+    else {
+        panic!("a message");
+    };
+    assert_eq!(older.task_event, None);
 }

@@ -351,17 +351,32 @@ def commands(listed: list[tuple[str, str, str]]) -> dict[str, Any]:
 
 def message_out(conversation: str, text: str, reply_to: str | None = None,
                 attachments: list[dict[str, Any]] | None = None,
-                kind: str | None = None) -> dict[str, Any]:
+                kind: str | None = None, task_event: dict[str, Any] | None = None) -> dict[str, Any]:
     """A reply when it answers a message, `notify` otherwise (a cron job, background work),
     or the `kind` given (`status`: the runtime about itself); with the files it carries,
-    each already in the channel's media folder (`attachment`)."""
+    each already in the channel's media folder (`attachment`). With `task_event` (the
+    runtime about one of its tasks, `task_events.py`), its kind is `task_event`."""
     fields: dict[str, Any] = {"conversation": conversation, "text": text,
-                              "kind": kind or ("reply" if reply_to else "notify")}
+                              "kind": "task_event" if task_event else kind or ("reply" if reply_to else "notify")}
     if reply_to:
         fields["reply_to"] = reply_to
     if attachments:
         fields["attachments"] = attachments
+    if task_event:
+        fields["task_event"] = task_event
     return _message("message.out", **fields)
+
+
+def for_bridge(message: dict[str, Any], task_events: bool) -> dict[str, Any]:
+    """`message` as the connected bridge takes it: a task event, to a bridge
+    whose hello does not name `task_events`, is its text as a `notify`, under
+    the same id, as before task events (an older bridge would refuse its kind
+    at every hello). Anything else as it is."""
+    if task_events or message.get("type") != "message.out" or message.get("kind") != "task_event":
+        return message
+    older = {key: value for key, value in message.items() if key != "task_event"}
+    older["kind"] = "notify"
+    return older
 
 
 def attachment(file: str, mime: str, name: str, size: int) -> dict[str, Any]:

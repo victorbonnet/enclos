@@ -1,0 +1,1 @@
+{"v":1,"id":"5d1b7e8e-6f1a-4c55-9a43-1d2f7d9e0a71","type":"message.out","conversation":"home.lab.main","text":"🛑 [enclos-org] @reviewer Kanban t_a09759c7 routed to TRIAGE — needs a human decision (blocked 3x for the same cause): which store?","kind":"task_event","task_event":{"task":"t_a09759c7","title":"S2a","assignee":"reviewer","event":"triage","state":"queued"}}

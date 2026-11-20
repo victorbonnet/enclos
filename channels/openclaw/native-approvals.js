@@ -18,7 +18,7 @@ const terminal = state => ['answered', 'resolved', 'expired', 'cancelled'].inclu
 const settledState = status => ['expired', 'cancelled'].includes(status) ? status : 'resolved';
 
 // ADR 0060. Match enclos_protocol::decision::Decision::statement and the Hermes verifier.
-function decisionKey(value) {
+export function decisionKey(value) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{87}$/u.test(value)) return undefined;
   const point = Buffer.from(value, 'base64url');
   if (point.length !== 65 || point[0] !== 4 || point.toString('base64url') !== value) return undefined;
@@ -29,23 +29,33 @@ function decisionKey(value) {
   } catch { return undefined; }
 }
 
-function checkDecision(key, agent, record, control, now) {
-  if (control.conversation !== record.conversation) return 'the conversation changed';
-  const { at, sig } = control.signed ?? {};
-  if (!Number.isSafeInteger(at) || typeof sig !== 'string') return 'the decision is unsigned or unreadable';
+// Why `signed` ({at, sig}) is not the bridge's signature of the statement
+// made of `fields` and its time, made within the last 60 seconds of `now`
+// (seconds) and at most 5 ahead; nothing when it is. Each field is its UTF-8
+// bytes after their length, 4 bytes big-endian, the time last.
+export function checkSigned(key, fields, signed, now) {
+  const { at, sig } = signed ?? {};
+  if (!Number.isSafeInteger(at) || typeof sig !== 'string') return 'unsigned or unreadable';
   if (at < now - 60 || at > now + 5) return 'the signature is not fresh';
   if (!/^[A-Za-z0-9_-]{86}$/u.test(sig)) return 'the signature cannot be read';
   const bytes = Buffer.from(sig, 'base64url');
   if (bytes.length !== 64 || bytes.toString('base64url') !== sig) return 'the signature cannot be read';
-  const { command, reason, patterns = [] } = record.definition.approval;
-  const fields = ['enclos/runtime-approval/1', agent, record.conversation, record.id, control.id,
-    control.answer.action, command, reason, String(patterns.length), ...patterns, String(at)];
-  const statement = Buffer.concat(fields.flatMap(field => {
+  const statement = Buffer.concat([...fields, String(at)].flatMap(field => {
     const data = Buffer.from(field, 'utf8');
     const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
     return [length, data];
   }));
-  if (!verify('sha256', statement, { key, dsaEncoding: 'ieee-p1363' }, bytes)) return 'the signature does not match this decision and key';
+  if (!verify('sha256', statement, { key, dsaEncoding: 'ieee-p1363' }, bytes)) return 'the signature does not match this statement and key';
+}
+
+function checkDecision(key, agent, record, control, now) {
+  if (control.conversation !== record.conversation) return 'the conversation changed';
+  const { command, reason, patterns = [] } = record.definition.approval;
+  const failure = checkSigned(key, ['enclos/runtime-approval/1', agent, record.conversation, record.id, control.id,
+    control.answer.action, command, reason, String(patterns.length), ...patterns], control.signed, now);
+  if (failure === 'unsigned or unreadable') return 'the decision is unsigned or unreadable';
+  if (failure === 'the signature does not match this statement and key') return 'the signature does not match this decision and key';
+  return failure;
 }
 
 

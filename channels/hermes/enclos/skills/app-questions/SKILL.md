@@ -7,7 +7,7 @@ description: Use when asking a person for a choice or missing information, or se
 
 Use this skill when a decision or missing detail needs the person's answer in the enclos app. Choose routine, low-stakes details yourself.
 
-Explain what is blocked, why, and what the person can decide in one or two plain sentences. Offer two or three short actionable choices, recommendation first. Keep internal run IDs, paths, logs and handoff rules in task reports. Example: “Inbox filters reset when you return from an agent. Allow a fix and independent testing?” Choices: “Fix Inbox filters”, “Keep paused”.
+Explain in two or three plain sentences what was tried, why it stopped, and what the person can decide; the person should be able to decide from that alone. Offer two or three short actionable choices, recommendation first, each saying what it costs (time, attempts); when asking for more time or attempts, offer more than one amount. Keep internal run IDs, paths, logs and handoff rules in task reports. Example: “Inbox filters reset when you return from an agent. Allow a fix and independent testing?” Choices: “Fix Inbox filters”, “Keep paused”.
 
 For a digest that should end your turn rather than wait, call `suggest_replies` with up to four literal replies, then send the short explanation as your next message in this conversation. Each button sends its exact text as the person's ordinary message on their next turn. The buttons remain until that person sends another message. Use distinct replies that name the decision, such as “Fix Inbox filters”, so an answer cannot be confused with another blocked task.
 

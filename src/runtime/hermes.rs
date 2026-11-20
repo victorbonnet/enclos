@@ -71,6 +71,7 @@ const APP_PLUGIN_HELD_TASKS: &str = include_str!("../../channels/hermes/enclos/h
 const APP_PLUGIN_ASKS: &str = include_str!("../../channels/hermes/enclos/asks.py");
 const APP_PLUGIN_VISIBLE: &str = include_str!("../../channels/hermes/enclos/visible.py");
 const APP_PLUGIN_TASKS: &str = include_str!("../../channels/hermes/enclos/tasks.py");
+const APP_PLUGIN_TASK_EVENTS: &str = include_str!("../../channels/hermes/enclos/task_events.py");
 const APP_PLUGIN_SUGGESTED_REPLIES: &str =
     include_str!("../../channels/hermes/enclos/suggested_replies.py");
 const APP_PLUGIN_INCOMING: &str = include_str!("../../channels/hermes/enclos/incoming.py");
@@ -365,6 +366,7 @@ impl RuntimeAdapter for Hermes {
                 file("asks.py", APP_PLUGIN_ASKS)?,
                 file("visible.py", APP_PLUGIN_VISIBLE)?,
                 file("tasks.py", APP_PLUGIN_TASKS)?,
+                file("task_events.py", APP_PLUGIN_TASK_EVENTS)?,
                 file("suggested_replies.py", APP_PLUGIN_SUGGESTED_REPLIES)?,
                 file("incoming.py", APP_PLUGIN_INCOMING)?,
                 file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
@@ -1393,6 +1395,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/asks.py",
                 ".hermes/profiles/main/plugins/enclos/visible.py",
                 ".hermes/profiles/main/plugins/enclos/tasks.py",
+                ".hermes/profiles/main/plugins/enclos/task_events.py",
                 ".hermes/profiles/main/plugins/enclos/suggested_replies.py",
                 ".hermes/profiles/main/plugins/enclos/incoming.py",
                 ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",

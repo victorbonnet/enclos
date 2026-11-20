@@ -130,6 +130,13 @@ pub enum FromBridge {
             skip_serializing_if = "Vec::is_empty"
         )]
         files: Vec<crate::incoming::IncomingFile>,
+        /// The bridge's signature of this message ([`crate::decision`],
+        /// `HostMessage`): only on a message the host's person sent from a
+        /// paired device in a direct conversation, with no attachments, so
+        /// never alongside `files`. A channel may give that turn its
+        /// runtime's owner authority, after checking it (ADR 0077, proposed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed: Option<crate::decision::SignedDecision>,
     },
     /// The next bytes of a file of a `message.in` with files.
     #[serde(rename = "message.part")]
@@ -246,6 +253,16 @@ pub enum FromPlugin {
         /// each put in the channel's `media` folder first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<OutAttachment>,
+        /// With `kind: task_event`, the task and what happened to it, read
+        /// from the runtime's state (ADR 0071, proposed). A bridge keeps the
+        /// text alone, as a `notify`, when it is missing or unusable; one
+        /// that does not parse reads as missing, so the message is not lost.
+        #[serde(
+            default,
+            deserialize_with = "crate::task_event::lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
+        task_event: Option<crate::task_event::TaskEvent>,
     },
     /// The agent is, or stops, working on an answer.
     #[serde(rename = "typing")]
@@ -389,6 +406,11 @@ pub enum OutKind {
     /// Not the agent speaking but its runtime, about itself: Hermes's
     /// gateway going online or shutting down. Shown as a quiet line.
     Status,
+    /// Not the agent speaking but its runtime, about one of its tasks
+    /// (Hermes's kanban ping), with `task_event`: shown as a task line.
+    /// Sent only to a bridge whose `hello` names
+    /// [`Capability::TaskEvents`]; an older one gets it as `notify`.
+    TaskEvent,
 }
 
 /// What a runtime can do; an unknown one, from a newer plugin, reads as
@@ -443,6 +465,11 @@ pub enum Capability {
     /// `files`, `message.part`), writes them inside its sandbox and gives
     /// them to the runtime with the message (ADR 0076, proposed).
     IncomingFiles,
+    /// It sends its runtime's task events as `message.out` of `kind:
+    /// task_event`; a bridge that takes them names it in its `hello`, a
+    /// device that draws them in its `auth`, and each gets them as `notify`
+    /// otherwise (ADR 0071, proposed).
+    TaskEvents,
     #[serde(other)]
     Unknown,
 }

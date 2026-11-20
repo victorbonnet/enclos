@@ -11,6 +11,8 @@ import { inboundMedia, mediaFolder, withStagedMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
 import { createNativeTurns } from './native-turns.js';
 import { createActivity } from './activity.js';
+import { registerUsage } from './usage.js';
+import { hostSender } from './host-messages.js';
 
 export const TESTED_OPENCLAW = '2026.11.5';
 const MINIMUM_OPENCLAW = '2026.11.5';
@@ -61,7 +63,7 @@ export function createChannel(sdk = {}) {
   const sessionRoutes = new Map();
   const routines = new RoutineInventory();
   const models = new ModelSettings({ catalogue: sdk.models, runtime: () => runtime });
-  let hooks = { tools: false, policy: false };
+  let hooks = { tools: false, policy: false }, usage = false;
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
@@ -87,8 +89,30 @@ export function createChannel(sdk = {}) {
     return turn;
   }
   const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
+  // A call's app conversation: its turn's, else, for a native chat this
+  // process has not dispatched a message to yet (a routine delivering into
+  // it, or since a restart), the saved route whose native session key it is,
+  // or Home's, worked out without saving a route: observing a call changes
+  // nothing. Not kept in `sessionRoutes`, which also opens tools and policy
+  // context.
+  function appTurn(ctx) {
+    const turn = findTurn(ctx);
+    if (turn || !ctx?.sessionKey || [ctx.messageChannel, ctx.messageProvider, ctx.channel].some(c => c && c !== 'enclos')) return turn;
+    for (const active of running.values()) {
+      if ((ctx.agentId && ctx.agentId !== active.account.agentId) || (ctx.accountId && ctx.accountId !== active.account.accountId)) continue;
+      const { transport } = active;
+      for (const conversation of new Set([...Object.keys(transport.state.routes), transport.home])) {
+        let key;
+        try { key = active.peekSessionKey(conversation); } catch { continue; }
+        if (key === ctx.sessionKey) return { active, conversation };
+      }
+    }
+    return undefined;
+  }
+  const appSession = ctx => [ctx?.messageChannel, ctx?.messageProvider, ctx?.channel].includes('enclos');
   function registerFull(api) {
     hooks = registerFeatures(api, { findTurn, assertTurn, running });
+    usage = registerUsage(api, { appTurn, appSession, assertTurn, running });
     routines.register(api);
   }
 
@@ -111,16 +135,35 @@ export function createChannel(sdk = {}) {
     let transport, titles, approvals, activity;
     const turns = createNativeTurns(() => assertCurrent(ctx.cfg, account, transport));
     const controllers = () => [turns, titles, approvals, activity].filter(Boolean);
+    const keyForPeer = peer => channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
+      peer: { kind: 'direct', id: peer }, dmScope: 'per-account-channel-peer' });
     const sessionKeyFor = (conversation, person) => {
       const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
       if (!saved) return undefined;
       if (person != null && saved.person !== person) throw new ProtocolError('not_allowed', 'native conversation belongs to another person');
-      return channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
-        peer: { kind: 'direct', id: saved.peer }, dmScope: 'per-account-channel-peer' });
+      return keyForPeer(saved.peer);
+    };
+    // The native session key a conversation has, or Home would have, saving
+    // nothing: for usage, which only observes a call.
+    const peekSessionKey = conversation => {
+      const peer = transport.state.routes[conversation]?.peer ??
+        (conversation != null && conversation === transport.home ? transport.homePeer(conversation) : undefined);
+      return peer === undefined ? undefined : keyForPeer(peer);
+    };
+    // ADR 0077: checked on receipt, before the message binds a route or
+    // leaves a receipt; the bridge signed it as it sent it.
+    const senders = new WeakMap();
+    const senderOf = incoming => {
+      const sandbox = process.env.ENCLOS_SANDBOX;
+      const sender = hostSender(account.bridgeKey, sandbox && `${sandbox}/${account.agentId}`, incoming);
+      if (sender.failure) (ctx.log?.warn ?? console.warn)(`enclos: a signed message goes on as its person's, without OpenClaw's owner authority: ${sender.failure}`);
+      if (sender.refused) throw new ProtocolError('not_allowed', sender.refused);
+      return sender;
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      admit: incoming => { senders.set(incoming, senderOf(incoming)); },
+      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...(models.available() ? ['model'] : []), ...(usage ? ['usage', 'agent_usage'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
@@ -165,6 +208,7 @@ export function createChannel(sdk = {}) {
         const cfg = currentConfig(ctx.cfg);
         const assertAuthority = () => { assertCurrent(cfg, account, transport); execution.signal.throwIfAborted(); };
         assertAuthority();
+        const sender = senders.get(incoming) ?? senderOf(incoming);
         const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: incoming.conversation }, dmScope: 'per-account-channel-peer' });
@@ -177,7 +221,7 @@ export function createChannel(sdk = {}) {
         const ingress = await channel.inbound.ingress.resolve({
           channelId: 'enclos', accountId: account.accountId,
           identity: { primary: { key: 'enclos-person', normalize: value => value, authentication: 'verified', sensitivity: 'pii' } },
-          subject: { stableId: incoming.person },
+          subject: { stableId: sender.id },
           conversation: { kind: 'direct', id: incoming.conversation },
           contextBinding: { agentId: account.agentId, sessionKey, messageId: incoming.id,
             nativeChannelId: incoming.conversation, inboundEventKind: 'user_request' },
@@ -185,15 +229,17 @@ export function createChannel(sdk = {}) {
           // The bridge authenticated this person before presenting the agent's
           // token. OpenClaw does not add another channel pairing database.
           policy: { dmPolicy: 'allowlist', groupPolicy: 'disabled' },
-          allowFrom: [incoming.person], useDefaultPairingStore: false,
+          allowFrom: [sender.id], useDefaultPairingStore: false,
           command: { allowTextCommands: true, hasControlCommand: isCommand },
         });
         assertAuthority();
         if (ingress.ingress?.admission !== 'dispatch' || !ingress.senderAccess?.allowed || !ingress.routeAccess?.allowed || ingress.activationAccess?.shouldSkip || ingress.commandAccess?.shouldBlockControlCommand) throw new Error('native channel ingress refused this message');
         const ctxPayload = channel.inbound.buildContext({
           channel: 'enclos', accountId: account.accountId,
-          messageId: incoming.id, timestamp: Date.now(), from: incoming.person,
-          sender: { id: incoming.person, name: incoming.person },
+          // OpenClaw's owner authority follows the sender (ADR 0077); the
+          // name stays the person's.
+          messageId: incoming.id, timestamp: Date.now(), from: sender.id,
+          sender: { id: sender.id, name: incoming.person },
           // Bridge groups deliberately remain ordinary direct contexts per
           // member; the bridge owns their turns, not OpenClaw broadcast groups.
           conversation: { kind: 'direct', id: incoming.conversation, nativeChannelId: incoming.conversation },
@@ -247,7 +293,7 @@ export function createChannel(sdk = {}) {
       },
     });
     activity = createActivity(transport, () => assertCurrent(ctx.cfg, account, transport));
-    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });
+    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor, peekSessionKey });
     const stop = async () => {
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
       for (const [key, turn] of sessionRoutes) if (turn.active?.transport === transport) sessionRoutes.delete(key);

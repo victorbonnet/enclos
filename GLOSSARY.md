@@ -68,7 +68,7 @@ A policy snapshot saved for a sandbox because the user declined the restart it n
 _Avoid_: draft, staged policy
 
 **Template**:
-A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant`, `coding` or `autonomous`.
+A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant` or `autonomous`.
 _Avoid_: preset, base policy
 
 **Runtime**:
@@ -225,6 +225,14 @@ _Avoid_: task page, ticket
 **Task history**:
 What happened to a task, oldest first: when it was asked for, each attempt at it and how that ended, when it blocked and went on, and when it was done.
 _Avoid_: activity, timeline, log (activity is what an agent is doing now)
+
+**Task event**:
+A change of a task that its runtime announces to a conversation, such as a task done, blocked or sent back for changes. The app shows it as a task line, not as the agent talking.
+_Avoid_: ping, task notification, kanban message (except when naming a runtime's own feature, such as Hermes's kanban ping)
+
+**Task line**:
+How the app shows a task event: one quiet line naming the task, its assignee and what happened, from which its task can be opened.
+_Avoid_: task message, task card (a task card is the task itself, where it was asked for)
 
 **Agent activity**:
 What an agent is doing right now: answering in a conversation, running a routine or working on a task, several at once, or nothing (idle).

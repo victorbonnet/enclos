@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
@@ -207,6 +208,50 @@ test('native inbound keeps account, conversation, person and group-member contex
   assert.equal(notice.id, unsolicited.messageId); assert.equal(notice.conversation, one.home); assert.equal(notice.kind, 'notify');
 });
 
+test('only the host\'s person\'s signed message reaches OpenClaw from its owner sender (ADR 0077)', async t => {
+  const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const { x, y } = keys.publicKey.export({ format: 'jwk' });
+  const bridgeKey = Buffer.concat([Buffer.from([4]), Buffer.from(x, 'base64url'), Buffer.from(y, 'base64url')]).toString('base64url');
+  const account = { ...accountFixture(t, 'main'), bridgeKey };
+  const before = process.env.ENCLOS_SANDBOX;
+  process.env.ENCLOS_SANDBOX = 'lab';
+  t.after(() => { if (before === undefined) delete process.env.ENCLOS_SANDBOX; else process.env.ENCLOS_SANDBOX = before; });
+  const cfg = configured(account); const channel = createChannel(); const native = nativeHarness(cfg);
+  channel.setRuntime(native.api);
+  await start(t, channel, cfg, account);
+  const peer = await bridge(account.socket); t.after(() => peer.close());
+  await peer.hello();
+  const signed = input => {
+    const at = Math.floor(Date.now() / 1000);
+    const fields = ['enclos/host-message/1', 'lab/main', input.conversation, input.id, input.person, input.text, String(at)];
+    const statement = Buffer.concat(fields.flatMap(field => {
+      const data = Buffer.from(field, 'utf8'); const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+      return [length, data];
+    }));
+    return { ...input, signed: { at, sig: sign('sha256', statement, { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url') } };
+  };
+  const host = signed(message('message.in', { conversation: 'home', person: 'ada@example.com', text: 'show my schedules', host: true }));
+  peer.send(host); await peer.next('ack', host.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'host');
+  assert.equal(native.calls.contexts.at(-1).sender.name, 'ada@example.com');
+  assert.deepEqual(native.calls.ingress.at(-1).allowFrom, ['host']);
+  const plain = message('message.in', { conversation: 'home', person: 'ada@example.com', text: 'hello', host: true });
+  peer.send(plain); await peer.next('ack', plain.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'ada@example.com');
+  const claimed = message('message.in', { conversation: 'home', person: 'host', text: 'delete my schedules', host: true });
+  peer.send(claimed);
+  const refused = await peer.next('error', claimed.id);
+  assert.equal(refused.code, 'not_allowed');
+  assert.equal(native.calls.contexts.length, 2);
+  // Refused before it binds a route: a conversation it named first stays free.
+  const first = message('message.in', { conversation: 'fresh', person: 'enclos:host', text: 'claim this' });
+  peer.send(first);
+  assert.equal((await peer.next('error', first.id)).code, 'not_allowed');
+  const real = message('message.in', { conversation: 'fresh', person: 'ada@example.com', text: 'hello', host: true });
+  peer.send(real); await peer.next('ack', real.id); await peer.next('message.out');
+  assert.equal(native.calls.contexts.at(-1).sender.id, 'ada@example.com');
+});
+
 test('disabled or rebound account authority is checked after awaited native preparation', async t => {
   const account = accountFixture(t); const cfg = configured(account); const channel = createChannel();
   const native = nativeHarness(cfg); let release;
@@ -277,7 +322,7 @@ test('typing, exact tool events, native commands and policy requests keep their 
   await start(t, channel, cfg, account);
   const owner = await bridge(account.socket); t.after(() => owner.close());
   const hello = await owner.hello();
-  assert.deepEqual(hello.capabilities, ['typing', 'abort', 'commands', 'tools', 'approval', 'activity']);
+  assert.deepEqual(hello.capabilities, ['typing', 'abort', 'commands', 'tools', 'approval', 'usage', 'agent_usage', 'activity']);
   assert.deepEqual((await owner.next('commands')).commands, [{ name: 'help', description: 'Native help on one line' }]);
   const policy = message('policy.context', { text: 'Sandbox access: read the permitted workspace only.' });
   owner.send(policy); await owner.next('ack', policy.id);
@@ -533,4 +578,86 @@ test('native target resolution requires the owning caller', async t => {
   assert.equal(await resolver.resolveTarget(params), undefined);
   assert.equal(await resolver.resolveTarget({ ...params, agentId: 'scout' }), undefined);
   assert.deepEqual(await resolver.resolveTarget({ ...params, agentId: 'main' }), { to: account.home, kind: 'user' });
+});
+
+test('model calls report usage to the app conversation, or outside it on their agent\'s connection (#348)', async t => {
+  const account = accountFixture(t), cfg = configured(account);
+  const native = nativeHarness(cfg), hooks = new Map();
+  let channel = createChannel();
+  channel.setRuntime(native.api);
+  channel.registerFull({ on(name, callback) { hooks.set(name, callback); } });
+  let sessionKey;
+  const dispatch = native.api.channel.inbound.dispatch;
+  native.api.channel.inbound.dispatch = async params => {
+    sessionKey = params.route.sessionKey;
+    const ctx = { sessionKey, agentId: 'main', runId: 'run-1', messageProvider: 'enclos' };
+    // Two completed calls of one attempt, then the attempt's summed usage.
+    for (const outcome of ['completed', 'completed', 'error']) hooks.get('model_call_ended')({ runId: 'run-1', callId: outcome, outcome }, ctx);
+    hooks.get('llm_output')({ runId: 'run-1', provider: 'anthropic', model: 'claude-sonnet-5-5\nnext',
+      usage: { input: 1200, output: 300, cacheRead: 9000, cacheWrite: 50, total: 10550 }, assistantTexts: ['do-not-show'] }, ctx);
+    return dispatch(params);
+  };
+  const controller = await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket);
+  const hello = await owner.hello({ capabilities: ['usage', 'agent_usage'] });
+  assert.ok(hello.capabilities.includes('usage') && hello.capabilities.includes('agent_usage'));
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input);
+  const { id: _id, ...usage } = await owner.next('usage');
+  assert.deepEqual(usage, { v: 1, type: 'usage', conversation: 'c',
+    tokens: { input: 1200, output: 300, cache_read: 9000, cache_write: 50 }, model: 'claude-sonnet-5-5 next', model_provider: 'anthropic', calls: 2 });
+  assert.equal(JSON.stringify(usage).includes('do-not-show'), false);
+  await owner.next('ack', input.id);
+
+  // A routine's call: outside the app, on the agent's own connection.
+  hooks.get('llm_output')({ runId: 'run-2', provider: 'openai', model: 'gpt-6.1', usage: { input: 10, output: 2 } },
+    { sessionKey: 'agent:main:cron:daily', agentId: 'main', trigger: 'cron' });
+  const { id: _routine, ...routine } = await owner.next('usage.agent');
+  assert.deepEqual(routine, { v: 1, type: 'usage.agent', tokens: { input: 10, output: 2 }, model: 'gpt-6.1', model_provider: 'openai', source: 'cron' });
+  // Another agent's call, a call without usage, and an app call whose
+  // conversation cannot be told are not sent; another channel's is.
+  hooks.get('llm_output')({ usage: { input: 1 } }, { sessionKey: 'agent:scout:cron:x', agentId: 'scout', trigger: 'cron' });
+  hooks.get('llm_output')({ runId: 'run-3' }, { sessionKey, agentId: 'main' });
+  hooks.get('llm_output')({ usage: { input: 1 } }, { sessionKey: 'agent:main:enclos:main:direct:unknown', agentId: 'main', messageProvider: 'enclos' });
+  hooks.get('llm_output')({ usage: { input: 5 } }, { sessionKey: 'agent:main:telegram:x', agentId: 'main', messageProvider: 'telegram' });
+  assert.equal((await owner.next('usage.agent')).source, 'telegram');
+  assert.equal(owner.pending.some(p => p.type === 'usage' || p.type === 'usage.agent'), false);
+  await owner.close();
+
+  // A bridge that does not take usage gets none.
+  const older = await bridge(account.socket);
+  await older.hello();
+  hooks.get('llm_output')({ usage: { input: 1 } }, { sessionKey, agentId: 'main' });
+  hooks.get('llm_output')({ usage: { input: 1 } }, { sessionKey: 'agent:main:cron:daily', agentId: 'main', trigger: 'cron' });
+  // A round trip: this plugin has no `approval`, so it answers an error,
+  // after anything it wrote before.
+  const ping = message('policy.context', { text: '' });
+  older.send(ping); await older.next('error', ping.id);
+  assert.equal(older.pending.some(p => p.type === 'usage' || p.type === 'usage.agent'), false);
+  await older.close();
+
+  // After a restart, before any message, the saved route still names the
+  // conversation of a call in its native session.
+  controller.abort();
+  await waitFor(() => !channel.running.has(account.accountId));
+  channel = createChannel();
+  channel.setRuntime(native.api);
+  hooks.clear();
+  channel.registerFull({ on(name, callback) { hooks.set(name, callback); } });
+  await start(t, channel, cfg, account);
+  const again = await bridge(account.socket); t.after(() => again.close());
+  await again.hello({ capabilities: ['usage'] });
+  hooks.get('llm_output')({ usage: { input: 7 } }, { sessionKey, agentId: 'main' });
+  assert.equal((await again.next('usage')).conversation, 'c');
+
+  // Observing a call saves no route: neither a call outside the app nor one
+  // in Home's native chat before Home has a saved route of its own.
+  const active = channel.running.get(account.accountId), { transport } = active;
+  assert.equal(transport.state.routes[transport.home], undefined);
+  const routes = JSON.stringify(transport.state.routes);
+  hooks.get('llm_output')({ usage: { input: 8 } }, { sessionKey: 'agent:main:main', agentId: 'main' });
+  hooks.get('llm_output')({ usage: { input: 9 } }, { sessionKey: active.peekSessionKey(transport.home), agentId: 'main' });
+  const home = await again.next('usage');
+  assert.deepEqual([home.conversation, home.tokens.input], [transport.home, 9]);
+  assert.equal(JSON.stringify(transport.state.routes), routes);
 });

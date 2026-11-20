@@ -110,6 +110,15 @@ fn incoming_left(bridge: &Bridge) -> usize {
 /// A bridge serving `lab/main` at `socket`, a paired device of its host's
 /// person connected and synced, with conversation `c-1` started.
 fn ready(folder: &Path, socket: PathBuf) -> (Bridge, PhoneLink) {
+    ready_keyed(folder, socket, None)
+}
+
+/// As [`ready`], with the bridge's signing key when there is one.
+fn ready_keyed(
+    folder: &Path,
+    socket: PathBuf,
+    approval_key: Option<enclos_protocol::decision::DecisionKey>,
+) -> (Bridge, PhoneLink) {
     let main = vec![AgentEndpoint {
         name: "lab/main".to_owned(),
         runtime: "hermes".to_owned(),
@@ -120,7 +129,7 @@ fn ready(folder: &Path, socket: PathBuf) -> (Bridge, PhoneLink) {
         crate::layout::Layout::at(folder.join("enclos")),
         "/unused/enclos".into(),
     );
-    let bridge = bridge_built(folder, SILENCE, host, main, None);
+    let bridge = bridge_keyed(folder, SILENCE, host, main, None, approval_key);
     let phone = paired(&bridge, "n-pixel");
     let (mut device, first) = connect(&bridge, &phone);
     assert!(
@@ -232,6 +241,53 @@ fn a_conversation_that_changes_owner_while_files_are_sent_refuses_them() {
     assert_eq!(incoming_left(&bridge), 0);
     assert_eq!(store.newest_seq().unwrap(), seq);
     assert_eq!(got.lock().unwrap().len(), 2);
+}
+
+/// The host's person's direct message is signed (ADR 0077); the same
+/// person's direct message with files never is: the signature covers its
+/// text, not its files.
+#[test]
+fn a_message_with_files_from_the_hosts_person_is_never_signed() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let got = files_plugin(&socket, true);
+    let key = enclos_protocol::decision::DecisionKey::from_bytes(&[7u8; 32]).unwrap();
+    let (bridge, mut device) = ready_keyed(folder.path(), socket, Some(key));
+    Store::open(&bridge.store)
+        .unwrap()
+        .set_host(PERSON)
+        .unwrap();
+    device.send(
+        "m-0",
+        FromDevice::MessageSend {
+            conversation: ConversationId::new("c-1").unwrap(),
+            text: "plain".into(),
+        },
+    );
+    assert!(eventually(|| got.lock().unwrap().len() == 1));
+    begin(
+        &mut device,
+        "m-1",
+        "c-1",
+        "with a file",
+        &[file("a.txt", "text/plain", 2)],
+    );
+    part(&mut device, "p-1", "m-1", 0, 0, b"ok");
+    assert!(eventually(|| got.lock().unwrap().len() == 3));
+    let got = got.lock().unwrap();
+    assert!(
+        matches!(&got[0], FromBridge::MessageIn { text, host, files, signed, .. }
+            if text == "plain" && *host == Some(true) && files.is_empty() && signed.is_some()),
+        "the host's person's direct message is signed: {:?}",
+        got[0]
+    );
+    assert!(
+        matches!(&got[1], FromBridge::MessageIn { text, host, files, signed, .. }
+            if text == "with a file" && *host == Some(true) && files.len() == 1 && signed.is_none()),
+        "a message with files is not: {:?}",
+        got[1]
+    );
+    assert!(matches!(&got[2], FromBridge::MessagePart(_)));
 }
 
 /// The Hermes plugin's own adapter, in Python, on a socket in a synthetic

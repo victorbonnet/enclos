@@ -803,6 +803,7 @@ fn chat(
             suggested_replies: Vec::new(),
             question: None,
             held_task: None,
+            task_event: None,
             conversation: conversation.clone(),
             agent: format!("{sandbox}/{agent}"),
             from: person.to_string(),
@@ -849,6 +850,7 @@ fn typed_message(conversation: &ConversationId, person: &Person, text: &str) -> 
         text: text.to_owned(),
         host: Some(false),
         files: Vec::new(),
+        signed: None,
     }
 }
 
@@ -899,9 +901,11 @@ fn read_agent(
         else {
             continue;
         };
+        // A task event is kept here as its text alone, a `notify`, as a
+        // bridge keeps one whose task it cannot use (ADR 0071, proposed).
         let kind = match kind {
             OutKind::Reply => "reply",
-            OutKind::Notify => "notify",
+            OutKind::Notify | OutKind::TaskEvent => "notify",
             OutKind::Status => "status",
         };
         let ours = store
@@ -929,6 +933,7 @@ fn read_agent(
                         suggested_replies: Vec::new(),
                         question: None,
                         held_task: None,
+                        task_event: None,
                         conversation: conversation.clone(),
                         agent: format!("{sandbox}/{agent}"),
                         from: "agent".to_owned(),
@@ -1042,6 +1047,7 @@ mod tests {
                         kind: *kind,
                         reply_to: None,
                         attachments: vec![],
+                        task_event: None,
                     },
                 );
             }
@@ -1150,6 +1156,7 @@ mod tests {
                     text: text.into(),
                     host: Some(false),
                     files: Vec::new(),
+                    signed: None,
                 }
             );
         }

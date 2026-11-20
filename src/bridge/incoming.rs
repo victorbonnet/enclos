@@ -345,6 +345,8 @@ fn echo(
         suggested_replies: Vec::new(),
         question: None,
         held_task: None,
+        // A person's message is never a runtime's task event.
+        task_event: None,
         conversation: conversation.clone(),
         agent: agent.to_owned(),
         from: person.to_owned(),

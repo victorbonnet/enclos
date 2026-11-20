@@ -45,6 +45,7 @@ from . import suggested_replies
 from . import interrupts
 from . import runtime_approvals
 from . import tasks
+from . import task_events
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,12 @@ def validate_config(config) -> bool:
 
 
 class EnclosAdapter(BasePlatformAdapter):
+    # Defaults for an adapter that did not run `__init__` (enclos's tests build
+    # it with EnclosAdapter.__new__): no kanban pings to tell apart, and a
+    # bridge that does not take task events (ADR 0071).
+    _pings: Optional["task_events.Recogniser"] = None
+    _bridge_task_events = False
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM))
         self._path = _setting(config, "socket", "MOBILE_APP_SOCKET")
@@ -131,6 +138,11 @@ class EnclosAdapter(BasePlatformAdapter):
         # What the agent is doing, and its tasks on Hermes's board (ADR 0068).
         self._reporter = tasks.Reporter(self._agent, self._write,
                                         tasks.hermes_board(self._conversation_home, PLATFORM))
+        # Hermes's kanban pings, told from the agent's messages (ADR 0071);
+        # None when this Hermes has no board to read, and they stay messages.
+        self._pings = task_events.hermes(PLATFORM)
+        # Whether the connected bridge takes `kind: task_event` (its hello says so).
+        self._bridge_task_events = False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -175,6 +187,7 @@ class EnclosAdapter(BasePlatformAdapter):
             self._bridge = None
             self._bridge_usage = False
             self._bridge_agent_usage = False
+            self._bridge_task_events = False
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -214,6 +227,7 @@ class EnclosAdapter(BasePlatformAdapter):
         # An older bridge would answer each `usage` as an unknown type.
         self._bridge_usage = "usage" in hello.get("capabilities", [])
         self._bridge_agent_usage = "agent_usage" in hello.get("capabilities", [])
+        self._bridge_task_events = "task_events" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
@@ -235,6 +249,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("abort")
             if self._held.native:
                 capabilities.append("held_tasks")
+            if self._pings is not None:
+                capabilities.append("task_events")
             capabilities.extend(self._reporter.capabilities)
             capabilities.append("incoming_files")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
@@ -250,7 +266,7 @@ class EnclosAdapter(BasePlatformAdapter):
                                    self.name, message.get("id"), reason)
                     self._outbox.set_aside(str(message.get("id")))
                     continue
-                await self._write(message)
+                await self._write(protocol.for_bridge(message, self._bridge_task_events))
             await self._questions.fallback_cards()
             # The board is read beside the connection, so the bridge's
             # messages are read meanwhile.
@@ -289,6 +305,7 @@ class EnclosAdapter(BasePlatformAdapter):
                 self._bridge = None
                 self._bridge_usage = False
                 self._bridge_agent_usage = False
+                self._bridge_task_events = False
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -707,7 +724,12 @@ class EnclosAdapter(BasePlatformAdapter):
             return await self._send_files(chat_id, files, rest, reply_to)
         # Hermes about itself (gateway online, shutting down): a quiet line.
         notice = False if literal_approval else protocol.is_notice(content)
-        message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
+        # Hermes about one of its tasks (its kanban ping): a task line, with
+        # the task as the board has it (ADR 0071).
+        event = None if literal_approval or notice or reply_to else await self._task_event(chat_id, content)
+        message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None,
+                                       task_event=event)
+        notice = notice or event is not None
         pending_replies = None
         if not notice and not literal_approval:
             pending_replies = suggested_replies.peek(self, chat_id, reply_to)
@@ -722,10 +744,31 @@ class EnclosAdapter(BasePlatformAdapter):
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
         suggested_replies.consume(self, chat_id, pending_replies)
-        await self._write(message)  # if it is not connected, it gets the message on its next hello
+        # If it is not connected, it gets the message on its next hello
+        await self._write(protocol.for_bridge(message, self._bridge_task_events))
         if not notice:
             self._check_title_soon(chat_id)
         return SendResult(success=True, message_id=message["id"])
+
+    async def _task_event(self, chat_id: str, content: str) -> Optional[dict[str, Any]]:
+        """The task event `content` is, when it is Hermes's kanban ping for a
+        task this chat is subscribed to, read from the board off the loop;
+        None for the agent's own text, or when the board cannot be read."""
+        # Hermes does not mark its pings in `metadata` yet (ADR 0071); a mark
+        # would be read here first. Told by their text, read in the language
+        # of the context send() runs in (that this is the ping's language is
+        # to verify, design §14), and by the board.
+        if self._pings is None:
+            return None
+        try:
+            found = task_events.candidates(content)
+            if not found:
+                return None
+            return await asyncio.to_thread(held_tasks._fresh, self._pings.read, chat_id, found)
+        except Exception:
+            logger.warning("[%s] Cannot tell whether a message is a kanban ping; it is sent as the agent's message",
+                           self.name, exc_info=True)
+            return None
 
     # Conversation titles. Hermes names each session (a title cut from the
     # first message at once, then a model's summary about a second later) but

@@ -1,8 +1,9 @@
 """What an agent writes for the person when it hands a held task to them
 (ADR 0073; docs/protocol.md, Held tasks): the decision as one question,
 what is blocked, up to four choices and the one it recommends. The app
-shows it first on the task's card, and the person answers there with one
-tap; the answer comes back to the agent as the person's message.
+shows it first on the task's card, and the person answers there, with one
+tap on a choice or in their own words; the answer comes back to the agent
+as the person's message.
 
 The agent calls `enclos_ask_person` for a task it created that is held now,
 and `enclos_person_answered` when the person answered in the conversation
@@ -34,12 +35,10 @@ MAX_CHOICE_CHARS = 80
 # Told to the agent in each turn where held tasks are on: short, since it is
 # in every turn.
 HINT = (
-    "When a kanban task you created is stopped and needs the person's decision, call enclos_ask_person with "
-    "its id, the decision as one short question, one or two plain sentences on what is blocked and why, and "
-    "up to four choices that each say what happens (give the index of the one you recommend). The person "
-    "answers on the task's card in the enclos app; the answer comes back to you as their message naming the "
-    "task. If they answer in the conversation instead, call enclos_person_answered. Write for the person: "
-    "no run numbers, hashes or board terms."
+    "When a kanban task you created is stopped and needs the person's decision, call enclos_ask_person. The "
+    "person decides from its card alone, so say what was tried, why it stopped and what each choice costs. "
+    "The answer comes back to you as their message naming the task. If they answer in the conversation "
+    "instead, call enclos_person_answered. Write for the person: no run numbers, hashes or board terms."
 )
 
 
@@ -159,7 +158,7 @@ def validate(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     decision = _line(args.get("decision"), "the decision", MAX_DECISION_CHARS)
     blocked = args.get("blocked", "")
     if not isinstance(blocked, str) or not blocked.strip():
-        raise ValueError("Say in one or two sentences what is blocked and why.")
+        raise ValueError("Say in `blocked`, in two or three sentences, what was tried, why it stopped and whether another attempt would go differently.")
     blocked = blocked.strip()
     if visible.has_hidden(blocked, lines=True) or len(blocked) > MAX_BLOCKED_CHARS:
         raise ValueError(f"What is blocked must be visible text of at most {MAX_BLOCKED_CHARS} characters.")
@@ -240,9 +239,15 @@ def register(ctx, adapters: list, current_agent: Callable[[], Optional[str]]) ->
                 "parameters": {"type": "object", "properties": {
                     "task": {"type": "string", "description": "The task's id, as the board names it (board/id off the default board)."},
                     "decision": {"type": "string", "description": "The decision as one short question, at most 120 characters."},
-                    "blocked": {"type": "string", "description": "One or two plain sentences: what is stopped and why it needs the person. At most 400 characters."},
+                    "blocked": {"type": "string", "description": (
+                        "Two or three plain sentences the person decides from, without opening anything else: what "
+                        "was tried, why it stopped, and why another attempt would go differently (or that it may "
+                        "not). At most 400 characters.")},
                     "choices": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_CHOICES,
-                                "description": "Up to four answers, each one line saying what happens. None asks for a free answer."},
+                                "description": ("Up to four answers, each one line saying what happens and what it costs "
+                                                "(time, attempts). When you ask for more time or attempts, offer more "
+                                                "than one amount, such as one hour and three hours. None asks for an "
+                                                "answer in the person's own words.")},
                     "recommended": {"type": "integer", "description": "The index, from 0, of the choice you recommend."}},
                     "required": ["task", "decision", "blocked"]}})
     ctx.register_tool(

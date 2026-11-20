@@ -1407,6 +1407,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         let store = server_hub.store().unwrap();
         run_session(&server_hub, &store, &mut link, &device, OWNER, &rx)
@@ -2288,6 +2289,7 @@ fn device_session(
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         let store = server_hub.store().unwrap();
         run_session(&server_hub, &store, &mut link, &device, person, &rx)
@@ -2390,6 +2392,82 @@ fn no_one_can_type_a_runtime_approval() {
     assert!(
         matches!(native.receive().body, FromBridge::MessageIn { text, host, .. } if text == "hello" && host == Some(true))
     );
+}
+
+#[test]
+fn only_the_hosts_persons_direct_message_is_signed() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![]);
+    let (guest, guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
+    let (mut guest_send, _guest) = device_session(&hub, guest, "guest@example.com", guest_rx);
+    guest_send(
+        "guest-hello",
+        FromDevice::MessageSend {
+            conversation: ConversationId::new("foreign").unwrap(),
+            text: "hello".into(),
+        },
+    );
+    let message = native.receive();
+    assert!(
+        matches!(&message.body, FromBridge::MessageIn { host, signed, .. } if *host == Some(false) && signed.is_none()),
+        "another person's message grants nothing: {message:?}"
+    );
+    let (mut host_send, _host) = device_session(&hub, device, OWNER, rx);
+    host_send(
+        "host-hello",
+        FromDevice::MessageSend {
+            conversation: ConversationId::new("owned").unwrap(),
+            text: "show my schedules".into(),
+        },
+    );
+    let message = native.receive();
+    let FromBridge::MessageIn {
+        conversation,
+        person,
+        text,
+        host,
+        files,
+        signed,
+    } = message.body
+    else {
+        panic!("not a message.in");
+    };
+    assert!(files.is_empty());
+    assert_eq!(host, Some(true));
+    let signed = signed.expect("the host's person's direct message is signed");
+    assert!((signed.at - now()).abs() <= 5);
+    let statement = enclos_protocol::decision::HostMessage {
+        agent: AGENT,
+        conversation: conversation.as_str(),
+        id: message.id.as_str(),
+        person: person.as_str(),
+        text: &text,
+    };
+    let public = approval_key().public();
+    assert_eq!(
+        enclos_protocol::decision::check_message(&public, &statement, &signed, now()),
+        Ok(())
+    );
+    // Over this message alone: another text, person or id does not verify.
+    for altered in [
+        enclos_protocol::decision::HostMessage {
+            text: "delete my schedules",
+            ..statement
+        },
+        enclos_protocol::decision::HostMessage {
+            person: "guest@example.com",
+            ..statement
+        },
+        enclos_protocol::decision::HostMessage {
+            id: "another",
+            ..statement
+        },
+    ] {
+        assert_eq!(
+            enclos_protocol::decision::check_message(&public, &altered, &signed, now()),
+            Err(enclos_protocol::decision::DecisionError::Mismatch)
+        );
+    }
 }
 
 #[test]
@@ -3486,6 +3564,7 @@ fn encrypted_session_subscribes_before_synced_and_delivers_dismissal_receipts() 
             session: bridge_session,
             heard: std::time::Instant::now(),
             scoped_approvals: false,
+            task_events: false,
         };
         run_session(
             &server_hub,

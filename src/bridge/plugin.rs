@@ -119,6 +119,7 @@ fn connect_within(
             Capability::Usage,
             Capability::HeldTasks,
             Capability::AgentUsage,
+            Capability::TaskEvents,
         ],
         home: ConversationId::new(home).ok(),
     })?;
@@ -222,7 +223,7 @@ impl PluginWriter {
     }
 
     /// A person's message to the agent, in `conversation`; `host` when
-    /// the person is the host's person.
+    /// the person is the host's person. Unsigned: it grants nothing.
     pub fn message(
         &mut self,
         conversation: &ConversationId,
@@ -236,6 +237,7 @@ impl PluginWriter {
             text: text.to_owned(),
             host: Some(host),
             files: Vec::new(),
+            signed: None,
         })
     }
 
@@ -483,6 +485,7 @@ mod tests {
                             kind: OutKind::Reply,
                             reply_to: Some(message.id),
                             attachments: Vec::new(),
+                            task_event: None,
                         },
                     );
                 }
@@ -636,6 +639,7 @@ mod tests {
             kind: OutKind::Reply,
             reply_to: None,
             attachments: vec![],
+            task_event: None,
         };
         encode_line(&Envelope::new(MessageId::new(id).unwrap(), body))
     }
