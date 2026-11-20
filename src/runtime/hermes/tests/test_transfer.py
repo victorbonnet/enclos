@@ -164,6 +164,114 @@ class TransferTests(unittest.TestCase):
                     with self.subTest(text=text), self.assertRaises(ValueError):
                         transfer.archive_pointers(text, self.profile)
 
+    def test_genuine_missing_and_linked_forms_remain_required(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        original = cache / 'missing.txt'
+        outside = self.base / 'outside'; outside.write_text('unrelated')
+        heading = 'Archived tool output (exact originals; read_file a path to recover one):'
+        for linked in (False, True):
+            if linked:
+                original.symlink_to(outside)
+            for form in ('short — full result: ' + str(original),
+                         json.dumps([{'type': 'text', 'text': 'full result: ' + str(original)}]),
+                         'summary\n\n' + heading + '\n- ' + str(original)):
+                with self.subTest(linked=linked, form=form):
+                    with sqlite3.connect(self.profile / 'state.db') as db:
+                        db.execute('create table if not exists messages(role text, content text, api_content text)')
+                        db.execute('delete from messages')
+                        # Summary pointers are real dependencies even outside tool roles.
+                        db.execute('insert into messages values (?,?,?)',
+                                   ('assistant', form, json.dumps({'content': form})))
+                    with self.assertRaises(ValueError):
+                        transfer.export(self.source, 'main', self.archive)
+                    self.assertFalse(self.archive.exists())
+                    self.assertEqual(outside.read_text(), 'unrelated')
+
+    def recall_outputs(self, full, crop=None, entry=None):
+        # tools.session_search_tool shapes: _shape_message crops content to N
+        # chars + '…'; _derived_snippet windows the anchor with '...' and
+        # >>>term<<< marks. Both cut the pointer filename here.
+        cut = full[:full.index('cache/pruned/') + len('cache/pruned/ori')]
+        cropped = {'id': 1, 'role': 'tool', 'content': cut + '…', 'timestamp': 1.0,
+                   **({'content_truncated': True, 'original_content_chars': len(full)} if crop is None else crop)}
+        message = {'id': 1, 'role': 'tool', 'content': full, 'timestamp': 1.0, 'tool_name': 'terminal'}
+        snippet = '...' + cut.replace('ok', '>>>ok<<<', 1) + '...'
+        if entry is None:
+            entry = {'session_id': 'remembered', 'when': 'now', 'matched_role': 'tool', 'match_message_id': 1,
+                     'snippet': snippet, 'bookend_start': [cropped], 'messages': [message], 'bookend_end': []}
+        else:
+            entry = {**entry, 'snippet': snippet}
+        discover = json.dumps({'success': True, 'mode': 'discover', 'results': [entry], 'count': 1})
+        read = json.dumps({'success': True, 'session_id': 'remembered', 'messages': [cropped, message]})
+        return {'discover': discover, 'read': read}, (cut + '…', snippet)
+
+    def write_recall(self, outputs):
+        with sqlite3.connect(self.profile / 'state.db') as db:
+            db.execute('create table if not exists messages(role text, content text, api_content text)')
+            db.execute('delete from messages')
+            for output in outputs.values():
+                for api in (json.dumps({'content': output}), '\x00json:' + json.dumps({'content': output})):
+                    db.execute('insert into messages values (?,?,?)', ('tool', output, api))
+
+    def test_native_recall_crops_are_display_data(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        (cache / 'original.txt').write_text('exact original')
+        path = str(cache / 'original.txt')
+        outputs, crops = self.recall_outputs('ok — full result: ' + path)
+        self.write_recall(outputs)
+        transfer.export(self.source, 'main', self.archive)
+        transfer.restore(self.dest, 'renamed', self.archive)
+        target = self.dest / '.hermes/profiles/renamed'
+        self.assertEqual((target / 'cache/pruned/original.txt').read_text(), 'exact original')
+        expected = [json.loads(output.replace(path, str(target / 'cache/pruned/original.txt')))
+                    for output in outputs.values()]
+        with sqlite3.connect(target / 'state.db') as db:
+            rows = db.execute('select content, api_content from messages').fetchall()
+        self.assertEqual(len(rows), 4)
+        for content, api in rows:
+            api = json.loads(api.removeprefix('\x00json:'))['content']
+            for text in (content, api):
+                value = json.loads(text)
+                self.assertIn(value, expected)
+                self.assertNotIn(path, text)
+                displayed = [m['content'] for m in value.get('messages', []) if m.get('content_truncated')]
+                for result in value.get('results', []):
+                    displayed += [result['snippet']] + [m['content'] for m in result['bookend_start']]
+                self.assertTrue(displayed)
+                for crop in displayed:
+                    self.assertIn(crop, crops)
+
+    def test_native_recall_shape_keeps_genuine_pointers_required(self):
+        cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
+        outside = self.base / 'outside'; outside.write_text('unrelated')
+        present = cache / 'original.txt'
+        cases = [('missing full', 'ok — full result: ' + str(cache / 'missing.txt'), None, None)]
+        for path in ('/outside/cache/pruned/x.txt', str(cache) + '/../secret',
+                     '~/.hermes/profiles/another/cache/pruned/x.txt', str(cache / 'linked.txt')):
+            cases.append(('unsafe full', 'ok — full result: ' + path, None, None))
+        for crop in ({'original_content_chars': 99}, {'content_truncated': 'true', 'original_content_chars': 99},
+                     {'content_truncated': 1, 'original_content_chars': 99}, {'content_truncated': True},
+                     {'content_truncated': True, 'original_content_chars': '99'},
+                     {'content_truncated': True, 'original_content_chars': True}):
+            cases.append(('not a native crop', 'ok — full result: ' + str(present), crop, None))
+        for entry in ({}, {'session_id': 'remembered'}, {'match_message_id': 1, 'bookend_start': []}):
+            cases.append(('not a native entry', 'ok — full result: ' + str(present), None, entry))
+        present.write_text('exact original'); (cache / 'linked.txt').symlink_to(outside)
+        for label, full, crop, entry in cases:
+            outputs, _ = self.recall_outputs(full, crop, entry)
+            # A shape outside the native recognition is scanned as a whole.
+            outputs = {'discover': outputs['discover']} if entry is not None else (
+                {'read': outputs['read']} if crop is not None else outputs)
+            with self.subTest(label=label, full=full, crop=crop, entry=entry):
+                self.write_recall(outputs)
+                with self.assertRaises(ValueError):
+                    transfer.export(self.source, 'main', self.archive)
+                self.assertFalse(self.archive.exists())
+                for text in outputs.values():
+                    with self.assertRaises(ValueError):
+                        transfer.rewrite_archive_text(text, self.profile, self.dest, self.profile, set())
+        self.assertEqual(outside.read_text(), 'unrelated')
+
     def test_missing_summary_original_refuses_restore_without_publication(self):
         cache = self.profile / 'cache/pruned'; cache.mkdir(parents=True)
         (cache / 'original.txt').write_text('exact')

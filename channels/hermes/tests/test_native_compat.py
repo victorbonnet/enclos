@@ -141,3 +141,126 @@ asyncio.run(check())
 '''
         result = subprocess.run([sys.executable, '-c', script, os.environ['ENCLOS_HERMES_SOURCE'], str(Path(__file__).parents[1]), str(Path(__file__).parents[3] / 'src/runtime/hermes/transfer.py')], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(os.environ.get('ENCLOS_HERMES_SOURCE'), 'real Hermes checkout not supplied')
+    def test_real_recall_archive_roundtrip(self):
+        # Separate processes isolate native HOME caches and let restore fail
+        # independently of export. The controlled archive retains every original.
+        script = r'''
+import importlib.util, io, json, os, sqlite3, sys, tarfile, tempfile
+from contextlib import closing
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location('transfer', sys.argv[2])
+t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+cap, operation = int(sys.argv[3]), sys.argv[4]
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp); home = root / 'source'
+    profile = home / '.hermes/profiles/coder'; profile.mkdir(parents=True)
+    os.environ.update(HOME=str(home), HERMES_HOME=str(profile))
+    from persistence_assembly import open_persistence, profile_scope
+    from persistence.conversation.sessions import NewSession
+    from persistence.conversation.messages import NewMessage
+    from tools.tool_result_storage import write_pruned_original, _with_pointer
+    from tools.session_search_tool import session_search
+    from agent.context_compressor_prune import terminal_stub
+    store = open_persistence(profile_scope(home=profile))
+    try:
+        for sid in ('remembered', 'current'):
+            store.sessions.create(NewSession(session_id=sid, source='cli'))
+        body = b'OWNED SYNTHETIC ORIGINAL\n'
+        host, display = write_pruned_original(body.decode(), 'remembered', 'terminal', 'probe')
+        # Harmless command length places the native display boundary inside
+        # the path, without editing the formatter or returned search JSON.
+        prefix = terminal_stub({'command': 'printf control-' + 'x' * 60},
+                               json.dumps({'output': 'ordinary output', 'exit_code': 0}), 1)
+        # Longer ordinary tool context exercises native bookend/window caps.
+        prefix = 'ordinary context ' + 'x' * (cap - 217) + prefix if cap > 200 else prefix
+        stub = _with_pointer(prefix, display)
+        store.messages.append('remembered', NewMessage(role='assistant' if cap == 1200 else 'tool', content=stub,
+                              tool_name='terminal', tool_call_id='probe'))
+        if cap == 1200:
+            # Keep the long row outside the anchor window so native discovery
+            # returns it through its separately capped opening bookend.
+            for n in range(12):
+                store.messages.append('remembered', NewMessage(role='tool', content='ordinary filler ' + str(n)))
+            store.messages.append('remembered', NewMessage(role='tool', content='recallanchor'))
+        (profile / 'memory.md').write_text('unrelated data')
+        (profile / 'cache/pruned/unused.txt').write_text('excluded')
+        (profile / 'cache/other').write_text('excluded')
+        baseline = root / 'before.tgz'; t.export(home, 'coder', baseline)
+
+        def verify(archive, name, recall=None):
+            destination_home = root / name; destination_home.mkdir()
+            t.restore(destination_home, 'renamed', archive)
+            target = destination_home / '.hermes/profiles/renamed'
+            assert (target / 'cache/pruned' / Path(host).name).read_bytes() == body
+            assert (target / 'memory.md').read_text() == 'unrelated data'
+            assert not (target / 'cache/pruned/unused.txt').exists()
+            assert not (target / 'cache/other').exists()
+            with closing(sqlite3.connect(target / 'state.db')) as raw:
+                genuine = raw.execute("select content from messages where session_id='remembered'").fetchone()[0]
+                assert genuine == stub.replace(display, str(target / 'cache/pruned' / Path(host).name))
+                if recall is not None:
+                    content, api = raw.execute("select content,api_content from messages where session_id='current'").fetchone()
+                    # Full recovered messages relocate; cropped display data
+                    # stays ordinary text, byte-for-byte.
+                    expected = recall.replace(display, str(target / 'cache/pruned' / Path(host).name))
+                    assert json.loads(content) == json.loads(expected), (content, expected)
+                    assert json.loads(json.loads(api)['content']) == json.loads(expected)
+            assert Path(host).read_bytes() == body
+
+        verify(baseline, 'before-home')
+        output = (session_search(session_id='remembered', persistence=store) if cap == 0 else
+                  session_search(query='recallanchor' if cap == 1200 else 'terminal', role_filter='tool',
+                                 current_session_id='current', persistence=store))
+        payload = json.loads(output); assert payload['success'], payload
+        result = payload['results'][0] if cap else payload
+        if cap == 0:
+            assert result['messages'][0]['content'] == stub
+            excerpt = None
+        elif cap == 200:
+            excerpt = result['snippet']
+            assert excerpt.endswith('...'), excerpt
+            assert any(m['content'] == stub for m in result['messages'])
+        else:
+            rows = result['bookend_start'] if cap == 1200 else result['messages']
+            cropped = next((m for m in rows if m.get('content_truncated')), None)
+            assert cropped is not None, result
+            excerpt = cropped['content']
+            assert len(excerpt) == cap + 1 and excerpt.endswith('…'), excerpt
+            assert cropped['original_content_chars'] == len(stub)
+        if excerpt is not None:
+            assert ' — full result: ' in excerpt and 'cache/pruned/' in excerpt, excerpt
+            assert display not in excerpt, excerpt
+        store.messages.append('current', NewMessage(role='tool', content=output,
+            api_content=json.dumps({'content': output}), tool_name='session_search', tool_call_id='search'))
+        archive = root / 'after.tgz'
+        if operation == 'export':
+            t.export(home, 'coder', archive)
+        else:
+            # Coherent native post-recall snapshot plus the COMPLETE pre-recall
+            # archive. An old-base archive omitting originals is not causal proof.
+            snapshot = root / 'post.db'
+            with closing(sqlite3.connect(profile / 'state.db')) as src:
+                with closing(sqlite3.connect(snapshot)) as dst:
+                    src.backup(dst)
+            with tarfile.open(baseline) as src, tarfile.open(archive, 'w:gz') as dst:
+                for entry in src:
+                    if entry.name == 'profile/state.db':
+                        data = snapshot.read_bytes(); entry.size = len(data)
+                        dst.addfile(entry, io.BytesIO(data))
+                    else:
+                        dst.addfile(entry, src.extractfile(entry))
+        verify(archive, 'after-home', output)
+    finally:
+        store.close()
+'''
+        for cap in (0, 200, 1200, 4000):
+            for operation in ('export', 'restore'):
+                with self.subTest(cap=cap, operation=operation):
+                    result = subprocess.run([
+                        sys.executable, '-c', script, os.environ['ENCLOS_HERMES_SOURCE'],
+                        str(Path(__file__).parents[3] / 'src/runtime/hermes/transfer.py'),
+                        str(cap), operation], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

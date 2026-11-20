@@ -102,6 +102,20 @@ def native_archive_paths(text):
 
 
 PRUNED_NAME = re.compile(r'[A-Za-z0-9_.-]+')
+RECALL_ENTRY = ('messages', 'bookend_start', 'bookend_end', 'match_message_id')
+
+
+# tools.session_search_tool stores display crops beside the full recovered
+# messages: _shape_message cuts content (content_truncated/original_content_chars)
+# and _derived_snippet windows a discovery entry's snippet. A crop may cut a
+# pointer, so it is display data: neither required nor rewritten.
+def recall_crops(item):
+    crops = set()
+    if item.get('content_truncated') is True and type(item.get('original_content_chars')) is int:
+        crops.add('content')
+    if 'session_id' in item and any(key in item for key in RECALL_ENTRY):
+        crops.add('snippet')
+    return {key for key in crops if isinstance(item.get(key), str)}
 
 
 def archive_pointers(text, origin):
@@ -118,7 +132,9 @@ def archive_pointers(text, origin):
             elif isinstance(item, list):
                 for child in item: yield from strings(child)
             elif isinstance(item, dict):
-                for child in item.values(): yield from strings(child)
+                crops = recall_crops(item)
+                for key, child in item.items():
+                    if key not in crops: yield from strings(child)
         return [pair for child in strings(value) for pair in archive_pointers(child, origin)]
     result = []
     for pointer in native_archive_paths(text):
@@ -162,7 +178,9 @@ def rewrite_archive_text(text, origin, destination, profile, referenced):
         def rewrite(item):
             if isinstance(item, str): return rewrite_archive_text(item, origin, destination, profile, referenced)
             if isinstance(item, list): return [rewrite(child) for child in item]
-            if isinstance(item, dict): return {key: rewrite(child) for key, child in item.items()}
+            if isinstance(item, dict):
+                crops = recall_crops(item)
+                return {key: child if key in crops else rewrite(child) for key, child in item.items()}
             return item
         updated = rewrite(value)
         return prefix + json.dumps(updated) if updated != value else text
