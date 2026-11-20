@@ -43,6 +43,7 @@ from . import questions
 from . import suggested_replies
 from . import interrupts
 from . import runtime_approvals
+from . import slash_confirms
 from . import tasks
 from . import task_events
 
@@ -79,6 +80,9 @@ class EnclosAdapter(BasePlatformAdapter):
     # bridge that does not take task events (ADR 0071).
     _pings: Optional["task_events.Recogniser"] = None
     _bridge_task_events = False
+    # By conversation: the session keys Hermes sent its runtime approvals with, so
+    # that a bare approval word is refused while one of them blocks.
+    _approval_sessions: Optional[dict[str, set[str]]] = None
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM))
@@ -167,6 +171,11 @@ class EnclosAdapter(BasePlatformAdapter):
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
         self._reporter.start()
+        # Hermes's approval words in every language it has: their catalogs load once,
+        # in a thread, rather than on the loop when the first short message comes.
+        warm = asyncio.create_task(asyncio.to_thread(runtime_approvals.approval_words))
+        self._routine_tasks.add(warm)
+        warm.add_done_callback(self._routine_tasks.discard)
         self._wire_plugin_handlers(None)
         logger.info("[%s] Listening for the bridge", self.name)
         return True
@@ -467,8 +476,28 @@ class EnclosAdapter(BasePlatformAdapter):
         # any program with the token can send. So none is passed on, read with
         # Hermes's own parser: runtime approvals are decided with the app's buttons,
         # whose decisions the bridge signs (ADR 0060).
-        if runtime_approvals.approval_command(event):
-            await self.send(message["conversation"], runtime_approvals.TYPED_ANSWER, reply_to=message["id"])
+        conversation = message["conversation"]
+        refusal = None
+        command = runtime_approvals.approval_command_name(event)
+        if command is not None:
+            refusal = self._approval_command_answer(event, conversation, command)
+        elif runtime_approvals.is_approval_word(event):
+            # Nor is a bare word Hermes would read as a decision ("yes", "always",
+            # "👍"...): refused while an approval blocks the session, and while a turn
+            # runs, handed over as a message no gateway control reads, since Hermes
+            # reads it later, when an approval may block. A reply to a command
+            # confirmation the channel then answers itself. When nothing runs, it
+            # passes on untouched.
+            keys = self._approval_session_keys(event, conversation)
+            if runtime_approvals.blocking(keys):
+                refusal = runtime_approvals.TYPED_WORD
+            elif self._session_busy(keys):
+                if await self._questions.answer_typed_confirm(conversation, keys, event.text):
+                    await self._write(protocol.ack(message["id"]))
+                    return
+                event.allow_gateway_control = False
+        if refusal is not None:
+            await self.send(conversation, refusal, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
         try:
@@ -493,6 +522,71 @@ class EnclosAdapter(BasePlatformAdapter):
     def _interrupt_session_key(self, event) -> str:
         from gateway.session import build_session_key
         return build_session_key(event.source, profile=self._session_key_profile(event.source))
+
+    def _runner(self):
+        """Hermes's gateway runner serving this adapter, or None."""
+        return (getattr(self, "gateway_runner", None)
+                or getattr(getattr(self, "_message_handler", None), "__self__", None))
+
+    def _approval_session_keys(self, event, conversation: str) -> set[str]:
+        """The keys Hermes may give the session `event` goes to: the runner's own
+        (`_session_key_for_source`, which its routing and its runtime approvals use, and
+        which this conversation's approvals were sent with), and those Hermes's adapter
+        (`_event_session_key`) and this channel derive. One more key only refuses more."""
+        keys = set((self._approval_sessions or {}).get(conversation, ()))
+        runner = self._runner()
+        derivations = (getattr(runner, "_session_key_for_source", None) and
+                       (lambda e: runner._session_key_for_source(e.source)),
+                       getattr(self, "_event_session_key", None), self._interrupt_session_key)
+        for derive in derivations:
+            if callable(derive):
+                try:
+                    keys.add(derive(event))
+                except Exception:
+                    _warn_once(f"session-key-{getattr(derive, '__name__', 'runner')}",
+                               "[%s] A session key could not be derived for a bare approval word",
+                               self.name, exc_info=True)
+        return {key for key in keys if isinstance(key, str) and key}
+
+    def _session_busy(self, keys) -> bool:
+        """Whether a turn runs in the session: Hermes's adapter guard (`_active_sessions`)
+        or its runner's running-turn slot (`_is_session_running`), the two tests its
+        routing makes; a test that fails counts as busy."""
+        active = getattr(self, "_active_sessions", None) or {}
+        running = getattr(self._runner(), "_is_session_running", None)
+        for key in keys:
+            if key in active:
+                return True
+            if callable(running):
+                try:
+                    if running(key):
+                        return True
+                except Exception:
+                    _warn_once("session-running", "[%s] Whether a turn runs could not be read; counted as running",
+                               self.name, exc_info=True)
+                    return True
+        return False
+
+    def _approval_command_answer(self, event, conversation: str, command: str) -> str:
+        """Why a typed approval command was not passed on: `/approve` or `/deny` sent
+        to answer a command confirmation, while no runtime approval blocks, gets the
+        way to answer that instead."""
+        if command in ("approve", "deny"):
+            keys = self._approval_session_keys(event, conversation)
+            native = self._questions.confirms_native()
+            entry = next((slash_confirms.pending(native, key) for key in keys
+                          if native is not None and slash_confirms.pending(native, key)), None)
+            if entry is not None and not runtime_approvals.blocking(keys):
+                choices = slash_confirms.offered(str(entry.get("command") or ""))
+                return runtime_approvals.TYPED_CONFIRM.format(words=slash_confirms.reply_words(choices))
+        return runtime_approvals.TYPED_ANSWER
+
+    def _approval_seen(self, chat_id, session_key) -> None:
+        """Hermes sent a runtime approval for `session_key` to this conversation."""
+        if chat_id and isinstance(session_key, str) and session_key:
+            if self._approval_sessions is None:
+                self._approval_sessions = {}
+            self._approval_sessions.setdefault(str(chat_id), set()).add(session_key)
 
     async def on_processing_start(self, event) -> None:
         self._interrupts.start(event)
@@ -541,12 +635,26 @@ class EnclosAdapter(BasePlatformAdapter):
     async def retire_clarify_card(self, clarify_id, notice):
         await self._questions.retire(clarify_id)
 
+    async def send_slash_confirm(self, chat_id, title, message, session_key, confirm_id, metadata=None):
+        # Hermes asks the person to confirm some commands (`/new`, `/undo`,
+        # `/reload-mcp`, a guarded `/model`): a question card, answered through
+        # Hermes's own `tools.slash_confirm.resolve`, or the channel's own text.
+        # Neither shown, Hermes sends its text.
+        shown = await self._questions.ask_confirm(chat_id, title, message, session_key, confirm_id)
+        return SendResult(success=shown, message_id=confirm_id if shown else None,
+                          error=None if shown else "Not supported")
+
     async def _send_exec_approval_prompt(self, prompt):
+        self._approval_seen(prompt.chat_id, prompt.session_key)
         saved, question_id = await self._questions.ask_approval(prompt)
         return SendResult(success=saved, message_id=question_id,
                           error=None if saved else "The runtime approval could not be saved.")
 
     async def send_exec_approval(self, *args, **kwargs):
+        # The session a typed reply could decide, whichever way the prompt is shown:
+        # Hermes's (self, chat_id, command, session_key, ...).
+        self._approval_seen(kwargs.get("chat_id", args[0] if args else None),
+                            kwargs.get("session_key", args[2] if len(args) > 2 else None))
         # Keep the native visibility/Deny-only flow and old call signatures. Its
         # ordinary full-command pre-send must stay literal and frame-bounded too.
         token = _APPROVAL_SEND.set(True)
