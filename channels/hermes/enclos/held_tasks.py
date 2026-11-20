@@ -461,11 +461,18 @@ class Board:
 
 def for_the_person(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The holds of `held`, asks attached, that are the person's (ADR 0072):
-    one its agent handed to them (an `ask`, settled or not), and one Hermes
-    does not wake that agent for. One Hermes wakes the agent for is the
-    agent's to act on, and is left out until it asks. `WOKEN` is never sent."""
+    one Hermes does not wake that agent for, and one its agent handed to
+    them with `enclos_ask_person` (an `ask` it made, which carries `asked`),
+    settled or not. One Hermes wakes the agent for is the agent's to act on,
+    and is left out until it asks: an ask `enclos_person_answered` made up
+    for a hold the agent never handed over does not count, so the person
+    never gets a card for a hold they never saw. `WOKEN` is never sent."""
+    def asked(entry: dict[str, Any]) -> bool:
+        ask = entry.get("ask")
+        return isinstance(ask, dict) and "asked" in ask
+
     return [{key: value for key, value in entry.items() if key != WOKEN}
-            for entry in held if "ask" in entry or not entry.get(WOKEN)]
+            for entry in held if not entry.get(WOKEN) or asked(entry)]
 
 
 def _fresh(function: Callable[..., Any], *args: Any) -> Any:

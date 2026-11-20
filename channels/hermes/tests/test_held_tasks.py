@@ -1032,6 +1032,18 @@ class AgentFirst(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
         [task] = await self.listed()
         self.assertTrue(task["ask"]["settled"])
 
+    async def test_an_answer_the_agent_reports_for_a_hold_it_never_handed_over_sends_nothing(self):
+        # `enclos_person_answered` on a woken hold the agent never asked about
+        # makes up a settled ask: the person never saw this hold, so no card.
+        self.kb.subscribe("t_1")
+        [task] = self.board.read("main")
+        self.manager.asks.settle("t_1", task["since"], task["title"])
+        self.assertEqual(await self.listed(), [])
+        # Unwoken, the same made-up ask still answers the card the person has.
+        self.kb.unsubscribe_all()
+        [task] = await self.listed()
+        self.assertTrue(task["ask"]["settled"])
+
     async def test_a_hold_no_subscription_wakes_this_agent_for_is_the_person_s(self):
         for case, subscribe in (("notify only", dict(mode="notify")),
                                 ("another profile's wake", dict(profile="research")),
