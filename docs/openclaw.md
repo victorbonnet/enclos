@@ -1,6 +1,6 @@
 # OpenClaw on a Mac
 
-This guide uses the M5 OpenClaw CLI adapter, checked against OpenClaw 2026.11.5.
+This guide uses the M5 OpenClaw CLI adapter, checked against OpenClaw 2026.11.6.
 It creates sandbox `claw` with agents `main` and `scout`. Use the Mac requirements
 and enclos installation steps in [Getting started](getting-started.md). Allow disk
 space for a private Node/runtime, package downloads and provider runtime packages.

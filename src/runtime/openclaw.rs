@@ -1,5 +1,5 @@
 //! OpenClaw's native CLI, configuration and protected-file consumers.
-//! Source contracts were checked against the installed 2026.11.5 package;
+//! Source contracts were checked against the installed 2026.11.6 package;
 //! all native mutations remain SandboxCommands executed by the engine.
 
 use std::ffi::OsString;
@@ -28,7 +28,7 @@ const LATEST_RELEASE: &str = "https://registry.npmjs.org/openclaw/latest";
 /// The OpenClaw releases enclos's runtime tests passed with before this
 /// enclos release (ADR 0074, proposed): `TESTED_OPENCLAW`, which CI
 /// installs, among them.
-const CHECKED_RELEASES: &[&str] = &["2026.11.5"];
+const CHECKED_RELEASES: &[&str] = &["2026.11.5", "2026.11.6"];
 const CONFIG: &str = ".openclaw/openclaw.json";
 const MAX_CONFIG: u64 = 256 * 1024;
 const MAX_AGENTS: usize = 512;
