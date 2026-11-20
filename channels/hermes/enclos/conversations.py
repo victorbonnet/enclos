@@ -137,7 +137,9 @@ async def delete(adapter, chat_id, request_id):
     actor = Actor("enclos-app", owner.profile_id,
                       frozenset({"session:read", "session:control"}), "enclos-plugin")
     ref = messaging_owner_ref(owner, SessionRef(owner.profile_id, sid))
-    row = await asyncio.to_thread(owner.db.get_session, ref.session_id)
+    persistence = getattr(owner, "persistence", None)
+    get_row = persistence.sessions.get if persistence is not None else owner.db.get_session
+    row = await asyncio.to_thread(get_row, ref.session_id)
     if row is None:
         return
     # Native Stop and queued cancellation release the same admissions the delete
@@ -154,19 +156,24 @@ async def delete(adapter, chat_id, request_id):
             handle = await owner.resolve(actor, ref)
             if handle.execution_state != "running":
                 break
-    row = await asyncio.to_thread(owner.db.get_session, ref.session_id)
+    row = await asyncio.to_thread(get_row, ref.session_id)
     if row is None:
         return
     result = await mutate_session(owner, actor, ref, {
         "session_id": ref.session_id, "request_id": request_id,
-        "expected_revision": row["runtime_revision"],
-        "expected_generation": row["runtime_generation"], "operation": "delete", "payload": {},
+        "expected_revision": row.runtime_revision if persistence is not None else row["runtime_revision"],
+        "expected_generation": row.runtime_generation if persistence is not None else row["runtime_generation"], "operation": "delete", "payload": {},
     })
     # Match the REST endpoint: the authority retires rows and routes; its
     # native cleanup removes transcript snapshots and request dumps too.
-    from hermes_state import SessionDB
+    if persistence is not None:
+        from session_retention import remove_session_files
+    else:
+        from hermes_state import SessionDB
+        remove_session_files = SessionDB._remove_session_files
     for deleted in result.get("deleted_ids") or ():
-        await asyncio.to_thread(SessionDB._remove_session_files, Path(owner.profile_id) / "sessions", str(deleted))
+        await asyncio.to_thread(remove_session_files, Path(owner.profile_id) / "sessions", str(deleted))
+
 
 
 async def handle(adapter, message):

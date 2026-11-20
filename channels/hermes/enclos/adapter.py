@@ -893,7 +893,9 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def _session_db_call(self, method: str, *args: Any) -> Any:
         db = getattr(getattr(self, "gateway_runner", None), "_session_db", None)
-        call = getattr(db, method, None) if db is not None else None
+        sessions = getattr(db, "sessions", None) if db is not None else None
+        methods = {"get_session_title": "get_title", "get_session_title_source": "get_title_source", "set_session_title": "set_title"}
+        call = getattr(sessions, methods[method], None) if sessions is not None else getattr(db, method, None) if db is not None else None
         if call is None:
             raise LookupError("no session database")
         result = call(*args)
@@ -909,7 +911,7 @@ class EnclosAdapter(BasePlatformAdapter):
         except Exception:
             self._cannot_read_titles(f"the title of {chat_id}")
             return None
-        return (title, source or "") if title else None
+        return (title, getattr(source, "value", source) or "") if title else None
 
     async def _rename(self, chat_id: str, title: str) -> None:
         """The person named the conversation in the app (or cleared its name): the
@@ -919,8 +921,13 @@ class EnclosAdapter(BasePlatformAdapter):
         if not session_id:
             return
         try:
-            from hermes_state import SessionDB
-            await self._session_db_call("set_session_title", session_id, SessionDB.sanitize_title(title) or "")
+            db = getattr(getattr(self, "gateway_runner", None), "_session_db", None)
+            if getattr(db, "sessions", None) is not None:
+                from persistence.conversation.sessions import sanitize_title
+            else:
+                from hermes_state import SessionDB
+                sanitize_title = SessionDB.sanitize_title
+            await self._session_db_call("set_session_title", session_id, sanitize_title(title) or "")
         except Exception as e:
             # Another session holds that title (Hermes keeps them unique), or no
             # database: the app shows the bridge's name all the same.
