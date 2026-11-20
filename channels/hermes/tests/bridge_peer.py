@@ -24,6 +24,15 @@ from enclos.adapter import EnclosAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 
 
+def refusal_gate(write, wait_for_release):
+    """Wrap the fixture writer; only terminal errors wait for device release."""
+    async def gated_write(message):
+        if message.get("type") == "error":
+            await wait_for_release()
+        return await write(message)
+    return gated_write
+
+
 async def main(socket_path: str, token: str, mode="normal") -> None:
     adapter = EnclosAdapter(PlatformConfig({"socket": socket_path, "token": token}))
     # Transport-only fixture: model eligibility is covered separately.
@@ -38,16 +47,13 @@ async def main(socket_path: str, token: str, mode="normal") -> None:
     if mode != "normal":
         # Hold only the refusal frame so the device can disconnect first.
         original_write = adapter._write
-        async def gated_write(message):
-            if message.get("kind") == "error":
-                for _ in range(1000):
-                    if os.path.exists(socket_path + ".refuse"):
-                        break
-                    await asyncio.sleep(0.01)
-                else:
-                    raise TimeoutError("refusal gate not released")
-            return await original_write(message)
-        adapter._write = gated_write
+        async def wait_for_release():
+            for _ in range(1000):
+                if os.path.exists(socket_path + ".refuse"):
+                    return
+                await asyncio.sleep(0.01)
+            raise TimeoutError("refusal gate not released")
+        adapter._write = refusal_gate(original_write, wait_for_release)
     adapter._admit_files = adapter.handle_message
     async def transport_images(source):
         return adapter._images_available(source)
