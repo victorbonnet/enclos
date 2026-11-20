@@ -12,9 +12,14 @@ removed and never given to the runtime: the bridge sends it again whole.
 import base64
 import binascii
 import os
+import json
+import time
+import stat
 import re
-import unicodedata
+from .visible import has_hidden
 import uuid
+import threading
+import functools
 from typing import Any, Optional
 
 MAX_FILES = 4
@@ -47,6 +52,20 @@ class Refused(Exception):
         self.code = code
 
 
+# Rust str::trim uses Unicode White_Space. Python strip additionally trims
+# U+001C..U+001F (already refused as controls), so spell the set explicitly.
+_RUST_SPACE = "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+
+
+def check_name(name: Any) -> None:
+    """Exact incoming::check_name semantics; refuse rather than normalize."""
+    if (not isinstance(name, str) or not name or name in (".", "..")
+            or "/" in name or "\\" in name or len(name) > MAX_NAME_CHARS
+            or len(name.encode("utf-8")) > MAX_NAME_BYTES
+            or name.strip(_RUST_SPACE) != name or has_hidden(name)):
+        raise ValueError("a file's name is not one visible component")
+
+
 def check_files(files: Any) -> None:
     """A message's declared files, as the bridge checks them; raises ValueError."""
     if not isinstance(files, list) or not 1 <= len(files) <= MAX_FILES:
@@ -55,11 +74,7 @@ def check_files(files: Any) -> None:
         if not isinstance(f, dict):
             raise ValueError("a file is not an object")
         name, mime, size = f.get("name"), f.get("mime"), f.get("size")
-        if (not isinstance(name, str) or not name or name in (".", "..") or "/" in name or "\\" in name
-                or len(name) > MAX_NAME_CHARS or len(name.encode("utf-8")) > MAX_NAME_BYTES
-                or name.strip() != name
-                or any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in name)):
-            raise ValueError("a file's name is not one plain component")
+        check_name(name)
         stem, dot, ext = name.rpartition(".")
         if not stem or not dot or TYPES.get(f".{ext.lower()}") != mime:
             raise ValueError("a file's type is not one an agent takes, or not its name's")
@@ -86,9 +101,17 @@ def _plain(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name).lstrip(". ") or "file"
 
 
+def _is_disk_name(name: str) -> bool:
+    number, sep, plain = name.partition("-")
+    return (number in ("1", "2", "3", "4") and bool(sep) and bool(plain)
+            and _plain(plain) == plain)
+
+
 def _disk_name(n: int, name: str) -> str:
     """A file's name on disk: its number, then its name made plain."""
-    return f"{n + 1}-{_plain(name)}"
+    result = f"{n + 1}-{_plain(name)}"
+    assert _is_disk_name(result)
+    return result
 
 
 def _open_folder(parent: int, name: str) -> int:
@@ -105,19 +128,22 @@ class _Message:
         self.message = message
         self.files = message["files"]
         self.parent, self.folder = parent, folder
-        self.fd = os.open(folder, _FOLDER, dir_fd=parent)
         self.names = [_disk_name(n, f["name"]) for n, f in enumerate(self.files)]
         self.paths = [os.path.join(path, folder, name) for name in self.names]
         self.at = 0
         self.offset = 0
         self.out: Optional[int] = None
+        self.fd = os.open(folder, _FOLDER, dir_fd=parent)
 
     def write(self, data: bytes) -> None:
         if self.out is None:
             self.out = os.open(self.names[self.at], _NEW_FILE, 0o600, dir_fd=self.fd)
         view = memoryview(data)
         while view:
-            view = view[os.write(self.out, view):]
+            written = os.write(self.out, view)
+            if written == 0:
+                raise OSError("file write made no progress")
+            view = view[written:]
 
     def close(self) -> None:
         if self.out is not None:
@@ -126,18 +152,25 @@ class _Message:
 
     def remove(self) -> None:
         """Every file of it, and its folder, through the folders it opened."""
-        self.close()
-        for name in self.names:
-            try:
-                os.unlink(name, dir_fd=self.fd)
-            except FileNotFoundError:
-                pass
-        os.close(self.fd)
         try:
+            self.close()
+            for name in self.names + [".enclos-incoming.json"]:
+                try:
+                    os.unlink(name, dir_fd=self.fd)
+                except FileNotFoundError:
+                    pass
             os.rmdir(self.folder, dir_fd=self.parent)
-        except OSError:
-            pass
-        os.close(self.parent)
+        finally:
+            os.close(self.fd)
+            os.close(self.parent)
+
+
+def _serialized(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
 
 
 class Receiver:
@@ -147,10 +180,154 @@ class Receiver:
         self._home = os.path.dirname(socket_path)
         self._agent = _plain(agent)
         self._current: Optional[_Message] = None
+        self._active = set()
+        self._lock = threading.RLock()
 
+    @_serialized
+    def cleanup(self, conversation=None, now=None):
+        """Expire recognized leaves; confirmed native deletion also retires pending media.
+
+        Pending admissions survive restart indefinitely without a completion signal.
+        Legacy/partial leaves have no conversation provenance and only expire.
+        One receiver identity is supported; this is not a cross-process live lease.
+        """
+        if (conversation is not None and self._current is not None
+                and self._current.message["conversation"] == conversation):
+            self.drop()
+        now = time.time() if now is None else now
+        parent = None
+        try:
+            top = os.open(self._home, _FOLDER)
+            try:
+                incoming = os.open("incoming", _FOLDER, dir_fd=top)
+            finally:
+                os.close(top)
+            try:
+                parent = os.open(self._agent, _FOLDER, dir_fd=incoming)
+            finally:
+                os.close(incoming)
+        except FileNotFoundError:
+            return
+        except OSError:
+            if conversation is not None:
+                raise
+            return
+        errors = []
+        try:
+            for folder in os.listdir(parent):
+                if not re.fullmatch(r"[0-9a-f]{32}", folder):
+                    continue
+                if self._current is not None and folder == self._current.folder:
+                    continue
+                fd = None
+                try:
+                    fd = os.open(folder, _FOLDER, dir_fd=parent)
+                    entries = set(os.listdir(fd))
+                    record = None
+                    try:
+                        meta = os.open(".enclos-incoming.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                        try:
+                            if not stat.S_ISREG(os.fstat(meta).st_mode):
+                                continue
+                            record = json.loads(os.read(meta, 4096))
+                        finally:
+                            os.close(meta)
+                    except (FileNotFoundError, ValueError):
+                        pass
+                    if record is not None and (not isinstance(record, dict)
+                            or record.get("owner") != "enclos-incoming-1"):
+                        continue
+                    if conversation is not None:
+                        if record is None or record.get("conversation") != conversation:
+                            continue
+                    else:
+                        if folder in self._active or ".pending" in entries:
+                            continue
+                        created = record.get("created") if record else os.fstat(fd).st_mtime
+                        if not isinstance(created, (int, float)) or now - created < 86400:
+                            continue
+                    names = entries - {".enclos-incoming.json", ".pending"}
+                    if len(names) > MAX_FILES or any(not _is_disk_name(n) for n in names):
+                        continue
+                    # Never remove links, subdirectories, or unexpected entries.
+                    if any(not stat.S_ISREG(os.stat(n, dir_fd=fd, follow_symlinks=False).st_mode) for n in entries):
+                        continue
+                    for name in names:
+                        os.unlink(name, dir_fd=fd)
+                    if ".pending" in entries:
+                        os.unlink(".pending", dir_fd=fd)
+                    if ".enclos-incoming.json" in entries:
+                        os.unlink(".enclos-incoming.json", dir_fd=fd)
+                    # A failed rmdir leaves a recognizable empty UUID leaf for retry.
+                    os.rmdir(folder, dir_fd=parent)
+                    self._active.discard(folder)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    errors.append(error)
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+        finally:
+            os.close(parent)
+        if conversation is not None and errors:
+            raise OSError("incoming cleanup incomplete; retry deletion") from errors[0]
+
+    def _pending(self, paths, create):
+        if not paths:
+            return
+        folder = os.path.dirname(paths[0])
+        # Paths come only from this receiver, never runtime-supplied external media.
+        root = os.path.join(self._home, "incoming", self._agent)
+        if os.path.dirname(folder) != root:
+            return
+        try:
+            top = os.open(self._home, _FOLDER)
+            try:
+                incoming = os.open("incoming", _FOLDER, dir_fd=top)
+            finally:
+                os.close(top)
+            try:
+                parent = os.open(self._agent, _FOLDER, dir_fd=incoming)
+            finally:
+                os.close(incoming)
+            try:
+                fd = os.open(os.path.basename(folder), _FOLDER, dir_fd=parent)
+            finally:
+                os.close(parent)
+        except FileNotFoundError:
+            if not create:
+                return  # Confirmed conversation deletion already retired it.
+            raise
+        try:
+            if create:
+                out = os.open(".pending", _NEW_FILE, 0o600, dir_fd=fd)
+                os.close(out)
+            else:
+                try:
+                    os.unlink(".pending", dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(fd)
+
+    @_serialized
+    def admit(self, paths):
+        """Persist uncertainty before handing an event to the runtime queue."""
+        self._pending(paths, True)
+        if paths:
+            self._active.add(os.path.basename(os.path.dirname(paths[0])))
+
+    @_serialized
+    def release(self, paths):
+        """Public processing-complete callback confirms paths are no longer needed."""
+        self._pending(paths, False)
+        if paths:
+            self._active.discard(os.path.basename(os.path.dirname(paths[0])))
+
+    @_serialized
     def begin(self, message: dict[str, Any]) -> None:
         """A `message.in` with files: its folder is made, its bytes awaited."""
         self.drop()
+        self.cleanup()
         path = os.path.join(self._home, "incoming", self._agent)
         try:
             top = os.open(self._home, _FOLDER)
@@ -165,13 +342,37 @@ class Receiver:
             try:
                 folder = uuid.uuid4().hex
                 os.mkdir(folder, 0o700, dir_fd=parent)
-                self._current = _Message(message, parent, folder, path)
+                try:
+                    self._current = _Message(message, parent, folder, path)
+                except BaseException:
+                    os.rmdir(folder, dir_fd=parent)
+                    raise
+                current = self._current
+                self._active.add(folder)
+                try:
+                    meta = os.open(".enclos-incoming.json", _NEW_FILE, 0o600, dir_fd=current.fd)
+                    payload = json.dumps({"owner": "enclos-incoming-1", "conversation": message["conversation"],
+                                          "created": time.time(), "names": current.names}).encode()
+                    try:
+                        out = os.fdopen(meta, "wb")
+                    except BaseException:
+                        os.close(meta)
+                        raise
+                    with out:
+                        if out.write(payload) != len(payload):
+                            raise OSError("incomplete incoming metadata write")
+                except OSError:
+                    parent = None  # drop owns both descriptors, including on failure
+                    self.drop()
+                    raise
             except OSError:
-                os.close(parent)
+                if parent is not None:
+                    os.close(parent)
                 raise
         except OSError as e:
             raise Refused(message["id"], "internal", f"the files cannot be written: {e.strerror}") from None
 
+    @_serialized
     def part(self, message: dict[str, Any]):
         """Writes a `message.part`; the message and its files' paths, types and
         names once every byte came, else None. A part of no message being
@@ -202,16 +403,19 @@ class Receiver:
         if current.at < len(current.files):
             return None
         self._current = None
+        self._active.discard(current.folder)
         os.close(current.fd)
         os.close(current.parent)
         return (current.message, current.paths, [f["mime"] for f in current.files],
                 [f["name"] for f in current.files])
 
+    @_serialized
     def drop(self) -> Optional[str]:
         """Removes the message being received, whose connection ended or which
         was refused; its id, if there was one."""
         current, self._current = self._current, None
         if current is None:
             return None
+        self._active.discard(current.folder)
         current.remove()
         return current.message["id"]

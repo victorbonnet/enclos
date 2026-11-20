@@ -393,3 +393,50 @@ fn a_message_with_files_reaches_the_hermes_plugin_whole_in_the_sandbox_home() {
     drop(peer.0.stdin.take());
     assert!(peer.0.wait().unwrap().success());
 }
+
+#[test]
+fn missing_files_hold_only_their_conversation_across_forwards() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let got = files_plugin(&socket, true);
+    let (bridge, _device) = ready(folder.path(), socket);
+    let store = Store::open(&bridge.store).unwrap();
+    store.conversation("c-2", "lab", "main", PERSON).unwrap();
+    let files = [StoredAttachment {
+        id: "missing".into(),
+        conversation: "c-1".into(),
+        mime: "text/plain".into(),
+        name: "a.txt".into(),
+        size: 1,
+    }];
+    store
+        .add_from_device_with_files(
+            "d/file",
+            "file",
+            ("c-1", "lab", "main"),
+            PERSON,
+            "file",
+            &files,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .add_from_device("d/later", "later", "c-1", PERSON, "later")
+        .unwrap();
+    store
+        .add_from_device("d/other", "other", "c-2", PERSON, "other")
+        .unwrap();
+    for _ in 0..2 {
+        bridge.hub.forward(&store, "lab/main").unwrap();
+    }
+    assert!(eventually(|| !got.lock().unwrap().is_empty()));
+    let messages = got.lock().unwrap();
+    let texts: Vec<_> = messages
+        .iter()
+        .filter_map(|body| match body {
+            FromBridge::MessageIn { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["other"]);
+}

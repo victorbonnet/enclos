@@ -108,6 +108,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # The files a person sends with a message, written beside the socket
         # (ADR 0076, proposed).
         self._incoming = incoming.Receiver(self._path, self._agent)
+        self._incoming_cleanup = None
+        self._incoming_cleanup_pass = None
         # Work beside the connection (routine controls, deletions, the report
         # after a hello), kept so that none is collected early.
         self._routine_tasks: set[asyncio.Task] = set()
@@ -167,6 +169,7 @@ class EnclosAdapter(BasePlatformAdapter):
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
+        self._incoming_cleanup = asyncio.create_task(self._expire_incoming())
         self._mark_connected()
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
@@ -175,7 +178,25 @@ class EnclosAdapter(BasePlatformAdapter):
         logger.info("[%s] Listening for the bridge", self.name)
         return True
 
+    async def _expire_incoming(self):
+        while True:
+            try:
+                self._incoming_cleanup_pass = asyncio.create_task(asyncio.to_thread(self._incoming.cleanup))
+                await asyncio.shield(self._incoming_cleanup_pass)
+            except Exception:
+                logger.exception("Incoming expiry pass failed")
+            await asyncio.sleep(60)
+
     async def disconnect(self) -> None:
+        if self._incoming_cleanup is not None:
+            self._incoming_cleanup.cancel()
+            await asyncio.gather(self._incoming_cleanup, return_exceptions=True)
+            self._incoming_cleanup = None
+        if self._incoming_cleanup_pass is not None:
+            # Cancellation of to_thread does not join its worker. Keep ownership
+            # on timeout and fail before lifecycle teardown; a caller may retry.
+            await asyncio.wait_for(asyncio.shield(self._incoming_cleanup_pass), 5)
+            self._incoming_cleanup_pass = None
         _ADAPTERS.discard(self)
         self._interrupts.close()
         await self._reporter.stop()
@@ -522,6 +543,8 @@ class EnclosAdapter(BasePlatformAdapter):
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), message["id"]))
             return
+        if media:
+            self._incoming.admit(event.media_urls)
         try:
             await self.handle_message(event)
         except BaseException:
@@ -529,6 +552,7 @@ class EnclosAdapter(BasePlatformAdapter):
             raise
         if getattr(event, "_gateway_accepted", True) is False:
             self._interrupts.complete(event)
+            self._incoming.release(getattr(event, "media_urls", None))
         # Only once the runtime has it: if handle_message raised, the bridge
         # sends it again and it must not read as a duplicate
         self._seen[message["id"]] = None
@@ -548,6 +572,7 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome) -> None:
         self._interrupts.complete(event)
+        self._incoming.release(getattr(event, "media_urls", None))
         native_hook = getattr(super(), "on_processing_complete", None)
         if callable(native_hook):
             await native_hook(event, outcome)

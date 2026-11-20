@@ -1566,7 +1566,11 @@ impl Hub {
         };
         let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
+        let mut blocked = HashSet::new();
         for message in pending {
+            if blocked.contains(&message.conversation) {
+                continue;
+            }
             if store
                 .deletion_started(&message.conversation)
                 .map_err(|e| e.to_string())?
@@ -1581,12 +1585,14 @@ impl Hub {
             let files = match incoming::stored_files(self, store, &message.id) {
                 Ok(files) if files.is_empty() || takes_files => files,
                 Ok(_) => {
+                    blocked.insert(message.conversation.clone());
                     eprintln!(
                         "enclos app: {agent}: a message with files waits for an app channel that takes them"
                     );
                     continue;
                 }
                 Err(e) => {
+                    blocked.insert(message.conversation.clone());
                     eprintln!("enclos app: {agent}: a message's files cannot be sent: {e}");
                     continue;
                 }

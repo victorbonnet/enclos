@@ -339,6 +339,53 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e.text for e in self.adapter.received], ["hi"])
         writer.close()
 
+    async def test_disconnect_joins_blocked_cleanup_before_teardown(self):
+        import threading
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def blocked():
+            entered.set()
+            release.wait()
+            finished.set()
+        # Replace the initial periodic pass with an exactly controlled pass.
+        self.adapter._incoming_cleanup.cancel()
+        await asyncio.gather(self.adapter._incoming_cleanup, return_exceptions=True)
+        with patch.object(self.adapter._incoming, "cleanup", side_effect=blocked):
+            self.adapter._incoming_cleanup = asyncio.create_task(self.adapter._expire_incoming())
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+            task = asyncio.create_task(self.adapter.disconnect())
+            try:
+                await asyncio.sleep(0.03)
+                self.assertFalse(task.done(), "disconnect returned with cleanup still running")
+            finally:
+                release.set()
+                await task
+            self.assertTrue(finished.is_set())
+
+    async def test_disconnect_timeout_keeps_worker_owned_and_defers_teardown(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        def blocked():
+            entered.set()
+            release.wait()
+        self.adapter._incoming_cleanup.cancel()
+        await asyncio.gather(self.adapter._incoming_cleanup, return_exceptions=True)
+        with patch.object(self.adapter._incoming, "cleanup", side_effect=blocked):
+            self.adapter._incoming_cleanup = asyncio.create_task(self.adapter._expire_incoming())
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+            with patch.object(self.adapter, "_mark_disconnected") as teardown:
+                try:
+                    with self.assertRaises(TimeoutError):
+                        await self.adapter.disconnect()
+                    teardown.assert_not_called()
+                    self.assertFalse(self.adapter._incoming_cleanup_pass.done())
+                finally:
+                    release.set()
+                await self.adapter.disconnect()
+                teardown.assert_called_once()
+            self.assertIsNone(self.adapter._incoming_cleanup_pass)
+
     async def test_a_message_with_files_reaches_the_runtime_whole_with_its_media(self):
         import base64
         files = [{"name": "doc.pdf", "mime": "application/pdf", "size": 3}]
@@ -380,6 +427,13 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         with open(event.media_urls[0], "rb") as f:
             self.assertEqual(f.read(), b"%PD")
         self.assertTrue(event.media_urls[0].startswith(root + os.sep))
+        self.adapter._incoming.cleanup(now=10**12)
+        self.assertTrue(os.path.isfile(event.media_urls[0]))
+        await self.adapter.on_processing_start(event)
+        await self.adapter.on_processing_complete(event, None)
+        self.adapter._incoming.cleanup(now=10**12)
+        self.assertFalse(os.path.exists(event.media_urls[0]))
+        self.assertEqual(os.listdir(root), [])
         writer.close()
 
     async def test_a_line_over_the_limit_closes_the_connection(self):
