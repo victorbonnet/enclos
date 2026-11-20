@@ -1,5 +1,7 @@
 """Subprocess-only fixture: real ingress/capture/authority, no gateway bootstrap."""
 import asyncio
+import collections
+from datetime import UTC, datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 import os
@@ -12,7 +14,6 @@ from unittest.mock import patch
 sys.modules['gateway.run'] = ModuleType('gateway.run')
 from enclos.adapter import EnclosAdapter
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, SessionStore
 from gateway.session_authority import SessionAuthority
 from gateway.session_contract import SessionActor
@@ -34,24 +35,74 @@ async def main(root):
         epoch=begin_runtime_epoch(db, instance_id='test'))
     runner.session_authority = authority
     # Only execution scheduling is held; admission and ledger are unmodified.
-    authority._schedule = lambda ref: None
     @asynccontextmanager
     async def scope(a, event):
         assert a is adapter
         yield authority
     receipts = []
-    adapter._incoming = SimpleNamespace(captured=lambda paths, r: receipts.append(r), release=lambda paths: None)
-    path = root / 'staging.txt'
-    path.write_bytes(b'actual producer bytes')
-    event = MessageEvent(text='read', message_type=MessageType.DOCUMENT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id='c', user_id='u'),
-        message_id='delivery', media_urls=[str(path)], media_types=['text/plain'],
-        media_filenames=['staging.txt'], media_text_inlined=[False])
-    # This is the explicit test-owned runtime/runner seam. Never replace producer,
-    # capture, prepare_native, admit_native or the native write.
-    with patch.object(webhook_ingress, 'producer_scope', scope):
-        receipt = await EnclosAdapter._admit_files(adapter, event)
-    assert receipts == [receipt]
+    scheduled = []
+    authority._schedule = scheduled.append
+    async def write(message):
+        return True  # ACK may be lost; the next delivery uses a fresh plugin cache.
+    events = []
+    async def admit(event):
+        events.append(event)
+        return await EnclosAdapter._admit_files(adapter, event)
+    adapter._write = write
+    adapter._admit_files = admit
+    adapter.build_source = lambda **kw: SessionSource(platform=Platform.TELEGRAM,
+        chat_id=kw['chat_id'], user_id=kw['user_id'])
+    adapter._interrupts = SimpleNamespace(admit=lambda e: None, complete=lambda e: None)
+    adapter._incoming = SimpleNamespace(captured=lambda paths, r: receipts.append(r),
+        release=lambda paths: None, admit=lambda paths: None, admission_ended=lambda paths: None)
+    adapter._last_in = {}
+    message = dict(id='delivery', text='read', conversation='c', person='u')
+    class ReceivedTime:
+        current = datetime(2026, 1, 1, tzinfo=UTC)
+        @classmethod
+        def now(cls, **kw):
+            return cls.current
+        fromtimestamp = staticmethod(datetime.fromtimestamp)
+    async def deliver(directory, content):
+        path = root / directory / 'staging.txt'
+        path.parent.mkdir()
+        path.write_bytes(content)
+        adapter._seen = collections.OrderedDict()
+        await EnclosAdapter._on_message(adapter, message,
+            ([str(path)], ['text/plain'], ['staging.txt']))
+        return path
+    # Actual event construction and admission; only the runtime binding and
+    # execution scheduler are test-owned. Restart loses the plugin seen cache.
+    with patch.object(webhook_ingress, 'producer_scope', scope), patch('enclos.adapter.datetime', ReceivedTime):
+        path = await deliver('first', b'actual producer bytes')
+        receipt = receipts[0]
+        path.unlink()
+        ReceivedTime.current = datetime(2026, 1, 2, tzinfo=UTC)
+        path = await deliver('retry', b'actual producer bytes')
+        assert len(receipts) == 2 and receipts[1].admission_id == receipt.admission_id
+        assert receipts[1].ref == receipt.ref
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            await deliver('changed', b'changed bytes')
+        except RuntimeStoreError as error:
+            assert error.reason == 'admission_conflict', error
+        else:
+            raise AssertionError('same request with changed bytes must conflict')
+    import sqlite3
+    with sqlite3.connect(root / 'state.db') as conn:
+        assert conn.execute('SELECT COUNT(*) FROM session_admissions').fetchone()[0] == 1
+    assert scheduled and all(r == receipt.ref for r in scheduled)
+    assert not hasattr(adapter, 'handle_message')  # no model execution path installed
+    assert all(e.timestamp == datetime.fromtimestamp(0, tz=UTC) for e in events)
+    assert all(e.media_filenames == ['staging.txt'] for e in events)
+    texts = []
+    async def handle_text(event):
+        texts.append(event)
+    adapter.handle_message = handle_text
+    with patch('enclos.adapter.datetime', ReceivedTime):
+        adapter._seen.clear()
+        await EnclosAdapter._on_message(adapter, dict(message, id='ordinary-text'))
+    assert len(texts) == 1 and texts[0].timestamp == ReceivedTime.current
     row = get_session_admission(db, admission_id=receipt.admission_id)
     assert row['request_id'] == 'delivery'
     captured = Path(row['payload']['native_text_v1']['media'][0]['path'])

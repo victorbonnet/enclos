@@ -533,7 +533,10 @@ class EnclosAdapter(BasePlatformAdapter):
             kind = MessageType.PHOTO if any(t.startswith("image/") for t in types) else MessageType.DOCUMENT
             event = MessageEvent(
                 text=message["text"], message_type=kind, source=source, message_id=message["id"],
-                raw_message=message, timestamp=datetime.now(tz=UTC),
+                # The bridge supplies no producer timestamp. Native receipts hash
+                # this field: use the producer contract's epoch convention so
+                # a lost ACK/restart reconstructs the same immutable request.
+                raw_message=message, timestamp=datetime.fromtimestamp(0, tz=UTC),
                 media_urls=list(paths), media_types=list(types))
             if hasattr(event, "media_filenames"):
                 # A newer Hermes shows the person's own names
