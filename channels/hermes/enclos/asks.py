@@ -10,7 +10,8 @@ and `enclos_person_answered` when the person answered in the conversation
 instead. An ask is kept for the hold it was given for (the task and its
 `since`), in a file beside the agent's socket so a gateway restart keeps
 it, attached to that task in each `held_tasks` (`held_tasks.Manager`) and
-forgotten once the task is no longer held or is held anew.
+forgotten once the task is no longer held or is held anew. A hold Hermes
+wakes the agent for reaches the person only with an ask (ADR 0072).
 """
 
 import json
@@ -35,8 +36,9 @@ MAX_CHOICE_CHARS = 80
 # Told to the agent in each turn where held tasks are on: short, since it is
 # in every turn.
 HINT = (
-    "When a kanban task you created is stopped and needs the person's decision, call enclos_ask_person. The "
-    "person decides from its card alone, so say what was tried, why it stopped and what each choice costs. "
+    "When a kanban task you created stops, act on it yourself first: answer its assignee, resume it or end it. "
+    "The person sees it only once you call enclos_ask_person, which you do when only they can decide. They "
+    "decide from its card alone, so say what was tried, why it stopped and what each choice costs. "
     "The answer comes back to you as their message naming the task. If they answer in the conversation "
     "instead, call enclos_person_answered. Write for the person: no run numbers, hashes or board terms."
 )
