@@ -274,7 +274,6 @@ fn finish(
             return refuse(&u.id, ErrorCode::Conflict, why);
         }
     };
-    let new = matches!(added, Added::New(_));
     if let Added::New(seq) = added {
         // Recorded: one not moved now is moved when the bridge starts again
         u.kept = true;
@@ -300,17 +299,12 @@ fn finish(
         message.attachments = stored.into_iter().map(attachment_info).collect();
         hub.deliver(person, ToDevice::Message(message));
     }
-    // Acknowledged once its plugin was sent it: `forward` passes over a
-    // message whose files it cannot send now
-    let why = match hub.forward(store, &u.agent) {
-        Ok(()) if !new || handed_over(hub, store, &u.agent, &stored_as)? => {
-            return Ok(Some(ToDevice::Ack { of: u.id.clone() }));
-        }
-        Ok(()) => "its files could not be given to the agent's app channel".to_owned(),
-        Err(e) => e,
-    };
-    let why = format!("{why}: the message is kept, and goes to the agent once it can be reached");
-    refuse(&u.id, ErrorCode::AgentUnavailable, &why)
+    // The receipt confirms durable storage, including a message queued behind
+    // an unsettled file delivery. Plugin admission settles separately.
+    if let Err(e) = hub.forward(store, &u.agent) {
+        eprintln!("enclos app: incoming message kept for forwarding: {e}");
+    }
+    Ok(Some(ToDevice::Ack { of: u.id.clone() }))
 }
 
 /// What the device is told when a line it sent could not be read while a
@@ -328,19 +322,6 @@ fn takes_files(hub: &Hub, agent: &str, images: bool) -> bool {
         p.capabilities.contains(&Capability::IncomingFiles)
             && (!images || p.capabilities.contains(&Capability::IncomingImages))
     })
-}
-
-/// Whether stored message `id` was sent to `agent`'s plugin, or taken by it.
-fn handed_over(hub: &Hub, store: &Store, agent: &str, id: &str) -> Result<bool, String> {
-    let (sandbox, name) = agent.split_once('/').unwrap_or((agent, ""));
-    let pending = store.pending(sandbox, name).map_err(|e| e.to_string())?;
-    if !pending.iter().any(|m| m.id == id) {
-        return Ok(true);
-    }
-    let plugins = hub.plugins.lock().expect("not poisoned");
-    let out = plugins.get(agent).map(|p| Arc::clone(&p.out));
-    drop(plugins);
-    Ok(out.is_some_and(|out| out.lock().expect("not poisoned").sent.contains(id)))
 }
 
 /// Whether `text` is `/sethome` (or `/set-home`), which the plugin answers

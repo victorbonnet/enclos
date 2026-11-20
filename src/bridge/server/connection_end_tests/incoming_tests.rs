@@ -916,3 +916,145 @@ fn committed_upload_is_forwarded_before_rename_without_terminal_failure() {
     );
     assert_eq!(incoming_left(&bridge), 0);
 }
+
+#[test]
+fn successive_file_uploads_receive_durable_receipts_before_plugin_settlement() {
+    successive_file_uploads(false);
+}
+
+#[test]
+fn successive_file_uploads_keep_late_refusal_correlated() {
+    successive_file_uploads(true);
+}
+
+fn successive_file_uploads(refuse: bool) {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let (got, settle) = upgrading_files_plugin(&socket);
+    let (bridge, mut device) = ready(folder.path(), socket);
+    let store = Store::open(&bridge.store).unwrap();
+    store.conversation("c-2", "lab", "main", PERSON).unwrap();
+    bridge
+        .hub
+        .plugins
+        .lock()
+        .unwrap()
+        .get("lab/main")
+        .unwrap()
+        .closer
+        .shutdown();
+    assert!(eventually(|| bridge
+        .hub
+        .plugins
+        .lock()
+        .unwrap()
+        .get("lab/main")
+        .is_some_and(|p| p
+            .capabilities
+            .contains(&Capability::IncomingFiles))));
+    let files = [file("first.txt", "text/plain", 1)];
+    begin(&mut device, "upload-one", "c-1", "first", &files);
+    send_all(&mut device, "upload-one", &[vec![b'a']]);
+    assert_eq!(answer_to(&mut device, "upload-one"), None);
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |b| matches!(b, FromBridge::MessageIn { text, .. } if text == "first")
+    )));
+    assert!(
+        store
+            .pending("lab", "main")
+            .unwrap()
+            .iter()
+            .any(|m| m.text == "first")
+    );
+    let files = [file("second.txt", "text/plain", 1)];
+    begin(&mut device, "upload-two", "c-1", "second", &files);
+    send_all(&mut device, "upload-two", &[vec![b'b']]);
+    assert_eq!(
+        answer_to(&mut device, "upload-two"),
+        None,
+        "durably queued second upload needs its storage receipt"
+    );
+    assert!(
+        !got.lock()
+            .unwrap()
+            .iter()
+            .any(|b| matches!(b, FromBridge::MessageIn { text, .. } if text == "second"))
+    );
+    let history = store.messages_after("c-1", 0).unwrap();
+    let first = history.iter().find(|m| m.text == "first").unwrap();
+    let second = history.iter().find(|m| m.text == "second").unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(history.iter().filter(|m| m.kind == "status").count(), 0);
+    for (text, name, bytes) in [("first", "first.txt", b"a"), ("second", "second.txt", b"b")] {
+        let m = history.iter().find(|m| m.text == text).unwrap();
+        let attachments = store.attachments_of(&m.id).unwrap();
+        assert_eq!(attachments[0].name, name);
+        assert_eq!(
+            std::fs::read(bridge.hub.media().join(&attachments[0].id)).unwrap(),
+            bytes
+        );
+    }
+    store
+        .add_from_device("d/other", "other", "c-2", PERSON, "other")
+        .unwrap();
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |b| matches!(b, FromBridge::MessageIn { text, .. } if text == "other")
+    )));
+    settle.send(false).unwrap();
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |b| matches!(b, FromBridge::MessageIn { text, .. } if text == "second")
+    )));
+    settle.send(refuse).unwrap();
+    if refuse {
+        assert_eq!(
+            answer_to(&mut device, "upload-two"),
+            Some(ErrorCode::OperationFailed)
+        );
+    }
+    assert!(eventually(|| !store
+        .pending("lab", "main")
+        .unwrap()
+        .iter()
+        .any(|m| m.text == "first" || m.text == "second")));
+    if refuse {
+        let history = store.messages_after("c-1", 0).unwrap();
+        let notices: Vec<_> = history.iter().filter(|m| m.kind == "status").collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.contains("upload-two"));
+        assert!(notices[0].text.contains("second.txt"));
+        assert!(!notices[0].text.contains("upload-one"));
+        assert!(
+            !store
+                .messages_after("c-2", 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.kind == "status")
+        );
+        begin(&mut device, "upload-two", "c-1", "second", &files);
+        send_all(&mut device, "upload-two", &[vec![b'b']]);
+        assert_eq!(answer_to(&mut device, "upload-two"), None);
+        bridge.hub.forward(&store, "lab/main").unwrap();
+        let history = store.messages_after("c-1", 0).unwrap();
+        assert_eq!(history.iter().filter(|m| m.kind == "status").count(), 1);
+        assert_eq!(history.iter().filter(|m| m.text == "second").count(), 1);
+        assert!(
+            !store
+                .pending("lab", "main")
+                .unwrap()
+                .iter()
+                .any(|m| m.text == "second")
+        );
+    }
+    let messages = got.lock().unwrap();
+    let texts: Vec<_> = messages
+        .iter()
+        .filter_map(|b| match b {
+            FromBridge::MessageIn { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.iter().filter(|t| **t == "first").count(), 1);
+    assert_eq!(texts.iter().filter(|t| **t == "second").count(), 1);
+    assert!(texts.iter().position(|t| *t == "first") < texts.iter().position(|t| *t == "second"));
+}

@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory() as temporary:
     assert not captured.exists()
     db.close()
     verify()
-''' 
+'''
         env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(source), str(Path(__file__).parent.resolve())]))
         result = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True, timeout=25)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -65,4 +65,15 @@ with tempfile.TemporaryDirectory() as temporary:
         env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(source), str(Path(__file__).resolve().parents[1])]))
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("native_ingress_fixture.py"))], env=env,
                                 text=True, capture_output=True, timeout=25)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_actual_admission_preserves_prepared_write_uncertainty(self):
+        source = Path(os.environ.get("ENCLOS_HERMES_SOURCE", Path.home() / ".hermes/hermes-agent"))
+        if not (source / "gateway/session_authority.py").is_file():
+            if "ENCLOS_HERMES_SOURCE" in os.environ:
+                self.fail(f"Named Hermes source is missing: {source}")
+            self.skipTest("Optional installed Hermes source absent")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(source), str(Path(__file__).resolve().parents[1])]))
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("native_admission_fixture.py"))],
+                                env=env, text=True, capture_output=True, timeout=25)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -605,11 +605,16 @@ class EnclosAdapter(BasePlatformAdapter):
                 native_write_started.set(False)
                 from gateway.platforms.webhook_ingress import admit_producer
                 receipt = await admit_producer(self, event)
-            except (ImportError, OSError) as error:
-                if 'native_write_started' in locals() and native_write_started.get():
-                    raise  # a write may already have committed
+            except ImportError as error:
+                # Once ingress is called, even an import error can follow a write.
+                if 'admit_producer' in locals():
+                    raise
                 self._incoming.release(paths)
                 raise FileAdmissionRefused() from error
+            except OSError:
+                # Prepared ingress restores its ContextVar on exit. A false
+                # marker here cannot prove that a write never started.
+                raise
             except Exception as error:
                 from importlib.util import find_spec
                 if find_spec("persistence_assembly") is not None:
