@@ -144,6 +144,35 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual(answer["type"], "hello")
 
+    async def test_runtime_consumed_text_needs_no_file_receiver(self):
+        from collections import OrderedDict
+        from unittest.mock import AsyncMock
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter = EnclosAdapter.__new__(EnclosAdapter)
+        BasePlatformAdapter.__init__(adapter, PlatformConfig(), "enclos")
+        adapter._seen = OrderedDict()
+        adapter._last_in = {}
+        adapter._interrupts = types.SimpleNamespace(admit=Mock(), complete=Mock())
+        adapter._write = AsyncMock(return_value=True)
+
+        async def consume(event):
+            event._gateway_accepted = False
+        adapter.handle_message = AsyncMock(side_effect=consume)
+        message = protocol._message("message.in", conversation="c", person="person", text="yes please")
+        self.assertFalse(hasattr(adapter, "_incoming"))
+        await adapter._on_message(message)
+        event = adapter.handle_message.call_args.args[0]
+        adapter._interrupts.admit.assert_called_once_with(event)
+        adapter._interrupts.complete.assert_called_once_with(event)
+        self.assertIn(message["id"], adapter._seen)
+        self.assertEqual(adapter._write.call_args.args[0]["type"], "ack")
+        self.assertEqual(adapter._write.call_args.args[0]["of"], message["id"])
+        # A repeated delivery retains the ordinary text deduplication contract.
+        await adapter._on_message(message)
+        adapter.handle_message.assert_awaited_once()
+        self.assertEqual(adapter._write.await_count, 2)
+
     async def test_image_check_canonicalizes_in_owning_profile_scope(self):
         from contextlib import asynccontextmanager
         source = types.SimpleNamespace(profile=None)

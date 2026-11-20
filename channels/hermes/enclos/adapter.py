@@ -578,7 +578,8 @@ class EnclosAdapter(BasePlatformAdapter):
             raise
         if getattr(event, "_gateway_accepted", True) is False:
             self._interrupts.complete(event)
-            self._incoming.release(getattr(event, "media_urls", None))
+            if media:
+                self._incoming.release(event.media_urls)
         # Only once the runtime has it: if handle_message raised, the bridge
         # sends it again and it must not read as a duplicate
         self._seen[message["id"]] = None
