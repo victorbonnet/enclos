@@ -26,7 +26,7 @@ from typing import Optional
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from enclos import held_tasks, protocol  # noqa: E402
+from enclos import asks, held_tasks, protocol  # noqa: E402
 
 
 @dataclasses.dataclass
@@ -59,6 +59,23 @@ CREATE TABLE IF NOT EXISTS task_events (
     kind       TEXT NOT NULL,
     payload    TEXT,
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_subs (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    user_id       TEXT,
+    user_id_alt   TEXT,
+    chat_type     TEXT,
+    notifier_profile TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'notify',
+    delivery_metadata TEXT,
+    created_at    INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 """
 
@@ -190,6 +207,17 @@ class FakeKanban:
     def comment(self, task_id, board="default"):
         with self.db(board) as conn, conn:
             self._event(conn, task_id, "commented", {"author": "someone"})
+
+    def subscribe(self, task_id, profile="main", mode="notify+wake", chat_id="chat-1", board="default"):
+        """As Hermes subscribes a chat to a task, the one asking for it."""
+        with self.db(board) as conn, conn:
+            conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, notifier_profile, "
+                         "delivery_mode, created_at) VALUES (?, 'enclos', ?, ?, ?, ?)",
+                         (task_id, chat_id, profile, mode, int(time.time())))
+
+    def unsubscribe_all(self, board="default"):
+        with self.db(board) as conn, conn:
+            conn.execute("DELETE FROM kanban_notify_subs")
 
     def status(self, task_id, board="default"):
         with self.db(board) as conn:
@@ -949,6 +977,102 @@ class Sent(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.tasks, set())
 
 
+ASK = {"task": "t_1", "decision": "Which client is the report for?",
+       "blocked": "The writer cannot tell which client the report is for.",
+       "choices": ["Acme", "Globex"], "recommended": 0}
+
+
+class AgentFirst(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
+    """A hold goes to the agent that created the task first (ADR 0072): one
+    Hermes wakes that agent for is left out of the list until it asks."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent: list[dict] = []
+        self.kb.create("t_1")
+        self.kb.hold("t_1", payload={"reason": "Which client?", "kind": "needs_input"})
+        self.manager = held_tasks.Manager("main", self.write, board=self.board, refresh_seconds=3600)
+        self.manager.bridge_supports = True
+        self.manager.asks = asks.Asks(str(Path(self.temporary.name) / "main.sock.held-asks.json"))
+
+    async def write(self, message):
+        self.sent.append(message)
+        return True
+
+    async def listed(self):
+        """The tasks of the list the next read sends, forced."""
+        await self.manager.refresh(force=True)
+        tasks = self.sent[-1]["tasks"]
+        self.assertTrue(all(held_tasks.WOKEN not in task for task in tasks))
+        return tasks
+
+    def ask(self):
+        task, ask = asks.validate(ASK)
+        self.manager.asks.put(task, self.board.read("main")[0]["since"], ask)
+
+    async def test_a_hold_hermes_wakes_the_agent_for_is_read_but_not_sent(self):
+        self.kb.subscribe("t_1")
+        [task] = self.board.read("main")
+        self.assertIs(task[held_tasks.WOKEN], True)
+        self.assertEqual(await self.listed(), [])
+
+    async def test_either_waking_mode_leaves_the_hold_with_the_agent(self):
+        for mode in ("wake", "notify+wake"):
+            with self.subTest(mode):
+                self.kb.unsubscribe_all()
+                self.kb.subscribe("t_1", mode=mode)
+                self.assertEqual(await self.listed(), [])
+
+    async def test_a_woken_hold_is_sent_once_the_agent_asks_and_still_once_it_is_settled(self):
+        self.kb.subscribe("t_1")
+        self.ask()
+        [task] = await self.listed()
+        self.assertEqual((task["task"], task["ask"]["decision"]), ("t_1", ASK["decision"]))
+        self.manager.asks.settle("t_1", task["since"], task["title"])
+        [task] = await self.listed()
+        self.assertTrue(task["ask"]["settled"])
+
+    async def test_a_hold_no_subscription_wakes_this_agent_for_is_the_person_s(self):
+        for case, subscribe in (("notify only", dict(mode="notify")),
+                                ("another profile's wake", dict(profile="research")),
+                                ("no profile", dict(profile=None)),
+                                ("a blank profile", dict(profile=""))):
+            with self.subTest(case):
+                self.kb.unsubscribe_all()
+                self.kb.subscribe("t_1", **subscribe)
+                self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+
+    async def test_a_board_without_hermes_s_subscriptions_wakes_no_one(self):
+        with self.kb.db() as conn, conn:
+            conn.execute("DROP TABLE kanban_notify_subs")
+        self.assertNotIn(held_tasks.WOKEN, self.board.read("main")[0])
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+
+    async def test_a_hold_that_becomes_woken_leaves_the_list_and_one_no_longer_woken_comes_back(self):
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+        self.kb.subscribe("t_1")
+        self.assertEqual(await self.listed(), [])
+        # Hermes drops a subscription whose wakes keep failing: the hold is the person's.
+        self.kb.unsubscribe_all()
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+
+    async def test_an_ask_on_a_woken_hold_is_kept_while_the_hold_is_left_out(self):
+        self.ask()
+        self.kb.subscribe("t_1")
+        self.kb.create("t_2")
+        self.kb.hold("t_2", at=3_000)
+        self.kb.subscribe("t_2")
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+
+    async def test_another_board_s_subscription_is_read_on_that_board(self):
+        self.kb.add_board("ops")
+        self.kb.create("t_1", board="ops")
+        self.kb.hold("t_1", board="ops", at=3_000)
+        self.kb.subscribe("t_1", board="ops")
+        self.assertEqual([t["task"] for t in await self.listed()], ["t_1"])
+
+
 @unittest.skipUnless(os.environ.get("ENCLOS_HERMES_SOURCE"), "optional real Hermes checkout")
 class NativeHermesHeldTasks(unittest.TestCase):
     """Against a real Hermes, on boards in a temporary home: no dispatcher or worker runs."""
@@ -1584,6 +1708,37 @@ class NativeHermesHeldTasks(unittest.TestCase):
         self.held()
         self.assertEqual(len(self.board.read("main")), 1)
         self.assertFalse(database.exists())
+
+    def test_a_hold_hermes_wakes_the_agent_for_is_not_sent_until_it_asks(self):
+        try:
+            from hermes_cli.kanban_db_notify import add_notify_sub
+        except ImportError:
+            add_notify_sub = getattr(self.kb, "add_notify_sub", None)
+        if not callable(add_notify_sub):
+            self.skipTest("this Hermes has no add_notify_sub")
+        woken = self.held()
+        told = self.held(title="Check the invoices")
+        # As Hermes subscribes the chat a task was asked from (its kanban tool's
+        # `_maybe_auto_subscribe`): `notify+wake` for the asking profile.
+        add_notify_sub(self.conn, task_id=woken, platform="enclos", chat_id="main-home", notifier_profile="main",
+                       delivery_mode="notify+wake")
+        add_notify_sub(self.conn, task_id=told, platform="enclos", chat_id="main-home", notifier_profile="main",
+                       delivery_mode="notify")
+        read = {task["task"]: task.get(held_tasks.WOKEN, False) for task in self.board.read("main")}
+        self.assertEqual(read, {woken: True, told: False})
+        sent = []
+
+        async def write(message):
+            sent.append(message)
+            return True
+
+        async def run():
+            manager = held_tasks.Manager("main", write, board=self.board, refresh_seconds=3600)
+            manager.bridge_supports = True
+            await manager.refresh()
+
+        asyncio.run(run())
+        self.assertEqual([t["task"] for t in sent[0]["tasks"]], [told])
 
     def test_the_manager_sends_the_list_and_answers_a_resume(self):
         task_id = self.held()
