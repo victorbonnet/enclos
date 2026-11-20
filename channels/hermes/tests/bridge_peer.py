@@ -24,8 +24,34 @@ from enclos.adapter import EnclosAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 
 
-async def main(socket_path: str, token: str) -> None:
+async def main(socket_path: str, token: str, mode="normal") -> None:
     adapter = EnclosAdapter(PlatformConfig({"socket": socket_path, "token": token}))
+    # Transport-only fixture: model eligibility is covered separately.
+    adapter._files_available = lambda: True
+    adapter._images_available = lambda source=None: mode != "capability" or source is None
+    if mode in ("write", "space"):
+        import errno
+        from enclos import incoming
+        def refuse_write(self, data):
+            raise OSError(errno.ENOSPC if mode == "space" else errno.EACCES, "fixture")
+        incoming._Message.write = refuse_write
+    if mode != "normal":
+        # Hold only the refusal frame so the device can disconnect first.
+        original_write = adapter._write
+        async def gated_write(message):
+            if message.get("kind") == "error":
+                for _ in range(1000):
+                    if os.path.exists(socket_path + ".refuse"):
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise TimeoutError("refusal gate not released")
+            return await original_write(message)
+        adapter._write = gated_write
+    adapter._admit_files = adapter.handle_message
+    async def transport_images(source):
+        return adapter._images_available(source)
+    adapter._conversation_images_available = transport_images
     if not await adapter.connect():
         sys.exit("cannot listen")
     print("listening", flush=True)
@@ -44,4 +70,4 @@ async def main(socket_path: str, token: str) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(*sys.argv[1:3]))
+    asyncio.run(main(*sys.argv[1:4]))

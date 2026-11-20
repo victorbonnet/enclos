@@ -47,6 +47,11 @@ class InstalledHermesDocumentNotesTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.dir.cleanup)
         self.adapter = EnclosAdapter(PlatformConfig({"socket": os.path.join(self.dir.name, "main.sock"),
                                                      "token": "t" * 64}))
+        self.adapter._images_available = lambda source=None: True
+        self.adapter._admit_files = self.adapter.handle_message
+        async def transport_images(source):
+            return self.adapter._images_available(source)
+        self.adapter._conversation_images_available = transport_images
         self.adapter._write = AsyncMock()
         self.adapter._interrupts = Mock()
 

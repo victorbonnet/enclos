@@ -185,9 +185,10 @@ struct PluginOut {
 /// The capabilities the bridge knows of: one it does not (`notify`, from
 /// an older plugin) is not shown to devices as `unknown`.
 fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    let files = capabilities.contains(&Capability::IncomingFiles);
     capabilities
         .into_iter()
-        .filter(|c| *c != Capability::Unknown)
+        .filter(|c| *c != Capability::Unknown && (*c != Capability::IncomingImages || files))
         .collect()
 }
 
@@ -994,6 +995,27 @@ impl Hub {
                         if hub.model_error(&store, &agent, generation, &error) {
                             continue;
                         }
+                        if let Some(of) = &error.of {
+                            match store.attachments_of(of.as_str()) {
+                                Ok(files) if !files.is_empty() => {
+                                    if let Err(e) = hub.refuse_incoming(
+                                        &store,
+                                        &agent,
+                                        of.as_str(),
+                                        "The agent could not accept the files.",
+                                    ) {
+                                        eprintln!(
+                                            "enclos app: incoming refusal could not be stored: {e}"
+                                        );
+                                    } else if let Err(e) = hub.forward(&store, &agent) {
+                                        eprintln!(
+                                            "enclos app: {agent}: cannot forward after file refusal: {e}"
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -1239,7 +1261,17 @@ impl Hub {
                         if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
                             continue;
                         }
+                        let has_files = store
+                            .attachments_of(of.as_str())
+                            .is_ok_and(|files| !files.is_empty());
                         match store.delivered(of.as_str(), &agent) {
+                            Ok(Acked::Delivered) if has_files => {
+                                if let Err(e) = hub.forward(&store, &agent) {
+                                    eprintln!(
+                                        "enclos app: {agent}: cannot forward after file ack: {e}"
+                                    );
+                                }
+                            }
                             Ok(Acked::Delivered | Acked::Nothing) => {}
                             Ok(Acked::NotItsOwn) => {
                                 let why = format!(
@@ -1539,6 +1571,27 @@ impl Hub {
         Ok(last)
     }
 
+    /// Safe terminal text is chosen here, never copied from a plugin exception.
+    fn refuse_incoming(
+        &self,
+        store: &Store,
+        agent: &str,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        if let Some((device, operation)) = store
+            .refuse_incoming(id, agent, reason)
+            .map_err(|e| e.to_string())?
+        {
+            let devices = self.devices.lock().expect("not poisoned");
+            if let Some((_, sender, _)) = devices.get(&device) {
+                let of = MessageId::new(operation).map_err(|e| e.to_string())?;
+                let _ = sender.send(operation_failed(of, reason));
+            }
+        }
+        Ok(())
+    }
+
     /// Gives `agent`'s plugin the messages still pending for it, opening
     /// its connection if it is not open, each with the id it was stored
     /// with: the plugin drops one it has had already.
@@ -1553,7 +1606,7 @@ impl Hub {
         self.plugin(agent)?;
         // The plugins lock is let go before writing: a write waits for the
         // plugin to read, up to the plugin leg's write timeout
-        let (out, generation, takes_files) = {
+        let (out, generation, takes_files, takes_images) = {
             let plugins = self.plugins.lock().expect("not poisoned");
             let Some(plugin) = plugins.get(agent) else {
                 return Err(format!("{agent}'s app channel closed"));
@@ -1562,6 +1615,7 @@ impl Hub {
                 Arc::clone(&plugin.out),
                 plugin.generation,
                 plugin.capabilities.contains(&Capability::IncomingFiles),
+                plugin.capabilities.contains(&Capability::IncomingImages),
             )
         };
         let host = self.known_host();
@@ -1578,12 +1632,26 @@ impl Hub {
                 continue;
             }
             if plugin.sent.contains(&message.id) {
+                if !store
+                    .attachments_of(&message.id)
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
+                {
+                    blocked.insert(message.conversation.clone());
+                }
                 continue;
             }
             // A message with files goes whole, to a plugin that takes them,
             // or waits: never as its text alone (ADR 0076, proposed).
             let files = match incoming::stored_files(self, store, &message.id) {
-                Ok(files) if files.is_empty() || takes_files => files,
+                Ok(files)
+                    if files.is_empty()
+                        || (takes_files
+                            && (takes_images
+                                || !files.iter().any(|(f, _)| f.mime.starts_with("image/")))) =>
+                {
+                    files
+                }
                 Ok(_) => {
                     blocked.insert(message.conversation.clone());
                     eprintln!(
@@ -1592,11 +1660,19 @@ impl Hub {
                     continue;
                 }
                 Err(e) => {
-                    blocked.insert(message.conversation.clone());
+                    self.refuse_incoming(
+                        store,
+                        agent,
+                        &message.id,
+                        "The stored files are unavailable.",
+                    )?;
                     eprintln!("enclos app: {agent}: a message's files cannot be sent: {e}");
                     continue;
                 }
             };
+            if !files.is_empty() {
+                blocked.insert(message.conversation.clone());
+            }
             let from_host = host.as_deref() == Some(message.person.as_str());
             // A message with files is never signed: the signature covers its
             // text, not its files, so it would vouch for bytes it never saw

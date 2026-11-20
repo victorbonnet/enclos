@@ -176,7 +176,8 @@ def _serialized(method):
 class Receiver:
     """The message with files being received on the bridge's connection."""
 
-    def __init__(self, socket_path: str, agent: str):
+    def __init__(self, socket_path: str, agent: str, *, capture_only=False):
+        self._capture_only = capture_only
         self._home = os.path.dirname(socket_path)
         self._agent = _plain(agent)
         self._current: Optional[_Message] = None
@@ -187,7 +188,8 @@ class Receiver:
     def cleanup(self, conversation=None, now=None):
         """Expire recognized leaves; confirmed native deletion also retires pending media.
 
-        Pending admissions survive restart indefinitely without a completion signal.
+        Legacy pending admissions stay protected. Receipt-only staging can expire:
+        native admission never queues these paths, only independent captured bytes.
         Legacy/partial leaves have no conversation provenance and only expire.
         One receiver identity is supported; this is not a cross-process live lease.
         """
@@ -241,12 +243,12 @@ class Receiver:
                         if record is None or record.get("conversation") != conversation:
                             continue
                     else:
-                        if folder in self._active or ".pending" in entries:
+                        if folder in self._active or (".pending" in entries and not (record and record.get("handoff") == "immutable-native")):
                             continue
                         created = record.get("created") if record else os.fstat(fd).st_mtime
                         if not isinstance(created, (int, float)) or now - created < 86400:
                             continue
-                    names = entries - {".enclos-incoming.json", ".pending"}
+                    names = entries - {".enclos-incoming.json", ".pending", ".pending.receipt"}
                     if len(names) > MAX_FILES or any(not _is_disk_name(n) for n in names):
                         continue
                     # Never remove links, subdirectories, or unexpected entries.
@@ -254,8 +256,9 @@ class Receiver:
                         continue
                     for name in names:
                         os.unlink(name, dir_fd=fd)
-                    if ".pending" in entries:
-                        os.unlink(".pending", dir_fd=fd)
+                    for marker in (".pending", ".pending.receipt"):
+                        if marker in entries:
+                            os.unlink(marker, dir_fd=fd)
                     if ".enclos-incoming.json" in entries:
                         os.unlink(".enclos-incoming.json", dir_fd=fd)
                     # A failed rmdir leaves a recognizable empty UUID leaf for retry.
@@ -271,7 +274,7 @@ class Receiver:
         if conversation is not None and errors:
             raise OSError("incoming cleanup incomplete; retry deletion") from errors[0]
 
-    def _pending(self, paths, create):
+    def _pending(self, paths, create, receipt=None):
         if not paths:
             return
         folder = os.path.dirname(paths[0])
@@ -299,8 +302,24 @@ class Receiver:
             raise
         try:
             if create:
-                out = os.open(".pending", _NEW_FILE, 0o600, dir_fd=fd)
-                os.close(out)
+                temporary = ".pending.receipt" if receipt is not None else ".pending"
+                out = os.open(temporary, _NEW_FILE, 0o600, dir_fd=fd)
+                try:
+                    if receipt is not None:
+                        payload = json.dumps({"admission_id": receipt.admission_id,
+                            "profile_id": receipt.ref.profile_id, "session_id": receipt.ref.session_id}).encode()
+                        view = memoryview(payload)
+                        while view:
+                            written = os.write(out, view)
+                            if not written:
+                                raise OSError("receipt write made no progress")
+                            view = view[written:]
+                    os.fsync(out)
+                finally:
+                    os.close(out)
+                if receipt is not None:
+                    os.replace(temporary, ".pending", src_dir_fd=fd, dst_dir_fd=fd)
+                os.fsync(fd)
             else:
                 try:
                     os.unlink(".pending", dir_fd=fd)
@@ -315,6 +334,27 @@ class Receiver:
         self._pending(paths, True)
         if paths:
             self._active.add(os.path.basename(os.path.dirname(paths[0])))
+
+    @_serialized
+    def captured(self, paths, receipt):
+        """Receipt ingress committed independent bytes; retain identity until staging expires."""
+        try:
+            self._pending(paths, True, receipt)
+        finally:
+            # Admission already owns immutable copies even if its diagnostic
+            # marker cannot be saved. The new staging manifest permits expiry.
+            if paths:
+                self._active.discard(os.path.basename(os.path.dirname(paths[0])))
+
+    @_serialized
+    def admission_ended(self, paths):
+        """Release worker ownership without changing the diagnostic pending marker.
+
+        Capture-only manifests can expire once admission has fully ended, even
+        when its outcome is unknown. Legacy pending paths remain protected.
+        """
+        if paths:
+            self._active.discard(os.path.basename(os.path.dirname(paths[0])))
 
     @_serialized
     def release(self, paths):
@@ -352,7 +392,8 @@ class Receiver:
                 try:
                     meta = os.open(".enclos-incoming.json", _NEW_FILE, 0o600, dir_fd=current.fd)
                     payload = json.dumps({"owner": "enclos-incoming-1", "conversation": message["conversation"],
-                                          "created": time.time(), "names": current.names}).encode()
+                                          "created": time.time(), "names": current.names,
+                                          "handoff": "immutable-native" if self._capture_only else "legacy"}).encode()
                     try:
                         out = os.fdopen(meta, "wb")
                     except BaseException:

@@ -259,3 +259,51 @@ class ReceiverTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CaptureOnlyLifetime(unittest.TestCase):
+    def test_marker_failure_releases_active_capture_for_expiry(self):
+        import json
+        import types
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as home:
+            receiver = incoming.Receiver(os.path.join(home, "main.sock"), "main", capture_only=True)
+            receiver.begin(message_in([{"name": "a.txt", "mime": "text/plain", "size": 1}]))
+            paths = receiver.part(part(0, 0, b"x"))[1]
+            receiver.admit(paths)
+            folder = Path(paths[0]).parent
+            later = json.loads((folder / ".enclos-incoming.json").read_text())["created"] + 90000
+            receipt = types.SimpleNamespace(admission_id="committed", ref=types.SimpleNamespace(profile_id="p", session_id="s"))
+            with patch.object(receiver, "_pending", side_effect=OSError("marker disk full")):
+                with self.assertRaises(OSError):
+                    receiver.captured(paths, receipt)
+            receiver.cleanup(now=later)
+            self.assertFalse(folder.exists())
+
+    def test_crash_gap_and_receipt_staging_expire_but_active_copy_does_not(self):
+        import json
+        import types
+        with tempfile.TemporaryDirectory() as home:
+            socket = os.path.join(home, "main.sock")
+            receiver = incoming.Receiver(socket, "main", capture_only=True)
+            receiver.begin(message_in([{"name": "a.txt", "mime": "text/plain", "size": 1}]))
+            received = receiver.part(part(0, 0, b"x"))
+            paths = received[1]
+            receiver.admit(paths)
+            folder = Path(paths[0]).parent
+            meta = json.loads((folder / ".enclos-incoming.json").read_text())
+            later = meta["created"] + 90000
+            receiver.cleanup(now=later)
+            self.assertTrue(Path(paths[0]).exists())
+            receipt = types.SimpleNamespace(admission_id="actual-id", ref=types.SimpleNamespace(profile_id="p", session_id="s"))
+            receiver.captured(paths, receipt)
+            self.assertEqual(json.loads((folder / ".pending").read_text())["admission_id"], "actual-id")
+            receiver.cleanup(now=later)
+            self.assertFalse(folder.exists())
+            # Crash after admission but before writing the receipt: no running
+            # capture survives process restart, and queues only use owned copies.
+            receiver.begin(message_in([{"name": "a.txt", "mime": "text/plain", "size": 1}]))
+            received = receiver.part(part(0, 0, b"x"))
+            receiver.admit(received[1])
+            folder = Path(received[1][0]).parent
+            incoming.Receiver(socket, "main", capture_only=True).cleanup(now=later + 1)
+            self.assertFalse(folder.exists())

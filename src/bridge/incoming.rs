@@ -116,8 +116,16 @@ pub(super) fn begin(
         let why = format!("{e}: nothing was sent; send it again once the agent can be reached");
         return refuse(&id, AgentUnavailable, &why);
     }
-    if !takes_files(hub, &name) {
-        let why = "This agent's app channel does not take files: nothing was sent.";
+    if !takes_files(
+        hub,
+        &name,
+        files.iter().any(|f| f.mime.starts_with("image/")),
+    ) {
+        let why = if takes_files(hub, &name, false) {
+            "This agent's app channel does not take images; documents remain available: nothing was sent."
+        } else {
+            "This agent's app channel does not take files: nothing was sent."
+        };
         return refuse(&id, Unsupported, why);
     }
     let incoming = hub.media().join(INCOMING);
@@ -224,8 +232,16 @@ fn finish(
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
     // Its plugin may have connected again since, as one that takes no files
-    if !takes_files(hub, &u.agent) {
-        let why = "This agent's app channel does not take files: nothing was sent.";
+    if !takes_files(
+        hub,
+        &u.agent,
+        u.files.iter().any(|f| f.mime.starts_with("image/")),
+    ) {
+        let why = if takes_files(hub, &u.agent, false) {
+            "This agent's app channel does not take images; documents remain available: nothing was sent."
+        } else {
+            "This agent's app channel does not take files: nothing was sent."
+        };
         return refuse(&u.id, ErrorCode::Unsupported, why);
     }
     let stored: Vec<StoredAttachment> = u
@@ -302,11 +318,12 @@ pub(super) fn dropped(upload: &mut Option<Upload>) -> Option<ToDevice> {
 }
 
 /// Whether `agent`'s plugin, connected now, names `incoming_files`.
-fn takes_files(hub: &Hub, agent: &str) -> bool {
+fn takes_files(hub: &Hub, agent: &str, images: bool) -> bool {
     let plugins = hub.plugins.lock().expect("not poisoned");
-    plugins
-        .get(agent)
-        .is_some_and(|p| p.capabilities.contains(&Capability::IncomingFiles))
+    plugins.get(agent).is_some_and(|p| {
+        p.capabilities.contains(&Capability::IncomingFiles)
+            && (!images || p.capabilities.contains(&Capability::IncomingImages))
+    })
 }
 
 /// Whether stored message `id` was sent to `agent`'s plugin, or taken by it.

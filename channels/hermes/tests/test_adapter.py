@@ -144,6 +144,137 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         answer = json.loads(await asyncio.wait_for(reader.readline(), 5))
         self.assertEqual(answer["type"], "hello")
 
+    async def test_image_check_canonicalizes_in_owning_profile_scope(self):
+        from contextlib import asynccontextmanager
+        source = types.SimpleNamespace(profile=None)
+        entered = []
+        @asynccontextmanager
+        async def scope(adapter, event):
+            self.assertIs(event.source, source)
+            source.profile = "secondary"
+            entered.append(True)
+            yield object()
+            entered.pop()
+        def check(actual):
+            self.assertIs(actual, source)
+            self.assertEqual(actual.profile, "secondary")
+            self.assertEqual(entered, [True])
+            return True
+        self.adapter._images_available = check
+        with patch.dict(sys.modules, {"gateway.platforms.webhook_ingress": types.SimpleNamespace(producer_scope=scope)}):
+            self.assertTrue(await self.adapter._conversation_images_available(source))
+        self.assertEqual(entered, [])
+
+    async def test_disconnect_joins_cancelled_native_admission(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def producer(adapter, event):
+            started.set()
+            await release.wait()
+            return object()
+        modules = {
+            "gateway.platforms.webhook_ingress": types.SimpleNamespace(admit_producer=producer),
+            "gateway.session_authority": types.SimpleNamespace(native_write_started=__import__("contextvars").ContextVar("writing", default=False)),
+        }
+        with patch.dict(sys.modules, modules), patch.object(self.adapter._incoming, "captured"):
+            waiter = asyncio.create_task(self.adapter._admit_files(types.SimpleNamespace(media_urls=[])))
+            await started.wait()
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            worker = next(iter(self.adapter._native_admissions))
+            with patch.object(self.adapter, "_mark_disconnected") as teardown:
+                closing = asyncio.create_task(self.adapter.disconnect())
+                try:
+                    await asyncio.sleep(0.03)
+                    self.assertFalse(closing.done())
+                    teardown.assert_not_called()
+                finally:
+                    release.set()
+                    await closing
+                self.assertTrue(worker.done())
+
+    async def test_disconnect_native_timeout_retains_ownership(self):
+        release = asyncio.Event()
+        worker = asyncio.create_task(release.wait())
+        self.adapter._native_admissions = {worker}
+        with patch.object(self.adapter, "_mark_disconnected") as teardown:
+            try:
+                with self.assertRaises(TimeoutError):
+                    await self.adapter.disconnect()
+                teardown.assert_not_called()
+                self.assertIn(worker, self.adapter._native_admissions)
+                self.assertFalse(worker.done())
+            finally:
+                release.set()
+                await worker
+            await self.adapter.disconnect()
+
+    async def test_unknown_admission_releases_completed_capture_for_expiry(self):
+        from test_incoming import message_in, part
+        from enclos import incoming
+        import contextvars
+        import time
+        receiver = self.adapter._incoming
+        self.assertTrue(receiver._capture_only)
+        receiver.begin(message_in([{"name": "a.txt", "mime": "text/plain", "size": 5}]))
+        _, paths, _, _ = receiver.part(part(0, 0, b"hello"))
+        receiver.admit(paths)
+        folder = Path(paths[0]).parent
+        native = Path(self.dir) / "immutable-native.txt"
+        writing = contextvars.ContextVar("writing", default=False)
+        async def producer(adapter, event):
+            native.write_bytes(Path(paths[0]).read_bytes())
+            writing.set(True)
+            raise RuntimeError("unknown outcome after capture")
+        modules = {
+            "gateway.platforms.webhook_ingress": types.SimpleNamespace(admit_producer=producer),
+            "gateway.session_authority": types.SimpleNamespace(native_write_started=writing),
+            "hermes_state_runtime": types.SimpleNamespace(RuntimeStoreError=type("RuntimeStoreError", (Exception,), {})),
+        }
+        with patch.dict(sys.modules, modules), patch.object(self.adapter, "send") as emit:
+            with self.assertRaisesRegex(RuntimeError, "unknown outcome"):
+                await self.adapter._admit_files(types.SimpleNamespace(media_urls=paths))
+            self.assertFalse(self.adapter._native_admissions)
+            self.assertTrue((folder / ".pending").exists())
+            receiver.cleanup(now=time.time() + 86401)
+            self.assertFalse(folder.exists())
+            self.assertEqual(native.read_bytes(), b"hello")
+            emit.assert_not_called()
+
+    async def test_native_capture_cancellation_and_marker_failure(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+        receipt = object()
+        async def producer(adapter, event):
+            started.set()
+            await finish.wait()
+            return receipt
+        marks = []
+        receiver = types.SimpleNamespace(
+            captured=lambda paths, value: marks.append(value),
+            admission_ended=lambda paths: None,
+            release=lambda paths: self.fail("capture still owns staging"))
+        owner = types.SimpleNamespace(_incoming=receiver, name="test")
+        event = types.SimpleNamespace(media_urls=["staging"])
+        modules = {
+            "gateway.platforms.webhook_ingress": types.SimpleNamespace(admit_producer=producer),
+            "gateway.session_authority": types.SimpleNamespace(native_write_started=__import__("contextvars").ContextVar("writing", default=False)),
+        }
+        with patch.dict(sys.modules, modules):
+            task = asyncio.create_task(EnclosAdapter._admit_files(owner, event))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(marks, [])
+            finish.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.assertEqual(marks, [receipt])
+            def marker_failure(*args):
+                raise OSError("full marker disk after commit")
+            receiver.captured = marker_failure
+            self.assertIs(await EnclosAdapter._admit_files(owner, event), receipt)
+
     async def test_suggested_replies_survive_outbox_replay_and_do_not_attach_to_notices(self):
         reader, writer = await self.bridge()
         await self.hello(reader, writer)
@@ -387,6 +518,8 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(self.adapter._incoming_cleanup_pass)
 
     async def test_a_message_with_files_reaches_the_runtime_whole_with_its_media(self):
+        # Transport fixture; native capture has separate public-runtime tests.
+        self.adapter._admit_files = self.adapter.handle_message
         import base64
         files = [{"name": "doc.pdf", "mime": "application/pdf", "size": 3}]
         begin = line("message.in", conversation="c-1", person="alice@example.com", text="read", files=files)

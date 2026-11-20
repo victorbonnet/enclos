@@ -465,6 +465,8 @@ pub enum Capability {
     /// `files`, `message.part`), writes them inside its sandbox and gives
     /// them to the runtime with the message (ADR 0076, proposed).
     IncomingFiles,
+    /// It accepts images as well as documents; requires `incoming_files`.
+    IncomingImages,
     /// It sends its runtime's task events as `message.out` of `kind:
     /// task_event`; a bridge that takes them names it in its `hello`, a
     /// device that draws them in its `auth`, and each gets them as `notify`
@@ -522,4 +524,13 @@ pub fn decode_from_bridge(line: &[u8]) -> Result<Envelope<FromBridge>, DecodeErr
 /// Reads a message a plugin sent.
 pub fn decode_from_plugin(line: &[u8]) -> Result<Envelope<FromPlugin>, DecodeError> {
     decode(line, FROM_PLUGIN_TYPES)
+}
+
+#[cfg(test)]
+mod incoming_image_capability_tests {
+    #[test]
+    fn incoming_images_is_known() {
+        let cap: super::Capability = serde_json::from_str("\"incoming_images\"").unwrap();
+        assert_ne!(cap, super::Capability::Unknown);
+    }
 }

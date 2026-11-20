@@ -38,7 +38,7 @@ from . import approvals
 from . import decisions
 from . import asks
 from . import held_tasks
-from . import model
+from . import model, image_eligibility
 from . import routines
 from . import questions
 from . import suggested_replies
@@ -74,6 +74,10 @@ def validate_config(config) -> bool:
     return bool(_setting(config, "socket", "MOBILE_APP_SOCKET") and _setting(config, "token", "MOBILE_APP_TOKEN"))
 
 
+class FileAdmissionRefused(Exception):
+    """The native ingress definitively did not admit this delivery."""
+
+
 class EnclosAdapter(BasePlatformAdapter):
     # Defaults for an adapter that did not run `__init__` (enclos's tests build
     # it with EnclosAdapter.__new__): no kanban pings to tell apart, and a
@@ -107,7 +111,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
         # The files a person sends with a message, written beside the socket
         # (ADR 0076, proposed).
-        self._incoming = incoming.Receiver(self._path, self._agent)
+        self._incoming = incoming.Receiver(self._path, self._agent, capture_only=True)
         self._incoming_cleanup = None
         self._incoming_cleanup_pass = None
         # Work beside the connection (routine controls, deletions, the report
@@ -197,6 +201,12 @@ class EnclosAdapter(BasePlatformAdapter):
             # on timeout and fail before lifecycle teardown; a caller may retry.
             await asyncio.wait_for(asyncio.shield(self._incoming_cleanup_pass), 5)
             self._incoming_cleanup_pass = None
+        admissions = tuple(getattr(self, "_native_admissions", ()))
+        if admissions:
+            # Join actual capture/admission, even if its original waiter was
+            # cancelled. Timeout preserves ownership and defers resource teardown.
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*admissions)), 5)
         _ADAPTERS.discard(self)
         self._interrupts.close()
         await self._reporter.stop()
@@ -273,7 +283,10 @@ class EnclosAdapter(BasePlatformAdapter):
             if self._pings is not None:
                 capabilities.append("task_events")
             capabilities.extend(self._reporter.capabilities)
-            capabilities.append("incoming_files")
+            if self._files_available():
+                capabilities.append("incoming_files")
+                if await asyncio.to_thread(self._images_available):
+                    capabilities.append("incoming_images")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
@@ -510,6 +523,9 @@ class EnclosAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
+        if media and any(t.startswith("image/") for t in media[1]) and not await self._conversation_images_available(source):
+            await self._write(protocol.error("unsupported", "This conversation cannot receive images.", message["id"]))
+            return
         if media:
             # As Hermes's own platforms hand it media: paths it reads, each with
             # its type, so a photo goes to vision and a document is noted by path
@@ -546,7 +562,14 @@ class EnclosAdapter(BasePlatformAdapter):
         if media:
             self._incoming.admit(event.media_urls)
         try:
-            await self.handle_message(event)
+            if media:
+                await self._admit_files(event)
+            else:
+                await self.handle_message(event)
+        except FileAdmissionRefused:
+            self._interrupts.complete(event)
+            await self._write(protocol.error("unsupported", "The files could not be saved for the agent.", message["id"]))
+            return
         except BaseException:
             self._interrupts.complete(event)
             raise
@@ -559,6 +582,72 @@ class EnclosAdapter(BasePlatformAdapter):
         while len(self._seen) > SEEN_MESSAGES:
             self._seen.popitem(last=False)
         await self._write(protocol.ack(message["id"]))
+
+    def _files_available(self):
+        try:
+            from gateway.platforms.webhook_ingress import admit_producer
+            return callable(admit_producer)
+        except ImportError:
+            return False
+
+    async def _admit_files(self, event):
+        # Receipt ingress captures independent immutable bytes before committing.
+        # Handler return alone never establishes consumption of staging paths.
+        paths = list(event.media_urls)
+        async def admission():
+            # Shield the entire capture, including its off-loop worker: cancellation
+            # must not make staging collectible while the worker is still reading.
+            try:
+                from gateway.session_authority import native_write_started
+                native_write_started.set(False)
+                from gateway.platforms.webhook_ingress import admit_producer
+                receipt = await admit_producer(self, event)
+            except (ImportError, OSError) as error:
+                if 'native_write_started' in locals() and native_write_started.get():
+                    raise  # a write may already have committed
+                self._incoming.release(paths)
+                raise FileAdmissionRefused() from error
+            except Exception as error:
+                from hermes_state_runtime import RuntimeStoreError
+                if isinstance(error, RuntimeStoreError) and not native_write_started.get():
+                    self._incoming.release(paths)
+                    raise FileAdmissionRefused() from error
+                # Unknown errors may follow a commit. Retain the diagnostic
+                # marker; never announce definite failure.
+                raise
+            try:
+                if receipt is not None:
+                    self._incoming.captured(paths, receipt)
+                else:
+                    self._incoming.release(paths)
+            except OSError:
+                logger.warning("[%s] Admission completed; staging marker could not be saved", self.name)
+            return receipt
+
+        task = asyncio.create_task(admission())
+        tasks = getattr(self, "_native_admissions", None)
+        if tasks is None:
+            tasks = self._native_admissions = set()
+        tasks.add(task)
+        def finished(done):
+            tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # observe errors even after the caller disconnects
+                self._incoming.admission_ended(paths)
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _conversation_images_available(self, source):
+        try:
+            from gateway.platforms.webhook_ingress import producer_scope
+            from types import SimpleNamespace
+            async with producer_scope(self, SimpleNamespace(source=source)):
+                return await asyncio.to_thread(self._images_available, source)
+        except Exception:
+            return False
+
+    def _images_available(self, source=None):
+        return image_eligibility.available(self, source)
 
     def _interrupt_session_key(self, event) -> str:
         from gateway.session import build_session_key

@@ -53,6 +53,14 @@ fn send_all(device: &mut PhoneLink, message: &str, contents: &[Vec<u8>]) {
 /// `takes_files`, and keeps every `message.in` and `message.part` it gets.
 /// It acknowledges none: in these tests, nothing is to reach it.
 fn files_plugin(socket: &Path, takes_files: bool) -> Arc<Mutex<Vec<FromBridge>>> {
+    files_plugin_caps(socket, takes_files, takes_files)
+}
+
+fn files_plugin_caps(
+    socket: &Path,
+    takes_files: bool,
+    takes_images: bool,
+) -> Arc<Mutex<Vec<FromBridge>>> {
     let listener = UnixListener::bind(socket).unwrap();
     let got = Arc::new(Mutex::new(Vec::new()));
     let kept = Arc::clone(&got);
@@ -67,8 +75,11 @@ fn files_plugin(socket: &Path, takes_files: bool) -> Arc<Mutex<Vec<FromBridge>>>
                 line.clear();
                 match message.body {
                     FromBridge::Hello { .. } => {
-                        let capabilities =
+                        let mut capabilities =
                             Vec::from_iter(takes_files.then_some(Capability::IncomingFiles));
+                        if takes_images {
+                            capabilities.push(Capability::IncomingImages);
+                        }
                         let hello = FromPlugin::Hello {
                             runtime: "hermes".into(),
                             agent: "main".into(),
@@ -119,6 +130,15 @@ fn ready_keyed(
     socket: PathBuf,
     approval_key: Option<enclos_protocol::decision::DecisionKey>,
 ) -> (Bridge, PhoneLink) {
+    let (bridge, device, _) = ready_phone(folder, socket, approval_key);
+    (bridge, device)
+}
+
+fn ready_phone(
+    folder: &Path,
+    socket: PathBuf,
+    approval_key: Option<enclos_protocol::decision::DecisionKey>,
+) -> (Bridge, PhoneLink, Phone) {
     let main = vec![AgentEndpoint {
         name: "lab/main".to_owned(),
         runtime: "hermes".to_owned(),
@@ -137,7 +157,7 @@ fn ready_keyed(
     );
     start_conversation(&mut device);
     synced(&mut device, 0);
-    (bridge, device)
+    (bridge, device, phone)
 }
 
 #[test]
@@ -304,12 +324,17 @@ impl Drop for Peer {
 
 impl Peer {
     fn start(socket: &Path) -> Self {
+        Self::mode(socket, "normal")
+    }
+
+    fn mode(socket: &Path, mode: &str) -> Self {
         let script =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("channels/hermes/tests/bridge_peer.py");
         let mut child = Command::new("python3")
             .arg("-I")
             .arg(&script)
             .args([socket.as_os_str(), TOKEN.as_ref()])
+            .arg(mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -346,7 +371,7 @@ fn a_message_with_files_reaches_the_hermes_plugin_whole_in_the_sandbox_home() {
     let files = [
         file("scan.pdf", "application/pdf", contents[0].len()),
         file("Beach photo.JPG", "image/jpeg", contents[1].len()),
-        file("notes.txt", "text/plain", contents[2].len()),
+        file("notes.py", "text/plain", contents[2].len()),
         file("dot.png", "image/png", 1),
     ];
     begin(&mut device, "m-1", "c-1", "have a look", &files);
@@ -395,7 +420,7 @@ fn a_message_with_files_reaches_the_hermes_plugin_whole_in_the_sandbox_home() {
 }
 
 #[test]
-fn missing_files_hold_only_their_conversation_across_forwards() {
+fn missing_files_settle_before_later_text_across_forwards() {
     let folder = tempfile::tempdir().unwrap();
     let socket = folder.path().join("main.sock");
     let got = files_plugin(&socket, true);
@@ -438,5 +463,416 @@ fn missing_files_hold_only_their_conversation_across_forwards() {
             _ => None,
         })
         .collect();
-    assert_eq!(texts, ["other"]);
+    assert_eq!(texts, ["later", "other"]);
+    let history = store.messages_after("c-1", 0).unwrap();
+    assert_eq!(history.iter().filter(|m| m.kind == "status").count(), 1);
+    assert!(history.last().unwrap().text.contains("a.txt"));
+    assert!(
+        !store
+            .pending("lab", "main")
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "file")
+    );
+}
+
+#[test]
+fn plugin_refusal_after_receipt_settles_original_operation_once() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut lines = BufReader::new(stream);
+        let mut line = Vec::new();
+        let mut stored = None;
+        while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+            let message = decode_from_bridge(&line).unwrap();
+            line.clear();
+            match message.body {
+                FromBridge::Hello { .. } => {
+                    let body = FromPlugin::Hello {
+                        runtime: "hermes".into(),
+                        agent: "main".into(),
+                        capabilities: vec![Capability::IncomingFiles],
+                    };
+                    out.write_all(&encode_line(&Envelope::new(
+                        MessageId::new("hello").unwrap(),
+                        body,
+                    )))
+                    .unwrap();
+                }
+                FromBridge::MessageIn { .. } => stored = Some(message.id),
+                FromBridge::MessagePart(_) => {
+                    wait.recv().unwrap();
+                    for _ in 0..2 {
+                        let body = FromPlugin::Error(enclos_protocol::plugin::ErrorBody {
+                            of: stored.clone(),
+                            code: enclos_protocol::plugin::ErrorCode::Internal,
+                            message: "PRIVATE PATH MUST NOT BE SHOWN".into(),
+                        });
+                        out.write_all(&encode_line(&Envelope::new(
+                            MessageId::new(new_id().unwrap()).unwrap(),
+                            body,
+                        )))
+                        .unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    let (bridge, mut device) = ready(folder.path(), socket);
+    begin(
+        &mut device,
+        "original-begin",
+        "c-1",
+        "read",
+        &[file("code.py", "text/plain", 1)],
+    );
+    send_all(&mut device, "original-begin", &[vec![42]]);
+    assert_eq!(answer_to(&mut device, "original-begin"), None);
+    release.send(()).unwrap();
+    assert_eq!(
+        answer_to(&mut device, "original-begin"),
+        Some(ErrorCode::OperationFailed)
+    );
+    let store = Store::open(&bridge.store).unwrap();
+    assert!(eventually(|| store
+        .pending("lab", "main")
+        .unwrap()
+        .is_empty()));
+    let history = store.messages_after("c-1", 0).unwrap();
+    let notices: Vec<_> = history.iter().filter(|m| m.kind == "status").collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.contains("original-begin"));
+    assert!(notices[0].text.contains("code.py"));
+    assert!(!notices[0].text.contains("PRIVATE"));
+    // A retry after terminal settlement gets receipt only, and cannot reopen pending.
+    begin(
+        &mut device,
+        "original-begin",
+        "c-1",
+        "read",
+        &[file("code.py", "text/plain", 1)],
+    );
+    send_all(&mut device, "original-begin", &[vec![42]]);
+    assert_eq!(answer_to(&mut device, "original-begin"), None);
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    assert!(store.pending("lab", "main").unwrap().is_empty());
+    assert_eq!(
+        store
+            .messages_after("c-1", 0)
+            .unwrap()
+            .iter()
+            .filter(|m| m.kind == "status")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn image_capability_is_additive_and_rechecked_at_finish() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let _got = files_plugin_caps(&socket, true, false);
+    let (bridge, mut device) = ready(folder.path(), socket);
+    let image = [file("a.png", "image/png", 2)];
+    begin(&mut device, "image", "c-1", "look", &image);
+    assert_eq!(
+        answer_to(&mut device, "image"),
+        Some(ErrorCode::Unsupported)
+    );
+    {
+        let mut plugins = bridge.hub.plugins.lock().unwrap();
+        plugins
+            .get_mut("lab/main")
+            .unwrap()
+            .capabilities
+            .push(Capability::IncomingImages);
+    }
+    begin(&mut device, "changed", "c-1", "look", &image);
+    part(&mut device, "first", "changed", 0, 0, b"x");
+    // Wait for the first part before replacing the connected capability.
+    assert!(eventually(|| incoming_left(&bridge) > 0));
+    {
+        let mut plugins = bridge.hub.plugins.lock().unwrap();
+        plugins
+            .get_mut("lab/main")
+            .unwrap()
+            .capabilities
+            .retain(|c| *c != Capability::IncomingImages);
+    }
+    part(&mut device, "last", "changed", 0, 1, b"x");
+    assert_eq!(
+        answer_to(&mut device, "changed"),
+        Some(ErrorCode::Unsupported)
+    );
+    let doc = [file("a.txt", "text/plain", 1)];
+    begin(&mut device, "document", "c-1", "read", &doc);
+    part(&mut device, "doc-part", "document", 0, 0, b"x");
+    assert_eq!(answer_to(&mut device, "document"), None);
+}
+
+#[test]
+fn actual_python_adapter_refusals_settle_files() {
+    for mode in ["write", "space", "capability"] {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("home/.enclos-app/main.sock");
+        let mut peer = Peer::mode(&socket, mode);
+        assert_eq!(peer.line(), "listening\n");
+        let (bridge, mut device, phone) = ready_phone(folder.path(), socket.clone(), None);
+        let files = if mode == "capability" {
+            [file("photo.png", "image/png", 1)]
+        } else {
+            [file("notes.py", "text/plain", 1)]
+        };
+        begin(&mut device, "original", "c-1", "read", &files);
+        send_all(&mut device, "original", &[vec![b'x']]);
+        assert_eq!(answer_to(&mut device, "original"), None);
+        drop(device);
+        std::fs::write(socket.with_extension("sock.refuse"), b"release").unwrap();
+        let store = Store::open(&bridge.store).unwrap();
+        assert!(eventually(|| store
+            .pending("lab", "main")
+            .unwrap()
+            .is_empty()));
+        let (mut device, authenticated) = connect(&bridge, &phone);
+        assert!(matches!(
+            authenticated,
+            Some(ToDevice::Authenticated { .. })
+        ));
+        let (recovered, _) = synced(&mut device, 0);
+        assert!(recovered.iter().any(|m| m.conversation.as_str() == "c-1"
+            && m.kind == "status"
+            && m.text.contains("original")));
+        let original = recovered
+            .iter()
+            .find(|m| m.conversation.as_str() == "c-1" && m.kind == "message" && m.text == "read")
+            .unwrap();
+        assert_eq!(original.attachments.len(), 1);
+        assert_eq!(original.attachments[0].name, files[0].name);
+        assert_eq!(original.attachments[0].mime, files[0].mime);
+        assert_eq!(original.attachments[0].size, 1);
+        begin(&mut device, "original", "c-1", "read", &files);
+        send_all(&mut device, "original", &[vec![b'x']]);
+        assert_eq!(answer_to(&mut device, "original"), None);
+        let history = store.messages_after("c-1", 0).unwrap();
+        let notices: Vec<_> = history.iter().filter(|m| m.kind == "status").collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.contains(&files[0].name));
+        assert!(!notices[0].text.contains("fixture"));
+    }
+}
+
+#[test]
+fn images_are_only_advertised_with_files() {
+    assert!(known(vec![Capability::IncomingImages]).is_empty());
+    assert_eq!(
+        known(vec![Capability::IncomingFiles, Capability::IncomingImages]),
+        vec![Capability::IncomingFiles, Capability::IncomingImages]
+    );
+}
+
+fn upgrading_files_plugin(
+    socket: &Path,
+) -> (Arc<Mutex<Vec<FromBridge>>>, std::sync::mpsc::Sender<bool>) {
+    let (settle, wait) = std::sync::mpsc::channel();
+    let wait = Arc::new(Mutex::new(wait));
+    let listener = UnixListener::bind(socket).unwrap();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&got);
+    std::thread::spawn(move || {
+        for (connection, stream) in listener.incoming().enumerate() {
+            let takes_files = connection > 0;
+            let takes_images = false;
+            let stream = stream.unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let message = decode_from_bridge(&line).unwrap();
+                line.clear();
+                match message.body {
+                    FromBridge::Hello { .. } => {
+                        let mut capabilities =
+                            Vec::from_iter(takes_files.then_some(Capability::IncomingFiles));
+                        if takes_images {
+                            capabilities.push(Capability::IncomingImages);
+                        }
+                        let hello = FromPlugin::Hello {
+                            runtime: "hermes".into(),
+                            agent: "main".into(),
+                            capabilities,
+                        };
+                        let id = MessageId::new(new_id().unwrap()).unwrap();
+                        let _ = out.write_all(&encode_line(&Envelope::new(id, hello)));
+                    }
+                    body @ (FromBridge::MessageIn { .. } | FromBridge::MessagePart(_)) => {
+                        if matches!(&body, FromBridge::MessageIn { files, .. } if !files.is_empty())
+                        {
+                            let wait = Arc::clone(&wait);
+                            let mut reply = out.try_clone().unwrap();
+                            let of = message.id.clone();
+                            std::thread::spawn(move || {
+                                let refuse = wait.lock().unwrap().recv().unwrap();
+                                let body = if refuse {
+                                    FromPlugin::Error(ErrorBody {
+                                        of: Some(of),
+                                        code: ErrorCode::Internal,
+                                        message: "fixture".into(),
+                                    })
+                                } else {
+                                    FromPlugin::Ack { of }
+                                };
+                                reply
+                                    .write_all(&encode_line(&Envelope::new(
+                                        MessageId::new(new_id().unwrap()).unwrap(),
+                                        body,
+                                    )))
+                                    .unwrap();
+                            });
+                        }
+                        kept.lock().unwrap().push(body)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    (got, settle)
+}
+
+#[test]
+fn unsupported_plugin_reconnect_preserves_conversation_order() {
+    delayed_file_settlement(false);
+}
+#[test]
+fn file_refusal_commits_before_following_text() {
+    delayed_file_settlement(true);
+}
+fn delayed_file_settlement(refuse: bool) {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = folder.path().join("main.sock");
+    let (got, settle) = upgrading_files_plugin(&socket);
+    let (bridge, _device) = ready(folder.path(), socket);
+    let store = Store::open(&bridge.store).unwrap();
+    store.conversation("c-2", "lab", "main", PERSON).unwrap();
+    std::fs::create_dir_all(bridge.hub.media()).unwrap();
+    std::fs::write(bridge.hub.media().join("held-file"), b"x").unwrap();
+    let files = [StoredAttachment {
+        id: "held-file".into(),
+        conversation: "c-1".into(),
+        mime: "text/plain".into(),
+        name: "held.txt".into(),
+        size: 1,
+    }];
+    store
+        .add_from_device_with_files(
+            "d/file",
+            "file",
+            ("c-1", "lab", "main"),
+            PERSON,
+            "file",
+            &files,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .add_from_device("d/later", "later", "c-1", PERSON, "later")
+        .unwrap();
+    store
+        .add_from_device("d/other", "other", "c-2", PERSON, "other")
+        .unwrap();
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    assert!(eventually(|| !got.lock().unwrap().is_empty()));
+    {
+        let messages = got.lock().unwrap();
+        let texts: Vec<_> = messages
+            .iter()
+            .filter_map(|body| match body {
+                FromBridge::MessageIn { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["other"]);
+    }
+    bridge
+        .hub
+        .plugins
+        .lock()
+        .unwrap()
+        .get("lab/main")
+        .unwrap()
+        .closer
+        .shutdown();
+    assert!(eventually(|| bridge
+        .hub
+        .plugins
+        .lock()
+        .unwrap()
+        .get("lab/main")
+        .is_some_and(|plugin| plugin
+            .capabilities
+            .contains(&Capability::IncomingFiles))));
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |body| matches!(body, FromBridge::MessageIn { text, .. } if text == "file")
+    )));
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !got.lock()
+            .unwrap()
+            .iter()
+            .any(|body| matches!(body, FromBridge::MessageIn { text, .. } if text == "later")),
+        "text crossed unsettled file barrier"
+    );
+    store
+        .add_from_device("d/free", "free", "c-2", PERSON, "free")
+        .unwrap();
+    bridge.hub.forward(&store, "lab/main").unwrap();
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |body| matches!(body, FromBridge::MessageIn { text, .. } if text == "free")
+    )));
+    assert!(
+        !got.lock()
+            .unwrap()
+            .iter()
+            .any(|body| matches!(body, FromBridge::MessageIn { text, .. } if text == "later"))
+    );
+    settle.send(refuse).unwrap();
+    assert!(eventually(|| got.lock().unwrap().iter().any(
+        |body| matches!(body, FromBridge::MessageIn { text, .. } if text == "later")
+    )));
+    assert!(
+        !store
+            .pending("lab", "main")
+            .unwrap()
+            .iter()
+            .any(|m| m.text == "file")
+    );
+    if refuse {
+        assert!(
+            store
+                .messages_after("c-1", 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.kind == "status")
+        );
+    }
+
+    let messages = got.lock().unwrap();
+    let texts: Vec<_> = messages
+        .iter()
+        .filter_map(|body| match body {
+            FromBridge::MessageIn { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let file = texts.iter().position(|text| *text == "file").unwrap();
+    let later = texts.iter().position(|text| *text == "later").unwrap();
+    assert!(file < later);
 }

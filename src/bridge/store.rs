@@ -2399,6 +2399,61 @@ impl Store {
         })
     }
 
+    /// Settle a device operation and append its terminal notice atomically.
+    /// The status row's deterministic id deduplicates late/repeated refusals,
+    /// including a refusal after the runtime's receipt ACK cleared pending.
+    pub fn refuse_incoming(
+        &self,
+        id: &str,
+        agent: &str,
+        reason: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Ok(None);
+        };
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let source: Option<(String, String)> = tx.query_row(
+            "SELECT m.origin, m.conversation FROM messages m JOIN conversations c ON c.id=m.conversation
+             WHERE m.id=?1 AND m.origin IS NOT NULL AND c.sandbox=?2 AND c.agent=?3 AND EXISTS (SELECT 1 FROM attachments a WHERE a.message=m.id)",
+            params![id, sandbox, name], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((origin, conversation)) = source else {
+            return Ok(None);
+        };
+        let Some((device, operation)) = origin.split_once('/') else {
+            return Ok(None);
+        };
+        let names = self
+            .attachments_of(id)?
+            .into_iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prefix = format!("Operation {operation} ({names}) failed: ");
+        // Only a matching terminal notice is a duplicate. An unrelated row at
+        // this id must still fail the strict INSERT and roll back settlement.
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1 AND conversation=?2
+             AND kind='status' AND origin IS NULL AND substr(text, 1, length(?3))=?3)",
+            params![format!("incoming-refusal/{id}"), conversation, prefix],
+            |r| r.get(0),
+        )?;
+        if duplicate {
+            return Ok(None);
+        }
+        let text = format!("{prefix}{reason}");
+        let inserted = tx.execute(
+            "INSERT INTO messages (id, conversation, text, kind, at) VALUES (?1, ?2, ?3, 'status', ?4)",
+            params![format!("incoming-refusal/{id}"), conversation, text, now()],
+        )?;
+        tx.execute("UPDATE messages SET pending=0 WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok((inserted == 1).then(|| (device.to_owned(), operation.to_owned())))
+    }
+
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
@@ -3949,6 +4004,188 @@ mod tests {
             assert!(!store.has_attachment(&format!("f-{n}")).unwrap());
         }
         assert!(store.has_attachment("f-m-1").unwrap());
+    }
+
+    #[test]
+    fn incoming_refusal_never_settles_text() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("db")).unwrap();
+        store.conversation("c", "lab", "main", "p").unwrap();
+        store
+            .add_from_device("d/op", "text", "c", "p", "hello")
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("text", "lab/main", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incoming_terminal_refusal_after_receipt_ack() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store
+            .add_from_device_with_files(
+                "d-1/begin-1",
+                "stored-1",
+                ("c-1", "lab", "main"),
+                owner,
+                "read",
+                &[StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    name: "a.txt".into(),
+                    mime: "text/plain".into(),
+                    size: 1,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/scout", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        store.delivered("stored-1", "lab/main").unwrap();
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        let refusal = store
+            .refuse_incoming("stored-1", "lab/main", "unavailable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal, ("d-1".into(), "begin-1".into()));
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "again")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .add_from_device("d-1/begin-1", "new-id", "c-1", owner, "retry")
+                .unwrap(),
+            Added::Again
+        );
+        assert_eq!(
+            store
+                .add_from_device_with_files(
+                    "d-1/begin-1",
+                    "stored-1",
+                    ("c-1", "lab", "main"),
+                    owner,
+                    "retry",
+                    &[StoredAttachment {
+                        id: "f-1".into(),
+                        conversation: "c-1".into(),
+                        name: "a.txt".into(),
+                        mime: "text/plain".into(),
+                        size: 1,
+                    }],
+                )
+                .unwrap(),
+            Ok(Added::Again)
+        );
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let history = store.since(owner, 0).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].kind, "status");
+        assert_eq!(history[1].conversation, "c-1");
+        assert!(history[1].text.contains("begin-1"));
+        assert!(history[1].text.contains("unavailable"));
+    }
+
+    #[test]
+    fn incoming_terminal_refusal_is_durable_and_deduplicated() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store
+            .add_from_device_with_files(
+                "d-1/begin-1",
+                "stored-1",
+                ("c-1", "lab", "main"),
+                owner,
+                "read",
+                &[StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    name: "a.txt".into(),
+                    mime: "text/plain".into(),
+                    size: 1,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/scout", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        store.db.execute(
+            "INSERT INTO messages (id, conversation, text, kind, at) VALUES ('incoming-refusal/stored-1', 'c-1', 'unrelated status', 'status', 0)", [],
+        ).unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "unavailable")
+                .is_err()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+        store
+            .db
+            .execute(
+                "DELETE FROM messages WHERE id='incoming-refusal/stored-1'",
+                [],
+            )
+            .unwrap();
+        store.db.execute_batch("CREATE TEMP TRIGGER refuse_status BEFORE INSERT ON messages WHEN NEW.kind='status' BEGIN SELECT RAISE(FAIL, 'fixture'); END;").unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "unavailable")
+                .is_err()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+        store
+            .db
+            .execute_batch("DROP TRIGGER refuse_status;")
+            .unwrap();
+        let refusal = store
+            .refuse_incoming("stored-1", "lab/main", "unavailable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal, ("d-1".into(), "begin-1".into()));
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "again")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .add_from_device("d-1/begin-1", "new-id", "c-1", owner, "retry")
+                .unwrap(),
+            Added::Again
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let history = store.since(owner, 0).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].kind, "status");
+        assert_eq!(history[1].conversation, "c-1");
+        assert!(history[1].text.contains("begin-1"));
+        assert!(history[1].text.contains("unavailable"));
     }
 
     #[test]
