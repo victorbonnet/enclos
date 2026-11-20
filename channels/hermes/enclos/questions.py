@@ -174,7 +174,7 @@ def _chunks(text):
 
 
 def _confirm(card):
-    """Whether `card` shows Hermes's confirmation of a slash command."""
+    """Whether `card` shows a command confirmation of Hermes's."""
     return isinstance(card.entry, slash_confirms.Binding)
 
 
@@ -359,20 +359,31 @@ class Manager:
         return True
 
     async def ask_confirm(self, chat_id, title, message, session_key, confirm_id):
-        """Hermes's confirmation of a slash command (`slash_confirms`) as a question card;
-        False when there is none to show, and Hermes sends its text, as before."""
-        native = self.confirms_native() if self.bridge_supports else None
-        if native is None:
+        """A command confirmation of Hermes's (`slash_confirms`) as a question card or,
+        where no card can show it, as the channel's own text, which a reply in the
+        composer answers. False when Hermes has no such confirmation pending, or the
+        text could not be sent either: Hermes then sends its own text."""
+        native = self.confirms_native()
+        entry = slash_confirms.pending(native, session_key, confirm_id) if native is not None else None
+        if entry is None:
+            if native is not None:
+                logger.warning("Command confirmation %s is not pending in Hermes; Hermes sends its text", confirm_id)
             return False
+        choices = slash_confirms.offered(str(entry.get("command") or ""))
+        text = slash_confirms.prompt_text(title, message, choices)
+        if self.bridge_supports and await self._confirm_card(chat_id, text, session_key, confirm_id, native):
+            return True
+        return await self._confirm_text(chat_id, text, choices, confirm_id)
+
+    async def _confirm_card(self, chat_id, text, session_key, confirm_id, native):
         binding = slash_confirms.bind(native, session_key, confirm_id)
         if binding is None:
-            logger.warning("Slash-command confirmation %s is not pending in Hermes; it is sent as text", confirm_id)
             return False
-        definition = slash_confirms.definition(protocol.new_id(), title, message, binding)
+        definition = slash_confirms.definition(protocol.new_id(), text, binding.choices)
         try:
             validate_definition(definition)
         except ValueError as error:
-            logger.warning("Slash-command confirmation %s cannot be a card (%s); it is sent as text", confirm_id, error)
+            logger.warning("Command confirmation %s cannot be a card (%s); it is sent as text", confirm_id, error)
             return False
         ask = protocol.message("question.ask", conversation=chat_id, question=definition)
         card = Card(definition, chat_id, confirm_id, session_key, binding, native, ask["id"])
@@ -380,10 +391,44 @@ class Manager:
         if not await self._emit(ask):
             self.cards.pop(definition["id"], None)
             return False
-        # Hermes retires a confirm without telling its adapter (a session reset, a newer
-        # confirm, its five minutes): the watcher closes the card when it does.
+        # Hermes drops a confirmation without telling its adapter (a session reset, a
+        # newer one), and stops taking an answer after five minutes: the watcher
+        # closes the card when either happens.
         self._track(self._watch(card))
         return True
+
+    async def answer_typed_confirm(self, chat_id, session_keys, text):
+        """A reply typed in the composer to a command confirmation of one of
+        `session_keys`, while a turn runs and the channel keeps the reply from Hermes
+        (an approval word, which Hermes could read as a runtime approval's decision by
+        the time it reads it): answered as Hermes would answer it, through the card's
+        binding when there is a card. False when no confirmation waits or the text is
+        no reply to it, and the message goes on to Hermes."""
+        native = self.confirms_native()
+        if native is None:
+            return False
+        for key in session_keys:
+            entry = slash_confirms.pending(native, key) if key else None
+            if entry is None:
+                continue
+            choices = slash_confirms.offered(str(entry.get("command") or ""))
+            choice = slash_confirms.typed_choice(text, choices)
+            if choice is None:
+                return False
+            card = next((c for c in self.cards.values() if _confirm(c) and c.state == "pending"
+                         and c.session_key == key and c.native_id == entry.get("confirm_id")), None)
+            try:
+                if card is not None:
+                    # The agent's report, as for any reply typed in the composer.
+                    reply = await card.entry.resolve(choice)
+                else:
+                    reply = await native.resolve(key, entry.get("confirm_id"), choice)
+            except Exception:
+                logger.exception("Hermes could not resolve command confirmation %s", entry.get("confirm_id"))
+                return True
+            await self._confirm_reply(chat_id, reply, entry.get("confirm_id"), entry.get("command"))
+            return True
+        return False
 
     async def text_fallback(self, chat_id, question, choices, clarify_id, metadata=None):
         """Hermes's own numbered text (`BasePlatformAdapter.send_clarify`), with every
@@ -548,7 +593,7 @@ class Manager:
             return
         observed = card.entry.observed()
         if observed is not None:
-            await self._settle(card, *observed[:2], of=request_id)
+            await self._settled_then(card, observed, request_id)
             return
         if answer["kind"] == "skip":
             choice, settled = "cancel", ("skipped", None, request_id)
@@ -569,7 +614,7 @@ class Manager:
         try:
             reply = await card.entry.resolve(choice, settled)
         except Exception:
-            logger.exception("Hermes could not resolve slash-command confirmation %s", card.native_id)
+            logger.exception("Hermes could not resolve command confirmation %s", card.native_id)
             reply = None
         if card.entry.settled == settled:
             # The card closes before the command's reply, unless the watcher closed it already.
@@ -578,14 +623,31 @@ class Manager:
         else:
             # Hermes took nothing from this answer (it expired, or was answered or dropped
             # meanwhile): the card's own state answers the request.
-            observed = card.entry.observed() or ("cancelled", None)
-            await self._settle(card, *observed[:2], of=settled[2])
-        if reply:
-            # The command's own reply, as Hermes's button adapters send it.
-            try:
-                await self.send(card.conversation, reply)
-            except Exception:
-                logger.exception("The reply of a confirmed command could not be sent")
+            await self._settled_then(card, card.entry.observed() or ("cancelled", None), settled[2])
+        await self._confirm_reply(card.conversation, reply, card.native_id, card.entry.command)
+
+    async def _settled_then(self, card, observed, request_id):
+        """Closes `card` as Hermes left it, with the receipt of the answer that settled it
+        when that was a device's, then answers `request_id` with the card's state."""
+        if card.state == "pending":
+            await self._settle(card, *observed)
+        if observed[2:] != (request_id,):
+            await self._settle(card, card.state, card.answer, of=request_id)
+
+    async def _confirm_reply(self, chat_id, reply, confirm_id, command):
+        """The confirmed command's own reply, when Hermes's resolver returns text, sent as
+        Hermes's button adapters send it."""
+        if not reply:
+            return
+        try:
+            result = await self.send(chat_id, reply)
+            sent = getattr(result, "success", False)
+        except Exception:
+            logger.exception("The reply of /%s (confirmation %s) could not be sent", command, confirm_id)
+            return
+        if not sent:
+            logger.error("The reply of /%s (confirmation %s) could not be sent: %s", command, confirm_id,
+                         getattr(result, "error", None))
 
     async def _refuse_decision(self, card, request_id, why):
         """A decision without the bridge's signature, forged, altered or replayed: it
@@ -631,7 +693,8 @@ class Manager:
         card.state = "refused"
         if _confirm(card):
             if self._live(card):
-                await self._confirm_text(card)
+                await self._confirm_text(card.conversation, card.definition["text"], card.entry.choices,
+                                         card.native_id)
             return
         if card.definition.get("approval"):
             if not self._live(card):
@@ -700,7 +763,8 @@ class Manager:
                         await self.approval_text_fallback(card.entry.prompt, card.state != "pending")
                 elif _confirm(card):
                     if not self.confirms_available:
-                        await self._confirm_text(card)
+                        await self._confirm_text(card.conversation, card.definition["text"],
+                                                 card.entry.choices, card.native_id)
                 elif not self.available:
                     await self.text_fallback(card.conversation, card.entry.question, card.entry.choices,
                                              card.native_id)
@@ -714,11 +778,13 @@ class Manager:
                 # Its terminal update is stored: nothing of this approval is sent again.
                 self.approval_ids.discard(question_id)
 
-    async def _confirm_text(self, card):
-        """A confirmation no card shows, as text the composer answers (Hermes reads the reply)."""
-        for chunk in _chunks(slash_confirms.fallback_text(card.definition["text"], card.entry)):
-            result = await self.send(card.conversation, chunk)
-            if not result.success:
+    async def _confirm_text(self, chat_id, text, choices, confirm_id):
+        """A confirmation no card shows, as text a reply in the composer answers."""
+        for chunk in _chunks(slash_confirms.fallback_text(text, choices)):
+            result = await self.send(chat_id, chunk)
+            if not getattr(result, "success", False):
+                logger.warning("Command confirmation %s could not be sent to conversation %s as text: %s",
+                               confirm_id, chat_id, getattr(result, "error", None))
                 return False
         return True
 
@@ -740,7 +806,7 @@ class Manager:
                 await self._settle(card, *(observed or ("cancelled", None)))
                 continue
             if _confirm(card):
-                # As a question's wait: the confirm is dropped with its card.
+                # As a question's wait: the confirmation is dropped with its card.
                 observed = card.entry.observed()
                 if observed is None:
                     card.entry.clear()

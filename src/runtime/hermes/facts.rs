@@ -263,6 +263,89 @@ pub(super) fn without_top_level(text: &str, key: &str) -> Option<String> {
     Some(kept.join("\n"))
 }
 
+/// `text` without the `keys` of its top-level `parent` mapping, each with a
+/// value on its own line, such as the `approvals` switches Hermes reads from
+/// disk for each command; the `parent` line goes too when no other setting
+/// is left under it, so a block Hermes adds for them alone changes nothing.
+/// Trailing blank lines are dropped. `None` when [`without_top_level`]
+/// cannot read the file, `parent` has a value on its own line (a flow
+/// mapping, say), or one of `keys` holds anything but a one-line scalar:
+/// the caller then compares the file as it did before.
+pub(super) fn without_nested(text: &str, parent: &str, keys: &[&str]) -> Option<String> {
+    // The reader's own checks: YAML it does not follow, `parent` twice or as
+    // a sequence.
+    without_top_level(text, parent)?;
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start_matches(' ').len()
+    }
+    fn named(line: &str, name: &str) -> bool {
+        let key = line.split(':').next().unwrap_or("").trim();
+        key == name || key == format!("\"{name}\"") || key == format!("'{name}'")
+    }
+    // What follows a key's colon, without a comment.
+    fn value(line: &str) -> &str {
+        line.split_once(':')
+            .map_or("", |(_, rest)| rest.split(" #").next().unwrap_or("").trim())
+    }
+    fn setting(line: &str) -> bool {
+        !line.trim().is_empty() && !line.trim_start().starts_with('#')
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let header = lines.iter().position(|line| {
+        !line.starts_with(|c: char| c.is_whitespace() || c == '#' || c == '-')
+            && named(line, parent)
+    });
+    let mut out: Vec<&str> = Vec::new();
+    match header {
+        None => out.extend(&lines),
+        Some(header) => {
+            if !value(lines[header]).is_empty() {
+                return None;
+            }
+            let end = lines[header + 1..]
+                .iter()
+                .position(|line| setting(line) && indent(line) == 0)
+                .map_or(lines.len(), |at| header + 1 + at);
+            let block = &lines[header + 1..end];
+            let child = block
+                .iter()
+                .find(|line| setting(line))
+                .map(|line| indent(line));
+            let mut kept: Vec<&str> = Vec::new();
+            let mut after_dropped = false;
+            for line in block {
+                if setting(line) && Some(indent(line)) == child {
+                    if keys.iter().any(|key| named(line, key)) {
+                        let one_line = value(line);
+                        if one_line.is_empty()
+                            || one_line.starts_with(|c: char| "|>{[&*!".contains(c))
+                        {
+                            return None;
+                        }
+                        after_dropped = true;
+                        continue;
+                    }
+                    after_dropped = false;
+                } else if after_dropped && setting(line) {
+                    // A dropped value that goes on below its key.
+                    return None;
+                }
+                kept.push(*line);
+            }
+            out.extend(&lines[..header]);
+            if kept.iter().any(|line| setting(line)) {
+                out.push(lines[header]);
+                out.extend(kept);
+            }
+            out.extend(&lines[end..]);
+        }
+    }
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    Some(out.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +494,57 @@ mod tests {
             without_top_level("model: x\nnote: *always*\n", "model"),
             None
         );
+    }
+
+    #[test]
+    fn nested_keys_with_one_line_values_are_left_out_and_nothing_else() {
+        let keys = &["destructive_slash_confirm", "mcp_reload_confirm"];
+        let before =
+            "# Hermes\napprovals:\n  timeout: 60\n  # a note\nterminal:\n  backend: local\n";
+        let rest = without_nested(before, "approvals", keys).unwrap();
+        assert_eq!(rest, before.trim_end());
+        let after = before.replace(
+            "  # a note\n",
+            "  # a note\n  destructive_slash_confirm: false # off\n",
+        );
+        assert_eq!(without_nested(&after, "approvals", keys).unwrap(), rest);
+        let quoted = before.replace(
+            "  timeout: 60\n",
+            "  timeout: 60\n  'mcp_reload_confirm': \"false\"\n",
+        );
+        assert_eq!(without_nested(&quoted, "approvals", keys).unwrap(), rest);
+        // A block left with these keys alone goes, its header too.
+        let alone =
+            "terminal:\n  backend: local\napprovals:\n  destructive_slash_confirm: false\n\n";
+        assert_eq!(
+            without_nested(alone, "approvals", keys).unwrap(),
+            "terminal:\n  backend: local"
+        );
+        // The same key elsewhere, deeper or under another block, is kept.
+        let deeper = "approvals:\n  timeout: 60\n  extra:\n    destructive_slash_confirm: false\n";
+        assert_eq!(
+            without_nested(deeper, "approvals", keys).unwrap(),
+            deeper.trim_end()
+        );
+        let other = "display:\n  destructive_slash_confirm: false\n";
+        assert_eq!(
+            without_nested(other, "approvals", keys).unwrap(),
+            other.trim_end()
+        );
+        // A value this reader cannot tell from a one-line scalar: compared whole.
+        for unsure in [
+            "approvals: {destructive_slash_confirm: false}\n",
+            "approvals:\n  destructive_slash_confirm:\n    x: 1\n",
+            "approvals:\n  destructive_slash_confirm: |\n    false\n",
+            "approvals:\n  destructive_slash_confirm: false\n    true\n",
+            "approvals:\n\tdestructive_slash_confirm: false\n",
+        ] {
+            assert_eq!(
+                without_nested(unsure, "approvals", keys),
+                None,
+                "{unsure:?}"
+            );
+        }
     }
 
     #[test]

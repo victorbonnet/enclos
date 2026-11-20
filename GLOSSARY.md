@@ -37,7 +37,7 @@ A runtime's request for a person's decision before an operation continues, with 
 _Avoid_: policy request, question (a request for information), command approval
 
 **Command confirmation**:
-A runtime's request that a person confirm a command they gave it before it runs, such as Hermes's before `/new` discards a conversation. It grants the agent nothing and changes no access, so it is not a runtime approval.
+A runtime's request that a person confirm a command they gave it before it runs, such as Hermes's before `/new` drops what the agent holds of a conversation. It grants the agent nothing and changes no access, so it is not a runtime approval; the app shows it as a question card.
 _Avoid_: runtime approval (an operation of the agent's), slash confirm
 
 **Signed decision**:

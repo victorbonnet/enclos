@@ -1,14 +1,15 @@
-"""Hermes's slash-command confirmations, shown as app questions.
+"""Hermes's command confirmations, shown as question cards.
 
-Hermes asks the person before some commands run: `/new`, `/reset`, `/clear` and
-`/undo` while `approvals.destructive_slash_confirm` is on, `/reload-mcp`, and a
-`/model` switch its guard warns about. It calls an adapter's `send_slash_confirm`,
-keeps one pending confirm per session in `tools.slash_confirm`, and runs the
-command's handler when `resolve(session_key, confirm_id, choice)` is called with
-"once", "always" or "cancel", as its own button adapters (Telegram, Slack, Discord)
-do. A card is bound to that exact confirm, its session key and confirm id;
-`questions.Manager` delivers it as an ordinary question. A confirm is not a runtime
-approval: it changes no access, and the bridge does not sign it.
+Hermes asks the person to confirm some of their own commands before they run:
+`/new` (and its alias `/reset`) and `/undo` while `approvals.destructive_slash_confirm`
+is on, `/reload-mcp` while `approvals.mcp_reload_confirm` is, and a `/model` switch
+its guard warns about. It calls an adapter's `send_slash_confirm`, keeps one pending
+confirmation per session key in `tools.slash_confirm`, and runs the command's handler
+when `resolve(session_key, confirm_id, choice)` is called with "once", "always" or
+"cancel", as its own button adapters (Telegram, Slack, Discord) do. A card is bound
+to that exact confirmation, its session key and confirm id; `questions.Manager`
+delivers it with the question transport. A command confirmation is not a runtime
+approval: it grants the agent nothing, and the bridge does not sign its answer.
 """
 
 import inspect
@@ -24,13 +25,14 @@ logger = logging.getLogger(__name__)
 # What the channel calls in `tools.slash_confirm`.
 NATIVE_FUNCTIONS = ("register", "get_pending", "resolve", "clear")
 CHOICES = ("once", "always", "cancel")
-LABELS = {"once": "Approve once", "always": "Always (restarts the agent)", "cancel": "Cancel"}
-# A command whose "always" proceeds as "once" does, writing nothing (Hermes's model
+LABELS = {"once": "Approve once", "always": "Always", "cancel": "Cancel"}
+# A command whose "always" proceeds as "once" does and writes nothing (Hermes's model
 # guard has no opt-out): its card offers no Always.
 ONCE_ONLY = frozenset(("model",))
 NOTE = "Hermes asks before it runs this command. This is not a runtime approval, and it changes no access."
-ALWAYS_NOTE = ("Always also turns this question off in the agent's settings, and enclos restarts the agent "
-               "when its settings change.")
+# Hermes writes its opt-out to the agent's `config.yaml` and reads it before each such
+# command; enclos leaves those keys out of the settings that restart the gateway.
+ALWAYS_NOTE = "Always also turns this confirmation off in the agent's settings: Hermes will not ask it again."
 UNKNOWN_ANSWER = "Answer with one of the card's choices."
 _warned = False
 
@@ -48,17 +50,30 @@ def native():
         return slash_confirm
     if not _warned:
         _warned = True
-        logger.warning("Hermes's slash-command confirmations lack %s: they are sent as text",
+        logger.warning("Hermes's command confirmations lack %s: they are sent as Hermes's text",
                        ", ".join(missing) if slash_confirm is not None else "tools.slash_confirm")
     return None
 
 
-def typed_choice(text, offered):
-    """The choice Hermes would take `text` for, typed as a reply to a confirm
+def offered(command):
+    """The choices a confirmation of `command` offers, in order."""
+    return tuple(c for c in CHOICES if not (c == "always" and command in ONCE_ONLY))
+
+
+def pending(native, session_key, confirm_id=None):
+    """Hermes's pending confirmation of `session_key` (that of `confirm_id`, when given), or None."""
+    entry = native.get_pending(session_key)
+    if not entry or (confirm_id is not None and entry.get("confirm_id") != confirm_id):
+        return None
+    return entry
+
+
+def typed_choice(text, choices):
+    """The choice Hermes would take `text` for, typed as a reply to a confirmation
     (`GatewayInboundMixin._hm_slash_confirm_reply`): its command spellings
     (`_SLASH_CONFIRM_CMD_CHOICES`, `/approve`, `/always`, `/cancel`...) first, then its
     words (`approval.inputs.confirm_*`, English and the active language), read as it
-    reads them. None when it reads none, it cannot be read, or the card does not offer it."""
+    reads them. None when it reads none, it cannot be read, or `choices` lacks it."""
     try:
         from gateway.run_inbound import GatewayInboundMixin
         commands = GatewayInboundMixin._SLASH_CONFIRM_CMD_CHOICES
@@ -70,14 +85,14 @@ def typed_choice(text, offered):
     command = (stripped.split(maxsplit=1)[0][1:].lower().split("@", 1)[0]
                if stripped.startswith("/") else None)
     choice = commands.get(command) or words.get(stripped.lstrip("!/").lower())
-    return choice if choice in offered else None
+    return choice if choice in choices else None
 
 
 @dataclass
 class Binding:
-    """One pending Hermes confirm. Its handler is Hermes's own, wrapped so the channel
-    learns which choice ran it, whoever answered: the card, or a reply typed in the
-    composer, which Hermes reads itself."""
+    """One pending Hermes confirmation. Its handler is Hermes's own, wrapped so the
+    channel learns which choice ran it, whoever answered: the card, or a reply typed
+    in the composer."""
     native: Any
     session_key: str
     confirm_id: str
@@ -91,16 +106,16 @@ class Binding:
     settled: tuple | None = None
 
     def _entry(self):
-        entry = self.native.get_pending(self.session_key)
-        return entry if entry and entry.get("confirm_id") == self.confirm_id else None
+        return pending(self.native, self.session_key, self.confirm_id)
 
     def _expired(self, now=time.time):
         return now() - self.created > self.timeout
 
     def observed(self):
         """None while it waits. Else what became of it: the choice Hermes ran it with;
-        expired, once Hermes no longer takes an answer; cancelled, when it was dropped
-        (a session reset, a newer confirm, the channel closing)."""
+        cancelled, when Hermes dropped it (a session reset, a newer confirmation) or the
+        channel closed; expired, once Hermes's five minutes are over by this clock,
+        after which Hermes takes no answer."""
         if self.settled is not None:
             return self.settled
         if self._expired():
@@ -120,9 +135,10 @@ class Binding:
         else:
             self.settled = ("answered", None)
 
-    async def resolve(self, choice, answering):
-        """Hermes's own resolver, as its button adapters call it; its handler's reply,
-        or None when it took nothing (stale, or answered meanwhile)."""
+    async def resolve(self, choice, answering=None):
+        """Hermes's own resolver, as its button adapters call it, with `answering` the
+        card's answer it carries out. Hermes returns its handler's reply when that is
+        text, and None when it took nothing (expired, or answered or dropped meanwhile)."""
         self.answering = answering
         try:
             return await self.native.resolve(self.session_key, self.confirm_id, choice)
@@ -130,22 +146,21 @@ class Binding:
             self.answering = None
 
     def clear(self):
-        """Drops the pending confirm, if it is still this one."""
+        """Drops the pending confirmation, if it is still this one."""
         if self._entry() is not None:
             self.native.clear(self.session_key)
 
 
 def bind(native, session_key, confirm_id):
-    """A binding to Hermes's pending confirm `confirm_id` of `session_key`, its handler
-    wrapped through Hermes's own `register` (same id, command and authority); None
-    when there is no such confirm, or it cannot be wrapped."""
-    entry = native.get_pending(session_key)
-    if not entry or entry.get("confirm_id") != confirm_id or not callable(entry.get("handler")):
+    """A binding to Hermes's pending confirmation `confirm_id` of `session_key`, its
+    handler wrapped through Hermes's own `register` (same id, command and authority);
+    None when there is none, or it cannot be wrapped (said in the log)."""
+    entry = pending(native, session_key, confirm_id)
+    if entry is None or not callable(entry.get("handler")):
         return None
     original = entry["handler"]
     command = str(entry.get("command") or "")
-    choices = tuple(c for c in CHOICES if not (c == "always" and command in ONCE_ONLY))
-    binding = Binding(native, session_key, confirm_id, command, choices, time.time(),
+    binding = Binding(native, session_key, confirm_id, command, offered(command), time.time(),
                       float(getattr(native, "DEFAULT_TIMEOUT_SECONDS", 300)))
 
     async def handler(choice):
@@ -159,31 +174,41 @@ def bind(native, session_key, confirm_id):
         if "authority" in entry and "authority" in inspect.signature(native.register).parameters:
             extra["authority"] = entry["authority"]
         native.register(session_key, confirm_id, command, handler, **extra)
-    except (TypeError, ValueError):
-        logger.warning("A slash-command confirmation could not be bound; it is sent as text", exc_info=True)
+        registered = native.get_pending(session_key) or {}
+        binding.created = float(registered.get("created_at") or binding.created)
+    except Exception:
+        logger.warning("Command confirmation %s could not be bound to a card", confirm_id, exc_info=True)
         return None
-    registered = native.get_pending(session_key) or {}
-    binding.created = float(registered.get("created_at") or binding.created)
     return binding
 
 
 def card_text(message, title):
     """Hermes's prompt, without its typed-reply line (it names `/approve`, which the
-    app does not pass on) or characters the card cannot show, and what the card is."""
+    app does not pass on) or characters the card cannot show."""
     paragraphs = [p for p in visible.stripped(message or "", lines=True).split("\n\n")
                   if p.strip() and "`/approve`" not in p]
     return "\n\n".join(paragraphs).strip() or visible.stripped(title or "", lines=False).strip()
 
 
-def definition(question_id, title, message, binding):
-    notes = [NOTE] + ([ALWAYS_NOTE] if "always" in binding.choices else [])
+def prompt_text(title, message, choices):
+    """What the card says, or the text that stands for it: Hermes's prompt, then what
+    a command confirmation is."""
+    notes = [NOTE] + ([ALWAYS_NOTE] if "always" in choices else [])
     heading = card_text(message, title)
-    return {"id": question_id, "text": "\n\n".join(([heading] if heading else []) + [" ".join(notes)]),
-            "choices": [LABELS[c] for c in binding.choices], "multiple": False}
+    return "\n\n".join(([heading] if heading else []) + [" ".join(notes)])
 
 
-def fallback_text(text, binding):
-    """The card as text, for a bridge that refused it or cannot show it: Hermes's
-    English words, which it always reads, answer it in the composer."""
-    words = "yes, always or cancel" if "always" in binding.choices else "yes or cancel"
-    return f"{text}\n\nReply {words}."
+def definition(question_id, text, choices):
+    return {"id": question_id, "text": text, "choices": [LABELS[c] for c in choices], "multiple": False}
+
+
+def reply_words(choices):
+    """Hermes's English words for `choices`, which it always reads."""
+    return "yes, always or cancel" if "always" in choices else "yes or cancel"
+
+
+def fallback_text(text, choices):
+    """The confirmation as text, where no card shows it: a reply in the composer
+    answers it, read as Hermes reads one (the channel reads it itself while a turn
+    runs)."""
+    return f"{text}\n\nReply {reply_words(choices)}."

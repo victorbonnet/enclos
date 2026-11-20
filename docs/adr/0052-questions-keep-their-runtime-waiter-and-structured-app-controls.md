@@ -13,3 +13,5 @@ The app renders native single/multiple selection, custom text and Skip and waits
 Reason: retaining the native waiter preserves the runtime's tool results, timeout and interruption behaviour. Structured ids and validation bind an answer to one real question, while durable bridge history keeps the app consistent across devices and restarts. The extra state, correlation and replay handling avoid guessing from prose or inventing a second question tool. A question answer changes no sandbox policy and executes no host command; policy requests remain a separate operation.
 
 [0053](0053-runtime-approvals-use-exact-native-requests-and-explicit-scopes.md), proposed, extends this delivery mechanism with distinctly typed runtime approvals. It preserves ordinary question behaviour and adds stricter authority and explicit consent scopes.
+
+A command confirmation (Hermes's `send_slash_confirm`) uses this transport for the runtime's own prompt rather than an agent's question: the runtime keeps the waiting confirmation, and an answer runs the person's command in the sandbox through the runtime's own resolver, granting the agent nothing new.

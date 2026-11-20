@@ -79,6 +79,10 @@ const APP_PLUGIN_SUGGESTED_REPLIES: &str =
 const APP_PLUGIN_QUESTIONS_SKILL: &str =
     include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+/// The `approvals` settings Hermes reads from `config.yaml` each time a
+/// command asks for confirmation, so a change to them needs no restart:
+/// what Always in a command confirmation writes.
+const READ_FOR_EACH_COMMAND: &[&str] = &["destructive_slash_confirm", "mcp_reload_confirm"];
 /// How long Hermes's `clarify` waits for the person's answer before the
 /// agent goes on without one. Hermes's own default (90 s on main of
 /// 2026-11-10, `tools/clarify_gateway.py`, `resolve_clarify_timeout`) frees
@@ -638,13 +642,17 @@ impl RuntimeAdapter for Hermes {
         // YAML this reader does not follow is compared whole, as before; the
         // channel's `model.py` follows the same rules for its `applies`.
         let config = file.as_path().file_name() == Some(std::ffi::OsStr::new("config.yaml"));
-        match config
+        let Some(rest) = config
             .then(|| facts::without_top_level(text, "model"))
             .flatten()
-        {
-            Some(rest) => rest,
-            None => text.to_owned(),
-        }
+        else {
+            return text.to_owned();
+        };
+        // Nor does turning a command confirmation off, which Hermes's
+        // `_read_user_config` reads from disk before each confirmed command
+        // (`gateway/run_busy.py`, `gateway/slash_commands.py`): what its
+        // Always writes.
+        facts::without_nested(&rest, "approvals", READ_FOR_EACH_COMMAND).unwrap_or(rest)
     }
 
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool {
@@ -940,6 +948,30 @@ mod tests {
         // YAML the reader does not follow is compared whole.
         let tabbed = "model:\n\tdefault: model-1\n";
         assert_eq!(relevant(&config, tabbed), tabbed);
+    }
+
+    #[test]
+    fn turning_a_command_confirmation_off_does_not_restart_the_gateway() {
+        let config = at(".hermes/profiles/main/config.yaml");
+        let relevant = |text: &str| Hermes.restart_relevant(&config, text);
+        let before =
+            "model:\n  default: model-1\napprovals:\n  timeout: 60\nterminal:\n  backend: local\n";
+        // What Hermes's Always writes, in a block it has or one it adds.
+        let after = before.replace(
+            "  timeout: 60\n",
+            "  timeout: 60\n  destructive_slash_confirm: false\n  mcp_reload_confirm: false\n",
+        );
+        assert_eq!(relevant(before), relevant(&after));
+        let bare = "terminal:\n  backend: local\n";
+        let added = "terminal:\n  backend: local\napprovals:\n  destructive_slash_confirm: false\n";
+        assert_eq!(relevant(bare), relevant(added));
+        // Any other approval setting still restarts it.
+        assert_ne!(relevant(before), relevant(&before.replace("60", "120")));
+        let mode = before.replace("  timeout: 60\n", "  timeout: 60\n  mode: off\n");
+        assert_ne!(relevant(before), relevant(&mode));
+        // A flow mapping is compared as before.
+        let flow = "approvals: {destructive_slash_confirm: false}\nterminal:\n  backend: local\n";
+        assert_ne!(relevant(bare), relevant(flow));
     }
 
     /// An agent reads its own secrets file through its own
