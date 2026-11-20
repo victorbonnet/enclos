@@ -26,6 +26,12 @@ from the text Hermes wakes the agent with: the reason of the latest
 revision a resume names. Reads run off the gateway's loop, in a fresh
 context (as Hermes runs its own board services), prompted by Hermes's
 board hooks, its dispatcher tick and a timer; no hook waits on them.
+
+A hold goes to the agent first (ADR 0072): `Board.read` marks a hold that
+Hermes wakes the agent for (`WOKEN`: a subscription in its board's
+`kanban_notify_subs`), and the list sent leaves such a hold out until the
+agent hands it to the person (`asks.py`). A hold Hermes does not wake the
+agent for is the person's at once.
 """
 
 import asyncio
@@ -86,6 +92,16 @@ _FUNCTIONS = ("list_tasks", "get_task", "unblock_task", "list_boards", "pin_firs
               "kanban_db_path")
 _TASK_FIELDS = {"id", "title", "assignee", "status", "created_by", "created_at", "last_failure_error"}
 _EVENT_COLUMNS = {"id", "task_id", "kind", "payload", "created_at"}
+# Hermes's subscriptions of a chat to a task (`kanban_notify_subs`), which its
+# gateway notifier reads: one whose `delivery_mode` is one of these wakes the
+# profile it names (`notifier_profile`) with the task's events, its holds
+# among them (`_WAKE_KINDS` in `gateway/kanban_watchers_notifier.py`).
+_SUBSCRIPTIONS = "kanban_notify_subs"
+_SUBSCRIPTION_COLUMNS = {"task_id", "notifier_profile", "delivery_mode"}
+_WAKING_MODES = ("wake", "notify+wake")
+# The key `Board.read` sets, to True, on a hold that Hermes wakes the agent
+# for. Never sent: `Manager` reads it and leaves it out of the list.
+WOKEN = "woken"
 
 
 class Unavailable(Exception):
@@ -212,6 +228,23 @@ def _events(conn: Any, task_id: str, bounds: tuple[str, ...] = _BOUNDS
     return int(latest or 0), (_text(row[0]), payload if isinstance(payload, dict) else {}, row[2])
 
 
+def _has_subscriptions(conn: Any) -> bool:
+    """Whether the board has Hermes's subscriptions, with the columns `_wakes`
+    reads. A board without them (an older Hermes) wakes no agent for a hold."""
+    columns = {_text(row[1]) for row in conn.execute(f"PRAGMA table_info({_SUBSCRIPTIONS})")}
+    return _SUBSCRIPTION_COLUMNS <= columns
+
+
+def _wakes(conn: Any, task_id: str, profile: str) -> bool:
+    """Whether a subscription to the task wakes `profile` for its events. One
+    that names no profile is not taken as `profile`'s: its hold stays the
+    person's."""
+    return conn.execute(
+        f"SELECT 1 FROM {_SUBSCRIPTIONS} WHERE task_id = ? AND notifier_profile = ? "
+        f"AND delivery_mode IN ({', '.join('?' for _ in _WAKING_MODES)}) LIMIT 1",
+        (task_id, profile, *_WAKING_MODES)).fetchone() is not None
+
+
 def _reason(kind: str, payload: dict) -> str:
     """Why the task is held, in Hermes's words."""
     if kind == "gave_up":
@@ -260,9 +293,10 @@ class Board:
 
     def read(self, profile: str) -> list[dict[str, Any]]:
         """Every task held now that `profile` created, newest first, each
-        once. A board that cannot be read stands with its tasks at its last
-        good reading, said in the log; raises only when the boards cannot be
-        listed: a list without a board's tasks would release their cards."""
+        once; one that Hermes wakes `profile` for carries `WOKEN`. A board
+        that cannot be read stands with its tasks at its last good reading,
+        said in the log; raises only when the boards cannot be listed: a list
+        without a board's tasks would release their cards."""
         held: list[dict[str, Any]] = []
         for slug, path in self._databases():
             try:
@@ -301,16 +335,18 @@ class Board:
         if "triage" in getattr(self.kb, "VALID_STATUSES", ()):
             statuses.append("triage")
         with contextlib.closing(self.read_only(path)) as conn:
+            subscriptions = _has_subscriptions(conn)
             for status in statuses:
                 for task in self.kb.list_tasks(conn, status=status):
                     if _creator(task) != profile:
                         continue
-                    entry = self._describe(conn, slug, task, profile)
+                    entry = self._describe(conn, slug, task, profile, subscriptions)
                     if entry is not None:
                         entries.append(entry)
         return entries
 
-    def _describe(self, conn: Any, slug: str, task: Any, profile: str) -> Optional[dict[str, Any]]:
+    def _describe(self, conn: Any, slug: str, task: Any, profile: str,
+                  subscriptions: bool = False) -> Optional[dict[str, Any]]:
         task_id = _text(task.id)
         ref = self._ref(slug, task_id)
         looped = task.status == "triage"
@@ -347,6 +383,8 @@ class Board:
         error = getattr(task, "last_failure_error", None) or (payload.get("error") if kind == "gave_up" else None)
         if isinstance(error, (str, bytes)) and _text(error).strip():
             entry["last_error"] = _cut(error, MAX_ERROR_CHARS)
+        if subscriptions and _wakes(conn, task_id, profile):
+            entry[WOKEN] = True
         return entry
 
     def _path(self, slug: str) -> Path:
@@ -419,6 +457,22 @@ class Board:
         except Exception:
             logger.warning("Cannot read the task again after Hermes failed to unblock it", exc_info=True)
             return False
+
+
+def for_the_person(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The holds of `held`, asks attached, that are the person's (ADR 0072):
+    one Hermes does not wake that agent for, and one its agent handed to
+    them with `enclos_ask_person` (an `ask` it made, which carries `asked`),
+    settled or not. One Hermes wakes the agent for is the agent's to act on,
+    and is left out until it asks: an ask `enclos_person_answered` made up
+    for a hold the agent never handed over does not count, so the person
+    never gets a card for a hold they never saw. `WOKEN` is never sent."""
+    def asked(entry: dict[str, Any]) -> bool:
+        ask = entry.get("ask")
+        return isinstance(ask, dict) and "asked" in ask
+
+    return [{key: value for key, value in entry.items() if key != WOKEN}
+            for entry in held if not entry.get(WOKEN) or asked(entry)]
 
 
 def _fresh(function: Callable[..., Any], *args: Any) -> Any:
@@ -572,6 +626,7 @@ class Manager:
                 # questions.
                 self._failed("The held tasks' asks could not be read")
                 return
+        held = for_the_person(held)
         listed = held[:MAX_TASKS]
         cut = frozenset(entry["task"] for entry in held[MAX_TASKS:])
         if cut and cut != self._cut:
