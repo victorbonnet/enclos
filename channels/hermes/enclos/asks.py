@@ -35,11 +35,12 @@ MAX_CHOICE_CHARS = 80
 # in every turn.
 HINT = (
     "When a kanban task you created is stopped and needs the person's decision, call enclos_ask_person with "
-    "its id, the decision as one short question, one or two plain sentences on what is blocked and why, and "
-    "up to four choices that each say what happens (give the index of the one you recommend). The person "
-    "answers on the task's card in the enclos app; the answer comes back to you as their message naming the "
-    "task. If they answer in the conversation instead, call enclos_person_answered. Write for the person: "
-    "no run numbers, hashes or board terms."
+    "its id, the decision as one short question, two or three plain sentences on what was tried, why it "
+    "stopped and why another attempt would go differently, and up to four choices that each say what happens "
+    "and what it costs (give the index of the one you recommend; when you ask for more time or runs, offer "
+    "more than one amount). The person decides from the card alone and answers with one tap; the answer comes "
+    "back to you as their message naming the task. If they answer in the conversation instead, call "
+    "enclos_person_answered. Write for the person: no run numbers, hashes or board terms."
 )
 
 
@@ -159,7 +160,7 @@ def validate(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     decision = _line(args.get("decision"), "the decision", MAX_DECISION_CHARS)
     blocked = args.get("blocked", "")
     if not isinstance(blocked, str) or not blocked.strip():
-        raise ValueError("Say in one or two sentences what is blocked and why.")
+        raise ValueError("Say in `blocked`, in two or three sentences, what was tried, why it stopped and why another attempt would go differently.")
     blocked = blocked.strip()
     if visible.has_hidden(blocked, lines=True) or len(blocked) > MAX_BLOCKED_CHARS:
         raise ValueError(f"What is blocked must be visible text of at most {MAX_BLOCKED_CHARS} characters.")
@@ -240,9 +241,14 @@ def register(ctx, adapters: list, current_agent: Callable[[], Optional[str]]) ->
                 "parameters": {"type": "object", "properties": {
                     "task": {"type": "string", "description": "The task's id, as the board names it (board/id off the default board)."},
                     "decision": {"type": "string", "description": "The decision as one short question, at most 120 characters."},
-                    "blocked": {"type": "string", "description": "One or two plain sentences: what is stopped and why it needs the person. At most 400 characters."},
+                    "blocked": {"type": "string", "description": (
+                        "Two or three plain sentences the person decides from, without opening anything else: what "
+                        "was tried, why it stopped, and why another attempt would go differently (or that it may "
+                        "not). At most 400 characters.")},
                     "choices": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_CHOICES,
-                                "description": "Up to four answers, each one line saying what happens. None asks for a free answer."},
+                                "description": ("Up to four answers, each one line saying what happens and what it costs "
+                                                "(time, runs). When you ask for more time or runs, offer more than one "
+                                                "amount, such as one hour and three hours. None asks for a free answer.")},
                     "recommended": {"type": "integer", "description": "The index, from 0, of the choice you recommend."}},
                     "required": ["task", "decision", "blocked"]}})
     ctx.register_tool(
