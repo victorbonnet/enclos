@@ -118,7 +118,42 @@ def recall_crops(item):
     return {key for key in crops if isinstance(item.get(key), str)}
 
 
-def archive_pointers(text, origin):
+# tools.session_search_tool _ok(mode=...) results: read/scroll messages and each
+# discover entry's messages and bookends, every one shaped by _shape_message.
+def recalled_messages(item):
+    if not isinstance(item, dict) or item.get('success') is not True:
+        return []
+    if item.get('mode') in {'read', 'scroll'} and isinstance(item.get('session_id'), str):
+        lists = [item.get('messages')]
+    elif item.get('mode') == 'discover' and isinstance(item.get('results'), list):
+        lists = [entry.get(key) for entry in item['results'] if isinstance(entry, dict) and isinstance(entry.get('session_id'), str)
+                 for key in ('messages', 'bookend_start', 'bookend_end')]
+    else:
+        return []
+    return [m for found in lists if isinstance(found, list) for m in found
+            if isinstance(m, dict) and isinstance(m.get('role'), str) and 'content' in m]
+
+
+def map_json(item, visit, recall=False, recalled=frozenset()):
+    """Apply visit(text, recall) to decoded JSON strings, leaving native crops unchanged."""
+    if isinstance(item, str): return visit(item, recall)
+    if isinstance(item, list): return [map_json(child, visit, recall, recalled) for child in item]
+    if isinstance(item, dict):
+        crops = recall_crops(item)
+        recalled = recalled | {id(m) for m in recalled_messages(item)}
+        return {key: child if key in crops else map_json(child, visit, recall or (key == 'content' and id(item) in recalled), recalled)
+                for key, child in item.items()}
+    return item
+
+
+# Native session_search reads another profile of this Hermes root (profile=,
+# @session:<profile>/<id>, root <-> named) and quotes that profile's genuine
+# pointers. Owner rule: inside recalled message content they are display text,
+# never required, read or rewritten, and that profile's files stay out.
+OTHER_HOME = re.compile(r'(?:profiles/[a-z0-9][a-z0-9_-]{0,63}/)?')  # hermes_constants.PROFILE_ID_RE
+
+
+def archive_pointers(text, origin, recall=False):
     if not isinstance(text, str):
         return []
     # api_content is JSON text; decode it before examining display paths.
@@ -127,24 +162,24 @@ def archive_pointers(text, origin):
     except (ValueError, TypeError):
         value = None
     if isinstance(value, (list, dict)):
-        def strings(item):
-            if isinstance(item, str): yield item
-            elif isinstance(item, list):
-                for child in item: yield from strings(child)
-            elif isinstance(item, dict):
-                crops = recall_crops(item)
-                for key, child in item.items():
-                    if key not in crops: yield from strings(child)
-        return [pair for child in strings(value) for pair in archive_pointers(child, origin)]
+        result = []
+        map_json(value, lambda child, inner: result.extend(archive_pointers(child, origin, inner)), recall)
+        return result
     result = []
     for pointer in native_archive_paths(text):
         if 'cache/pruned/' not in pointer:
             continue
         prefix, filename = pointer.rsplit('cache/pruned/', 1)
-        if (not PRUNED_NAME.fullmatch(filename) or filename in {'.', '..'}
-                or prefix not in {str(origin) + '/', '~/' + '/'.join(origin.parts[origin.parts.index('.hermes'):]) + '/'}):
-            raise ValueError('unsafe durable archive reference')
-        result.append((pointer, 'cache/pruned/' + filename))
+        if PRUNED_NAME.fullmatch(filename) and filename not in {'.', '..'}:
+            hermes = origin.parts.index('.hermes')
+            own = {str(origin) + '/', '~/' + '/'.join(origin.parts[hermes:]) + '/'}
+            if prefix in own:
+                result.append((pointer, 'cache/pruned/' + filename))
+                continue
+            roots = (str(Path(*origin.parts[:hermes + 1])) + '/', '~/.hermes/')
+            if recall and any(prefix.startswith(root) and OTHER_HOME.fullmatch(prefix[len(root):]) for root in roots):
+                continue
+        raise ValueError('unsafe durable archive reference')
     return result
 
 
@@ -167,7 +202,7 @@ def checked_archive(profile, relative):
     return path
 
 
-def rewrite_archive_text(text, origin, destination, profile, referenced):
+def rewrite_archive_text(text, origin, destination, profile, referenced, recall=False):
     if not isinstance(text, str): return text
     prefix = '\x00json:' if text.startswith('\x00json:') else ''
     try:
@@ -175,16 +210,9 @@ def rewrite_archive_text(text, origin, destination, profile, referenced):
     except ValueError:
         value = None
     if isinstance(value, (dict, list)):
-        def rewrite(item):
-            if isinstance(item, str): return rewrite_archive_text(item, origin, destination, profile, referenced)
-            if isinstance(item, list): return [rewrite(child) for child in item]
-            if isinstance(item, dict):
-                crops = recall_crops(item)
-                return {key: child if key in crops else rewrite(child) for key, child in item.items()}
-            return item
-        updated = rewrite(value)
+        updated = map_json(value, lambda child, inner: rewrite_archive_text(child, origin, destination, profile, referenced, inner), recall)
         return prefix + json.dumps(updated) if updated != value else text
-    for pointer, relative in archive_pointers(text, origin):
+    for pointer, relative in archive_pointers(text, origin, recall):
         checked_archive(profile, relative)
         referenced.add(relative)
         text = text.replace(pointer, str(destination / relative))

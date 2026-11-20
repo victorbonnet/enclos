@@ -264,3 +264,100 @@ with tempfile.TemporaryDirectory() as tmp:
                         str(Path(__file__).parents[3] / 'src/runtime/hermes/transfer.py'),
                         str(cap), operation], capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(os.environ.get('ENCLOS_HERMES_SOURCE'), 'real Hermes checkout not supplied')
+    def test_real_cross_profile_recall_archive_roundtrip(self):
+        # Native session_search reading ANOTHER profile quotes that profile's
+        # genuine pointers: display text only, never selected or rewritten.
+        script = r'''
+import importlib.util, io, json, os, sqlite3, sys, tarfile, tempfile
+from contextlib import closing
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location('transfer', sys.argv[2])
+t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+reader, other, form, operation = sys.argv[3:7]
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp); home = root / 'source'
+    homes = {name: home / '.hermes' if name == 'default' else home / '.hermes/profiles' / name for name in (reader, other)}
+    os.environ['HOME'] = str(home)
+    from persistence_assembly import open_persistence, profile_scope
+    from persistence.conversation.sessions import NewSession
+    from persistence.conversation.messages import NewMessage
+    from tools.tool_result_storage import write_pruned_original, _with_pointer
+    from tools.session_search_tool import session_search
+
+    def seed(name, sid, body):
+        # Each profile archives its own original through its own HERMES_HOME.
+        homes[name].mkdir(parents=True, exist_ok=True)
+        os.environ['HERMES_HOME'] = str(homes[name])
+        store = open_persistence(profile_scope(home=homes[name]))
+        store.sessions.create(NewSession(session_id=sid, source='cli'))
+        host, display = write_pruned_original(body.decode(), sid, 'terminal', sid)
+        stub = _with_pointer('short', display)
+        store.messages.append(sid, NewMessage(role='tool', content=stub, tool_name='terminal', tool_call_id=sid))
+        return store, host, display, stub
+
+    theirs = b'FOREIGN SYNTHETIC ORIGINAL\n'
+    foreign_store, foreign_host, foreign_display, foreign_stub = seed(other, 'theirs', theirs)
+    foreign_store.close()
+    assert foreign_display.startswith('~/.hermes/') and 'cache/pruned/' in foreign_display, foreign_display
+    body = b'OWNED SYNTHETIC ORIGINAL\n'
+    store, host, display, stub = seed(reader, 'mine', body)
+    try:
+        store.sessions.create(NewSession(session_id='current', source='cli'))
+        baseline = root / 'before.tgz'; t.export(home, reader, baseline)
+        output = (session_search(session_id=other + '/theirs', persistence=store) if form == 'link' else
+                  session_search(session_id='theirs', profile=other, persistence=store))
+        payload = json.loads(output); assert payload['success'] and payload['mode'] == 'read', payload
+        assert [m['content'] for m in payload['messages']] == [foreign_stub], payload
+        assert foreign_display in output and display not in output, output
+        store.messages.append('current', NewMessage(role='tool', content=output,
+            api_content=json.dumps({'content': output}), tool_name='session_search', tool_call_id='search'))
+        archive = root / 'after.tgz'
+        if operation == 'export':
+            t.export(home, reader, archive)
+        else:
+            # Complete pre-recall archive plus the coherent post-recall snapshot.
+            snapshot = root / 'post.db'
+            with closing(sqlite3.connect(homes[reader] / 'state.db')) as src:
+                with closing(sqlite3.connect(snapshot)) as dst:
+                    src.backup(dst)
+            with tarfile.open(baseline) as src, tarfile.open(archive, 'w:gz') as dst:
+                for entry in src:
+                    if entry.name == 'profile/state.db':
+                        data = snapshot.read_bytes(); entry.size = len(data)
+                        dst.addfile(entry, io.BytesIO(data))
+                    else:
+                        dst.addfile(entry, src.extractfile(entry))
+        with tarfile.open(archive) as members:
+            names = members.getnames()
+        assert [n for n in names if n.startswith('profile/cache/')] == ['profile/cache/pruned/' + Path(host).name], names
+        assert not any(Path(foreign_host).name in n for n in names), names
+        destination_home = root / 'restored'; destination_home.mkdir()
+        t.restore(destination_home, 'renamed', archive)
+        target = destination_home / '.hermes/profiles/renamed'
+        assert (target / 'cache/pruned' / Path(host).name).read_bytes() == body
+        with closing(sqlite3.connect(target / 'state.db')) as raw:
+            genuine = raw.execute("select content from messages where session_id='mine'").fetchone()[0]
+            assert genuine == stub.replace(display, str(target / 'cache/pruned' / Path(host).name)), genuine
+            content, api = raw.execute("select content,api_content from messages where session_id='current'").fetchone()
+        assert content == output and api == json.dumps({'content': output}), (content, api)
+        assert sorted(p.name for p in (destination_home / '.hermes/profiles').iterdir()) == ['renamed']
+        assert not (destination_home / '.hermes/cache').exists()
+        assert not list(destination_home.rglob(Path(foreign_host).name))
+        assert Path(foreign_host).read_bytes() == theirs and Path(host).read_bytes() == body
+    finally:
+        store.close()
+'''
+        # default reads a named profile; a named profile reads another by link
+        # and reads the root profile.
+        for reader, other, form in (('default', 'other', 'profile'), ('coder', 'other', 'link'),
+                                    ('coder', 'default', 'profile')):
+            for operation in ('export', 'restore'):
+                with self.subTest(reader=reader, other=other, form=form, operation=operation):
+                    result = subprocess.run([
+                        sys.executable, '-c', script, os.environ['ENCLOS_HERMES_SOURCE'],
+                        str(Path(__file__).parents[3] / 'src/runtime/hermes/transfer.py'),
+                        reader, other, form, operation], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
