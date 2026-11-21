@@ -179,6 +179,7 @@ async def handle(adapter, message):
         return
     try:
         await delete(adapter, chat_id, message["id"])
+        adapter._incoming.cleanup(conversation=chat_id)
     except Exception as error:
         reason = getattr(error, "reason", None)
         if type(error).__name__ == "SessionActiveWriteGuardError":

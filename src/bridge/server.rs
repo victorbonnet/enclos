@@ -42,6 +42,8 @@ mod forget;
 mod group_turns;
 #[path = "held_tasks.rs"]
 mod held_tasks;
+#[path = "incoming.rs"]
+mod incoming;
 #[path = "models.rs"]
 mod models;
 #[path = "open_items.rs"]
@@ -183,9 +185,10 @@ struct PluginOut {
 /// The capabilities the bridge knows of: one it does not (`notify`, from
 /// an older plugin) is not shown to devices as `unknown`.
 fn known(capabilities: Vec<Capability>) -> Vec<Capability> {
+    let files = capabilities.contains(&Capability::IncomingFiles);
     capabilities
         .into_iter()
-        .filter(|c| *c != Capability::Unknown)
+        .filter(|c| *c != Capability::Unknown && (*c != Capability::IncomingImages || files))
         .collect()
 }
 
@@ -229,6 +232,8 @@ struct Hub {
     opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Whether a pass of [`Hub::open_plugins`] runs: one at a time.
     opening_all: AtomicBool,
+    #[cfg(test)]
+    upload_committed: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not, until it
     /// connects again without the `commands` capability.
@@ -522,6 +527,8 @@ impl Hub {
             deletion_jobs: Mutex::new(HashSet::new()),
             opening: Mutex::new(HashMap::new()),
             opening_all: AtomicBool::new(false),
+            #[cfg(test)]
+            upload_committed: Mutex::new(None),
             questions: Mutex::new(Default::default()),
             open_items: Mutex::new(HashMap::new()),
             open_item_devices: Mutex::new(HashSet::new()),
@@ -992,6 +999,27 @@ impl Hub {
                         if hub.model_error(&store, &agent, generation, &error) {
                             continue;
                         }
+                        if let Some(of) = &error.of {
+                            match store.attachments_of(of.as_str()) {
+                                Ok(files) if !files.is_empty() => {
+                                    if let Err(e) = hub.refuse_incoming(
+                                        &store,
+                                        &agent,
+                                        of.as_str(),
+                                        "The agent could not accept the files.",
+                                    ) {
+                                        eprintln!(
+                                            "enclos app: incoming refusal could not be stored: {e}"
+                                        );
+                                    } else if let Err(e) = hub.forward(&store, &agent) {
+                                        eprintln!(
+                                            "enclos app: {agent}: cannot forward after file refusal: {e}"
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         hub.question_error(&store, origin(), error.clone());
                         if let Some(of) = &error.of {
                             let why = format!(
@@ -1237,7 +1265,17 @@ impl Hub {
                         if hub.delete_answer(&agent, generation, Some(&of), Ok(())) {
                             continue;
                         }
+                        let has_files = store
+                            .attachments_of(of.as_str())
+                            .is_ok_and(|files| !files.is_empty());
                         match store.delivered(of.as_str(), &agent) {
+                            Ok(Acked::Delivered) if has_files => {
+                                if let Err(e) = hub.forward(&store, &agent) {
+                                    eprintln!(
+                                        "enclos app: {agent}: cannot forward after file ack: {e}"
+                                    );
+                                }
+                            }
                             Ok(Acked::Delivered | Acked::Nothing) => {}
                             Ok(Acked::NotItsOwn) => {
                                 let why = format!(
@@ -1537,6 +1575,27 @@ impl Hub {
         Ok(last)
     }
 
+    /// Safe terminal text is chosen here, never copied from a plugin exception.
+    fn refuse_incoming(
+        &self,
+        store: &Store,
+        agent: &str,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        if let Some((device, operation)) = store
+            .refuse_incoming(id, agent, reason)
+            .map_err(|e| e.to_string())?
+        {
+            let devices = self.devices.lock().expect("not poisoned");
+            if let Some((_, sender, _)) = devices.get(&device) {
+                let of = MessageId::new(operation).map_err(|e| e.to_string())?;
+                let _ = sender.send(operation_failed(of, reason));
+            }
+        }
+        Ok(())
+    }
+
     /// Gives `agent`'s plugin the messages still pending for it, opening
     /// its connection if it is not open, each with the id it was stored
     /// with: the plugin drops one it has had already.
@@ -1551,16 +1610,25 @@ impl Hub {
         self.plugin(agent)?;
         // The plugins lock is let go before writing: a write waits for the
         // plugin to read, up to the plugin leg's write timeout
-        let (out, generation) = {
+        let (out, generation, takes_files, takes_images) = {
             let plugins = self.plugins.lock().expect("not poisoned");
             let Some(plugin) = plugins.get(agent) else {
                 return Err(format!("{agent}'s app channel closed"));
             };
-            (Arc::clone(&plugin.out), plugin.generation)
+            (
+                Arc::clone(&plugin.out),
+                plugin.generation,
+                plugin.capabilities.contains(&Capability::IncomingFiles),
+                plugin.capabilities.contains(&Capability::IncomingImages),
+            )
         };
         let host = self.known_host();
         let mut plugin = out.lock().expect("not poisoned");
+        let mut blocked = HashSet::new();
         for message in pending {
+            if blocked.contains(&message.conversation) {
+                continue;
+            }
             if store
                 .deletion_started(&message.conversation)
                 .map_err(|e| e.to_string())?
@@ -1568,11 +1636,58 @@ impl Hub {
                 continue;
             }
             if plugin.sent.contains(&message.id) {
+                if !store
+                    .attachments_of(&message.id)
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
+                {
+                    blocked.insert(message.conversation.clone());
+                }
                 continue;
             }
+            // A message with files goes whole, to a plugin that takes them,
+            // or waits: never as its text alone (ADR 0076, proposed).
+            let files = match incoming::stored_files(self, store, &message.id) {
+                Ok(files)
+                    if files.is_empty()
+                        || (takes_files
+                            && (takes_images
+                                || !files.iter().any(|(f, _)| f.mime.starts_with("image/")))) =>
+                {
+                    files
+                }
+                Ok(_) => {
+                    blocked.insert(message.conversation.clone());
+                    eprintln!(
+                        "enclos app: {agent}: a message with files waits for an app channel that takes them"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    self.refuse_incoming(
+                        store,
+                        agent,
+                        &message.id,
+                        "The stored files are unavailable.",
+                    )?;
+                    eprintln!("enclos app: {agent}: a message's files cannot be sent: {e}");
+                    continue;
+                }
+            };
+            if !files.is_empty() {
+                blocked.insert(message.conversation.clone());
+            }
             let from_host = host.as_deref() == Some(message.person.as_str());
-            let signed = self.host_signature(store, agent, &message, from_host);
+            // A message with files is never signed: the signature covers its
+            // text, not its files, so it would vouch for bytes it never saw
+            // (ADR 0077, proposed).
+            let signed = if files.is_empty() {
+                self.host_signature(store, agent, &message, from_host)
+            } else {
+                None
+            };
             let body = FromBridge::MessageIn {
+                files: files.iter().map(|(file, _)| file.clone()).collect(),
                 conversation: ConversationId::new(message.conversation)
                     .map_err(|e| e.to_string())?,
                 // Whether the person is the host's. Not signed, so it grants
@@ -1584,7 +1699,7 @@ impl Hub {
                 signed,
             };
             let id = MessageId::new(message.id.clone()).map_err(|e| e.to_string())?;
-            if let Err(e) = plugin.writer.send_as(&id, body) {
+            if let Err(e) = incoming::send_with_files(&mut plugin.writer, &id, body, files) {
                 // Ended: the next try opens a new one
                 plugin.writer.shutdown();
                 drop(plugin);
@@ -2820,6 +2935,9 @@ fn run_session(
     // The newest `seq` of the person's messages this connection sent, once
     // its device synced; none before.
     let mut sent: Option<i64> = None;
+    // The message with files being sent on this connection: dropped, with
+    // its files, when the connection ends first.
+    let mut upload: Option<incoming::Upload> = None;
     loop {
         if link.heard.elapsed() > hub.silence {
             return Err(SILENT.to_owned());
@@ -2840,6 +2958,10 @@ fn run_session(
             Ok(None) => continue,
             Err(Unread::Refused(error)) => {
                 link.send(ToDevice::Error(error))?;
+                // A malformed part, or any line unread, drops the message with files
+                if let Some(answer) = incoming::dropped(&mut upload) {
+                    link.send(answer)?;
+                }
                 continue;
             }
             Err(Unread::Ended(why)) => return Err(why),
@@ -3454,6 +3576,20 @@ fn run_session(
             }
             FromDevice::MessageSend { conversation, text } => {
                 if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
+                    // After the echo, which the outbox holds
+                    drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
+                    link.send(answer)?;
+                }
+            }
+            FromDevice::MessageBegin(begin) => {
+                let begun = incoming::begin(hub, store, device, &mut upload, message.id, begin)?;
+                if let Some(answer) = begun {
+                    link.send(answer)?;
+                }
+            }
+            FromDevice::MessagePart(part) => {
+                let answer = incoming::part(hub, store, device, &mut upload, message.id, part)?;
+                if let Some(answer) = answer {
                     // After the echo, which the outbox holds
                     drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
                     link.send(answer)?;
@@ -4603,6 +4739,8 @@ mod connection_end_tests {
     const PERSON: &str = "victor@example.com";
     const TOKEN: &str = "t0ken";
 
+    mod incoming_tests;
+
     /// A bridge on a free port of the loopback, serving `lab/main`, whose
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs
     /// answering `node`.
@@ -4651,6 +4789,19 @@ mod connection_end_tests {
         agents: Vec<AgentEndpoint>,
         watch: Option<AgentWatch>,
     ) -> Bridge {
+        bridge_keyed(folder, silence, provisioning, agents, watch, None)
+    }
+
+    /// As [`bridge_built`], signing the host's person's messages with
+    /// `approval_key` when there is one (ADR 0077).
+    fn bridge_keyed(
+        folder: &Path,
+        silence: Duration,
+        provisioning: Host,
+        agents: Vec<AgentEndpoint>,
+        watch: Option<AgentWatch>,
+        approval_key: Option<enclos_protocol::decision::DecisionKey>,
+    ) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
         let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
@@ -4678,6 +4829,9 @@ mod connection_end_tests {
         .with_provisioning(provisioning);
         if let Some(watch) = watch {
             hub = hub.with_agent_watch(watch);
+        }
+        if let Some(key) = approval_key {
+            hub = hub.with_approval_key(key);
         }
         let hub = Arc::new(hub);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7942,45 +8096,361 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
 
     #[test]
     fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
-        let folder = tempfile::tempdir().unwrap();
-        let bridge = bridge_with(folder.path(), Duration::from_millis(600));
-        let listener = UnixListener::bind(&bridge.socket).unwrap();
-        let (waiting, wait) = channel();
-        let (release, released) = channel();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut out = stream.try_clone().unwrap();
-            let mut lines = BufReader::new(stream);
-            let mut line = String::new();
-            lines.read_line(&mut line).unwrap();
-            out.write_all(&encode_line(&Envelope::new(
-                MessageId::new("hello").unwrap(),
-                FromPlugin::Hello {
-                    runtime: "hermes".into(),
-                    agent: "main".into(),
-                    capabilities: vec![Capability::ConversationDelete],
-                },
-            )))
-            .unwrap();
+        pending_delete_completion(true);
+    }
+
+    #[test]
+    fn a_pending_native_delete_idle_completion_records_silence() {
+        pending_delete_completion(false);
+    }
+
+    fn pending_delete_line(
+        reader: &mut impl std::io::BufRead,
+        line: &mut String,
+        phase: &str,
+    ) -> Result<(), String> {
+        match reader.read_line(line) {
+            Ok(0) => Err(format!("{phase}: EOF")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{phase}: io::Error {e:?}")),
+        }
+    }
+
+    // Only these two exact tests run in a child: every detached Bridge writer
+    // dies with that process. The parent alone owns the temporary directory.
+    struct PendingDeleteChild {
+        root: Option<tempfile::TempDir>,
+        child: Option<std::process::Child>,
+    }
+
+    impl PendingDeleteChild {
+        fn poll(&mut self, bound: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+            let deadline = std::time::Instant::now() + bound;
             loop {
-                line.clear();
-                if lines.read_line(&mut line).unwrap_or(0) == 0 {
-                    return;
-                }
-                let packet = decode_from_bridge(line.as_bytes()).unwrap();
-                if let FromBridge::Delete { .. } = packet.body {
-                    waiting.send(()).unwrap();
-                    released.recv_timeout(Duration::from_secs(5)).unwrap();
-                    out.write_all(&encode_line(&Envelope::new(
-                        MessageId::new("native-ack").unwrap(),
-                        FromPlugin::Ack { of: packet.id },
-                    )))
-                    .unwrap();
+                match self.child.as_mut().unwrap().try_wait()? {
+                    Some(status) => {
+                        self.child = None;
+                        return Ok(Some(status));
+                    }
+                    None if std::time::Instant::now() >= deadline => return Ok(None),
+                    None => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
-        });
+        }
+
+        fn retain(&mut self) -> Option<std::path::PathBuf> {
+            self.root.take().map(tempfile::TempDir::keep)
+        }
+    }
+
+    impl Drop for PendingDeleteChild {
+        fn drop(&mut self) {
+            if self.child.is_some() {
+                // Transfer ownership BEFORE any fallible diagnostic or drain.
+                let retained = self.retain();
+                let kill = self.child.as_mut().unwrap().kill();
+                let drain = self.poll(Duration::from_secs(5));
+                let diagnostics = retained
+                    .as_ref()
+                    .map(|path| std::fs::read_to_string(path.join("child.log")));
+                let cleanup = if matches!(drain, Ok(Some(_))) {
+                    retained.as_ref().map(std::fs::remove_dir_all)
+                } else {
+                    None
+                };
+                // Ignore diagnostic write errors during unwind.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pending-delete unwind root={retained:?} kill={kill:?} drain={drain:?} diagnostics={diagnostics:?} cleanup={cleanup:?}"
+                );
+            }
+        }
+    }
+
+    fn pending_delete_process(keep_alive: bool) -> std::path::PathBuf {
+        const ROOT: &str = "ENCLOS_PENDING_DELETE_CHILD_ROOT";
+        let control = std::env::var("ENCLOS_PENDING_DELETE_CONTROL").unwrap_or_default();
+        if let Some(root) = std::env::var_os(ROOT) {
+            match control.as_str() {
+                "setup-failure" => panic!("controlled setup failure before Bridge construction"),
+                "unknown-drain" => return std::path::PathBuf::new(),
+                _ => return root.into(),
+            }
+        }
+        if control == "read-seam" {
+            let (input, peer) = UnixStream::pair().unwrap();
+            input.set_nonblocking(true).unwrap();
+            let mut reader = BufReader::new(input);
+            let error =
+                pending_delete_line(&mut reader, &mut String::new(), "forced read").unwrap_err();
+            assert!(
+                error.contains("io::Error") && error.contains("WouldBlock"),
+                "{error}"
+            );
+            drop(peer);
+            let eof =
+                pending_delete_line(&mut reader, &mut String::new(), "forced read").unwrap_err();
+            assert_eq!(eof, "forced read: EOF");
+            eprintln!("forced read error={error}; eof={eof}");
+            return std::path::PathBuf::new();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_owned();
+        let output = path.join("child.log");
+        let file = std::fs::File::create(&output).unwrap();
+        let mut owned = PendingDeleteChild {
+            root: Some(root),
+            child: None,
+        };
+        let test = if keep_alive {
+            "bridge::server::connection_end_tests::a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt"
+        } else {
+            "bridge::server::connection_end_tests::a_pending_native_delete_idle_completion_records_silence"
+        };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(ROOT, &path)
+            .stdout(file.try_clone().unwrap())
+            .stderr(file);
+        owned.child = Some(crate::lifecycle::marker::spawn_unmarked(&mut command).unwrap());
+        if control == "parent-unwind" {
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _owned = owned;
+                panic!("controlled parent unwind");
+            }));
+            assert!(unwind.is_err());
+            assert!(
+                !path.exists(),
+                "unwind guard retained root; inspect drain diagnostics"
+            );
+            return std::path::PathBuf::new();
+        }
+        let primary = if control == "unknown-drain" {
+            Err(std::io::Error::other("controlled unknown primary wait"))
+        } else {
+            owned.poll(Duration::from_secs(30))
+        };
+        let mut kill = None;
+        let mut drain = None;
+        let reaped = matches!(primary, Ok(Some(_)));
+        let retained = if !reaped {
+            let retained = owned.retain();
+            kill = Some(owned.child.as_mut().unwrap().kill());
+            drain = Some(if control == "unknown-drain" {
+                Err(std::io::Error::other("controlled unknown drain"))
+            } else {
+                owned.poll(Duration::from_secs(5))
+            });
+            retained
+        } else {
+            None
+        };
+        let diagnostics = std::fs::read_to_string(&output);
+        let cleanup = if reaped {
+            owned.root.take().unwrap().close()
+        } else if matches!(drain, Some(Ok(Some(_)))) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            if control == "unknown-drain" {
+                assert!(path.exists());
+                eprintln!(
+                    "controlled unknown drain: root retained {path:?}; primary={primary:?} kill={kill:?} drain={drain:?}"
+                );
+                let actual = owned.poll(Duration::from_secs(5));
+                assert!(matches!(actual, Ok(Some(_))), "{actual:?}");
+                let diagnostics = std::fs::read_to_string(&output);
+                let cleanup = std::fs::remove_dir_all(&path);
+                eprintln!(
+                    "controlled eventual positive reap={actual:?} diagnostics={diagnostics:?} cleanup={cleanup:?}"
+                );
+                cleanup.unwrap();
+                assert!(!path.exists());
+                return std::path::PathBuf::new();
+            }
+            // Drop must not attempt another drain or delete unknown live data.
+            owned.child = None;
+            Err(std::io::Error::other("child drain unknown; root retained"))
+        };
+        eprintln!(
+            "pending-delete root={path:?} primary={primary:?} kill={kill:?} drain={drain:?} retained={retained:?} cleanup={cleanup:?} diagnostics={diagnostics:?}"
+        );
+        if matches!(control.as_str(), "setup-failure" | "assertion-failure") {
+            assert!(
+                matches!(primary, Ok(Some(status)) if !status.success()),
+                "{primary:?}"
+            );
+            cleanup.unwrap();
+            assert!(!path.exists());
+            eprintln!("controlled failure positively reaped; root absent {path:?}");
+            return std::path::PathBuf::new();
+        }
+        assert!(
+            matches!(primary, Ok(Some(status)) if status.success()),
+            "child failed: {primary:?}"
+        );
+        cleanup.unwrap();
+        assert!(!path.exists(), "root remains after positive reap");
+        // Empty path is the parent-only completion sentinel.
+        std::path::PathBuf::new()
+    }
+
+    // One synthetic plugin connection, one authenticated device generation.
+    // The completion gate deliberately crosses the fixture's 600ms silence
+    // limit. It is a controlled schedule, not a production timeout change.
+    fn pending_delete_completion(keep_alive: bool) {
+        use std::net::Shutdown;
+        use std::time::Instant;
+
+        struct Owned {
+            release: std::sync::mpsc::Sender<()>,
+            done: std::sync::mpsc::Sender<()>,
+            plugin: Arc<Mutex<Option<UnixStream>>>,
+            device: Option<TcpStream>,
+            worker: Option<std::thread::JoinHandle<()>>,
+            error: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.release.send(());
+                let _ = self.done.send(());
+                if let Some(socket) = &self.device {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                if let Some(socket) = self.plugin.lock().unwrap().as_ref() {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                if let Some(worker) = self.worker.take() {
+                    let result = worker.join();
+                    if std::thread::panicking() {
+                        if result.is_err() {
+                            eprintln!("pending-delete: plugin also panicked during unwind");
+                        }
+                    } else {
+                        result.unwrap();
+                    }
+                }
+                if let Some(error) = self.error.take() {
+                    let diagnostic = error.recv_timeout(Duration::from_secs(1));
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "pending-delete worker during unwind: {diagnostic:?}"
+                    );
+                }
+            }
+        }
+
+        let root = pending_delete_process(keep_alive);
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let bridge = bridge_with(&root, Duration::from_millis(600));
+        if std::env::var("ENCLOS_PENDING_DELETE_CONTROL").as_deref() == Ok("assertion-failure") {
+            assert_eq!(
+                1, 2,
+                "controlled assertion failure with detached Bridge writers"
+            );
+        }
+
+        let listener = UnixListener::bind(&bridge.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (waiting, wait) = channel();
+        let (release, released) = channel();
+        let (done, finished) = channel();
+        let plugin = Arc::new(Mutex::new(None));
+        let mut owned = Owned {
+            release,
+            done,
+            plugin: Arc::clone(&plugin),
+            device: None,
+            worker: None,
+            error: None,
+        };
+        let (errors, error) = channel();
+        owned.error = Some(error);
+        owned.worker = Some(std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err("accept: deadline elapsed".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => return Err(format!("accept: {e:?}")),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| format!("blocking mode: {e:?}"))?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|e| format!("read timeout: {e:?}"))?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|e| format!("write timeout: {e:?}"))?;
+                *plugin.lock().unwrap() = Some(
+                    stream
+                        .try_clone()
+                        .map_err(|e| format!("plugin clone: {e:?}"))?,
+                );
+                let mut out = stream
+                    .try_clone()
+                    .map_err(|e| format!("plugin clone: {e:?}"))?;
+                let mut lines = BufReader::new(stream);
+                let mut line = String::new();
+                pending_delete_line(&mut lines, &mut line, "hello read")?;
+                out.write_all(&encode_line(&Envelope::new(
+                    MessageId::new("hello").unwrap(),
+                    FromPlugin::Hello {
+                        runtime: "hermes".into(),
+                        agent: "main".into(),
+                        capabilities: vec![Capability::ConversationDelete],
+                    },
+                )))
+                .map_err(|e| format!("hello write: {e:?}"))?;
+                loop {
+                    line.clear();
+                    pending_delete_line(&mut lines, &mut line, "delete read")?;
+                    let packet = decode_from_bridge(line.as_bytes())
+                        .map_err(|e| format!("delete decode: {e:?}"))?;
+                    if let FromBridge::Delete { .. } = packet.body {
+                        waiting
+                            .send(())
+                            .map_err(|e| format!("waiting gate: {e:?}"))?;
+                        if released.recv_timeout(Duration::from_secs(5)).is_err() {
+                            return Err("release gate: timeout/disconnected".into());
+                        }
+                        eprintln!(
+                            "pending-delete keep_alive={keep_alive} gate released at {:?}",
+                            started.elapsed()
+                        );
+                        // Bounded stand-in gate: the main thread can keep the same
+                        // socket active, or observe SILENT, before confirming native work.
+                        let _ = finished.recv_timeout(Duration::from_millis(900));
+                        eprintln!(
+                            "pending-delete native confirmation at {:?}",
+                            started.elapsed()
+                        );
+                        out.write_all(&encode_line(&Envelope::new(
+                            MessageId::new("native-ack").unwrap(),
+                            FromPlugin::Ack { of: packet.id },
+                        )))
+                        .map_err(|e| format!("native ACK write: {e:?}"))?;
+                        let _ = finished.recv_timeout(Duration::from_secs(5));
+                        return Ok(());
+                    }
+                }
+            })();
+            let _ = errors.send(result);
+        }));
         let phone = paired(&bridge, "n-pixel");
         let (mut device, _) = connect(&bridge, &phone);
+        owned.device = Some(device.socket.get_ref().try_clone().unwrap());
         let store = Store::open(&bridge.store).unwrap();
         store
             .conversation("c-live-delete", "lab", "main", PERSON)
@@ -7991,7 +8461,14 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 conversation: ConversationId::new("c-live-delete").unwrap(),
             },
         );
-        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        if let Err(gate) = wait.recv_timeout(Duration::from_secs(3)) {
+            let diagnostic = owned
+                .error
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            panic!("pending-delete waiting gate: {gate:?}; worker: {diagnostic:?}");
+        }
         // Remain pending beyond the silence threshold while this SAME socket
         // keeps sending pings and receiving ordinary sync responses.
         for _ in 0..5 {
@@ -8013,21 +8490,118 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             std::thread::sleep(Duration::from_millis(160));
         }
         assert!(store.conversation_info("c-live-delete").unwrap().is_some());
-        release.send(()).unwrap();
+        eprintln!(
+            "pending-delete pending checks complete at {:?}",
+            started.elapsed()
+        );
+        owned.release.send(()).unwrap();
+        device
+            .socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_ping = Instant::now() - Duration::from_millis(160);
         let mut deleted = 0;
-        loop {
-            match device.receive() {
-                Some(ToDevice::ConversationDeleted { conversation })
-                    if conversation.as_str() == "c-live-delete" =>
-                {
-                    deleted += 1
+        let mut acked = false;
+        let mut ended = false;
+        while Instant::now() < deadline {
+            if keep_alive && last_ping.elapsed() >= Duration::from_millis(160) {
+                device.socket.send(Message::Ping(vec![2].into())).unwrap();
+                last_ping = Instant::now();
+            }
+            let body = match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    decode_to_device(&plain).unwrap().body
                 }
-                Some(ToDevice::Ack { of }) if of.as_str() == "delete-live" => break,
-                Some(_) => {}
-                None => panic!("deletion starved the device session"),
+                Ok(Message::Close(frame)) => {
+                    eprintln!(
+                        "pending-delete raw Close={frame:?} at {:?}",
+                        started.elapsed()
+                    );
+                    ended = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("pending-delete raw error={e:?} at {:?}", started.elapsed());
+                    ended = true;
+                    break;
+                }
+            };
+            eprintln!("pending-delete body={body:?} at {:?}", started.elapsed());
+            match body {
+                ToDevice::ConversationDeleted { conversation } => {
+                    assert_eq!(conversation.as_str(), "c-live-delete");
+                    deleted += 1;
+                    assert_eq!(deleted, 1, "duplicate canonical deletion");
+                }
+                ToDevice::Ack { of } => {
+                    assert_eq!(of.as_str(), "delete-live", "uncorrelated receipt");
+                    assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+                    acked = true;
+                    break;
+                }
+                ToDevice::Error(error) => panic!("deletion error: {error:?}"),
+                _ => {}
             }
         }
-        assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+        if !keep_alive {
+            assert!(ended, "idle control did not observe a raw connection end");
+            assert!(!acked);
+            assert_eq!(deleted, 0);
+            assert!(eventually(|| store.log_lines(100).unwrap().iter().any(
+                |l| l.event == "disconnected" && l.reason.as_deref() == Some(SILENT)
+            )));
+            for line in store
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .filter(|l| l.event == "disconnected")
+            {
+                eprintln!(
+                    "pending-delete persisted reason={:?} at {:?}",
+                    line.reason,
+                    started.elapsed()
+                );
+            }
+            // Allow native confirmation to finish before releasing the owned
+            // plugin. This measures completion even after the origin went silent.
+            assert!(eventually(|| store
+                .conversation_info("c-live-delete")
+                .unwrap()
+                .is_none()));
+            eprintln!(
+                "pending-delete idle store completion at {:?}",
+                started.elapsed()
+            );
+            owned.done.send(()).unwrap();
+            assert_eq!(
+                owned
+                    .error
+                    .take()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(6))
+                    .unwrap(),
+                Ok(())
+            );
+            return;
+        }
+        assert!(
+            !ended,
+            "live completion ended before receipt; inspect raw error above"
+        );
+        assert!(acked, "live completion deadline elapsed");
+        assert!(store.conversation_info("c-live-delete").unwrap().is_none());
         device.send(
             "sync-after-delete",
             FromDevice::Sync {
@@ -8035,13 +8609,55 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 open_items: false,
             },
         );
-        loop {
-            match device.receive() {
-                Some(ToDevice::Synced { .. }) => break,
-                Some(_) => {}
-                None => panic!("the deletion completion closed this socket"),
+        let mut synced = false;
+        while Instant::now() < deadline {
+            if last_ping.elapsed() >= Duration::from_millis(160) {
+                device.socket.send(Message::Ping(vec![2].into())).unwrap();
+                last_ping = Instant::now();
+            }
+            let body = match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    decode_to_device(&plain).unwrap().body
+                }
+                Ok(Message::Close(frame)) => panic!("final sync raw Close: {frame:?}"),
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("final sync raw error: {e:?}"),
+            };
+            match body {
+                ToDevice::Synced { .. } => {
+                    synced = true;
+                    break;
+                }
+                // Sync replays the owner's deletion tombstones.
+                ToDevice::ConversationDeleted { conversation } => {
+                    assert_eq!(conversation.as_str(), "c-live-delete");
+                }
+                ToDevice::Ack { of } => panic!("unexpected extra receipt: {of:?}"),
+                ToDevice::Error(error) => panic!("final sync error: {error:?}"),
+                _ => {}
             }
         }
+        assert!(synced, "final sync deadline elapsed");
+        eprintln!("pending-delete final Sync at {:?}", started.elapsed());
+        owned.done.send(()).unwrap();
+        assert_eq!(
+            owned
+                .error
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(6))
+                .unwrap(),
+            Ok(())
+        );
     }
 
     /// The `conversation.deleted` of a forget reach the device that asked

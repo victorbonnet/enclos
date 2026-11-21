@@ -236,6 +236,7 @@ impl PluginWriter {
             person: person.clone(),
             text: text.to_owned(),
             host: Some(host),
+            files: Vec::new(),
             signed: None,
         })
     }

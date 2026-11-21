@@ -883,6 +883,16 @@ pub enum Added {
     Again,
 }
 
+/// Why [`Store::add_from_device_with_files`] stored nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotStored {
+    /// The conversation is not the person's now, goes to another agent or
+    /// to a group, or is gone.
+    NotAllowed,
+    /// The conversation is being deleted.
+    Deleting,
+}
+
 /// What a plugin's `ack` did ([`Store::delivered`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acked {
@@ -2268,6 +2278,44 @@ impl Store {
         })
     }
 
+    /// [`Store::add_from_device`], with the records of its `files`, in one
+    /// transaction: none of them when the message was stored before. Stored
+    /// only while `conversation` is still `person`'s, goes to `sandbox`'s
+    /// `agent` alone and is not being deleted, checked in that transaction:
+    /// it holds the write lock from its start, so nothing changes them
+    /// between the check and the message.
+    pub fn add_from_device_with_files(
+        &self,
+        origin: &str,
+        id: &str,
+        (conversation, sandbox, agent): (&str, &str, &str),
+        person: &str,
+        text: &str,
+        files: &[StoredAttachment],
+    ) -> rusqlite::Result<Result<Added, NotStored>> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let to = (sandbox.to_owned(), agent.to_owned(), person.to_owned());
+        if self.conversation_of(conversation)? != Some(to)
+            || !self.members(conversation)?.is_empty()
+        {
+            return Ok(Err(NotStored::NotAllowed));
+        }
+        if self.deletion_started(conversation)? {
+            return Ok(Err(NotStored::Deleting));
+        }
+        let added = self.add_from_device(origin, id, conversation, person, text)?;
+        if let Added::New(_) = added {
+            for file in files {
+                self.add_attachment(file, id)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(Ok(added))
+    }
+
     /// A person's message in a group, from a device, as
     /// [`Store::add_from_device`] stores one, but given to no plugin: the
     /// bridge runs the group's turns itself.
@@ -2349,6 +2397,61 @@ impl Store {
         } else {
             Acked::Nothing
         })
+    }
+
+    /// Settle a device operation and append its terminal notice atomically.
+    /// The status row's deterministic id deduplicates late/repeated refusals,
+    /// including a refusal after the runtime's receipt ACK cleared pending.
+    pub fn refuse_incoming(
+        &self,
+        id: &str,
+        agent: &str,
+        reason: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Ok(None);
+        };
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let source: Option<(String, String)> = tx.query_row(
+            "SELECT m.origin, m.conversation FROM messages m JOIN conversations c ON c.id=m.conversation
+             WHERE m.id=?1 AND m.origin IS NOT NULL AND c.sandbox=?2 AND c.agent=?3 AND EXISTS (SELECT 1 FROM attachments a WHERE a.message=m.id)",
+            params![id, sandbox, name], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((origin, conversation)) = source else {
+            return Ok(None);
+        };
+        let Some((device, operation)) = origin.split_once('/') else {
+            return Ok(None);
+        };
+        let names = self
+            .attachments_of(id)?
+            .into_iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prefix = format!("Operation {operation} ({names}) failed: ");
+        // Only a matching terminal notice is a duplicate. An unrelated row at
+        // this id must still fail the strict INSERT and roll back settlement.
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1 AND conversation=?2
+             AND kind='status' AND origin IS NULL AND substr(text, 1, length(?3))=?3)",
+            params![format!("incoming-refusal/{id}"), conversation, prefix],
+            |r| r.get(0),
+        )?;
+        if duplicate {
+            return Ok(None);
+        }
+        let text = format!("{prefix}{reason}");
+        let inserted = tx.execute(
+            "INSERT INTO messages (id, conversation, text, kind, at) VALUES (?1, ?2, ?3, 'status', ?4)",
+            params![format!("incoming-refusal/{id}"), conversation, text, now()],
+        )?;
+        tx.execute("UPDATE messages SET pending=0 WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok((inserted == 1).then(|| (device.to_owned(), operation.to_owned())))
     }
 
     /// The messages of `owner`'s conversations after `since`, in order.
@@ -3839,6 +3942,250 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    /// A message with files is stored only where it was let in: the
+    /// person's conversation with the same agent, not a group, not being
+    /// deleted. Sent again, it is stored once, its files too.
+    #[test]
+    fn a_message_with_files_is_stored_only_to_its_first_destination() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        let file = |id: &str, conversation: &str| StoredAttachment {
+            id: id.into(),
+            conversation: conversation.into(),
+            mime: "text/plain".into(),
+            name: "a.txt".into(),
+            size: 1,
+        };
+        let add_as = |n: &str, id: &str, c: &str, agent: &str, person: &str| {
+            let (origin, files) = (format!("d-1/{n}"), [file(&format!("f-{id}"), c)]);
+            let to = (c, "lab", agent);
+            let id = format!("b-{id}");
+            store
+                .add_from_device_with_files(&origin, &id, to, person, "", &files)
+                .unwrap()
+        };
+        let add = |n: &str, c: &str, agent: &str, person: &str| add_as(n, n, c, agent, person);
+        for c in ["c-1", "c-2", "c-3", "c-4"] {
+            store.conversation(c, "lab", "main", owner).unwrap();
+        }
+        assert!(matches!(
+            add("m-1", "c-1", "main", owner),
+            Ok(Added::New(_))
+        ));
+        // Sent again: whatever ids the bridge would give it, nothing more
+        let again = add_as("m-1", "retry", "c-1", "main", owner);
+        assert_eq!(again, Ok(Added::Again));
+        assert!(!store.has_message("b-retry").unwrap());
+        assert!(!store.has_attachment("f-retry").unwrap());
+        let refused = Err(NotStored::NotAllowed);
+        assert_eq!(add("m-2", "c-9", "main", owner), refused);
+        assert_eq!(add("m-3", "c-1", "main", "alice@example.com"), refused);
+        assert_eq!(add("m-4", "c-1", "scout", owner), refused);
+        store
+            .db
+            .execute("UPDATE conversations SET agent='scout' WHERE id='c-2'", [])
+            .unwrap();
+        assert_eq!(add("m-5", "c-2", "main", owner), refused);
+        store
+            .db
+            .execute(
+                "INSERT INTO members (conversation, agent, position) VALUES ('c-3', 'main', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(add("m-6", "c-3", "main", owner), refused);
+        store.begin_deletion("c-4", owner).unwrap().unwrap();
+        assert_eq!(add("m-7", "c-4", "main", owner), Err(NotStored::Deleting));
+        for n in ["m-2", "m-3", "m-4", "m-5", "m-6", "m-7"] {
+            assert!(!store.has_message(&format!("b-{n}")).unwrap());
+            assert!(!store.has_attachment(&format!("f-{n}")).unwrap());
+        }
+        assert!(store.has_attachment("f-m-1").unwrap());
+    }
+
+    #[test]
+    fn incoming_refusal_never_settles_text() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("db")).unwrap();
+        store.conversation("c", "lab", "main", "p").unwrap();
+        store
+            .add_from_device("d/op", "text", "c", "p", "hello")
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("text", "lab/main", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incoming_terminal_refusal_after_receipt_ack() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store
+            .add_from_device_with_files(
+                "d-1/begin-1",
+                "stored-1",
+                ("c-1", "lab", "main"),
+                owner,
+                "read",
+                &[StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    name: "a.txt".into(),
+                    mime: "text/plain".into(),
+                    size: 1,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/scout", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        store.delivered("stored-1", "lab/main").unwrap();
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        let refusal = store
+            .refuse_incoming("stored-1", "lab/main", "unavailable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal, ("d-1".into(), "begin-1".into()));
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "again")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .add_from_device("d-1/begin-1", "new-id", "c-1", owner, "retry")
+                .unwrap(),
+            Added::Again
+        );
+        assert_eq!(
+            store
+                .add_from_device_with_files(
+                    "d-1/begin-1",
+                    "stored-1",
+                    ("c-1", "lab", "main"),
+                    owner,
+                    "retry",
+                    &[StoredAttachment {
+                        id: "f-1".into(),
+                        conversation: "c-1".into(),
+                        name: "a.txt".into(),
+                        mime: "text/plain".into(),
+                        size: 1,
+                    }],
+                )
+                .unwrap(),
+            Ok(Added::Again)
+        );
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let history = store.since(owner, 0).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].kind, "status");
+        assert_eq!(history[1].conversation, "c-1");
+        assert!(history[1].text.contains("begin-1"));
+        assert!(history[1].text.contains("unavailable"));
+    }
+
+    #[test]
+    fn incoming_terminal_refusal_is_durable_and_deduplicated() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store
+            .add_from_device_with_files(
+                "d-1/begin-1",
+                "stored-1",
+                ("c-1", "lab", "main"),
+                owner,
+                "read",
+                &[StoredAttachment {
+                    id: "f-1".into(),
+                    conversation: "c-1".into(),
+                    name: "a.txt".into(),
+                    mime: "text/plain".into(),
+                    size: 1,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/scout", "unavailable")
+                .unwrap()
+                .is_none()
+        );
+        store.db.execute(
+            "INSERT INTO messages (id, conversation, text, kind, at) VALUES ('incoming-refusal/stored-1', 'c-1', 'unrelated status', 'status', 0)", [],
+        ).unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "unavailable")
+                .is_err()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+        store
+            .db
+            .execute(
+                "DELETE FROM messages WHERE id='incoming-refusal/stored-1'",
+                [],
+            )
+            .unwrap();
+        store.db.execute_batch("CREATE TEMP TRIGGER refuse_status BEFORE INSERT ON messages WHEN NEW.kind='status' BEGIN SELECT RAISE(FAIL, 'fixture'); END;").unwrap();
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "unavailable")
+                .is_err()
+        );
+        assert_eq!(store.pending("lab", "main").unwrap().len(), 1);
+        store
+            .db
+            .execute_batch("DROP TRIGGER refuse_status;")
+            .unwrap();
+        let refusal = store
+            .refuse_incoming("stored-1", "lab/main", "unavailable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal, ("d-1".into(), "begin-1".into()));
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        assert!(
+            store
+                .refuse_incoming("stored-1", "lab/main", "again")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .add_from_device("d-1/begin-1", "new-id", "c-1", owner, "retry")
+                .unwrap(),
+            Added::Again
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let history = store.since(owner, 0).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].kind, "status");
+        assert_eq!(history[1].conversation, "c-1");
+        assert!(history[1].text.contains("begin-1"));
+        assert!(history[1].text.contains("unavailable"));
     }
 
     #[test]

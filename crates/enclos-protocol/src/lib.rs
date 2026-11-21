@@ -25,6 +25,7 @@ pub mod device;
 mod envelope;
 pub mod held_task;
 mod ids;
+pub mod incoming;
 pub mod model;
 pub mod noise;
 pub mod open_items;

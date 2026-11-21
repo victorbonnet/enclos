@@ -222,6 +222,15 @@ pub enum FromDevice {
         conversation: ConversationId,
         text: String,
     },
+    /// A message with files (ADR 0076, proposed): its text and the files it
+    /// carries, whose bytes follow on this connection in `message.part`s
+    /// naming this message's id. A bridge that names [`MESSAGE_BEGIN`] in
+    /// `authenticated` takes it.
+    #[serde(rename = "message.begin")]
+    MessageBegin(crate::incoming::Begin),
+    /// The next bytes of a file of the message being sent.
+    #[serde(rename = "message.part")]
+    MessagePart(crate::incoming::Part),
     /// Names the conversation; an empty `title` clears the name, and the
     /// runtime may name it again.
     #[serde(rename = "conversation.rename")]
@@ -288,6 +297,9 @@ pub const AGENT_FORGET: &str = "agent.forget";
 pub const HELD_TASK_BOARD: &str = "held_task.board";
 /// The bridge takes a person's answer to a held card (ADR 0073, proposed).
 pub const HELD_TASK_ANSWER: &str = "held_task.answer";
+/// The bridge takes a message with files (`message.begin`, ADR 0076,
+/// proposed), for an agent whose capabilities name `incoming_files`.
+pub const MESSAGE_BEGIN: &str = "message.begin";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
@@ -324,6 +336,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "group.new",
     "group.stop",
     "message.send",
+    MESSAGE_BEGIN,
+    "message.part",
     "conversation.rename",
     "conversation.read",
     "conversation.archive",

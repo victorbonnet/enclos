@@ -2426,11 +2426,13 @@ fn only_the_hosts_persons_direct_message_is_signed() {
         person,
         text,
         host,
+        files,
         signed,
     } = message.body
     else {
         panic!("not a message.in");
     };
+    assert!(files.is_empty());
     assert_eq!(host, Some(true));
     let signed = signed.expect("the host's person's direct message is signed");
     assert!((signed.at - now()).abs() <= 5);

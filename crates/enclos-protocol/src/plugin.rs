@@ -120,14 +120,27 @@ pub enum FromBridge {
         /// (`None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<bool>,
+        /// The files the person sent with it (ADR 0076, proposed), only to a
+        /// plugin that names [`Capability::IncomingFiles`]: their bytes follow
+        /// in `message.part`s naming this message's id, and the plugin gives
+        /// the runtime the message once it has every byte.
+        #[serde(
+            default,
+            deserialize_with = "crate::incoming::some_files",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        files: Vec<crate::incoming::IncomingFile>,
         /// The bridge's signature of this message ([`crate::decision`],
         /// `HostMessage`): only on a message the host's person sent from a
-        /// paired device in a direct conversation, with no attachments. A
-        /// channel may give that turn its runtime's owner authority, after
-        /// checking it (ADR 0077, proposed).
+        /// paired device in a direct conversation, with no attachments, so
+        /// never alongside `files`. A channel may give that turn its
+        /// runtime's owner authority, after checking it (ADR 0077, proposed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signed: Option<crate::decision::SignedDecision>,
     },
+    /// The next bytes of a file of a `message.in` with files.
+    #[serde(rename = "message.part")]
+    MessagePart(crate::incoming::Part),
     /// Requests cancellation of this exact ingress, when the plugin advertises
     /// `abort`. Unknown or settled targets have no effect on later turns. An ack
     /// accepts the request; it does not certify native cleanup has drained.
@@ -163,6 +176,7 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
     "policy.context",
     "hello",
     "message.in",
+    "message.part",
     "turn.abort",
     "conversation.rename",
     "conversation.delete",
@@ -447,6 +461,12 @@ pub enum Capability {
     /// It reads and changes the agent's model with the runtime's own
     /// catalogue and setting (`model.request`).
     Model,
+    /// It takes the files a person sends with a message (`message.in`'s
+    /// `files`, `message.part`), writes them inside its sandbox and gives
+    /// them to the runtime with the message (ADR 0076, proposed).
+    IncomingFiles,
+    /// It accepts images as well as documents; requires `incoming_files`.
+    IncomingImages,
     /// It sends its runtime's task events as `message.out` of `kind:
     /// task_event`; a bridge that takes them names it in its `hello`, a
     /// device that draws them in its `auth`, and each gets them as `notify`
@@ -504,4 +524,13 @@ pub fn decode_from_bridge(line: &[u8]) -> Result<Envelope<FromBridge>, DecodeErr
 /// Reads a message a plugin sent.
 pub fn decode_from_plugin(line: &[u8]) -> Result<Envelope<FromPlugin>, DecodeError> {
     decode(line, FROM_PLUGIN_TYPES)
+}
+
+#[cfg(test)]
+mod incoming_image_capability_tests {
+    #[test]
+    fn incoming_images_is_known() {
+        let cap: super::Capability = serde_json::from_str("\"incoming_images\"").unwrap();
+        assert_ne!(cap, super::Capability::Unknown);
+    }
 }
