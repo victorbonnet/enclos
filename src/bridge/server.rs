@@ -8104,6 +8104,197 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         pending_delete_completion(false);
     }
 
+    fn pending_delete_line(
+        reader: &mut impl std::io::BufRead,
+        line: &mut String,
+        phase: &str,
+    ) -> Result<(), String> {
+        match reader.read_line(line) {
+            Ok(0) => Err(format!("{phase}: EOF")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{phase}: io::Error {e:?}")),
+        }
+    }
+
+    // Only these two exact tests run in a child: every detached Bridge writer
+    // dies with that process. The parent alone owns the temporary directory.
+    struct PendingDeleteChild {
+        root: Option<tempfile::TempDir>,
+        child: Option<std::process::Child>,
+    }
+
+    impl PendingDeleteChild {
+        fn poll(&mut self, bound: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+            let deadline = std::time::Instant::now() + bound;
+            loop {
+                match self.child.as_mut().unwrap().try_wait()? {
+                    Some(status) => {
+                        self.child = None;
+                        return Ok(Some(status));
+                    }
+                    None if std::time::Instant::now() >= deadline => return Ok(None),
+                    None => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+
+        fn retain(&mut self) -> Option<std::path::PathBuf> {
+            self.root.take().map(tempfile::TempDir::keep)
+        }
+    }
+
+    impl Drop for PendingDeleteChild {
+        fn drop(&mut self) {
+            if self.child.is_some() {
+                // Transfer ownership BEFORE any fallible diagnostic or drain.
+                let retained = self.retain();
+                let kill = self.child.as_mut().unwrap().kill();
+                let drain = self.poll(Duration::from_secs(5));
+                let diagnostics = retained
+                    .as_ref()
+                    .map(|path| std::fs::read_to_string(path.join("child.log")));
+                let cleanup = if matches!(drain, Ok(Some(_))) {
+                    retained.as_ref().map(std::fs::remove_dir_all)
+                } else {
+                    None
+                };
+                // Ignore diagnostic write errors during unwind.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pending-delete unwind root={retained:?} kill={kill:?} drain={drain:?} diagnostics={diagnostics:?} cleanup={cleanup:?}"
+                );
+            }
+        }
+    }
+
+    fn pending_delete_process(keep_alive: bool) -> std::path::PathBuf {
+        const ROOT: &str = "ENCLOS_PENDING_DELETE_CHILD_ROOT";
+        let control = std::env::var("ENCLOS_PENDING_DELETE_CONTROL").unwrap_or_default();
+        if let Some(root) = std::env::var_os(ROOT) {
+            match control.as_str() {
+                "setup-failure" => panic!("controlled setup failure before Bridge construction"),
+                "unknown-drain" => return std::path::PathBuf::new(),
+                _ => return root.into(),
+            }
+        }
+        if control == "read-seam" {
+            let (input, peer) = UnixStream::pair().unwrap();
+            input.set_nonblocking(true).unwrap();
+            let mut reader = BufReader::new(input);
+            let error =
+                pending_delete_line(&mut reader, &mut String::new(), "forced read").unwrap_err();
+            assert!(
+                error.contains("io::Error") && error.contains("WouldBlock"),
+                "{error}"
+            );
+            drop(peer);
+            let eof =
+                pending_delete_line(&mut reader, &mut String::new(), "forced read").unwrap_err();
+            assert_eq!(eof, "forced read: EOF");
+            eprintln!("forced read error={error}; eof={eof}");
+            return std::path::PathBuf::new();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_owned();
+        let output = path.join("child.log");
+        let file = std::fs::File::create(&output).unwrap();
+        let mut owned = PendingDeleteChild {
+            root: Some(root),
+            child: None,
+        };
+        let test = if keep_alive {
+            "bridge::server::connection_end_tests::a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt"
+        } else {
+            "bridge::server::connection_end_tests::a_pending_native_delete_idle_completion_records_silence"
+        };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(ROOT, &path)
+            .stdout(file.try_clone().unwrap())
+            .stderr(file);
+        owned.child = Some(crate::lifecycle::marker::spawn_unmarked(&mut command).unwrap());
+        if control == "parent-unwind" {
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _owned = owned;
+                panic!("controlled parent unwind");
+            }));
+            assert!(unwind.is_err());
+            assert!(
+                !path.exists(),
+                "unwind guard retained root; inspect drain diagnostics"
+            );
+            return std::path::PathBuf::new();
+        }
+        let primary = if control == "unknown-drain" {
+            Err(std::io::Error::other("controlled unknown primary wait"))
+        } else {
+            owned.poll(Duration::from_secs(30))
+        };
+        let mut kill = None;
+        let mut drain = None;
+        let reaped = matches!(primary, Ok(Some(_)));
+        let retained = if !reaped {
+            let retained = owned.retain();
+            kill = Some(owned.child.as_mut().unwrap().kill());
+            drain = Some(if control == "unknown-drain" {
+                Err(std::io::Error::other("controlled unknown drain"))
+            } else {
+                owned.poll(Duration::from_secs(5))
+            });
+            retained
+        } else {
+            None
+        };
+        let diagnostics = std::fs::read_to_string(&output);
+        let cleanup = if reaped {
+            owned.root.take().unwrap().close()
+        } else if matches!(drain, Some(Ok(Some(_)))) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            if control == "unknown-drain" {
+                assert!(path.exists());
+                eprintln!(
+                    "controlled unknown drain: root retained {path:?}; primary={primary:?} kill={kill:?} drain={drain:?}"
+                );
+                let actual = owned.poll(Duration::from_secs(5));
+                assert!(matches!(actual, Ok(Some(_))), "{actual:?}");
+                let diagnostics = std::fs::read_to_string(&output);
+                let cleanup = std::fs::remove_dir_all(&path);
+                eprintln!(
+                    "controlled eventual positive reap={actual:?} diagnostics={diagnostics:?} cleanup={cleanup:?}"
+                );
+                cleanup.unwrap();
+                assert!(!path.exists());
+                return std::path::PathBuf::new();
+            }
+            // Drop must not attempt another drain or delete unknown live data.
+            owned.child = None;
+            Err(std::io::Error::other("child drain unknown; root retained"))
+        };
+        eprintln!(
+            "pending-delete root={path:?} primary={primary:?} kill={kill:?} drain={drain:?} retained={retained:?} cleanup={cleanup:?} diagnostics={diagnostics:?}"
+        );
+        if matches!(control.as_str(), "setup-failure" | "assertion-failure") {
+            assert!(
+                matches!(primary, Ok(Some(status)) if !status.success()),
+                "{primary:?}"
+            );
+            cleanup.unwrap();
+            assert!(!path.exists());
+            eprintln!("controlled failure positively reaped; root absent {path:?}");
+            return std::path::PathBuf::new();
+        }
+        assert!(
+            matches!(primary, Ok(Some(status)) if status.success()),
+            "child failed: {primary:?}"
+        );
+        cleanup.unwrap();
+        assert!(!path.exists(), "root remains after positive reap");
+        // Empty path is the parent-only completion sentinel.
+        std::path::PathBuf::new()
+    }
+
     // One synthetic plugin connection, one authenticated device generation.
     // The completion gate deliberately crosses the fixture's 600ms silence
     // limit. It is a controlled schedule, not a production timeout change.
@@ -8117,6 +8308,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             plugin: Arc<Mutex<Option<UnixStream>>>,
             device: Option<TcpStream>,
             worker: Option<std::thread::JoinHandle<()>>,
+            error: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
         }
         impl Drop for Owned {
             fn drop(&mut self) {
@@ -8138,12 +8330,29 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                         result.unwrap();
                     }
                 }
+                if let Some(error) = self.error.take() {
+                    let diagnostic = error.recv_timeout(Duration::from_secs(1));
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "pending-delete worker during unwind: {diagnostic:?}"
+                    );
+                }
             }
         }
 
+        let root = pending_delete_process(keep_alive);
+        if root.as_os_str().is_empty() {
+            return;
+        }
         let started = Instant::now();
-        let folder = tempfile::tempdir().unwrap();
-        let bridge = bridge_with(folder.path(), Duration::from_millis(600));
+        let bridge = bridge_with(&root, Duration::from_millis(600));
+        if std::env::var("ENCLOS_PENDING_DELETE_CONTROL").as_deref() == Ok("assertion-failure") {
+            assert_eq!(
+                1, 2,
+                "controlled assertion failure with detached Bridge writers"
+            );
+        }
+
         let listener = UnixListener::bind(&bridge.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (waiting, wait) = channel();
@@ -8156,78 +8365,88 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             plugin: Arc::clone(&plugin),
             device: None,
             worker: None,
+            error: None,
         };
+        let (errors, error) = channel();
+        owned.error = Some(error);
         owned.worker = Some(std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return;
+            let result = (|| -> Result<(), String> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err("accept: deadline elapsed".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
                         }
-                        std::thread::sleep(Duration::from_millis(10));
+                        Err(e) => return Err(format!("accept: {e:?}")),
                     }
-                    Err(e) => panic!("plugin accept: {e:?}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            *plugin.lock().unwrap() = Some(stream.try_clone().unwrap());
-            let mut out = stream.try_clone().unwrap();
-            let mut lines = BufReader::new(stream);
-            let mut line = String::new();
-            if lines.read_line(&mut line).unwrap_or(0) == 0 {
-                return;
-            }
-            out.write_all(&encode_line(&Envelope::new(
-                MessageId::new("hello").unwrap(),
-                FromPlugin::Hello {
-                    runtime: "hermes".into(),
-                    agent: "main".into(),
-                    capabilities: vec![Capability::ConversationDelete],
-                },
-            )))
-            .unwrap();
-            loop {
-                line.clear();
-                if lines.read_line(&mut line).unwrap_or(0) == 0 {
-                    return;
-                }
-                let packet = decode_from_bridge(line.as_bytes()).unwrap();
-                if let FromBridge::Delete { .. } = packet.body {
-                    waiting.send(()).unwrap();
-                    if released.recv_timeout(Duration::from_secs(5)).is_err() {
-                        return;
-                    }
-                    eprintln!(
-                        "pending-delete keep_alive={keep_alive} gate released at {:?}",
-                        started.elapsed()
-                    );
-                    // Bounded stand-in gate: the main thread can keep the same
-                    // socket active, or observe SILENT, before confirming native work.
-                    let _ = finished.recv_timeout(Duration::from_millis(900));
-                    eprintln!(
-                        "pending-delete native confirmation at {:?}",
-                        started.elapsed()
-                    );
-                    // Shutdown during unwinding may make this write fail.
-                    if out
-                        .write_all(&encode_line(&Envelope::new(
+                };
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| format!("blocking mode: {e:?}"))?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|e| format!("read timeout: {e:?}"))?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|e| format!("write timeout: {e:?}"))?;
+                *plugin.lock().unwrap() = Some(
+                    stream
+                        .try_clone()
+                        .map_err(|e| format!("plugin clone: {e:?}"))?,
+                );
+                let mut out = stream
+                    .try_clone()
+                    .map_err(|e| format!("plugin clone: {e:?}"))?;
+                let mut lines = BufReader::new(stream);
+                let mut line = String::new();
+                pending_delete_line(&mut lines, &mut line, "hello read")?;
+                out.write_all(&encode_line(&Envelope::new(
+                    MessageId::new("hello").unwrap(),
+                    FromPlugin::Hello {
+                        runtime: "hermes".into(),
+                        agent: "main".into(),
+                        capabilities: vec![Capability::ConversationDelete],
+                    },
+                )))
+                .map_err(|e| format!("hello write: {e:?}"))?;
+                loop {
+                    line.clear();
+                    pending_delete_line(&mut lines, &mut line, "delete read")?;
+                    let packet = decode_from_bridge(line.as_bytes())
+                        .map_err(|e| format!("delete decode: {e:?}"))?;
+                    if let FromBridge::Delete { .. } = packet.body {
+                        waiting
+                            .send(())
+                            .map_err(|e| format!("waiting gate: {e:?}"))?;
+                        if released.recv_timeout(Duration::from_secs(5)).is_err() {
+                            return Err("release gate: timeout/disconnected".into());
+                        }
+                        eprintln!(
+                            "pending-delete keep_alive={keep_alive} gate released at {:?}",
+                            started.elapsed()
+                        );
+                        // Bounded stand-in gate: the main thread can keep the same
+                        // socket active, or observe SILENT, before confirming native work.
+                        let _ = finished.recv_timeout(Duration::from_millis(900));
+                        eprintln!(
+                            "pending-delete native confirmation at {:?}",
+                            started.elapsed()
+                        );
+                        out.write_all(&encode_line(&Envelope::new(
                             MessageId::new("native-ack").unwrap(),
                             FromPlugin::Ack { of: packet.id },
                         )))
-                        .is_ok()
-                    {
+                        .map_err(|e| format!("native ACK write: {e:?}"))?;
                         let _ = finished.recv_timeout(Duration::from_secs(5));
+                        return Ok(());
                     }
-                    return;
                 }
-            }
+            })();
+            let _ = errors.send(result);
         }));
         let phone = paired(&bridge, "n-pixel");
         let (mut device, _) = connect(&bridge, &phone);
@@ -8242,7 +8461,14 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 conversation: ConversationId::new("c-live-delete").unwrap(),
             },
         );
-        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        if let Err(gate) = wait.recv_timeout(Duration::from_secs(3)) {
+            let diagnostic = owned
+                .error
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            panic!("pending-delete waiting gate: {gate:?}; worker: {diagnostic:?}");
+        }
         // Remain pending beyond the silence threshold while this SAME socket
         // keeps sending pings and receiving ordinary sync responses.
         for _ in 0..5 {
@@ -8358,6 +8584,16 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 "pending-delete idle store completion at {:?}",
                 started.elapsed()
             );
+            owned.done.send(()).unwrap();
+            assert_eq!(
+                owned
+                    .error
+                    .take()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(6))
+                    .unwrap(),
+                Ok(())
+            );
             return;
         }
         assert!(
@@ -8412,6 +8648,16 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         }
         assert!(synced, "final sync deadline elapsed");
         eprintln!("pending-delete final Sync at {:?}", started.elapsed());
+        owned.done.send(()).unwrap();
+        assert_eq!(
+            owned
+                .error
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(6))
+                .unwrap(),
+            Ok(())
+        );
     }
 
     /// The `conversation.deleted` of a forget reach the device that asked

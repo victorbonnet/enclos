@@ -934,6 +934,11 @@ fn successive_file_uploads(refuse: bool) {
     let (bridge, mut device) = ready(folder.path(), socket);
     let store = Store::open(&bridge.store).unwrap();
     store.conversation("c-2", "lab", "main", PERSON).unwrap();
+    assert!(
+        eventually(|| bridge.hub.plugins.lock().unwrap().contains_key("lab/main")),
+        "initial lab/main plugin registration did not complete"
+    );
+    eprintln!("successive uploads: initial lab/main registered before shutdown");
     bridge
         .hub
         .plugins
