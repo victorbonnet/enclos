@@ -8096,17 +8096,94 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
 
     #[test]
     fn a_pending_native_delete_does_not_block_sync_pings_or_duplicate_the_receipt() {
+        pending_delete_completion(true);
+    }
+
+    #[test]
+    fn a_pending_native_delete_idle_completion_records_silence() {
+        pending_delete_completion(false);
+    }
+
+    // One synthetic plugin connection, one authenticated device generation.
+    // The completion gate deliberately crosses the fixture's 600ms silence
+    // limit. It is a controlled schedule, not a production timeout change.
+    fn pending_delete_completion(keep_alive: bool) {
+        use std::net::Shutdown;
+        use std::time::Instant;
+
+        struct Owned {
+            release: std::sync::mpsc::Sender<()>,
+            done: std::sync::mpsc::Sender<()>,
+            plugin: Arc<Mutex<Option<UnixStream>>>,
+            device: Option<TcpStream>,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.release.send(());
+                let _ = self.done.send(());
+                if let Some(socket) = &self.device {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                if let Some(socket) = self.plugin.lock().unwrap().as_ref() {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                if let Some(worker) = self.worker.take() {
+                    let result = worker.join();
+                    if std::thread::panicking() {
+                        if result.is_err() {
+                            eprintln!("pending-delete: plugin also panicked during unwind");
+                        }
+                    } else {
+                        result.unwrap();
+                    }
+                }
+            }
+        }
+
+        let started = Instant::now();
         let folder = tempfile::tempdir().unwrap();
         let bridge = bridge_with(folder.path(), Duration::from_millis(600));
         let listener = UnixListener::bind(&bridge.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (waiting, wait) = channel();
         let (release, released) = channel();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+        let (done, finished) = channel();
+        let plugin = Arc::new(Mutex::new(None));
+        let mut owned = Owned {
+            release,
+            done,
+            plugin: Arc::clone(&plugin),
+            device: None,
+            worker: None,
+        };
+        owned.worker = Some(std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("plugin accept: {e:?}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            *plugin.lock().unwrap() = Some(stream.try_clone().unwrap());
             let mut out = stream.try_clone().unwrap();
             let mut lines = BufReader::new(stream);
             let mut line = String::new();
-            lines.read_line(&mut line).unwrap();
+            if lines.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
             out.write_all(&encode_line(&Envelope::new(
                 MessageId::new("hello").unwrap(),
                 FromPlugin::Hello {
@@ -8124,17 +8201,37 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 let packet = decode_from_bridge(line.as_bytes()).unwrap();
                 if let FromBridge::Delete { .. } = packet.body {
                     waiting.send(()).unwrap();
-                    released.recv_timeout(Duration::from_secs(5)).unwrap();
-                    out.write_all(&encode_line(&Envelope::new(
-                        MessageId::new("native-ack").unwrap(),
-                        FromPlugin::Ack { of: packet.id },
-                    )))
-                    .unwrap();
+                    if released.recv_timeout(Duration::from_secs(5)).is_err() {
+                        return;
+                    }
+                    eprintln!(
+                        "pending-delete keep_alive={keep_alive} gate released at {:?}",
+                        started.elapsed()
+                    );
+                    // Bounded stand-in gate: the main thread can keep the same
+                    // socket active, or observe SILENT, before confirming native work.
+                    let _ = finished.recv_timeout(Duration::from_millis(900));
+                    eprintln!(
+                        "pending-delete native confirmation at {:?}",
+                        started.elapsed()
+                    );
+                    // Shutdown during unwinding may make this write fail.
+                    if out
+                        .write_all(&encode_line(&Envelope::new(
+                            MessageId::new("native-ack").unwrap(),
+                            FromPlugin::Ack { of: packet.id },
+                        )))
+                        .is_ok()
+                    {
+                        let _ = finished.recv_timeout(Duration::from_secs(5));
+                    }
+                    return;
                 }
             }
-        });
+        }));
         let phone = paired(&bridge, "n-pixel");
         let (mut device, _) = connect(&bridge, &phone);
+        owned.device = Some(device.socket.get_ref().try_clone().unwrap());
         let store = Store::open(&bridge.store).unwrap();
         store
             .conversation("c-live-delete", "lab", "main", PERSON)
@@ -8167,21 +8264,108 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             std::thread::sleep(Duration::from_millis(160));
         }
         assert!(store.conversation_info("c-live-delete").unwrap().is_some());
-        release.send(()).unwrap();
+        eprintln!(
+            "pending-delete pending checks complete at {:?}",
+            started.elapsed()
+        );
+        owned.release.send(()).unwrap();
+        device
+            .socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_ping = Instant::now() - Duration::from_millis(160);
         let mut deleted = 0;
-        loop {
-            match device.receive() {
-                Some(ToDevice::ConversationDeleted { conversation })
-                    if conversation.as_str() == "c-live-delete" =>
-                {
-                    deleted += 1
+        let mut acked = false;
+        let mut ended = false;
+        while Instant::now() < deadline {
+            if keep_alive && last_ping.elapsed() >= Duration::from_millis(160) {
+                device.socket.send(Message::Ping(vec![2].into())).unwrap();
+                last_ping = Instant::now();
+            }
+            let body = match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    decode_to_device(&plain).unwrap().body
                 }
-                Some(ToDevice::Ack { of }) if of.as_str() == "delete-live" => break,
-                Some(_) => {}
-                None => panic!("deletion starved the device session"),
+                Ok(Message::Close(frame)) => {
+                    eprintln!(
+                        "pending-delete raw Close={frame:?} at {:?}",
+                        started.elapsed()
+                    );
+                    ended = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("pending-delete raw error={e:?} at {:?}", started.elapsed());
+                    ended = true;
+                    break;
+                }
+            };
+            eprintln!("pending-delete body={body:?} at {:?}", started.elapsed());
+            match body {
+                ToDevice::ConversationDeleted { conversation } => {
+                    assert_eq!(conversation.as_str(), "c-live-delete");
+                    deleted += 1;
+                    assert_eq!(deleted, 1, "duplicate canonical deletion");
+                }
+                ToDevice::Ack { of } => {
+                    assert_eq!(of.as_str(), "delete-live", "uncorrelated receipt");
+                    assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+                    acked = true;
+                    break;
+                }
+                ToDevice::Error(error) => panic!("deletion error: {error:?}"),
+                _ => {}
             }
         }
-        assert_eq!(deleted, 1, "only the canonical broadcast precedes the ack");
+        if !keep_alive {
+            assert!(ended, "idle control did not observe a raw connection end");
+            assert!(!acked);
+            assert_eq!(deleted, 0);
+            assert!(eventually(|| store.log_lines(100).unwrap().iter().any(
+                |l| l.event == "disconnected" && l.reason.as_deref() == Some(SILENT)
+            )));
+            for line in store
+                .log_lines(100)
+                .unwrap()
+                .iter()
+                .filter(|l| l.event == "disconnected")
+            {
+                eprintln!(
+                    "pending-delete persisted reason={:?} at {:?}",
+                    line.reason,
+                    started.elapsed()
+                );
+            }
+            // Allow native confirmation to finish before releasing the owned
+            // plugin. This measures completion even after the origin went silent.
+            assert!(eventually(|| store
+                .conversation_info("c-live-delete")
+                .unwrap()
+                .is_none()));
+            eprintln!(
+                "pending-delete idle store completion at {:?}",
+                started.elapsed()
+            );
+            return;
+        }
+        assert!(
+            !ended,
+            "live completion ended before receipt; inspect raw error above"
+        );
+        assert!(acked, "live completion deadline elapsed");
+        assert!(store.conversation_info("c-live-delete").unwrap().is_none());
         device.send(
             "sync-after-delete",
             FromDevice::Sync {
@@ -8189,13 +8373,45 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 open_items: false,
             },
         );
-        loop {
-            match device.receive() {
-                Some(ToDevice::Synced { .. }) => break,
-                Some(_) => {}
-                None => panic!("the deletion completion closed this socket"),
+        let mut synced = false;
+        while Instant::now() < deadline {
+            if last_ping.elapsed() >= Duration::from_millis(160) {
+                device.socket.send(Message::Ping(vec![2].into())).unwrap();
+                last_ping = Instant::now();
+            }
+            let body = match device.socket.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let plain = device.session.decrypt(&bytes).unwrap();
+                    decode_to_device(&plain).unwrap().body
+                }
+                Ok(Message::Close(frame)) => panic!("final sync raw Close: {frame:?}"),
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("final sync raw error: {e:?}"),
+            };
+            match body {
+                ToDevice::Synced { .. } => {
+                    synced = true;
+                    break;
+                }
+                // Sync replays the owner's deletion tombstones.
+                ToDevice::ConversationDeleted { conversation } => {
+                    assert_eq!(conversation.as_str(), "c-live-delete");
+                }
+                ToDevice::Ack { of } => panic!("unexpected extra receipt: {of:?}"),
+                ToDevice::Error(error) => panic!("final sync error: {error:?}"),
+                _ => {}
             }
         }
+        assert!(synced, "final sync deadline elapsed");
+        eprintln!("pending-delete final Sync at {:?}", started.elapsed());
     }
 
     /// The `conversation.deleted` of a forget reach the device that asked
