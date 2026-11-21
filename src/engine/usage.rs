@@ -321,6 +321,30 @@ impl Engine {
         only: Option<&SandboxName>,
         since: Timestamp,
     ) -> Result<UsageView> {
+        self.usage_read(by, only, since, None)
+    }
+
+    /// [`Engine::usage`] of every running sandbox, for the app's bridge
+    /// (issue #366): each sandbox's reader is stopped past `limit`, and
+    /// that sandbox is "cannot tell", so a reader that does not end holds
+    /// no device up; and a signal the bridge receives meanwhile ends it
+    /// once the reader is stopped, as it would have without the read.
+    pub fn usage_of_running(
+        &self,
+        by: &Actor,
+        since: Timestamp,
+        limit: std::time::Duration,
+    ) -> Result<UsageView> {
+        self.usage_read(by, None, since, Some(limit))
+    }
+
+    fn usage_read(
+        &self,
+        by: &Actor,
+        only: Option<&SandboxName>,
+        since: Timestamp,
+        limit: Option<std::time::Duration>,
+    ) -> Result<UsageView> {
         let records = match only {
             Some(name) => vec![self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
@@ -338,7 +362,7 @@ impl Engine {
                         "not running; `enclos usage {name}` reads it, starting its proxy"
                     ))
                 }
-                Some(kind) => match self.sandbox_usage(by, &name, kind, since) {
+                Some(kind) => match self.sandbox_usage(by, &name, kind, since, limit) {
                     Ok(agents) => agents,
                     Err(e) if only.is_none() => Fact::CannotTell(e.to_string()),
                     Err(e) => return Err(e),
@@ -375,6 +399,7 @@ impl Engine {
         name: &SandboxName,
         kind: RuntimeKind,
         since: Timestamp,
+        limit: Option<std::time::Duration>,
     ) -> Result<Fact<Vec<AgentUsage>>> {
         let runtime = adapter(kind);
         let home = self.sandbox_home(name);
@@ -395,7 +420,27 @@ impl Engine {
             return Ok(Fact::NotProvided);
         };
         let _remove = Removed(report.clone());
-        let ended = self.run_exec_in_sandbox(by, name, command, "usage session")?;
+        let ended = match limit {
+            None => self.run_exec_in_sandbox(by, name, command, "usage session")?,
+            Some(limit) => {
+                let deadline = std::time::Instant::now() + limit;
+                let (ended, stopped) = self.run_exec_in_sandbox_then_signalled(
+                    by,
+                    name,
+                    command,
+                    "usage session",
+                    deadline,
+                )?;
+                if stopped {
+                    return Ok(Fact::CannotTell(format!(
+                        "{}'s usage reader did not end within {} and was stopped",
+                        kind.display_name(),
+                        super::session::spoken(limit)
+                    )));
+                }
+                ended
+            }
+        };
         if ended.exit != 0 {
             let how = match ended.signal {
                 Some(signal) => format!("was ended by signal {signal}"),
@@ -673,6 +718,9 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
 fn hour(h: ReportHour) -> std::result::Result<HourUsage, String> {
     if h.at < 0 || h.at % 3600 != 0 {
         return Err("has an hour that does not start on the hour".into());
+    }
+    if Timestamp::from_second(h.at).is_err() {
+        return Err("has an hour out of range".into());
     }
     Ok(HourUsage {
         at: h.at,

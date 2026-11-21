@@ -2922,8 +2922,8 @@ fn run_session(
                         }
                         // For the host's person, every call the agents'
                         // runtimes recorded, as `enclos usage` shows them
-                        // (issue #366): board work and talks in the
-                        // sandbox too, which no plugin reports.
+                        // (issue #366): board work too, which no plugin
+                        // reports.
                         let runtime = match outside {
                             true => hub.runtime_hours(&authority::device_actor(
                                 person,

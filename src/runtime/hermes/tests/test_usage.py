@@ -187,6 +187,18 @@ class UsageTests(unittest.TestCase):
             (14400, 'a', 1), (14400, 'b', 1), (18000, 'a', 1), (18000, 'b', 1),
         ])
 
+    def test_more_hours_than_the_most_rows_sum_the_oldest_in_one_and_keep_the_totals(self):
+        db = self.db('default')
+        rows = [('s%d' % i, 'cli', 'a', None, 0, None, i * 3600 + 1, 1, 10, 1, 0, 0, 0, 0.0, None, 'included')
+                for i in range(6)]
+        db.executemany('insert into sessions values (' + ','.join('?' * 16) + ')', rows); db.commit()
+        with mock.patch.object(usage, 'MAX_HOURS', 4):
+            hours = self.run_reader(0, 'default')['default']['hours']
+        # Six hours of one model in four rows: the three oldest summed in one.
+        self.assertEqual([(h['at'], h['model'], h['calls']) for h in hours],
+                         [(7200, None, 3), (10800, 'a', 1), (14400, 'a', 1), (18000, 'a', 1)])
+        self.assertEqual(sum(h['calls'] for h in hours), 6)
+
     def run_reader_again(self, since, *agents):
         self.out.unlink()
         return self.run_reader(since, *(agents or ('default',)))

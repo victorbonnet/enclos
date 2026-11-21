@@ -42,6 +42,8 @@ MAX_TEXT = 200
 # The most rows of `hours`: past them, the oldest hours are each summed in
 # one row naming no model, so the agent's totals stay whole.
 MAX_HOURS = 2000
+# The latest time enclos reads, Unix seconds (9999-12-30T22:00:00Z).
+MAX_TIME = 253402207200
 # The most a count may be: the report's counts are unsigned 64-bit.
 MAX_COUNT = 2**64 - 1
 TOKENS = ("input", "output", "cache_read", "cache_write", "reasoning")
@@ -310,7 +312,9 @@ def read_agent(path, since):
 def hour_of(when):
     """The start of the hour that holds `when` (Unix seconds), or None."""
     when = amount(when)
-    if when is None:
+    # Past the latest time enclos reads (year 9999), the whole report would
+    # be refused: such a chat is left out of `hours` instead.
+    if when is None or when >= MAX_TIME:
         return None
     return int(when // 3600) * 3600
 
@@ -334,7 +338,9 @@ def merged(sums, kept):
 def by_hour(hours, kept):
     """`hours` as the report lists them, oldest first, at most MAX_HOURS
     rows: past them, the oldest hours are each summed in one row naming no
-    model. A chat with no known time is left out."""
+    model, and, with more hours than that still, the oldest rows in one,
+    at the latest of their hours, so the agent's totals stay whole. A chat
+    with no known time is left out."""
     keyed = {}
     for (at, model, provider), s in hours.items():
         if at is not None:
@@ -358,7 +364,19 @@ def by_hour(hours, kept):
                     "tokens": s.tokens(),
                 }
             )
-    return listed[-MAX_HOURS:]
+    if len(listed) > MAX_HOURS:
+        cut = len(listed) - MAX_HOURS + 1
+        oldest = [s for at in sorted(keyed) for _, _, s in keyed[at]][:cut]
+        listed = [
+            {
+                "at": listed[cut - 1]["at"],
+                "model": None,
+                "model_provider": None,
+                "calls": merged(oldest, kept).value("calls"),
+                "tokens": merged(oldest, kept).tokens(),
+            }
+        ] + listed[cut:]
+    return listed
 
 
 def write(out, report):

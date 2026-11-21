@@ -2,12 +2,15 @@
 //! (issue #366).
 //!
 //! A plugin reports the calls made in its runtime's gateway alone: Hermes's
-//! board workers, and talks in the sandbox, are processes of their own that
-//! it never sees. `enclos usage` reads each agent's own records instead,
+//! board workers are processes of their own that it never sees, and
+//! whether a talk in the sandbox runs its calls there is to verify (design
+//! §14). `enclos usage` reads each agent's own records instead,
 //! with the runtime's usage reader run in the sandbox. The bridge reads the
 //! same, so that the app shows what the CLI does: once at a time, kept for
-//! [`FRESH`], of the running sandboxes only, so that opening a usage page
-//! starts no proxy the user did not ask for.
+//! [`FRESH`], each sandbox's reader stopped past [`READ_LIMIT`], of the
+//! running sandboxes only, so that opening a usage page starts no proxy the
+//! user did not ask for. While one device's window reads, another's is
+//! served the last read, or its plugins' reports, rather than wait.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -22,31 +25,54 @@ use crate::model::audit::Actor;
 
 /// How long a read serves usage windows before the next one reads again.
 const FRESH: Duration = Duration::from_secs(120);
+/// How long one sandbox's reader may run before it is stopped.
+const READ_LIMIT: Duration = Duration::from_secs(30);
 
-/// The last read, and when it was made.
+/// The last read, when it was made, and whether one is under way.
 #[derive(Default)]
 pub(super) struct RuntimeUsage {
-    last: Mutex<Option<(Instant, Arc<RuntimeHours>)>>,
+    state: Mutex<Reads>,
+}
+
+#[derive(Default)]
+struct Reads {
+    last: Option<(Instant, Arc<RuntimeHours>)>,
+    reading: bool,
 }
 
 impl RuntimeUsage {
     /// The last read while it is fresh; otherwise a new one, made by
-    /// `read`, while the lock keeps a second caller waiting for it rather
-    /// than reading too. A read that fails gives the last one, if any.
+    /// `read` without the lock held. While another caller reads, the last
+    /// read, if any, at once. A read that fails gives the last one too.
     fn get(&self, read: impl FnOnce() -> Option<RuntimeHours>) -> Option<Arc<RuntimeHours>> {
-        let mut last = self.last.lock().expect("not poisoned");
-        if let Some((at, hours)) = &*last
-            && at.elapsed() < FRESH
-        {
-            return Some(Arc::clone(hours));
+        let last = {
+            let mut state = self.state.lock().expect("not poisoned");
+            let last = state.last.as_ref().map(|(at, h)| (*at, Arc::clone(h)));
+            match &last {
+                Some((at, hours)) if at.elapsed() < FRESH => return Some(Arc::clone(hours)),
+                _ if state.reading => return last.map(|(_, h)| h),
+                _ => state.reading = true,
+            }
+            last.map(|(_, h)| h)
+        };
+        // Cleared however the read ends, a panic included.
+        struct Done<'a>(&'a Mutex<Reads>);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut state) = self.0.lock() {
+                    state.reading = false;
+                }
+            }
         }
+        let _done = Done(&self.state);
         match read() {
             Some(hours) => {
                 let hours = Arc::new(hours);
-                *last = Some((Instant::now(), Arc::clone(&hours)));
+                let mut state = self.state.lock().expect("not poisoned");
+                state.last = Some((Instant::now(), Arc::clone(&hours)));
                 Some(hours)
             }
-            None => last.as_ref().map(|(_, hours)| Arc::clone(hours)),
+            None => last,
         }
     }
 }
@@ -59,6 +85,10 @@ impl RuntimeUsage {
 pub(super) fn runtime_hours(view: &UsageView) -> RuntimeHours {
     let mut agents = BTreeSet::new();
     let mut hours = Vec::new();
+    // The sandbox writes its records: an hour past the current one is
+    // counted in the current one, so it neither reads as future usage
+    // nor pushes a series' real points out.
+    let this_hour = crate::bridge::store::now().div_euclid(3600);
     for sandbox in &view.sandboxes {
         let Fact::Known(listed) = &sandbox.agents else {
             continue;
@@ -74,10 +104,15 @@ pub(super) fn runtime_hours(view: &UsageView) -> RuntimeHours {
                         let t = h.tokens;
                         hours.push(HourRow {
                             agent: name.clone(),
-                            hour: h.at.div_euclid(3600),
+                            hour: h.at.div_euclid(3600).min(this_hour),
                             model: h.model.clone().unwrap_or_default(),
                             model_provider: h.model_provider.clone().unwrap_or_default(),
                             counts: UsageTotal {
+                                // A Hermes too old to count calls (no
+                                // `api_call_count`) says none: the bridge's
+                                // totals keep a count of calls, never an
+                                // unknown one, as for a plugin's report
+                                // that names none; its tokens still count.
                                 calls: h.calls.unwrap_or(0),
                                 tokens: UsageTokens {
                                     input: t.input,
@@ -108,7 +143,7 @@ impl Hub {
             let since = crate::bridge::store::now() - AGENT_USAGE_DAYS * 86_400;
             let since = crate::model::Timestamp::from_second(since).ok()?;
             let engine = Engine::open(self.layout.clone(), crate::state::Wait::Background);
-            match engine.usage(by, None, since) {
+            match engine.usage_of_running(by, since, READ_LIMIT) {
                 Ok(view) => Some(runtime_hours(&view)),
                 Err(e) => {
                     eprintln!("enclos app: the runtimes' usage could not be read: {e}");
@@ -216,11 +251,24 @@ mod tests {
         assert!(again.is_some());
         assert_eq!(reads, 1);
         // Stale: read again; failed, the last is given.
-        *usage.last.lock().unwrap() = Some((
-            Instant::now() - FRESH - Duration::from_secs(1),
-            Arc::new(RuntimeHours::default()),
-        ));
+        let stale = || {
+            usage.state.lock().unwrap().last = Some((
+                Instant::now() - FRESH - Duration::from_secs(1),
+                Arc::new(RuntimeHours::default()),
+            ))
+        };
+        stale();
         assert!(usage.get(|| None).is_some());
         assert!(RuntimeUsage::default().get(|| None).is_none());
+        // While a read is under way, another caller is not held up: it
+        // gets the last read without reading.
+        stale();
+        let inner = usage.get(|| {
+            let during = usage.get(|| panic!("a second read while one runs"));
+            assert!(during.is_some());
+            None
+        });
+        assert!(inner.is_some());
+        assert!(!usage.state.lock().unwrap().reading);
     }
 }

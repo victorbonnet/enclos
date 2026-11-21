@@ -405,7 +405,7 @@ pub struct HourRow {
 
 /// The agents' usage as their runtimes recorded it, read in their
 /// sandboxes as `enclos usage` reads it (issue #366): every native chat,
-/// board work and talks in the sandbox too, which no plugin reports. A
+/// board work too, which no plugin reports. A
 /// window for the host's person takes each agent of `agents` from `hours`
 /// alone, in place of what its plugin reported, so that the app shows
 /// what `enclos usage` does and nothing is counted twice.
