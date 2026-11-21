@@ -14,7 +14,7 @@ import { createActivity } from './activity.js';
 import { registerUsage } from './usage.js';
 import { hostSender } from './host-messages.js';
 
-export const TESTED_OPENCLAW = '2026.11.5';
+export const TESTED_OPENCLAW = '2026.11.6';
 const MINIMUM_OPENCLAW = '2026.11.5';
 const release = /^v?(\d+\.\d+\.\d+)([+-].+)?$/u;
 function supportsRelease(version) {
