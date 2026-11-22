@@ -15,8 +15,8 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, ListenerPorts,
     NotRead, ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts,
-    RuntimeListener, RuntimeService, RuntimeSocketDashboard, SandboxCommand, SecretFileFormat,
-    SecretFiles, ServiceName, Signal, Unreadable, ValueAt,
+    RuntimeListener, RuntimeService, RuntimeSocketDashboard, RuntimeUpdate, SandboxCommand,
+    SecretFileFormat, SecretFiles, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -163,6 +163,13 @@ impl RuntimeAdapter for Hermes {
 
     fn endpoints(&self) -> &'static str {
         include_str!("hermes/endpoints.toml")
+    }
+
+    fn update(&self) -> RuntimeUpdate {
+        RuntimeUpdate {
+            installer: false,
+            commands: vec![SandboxCommand::from_words(&[HERMES, "update"])],
+        }
     }
 
     fn installer(&self) -> Installer {

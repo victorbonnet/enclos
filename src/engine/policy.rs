@@ -447,6 +447,31 @@ impl Engine {
         Ok(())
     }
 
+    /// Destinations `runtime`'s adapter declares that sandbox `name`'s active
+    /// policy cannot reach on port 443, decided with the proxy's own rule
+    /// ([`crate::proxy::decide::allowed`]): empty in public mode.
+    pub fn unreachable_destinations(
+        &self,
+        name: &SandboxName,
+        runtime: &dyn crate::runtime::RuntimeAdapter,
+    ) -> Result<Vec<String>> {
+        let (_, snapshot) = self.active_policy(name)?;
+        let layer = crate::policy::file::PolicyFile::parse(
+            &format!("{} adapter", runtime.kind()),
+            runtime.endpoints(),
+        )?;
+        let mut missing = Vec::new();
+        for host in layer.network.allow_add {
+            let Ok(dest) = crate::proxy::decide::Destination::parse(&host, 443) else {
+                continue;
+            };
+            if !crate::proxy::decide::allowed(&snapshot.policy, &dest) && !missing.contains(&host) {
+                missing.push(host);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Writes the file first, so the active version never runs ahead of it:
     /// if recording the version fails, the file goes back to what it was,
     /// and an error says so if that fails too.

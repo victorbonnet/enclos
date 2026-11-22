@@ -9,11 +9,12 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use super::output;
-use enclos::engine::{ChannelRequest, ChannelSet, Engine, Setting};
+use enclos::engine::{ChannelRequest, ChannelSet, Engine, RunningWork, ServicesAfter, Setting};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
+use enclos::model::count;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::runtime::RuntimeKind;
 use enclos::model::sandbox::SandboxName;
@@ -70,6 +71,20 @@ enum RuntimeVerb {
         #[arg(long = "allow-user", value_name = "ID", requires = "channel")]
         allow_user: Vec<ChannelUser>,
     },
+    /// Update the sandbox's runtime with its own updater, restarting its services around it.
+    Update {
+        sandbox: SandboxName,
+        /// Stop the updater, and every process it started, once it has
+        /// run this many seconds, and fail the update: for the mobile
+        /// app's bridge, which runs this command with nobody watching.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        time_limit: Option<u64>,
+        /// Who asked for the update, as the audit log names them: the
+        /// mobile app's bridge, which runs this command for a paired
+        /// device, names its person and device.
+        #[arg(long, hide = true, value_name = "WHO")]
+        requested_by: Option<String>,
+    },
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
@@ -98,6 +113,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
                 answers: allow_user,
             });
             return configure(engine, by, confirm, target, channel, &set);
+        }
+        RuntimeVerb::Update {
+            sandbox,
+            time_limit,
+            requested_by,
+        } => {
+            let by = &requester(by, requested_by);
+            let limit = time_limit.map(Duration::from_secs);
+            return update(engine, by, confirm, sandbox, limit);
         }
     };
     let by = &requester(by, requested_by);
@@ -293,6 +317,162 @@ fn configure(
     Ok(exit::OK)
 }
 
+fn update(
+    engine: &Engine,
+    by: &Actor,
+    confirm: Confirm,
+    sandbox: SandboxName,
+    limit: Option<Duration>,
+) -> Result<u8> {
+    if !output::json() && confirm != Confirm::DryRun {
+        let pre = engine.update_preflight(&sandbox)?;
+        let shown = pre.kind.display_name();
+        match &pre.running_work {
+            RunningWork::Count { count: n, agents } if *n > 0 => {
+                println!(
+                    "This interrupts {} ({}).",
+                    count(*n, "running task", "running tasks"),
+                    agents.join(", ")
+                );
+            }
+            RunningWork::Count { .. } => {}
+            RunningWork::Unknown(why) => {
+                println!("Cannot tell how many running tasks this interrupts: {why}.");
+            }
+        }
+        if !pre.policy_missing.is_empty() {
+            let allow_cmds: Vec<String> = pre
+                .policy_missing
+                .iter()
+                .map(|d| format!("`enclos policy allow {sandbox} {d}`"))
+                .collect();
+            println!(
+                "The policy of sandbox {sandbox} does not allow {}, which the {shown} updater may need: {}. The update goes ahead.",
+                pre.policy_missing.join(", "),
+                allow_cmds.join(", ")
+            );
+        }
+        if let Some(rel) = &pre.release
+            && !rel.checked
+        {
+            println!(
+                "{shown} {} is out, not checked with this enclos yet; the update goes ahead.",
+                rel.version
+            );
+        }
+    }
+    let updated = match limit {
+        None => engine.update_runtime(by, &sandbox, confirm)?,
+        Some(limit) => engine.update_runtime_within(by, &sandbox, confirm, limit)?,
+    };
+    let end = match updated {
+        Planned::DryRun(plan) => {
+            output::show_plan(&plan);
+            return Ok(exit::OK);
+        }
+        Planned::Done(end) => end,
+    };
+    let shown = end.kind.display_name();
+    let user_home = std::env::var("HOME").ok();
+    let log_shown = super::status::tilde(&end.log, user_home.as_deref());
+    let failure_message = || {
+        let ended = end.ended();
+        let services_clause = match end.services {
+            ServicesAfter::StartedAgain => {
+                "the sandbox's services are running again on what the updater left"
+            }
+            ServicesAfter::NotInstalled => "no service was installed (the sandbox was stopped)",
+        };
+        let state_sentence = match &end.before {
+            Some(v) => format!("{shown} {v} stays recorded, and {services_clause}."),
+            None => match end.services {
+                ServicesAfter::StartedAgain => {
+                    "The sandbox's services are running again on what the updater left.".to_owned()
+                }
+                ServicesAfter::NotInstalled => {
+                    "No service was installed (the sandbox was stopped).".to_owned()
+                }
+            },
+        };
+        format!(
+            "the {shown} updater {ended} in sandbox {sandbox}. Its log is {log_shown} (`enclos logs {sandbox}`). {state_sentence} There is no rollback: fix the cause, then run `enclos runtime update {sandbox}` again."
+        )
+    };
+    if output::json() {
+        let code = match end.succeeded {
+            true => exit::OK,
+            false => exit::ERROR,
+        };
+        let running_work = match &end.running_work {
+            RunningWork::Count { count: n, agents } => json!({
+                "count": n,
+                "agents": agents,
+            }),
+            RunningWork::Unknown(why) => json!({
+                "unknown": why,
+            }),
+        };
+        return Ok(output::conclude(
+            json!({
+                "sandbox": sandbox.to_string(),
+                "runtime": end.kind.to_string(),
+                "updated": end.updated,
+                "version_before": end.before.as_ref().map(|v| v.to_string()),
+                "version_after": end.after.as_ref().and_then(|v| v.as_ref().ok()).map(|v| v.to_string()),
+                "version_unreadable": end.after.as_ref().and_then(|v| v.as_ref().err()),
+                "session": output::session(&end.session),
+                "release": end.release.as_ref().map(|r| json!({
+                    "version": r.version,
+                    "checked": r.checked,
+                })),
+                "policy_version": end.policy,
+                "policy_missing": end.policy_missing,
+                "running_work": running_work,
+                "stopped_after": end.stopped_after.map(|d| d.as_secs()),
+                "log": end.log.display().to_string(),
+                "services": end.services.as_str(),
+            }),
+            code,
+            failure_message,
+        ));
+    }
+    if !end.succeeded {
+        eprintln!("enclos: {}", failure_message());
+        return Ok(exit::ERROR);
+    }
+    let services_semi = match end.services {
+        ServicesAfter::StartedAgain => "its services are running again.",
+        ServicesAfter::NotInstalled => "its services were not installed (the sandbox was stopped).",
+    };
+    let services_sentence = match end.services {
+        ServicesAfter::StartedAgain => "Its services are running again.",
+        ServicesAfter::NotInstalled => "Its services were not installed (the sandbox was stopped).",
+    };
+    if end.updated {
+        match (&end.before, &end.after) {
+            (Some(before), Some(Ok(after))) => println!(
+                "{shown} {after} now runs in sandbox {sandbox} (was {before}); {services_semi}"
+            ),
+            (None, Some(Ok(after))) => {
+                println!("{shown} {after} now runs in sandbox {sandbox}; {services_semi}")
+            }
+            _ => println!("{shown} updater finished in sandbox {sandbox}. {services_sentence}"),
+        }
+    } else if let Some(Ok(after)) = &end.after {
+        println!(
+            "{shown} is already at {after} in sandbox {sandbox}: its own update found no newer release. {services_sentence}"
+        );
+    } else {
+        println!("{shown} updater finished in sandbox {sandbox}. {services_sentence}");
+        if let Some(Err(why)) = &end.after {
+            eprintln!(
+                "enclos: {shown}'s version could not be read after the update, so `enclos status` cannot say whether it moved: {why}. The version recorded before is kept."
+            );
+        }
+    }
+    Ok(exit::OK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +538,37 @@ mod tests {
         };
         assert_eq!(limit(&[]), None);
         assert_eq!(limit(&["--time-limit=3600"]), Some(3600));
+    }
+
+    #[test]
+    fn an_update_parses_sandbox_and_hidden_flags() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RuntimeArgs,
+        }
+        let parsed = Cli::try_parse_from([
+            "enclos",
+            "update",
+            "lab",
+            "--requested-by=-alice (device d-1)",
+            "--time-limit=3600",
+        ])
+        .unwrap();
+        let RuntimeVerb::Update {
+            sandbox,
+            time_limit,
+            requested_by,
+        } = parsed.args.verb
+        else {
+            panic!("not an update");
+        };
+        assert_eq!(sandbox.as_str(), "lab");
+        assert_eq!(time_limit, Some(3600));
+        assert_eq!(requested_by.as_deref(), Some("-alice (device d-1)"));
+        // One runtime per sandbox: no --runtime flag.
+        assert!(Cli::try_parse_from(["enclos", "update", "lab", "--runtime", "hermes"]).is_err());
     }
 
     #[test]

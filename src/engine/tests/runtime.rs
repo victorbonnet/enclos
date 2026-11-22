@@ -5872,3 +5872,447 @@ fn configure_stops_a_service_that_refuses_its_commands_meanwhile() {
     done(configure(Confirm::Ask, &runtime).unwrap());
     assert!(fake.stopped.borrow().is_empty());
 }
+
+/// Stand-in adapter for `enclos runtime update` tests: runs a shell script
+/// as its updater and reads/reports a version through `version_command`.
+struct UpdatingRuntime {
+    inner: TestRuntime,
+    update_script: String,
+    version_script: String,
+}
+
+impl RuntimeAdapter for UpdatingRuntime {
+    fn kind(&self) -> RuntimeKind {
+        RuntimeKind::Hermes
+    }
+    fn version(&self) -> &'static str {
+        self.inner.version()
+    }
+    fn endpoints(&self) -> &'static str {
+        self.inner.endpoints()
+    }
+    fn installer(&self) -> crate::runtime::Installer {
+        self.inner.installer()
+    }
+    fn update(&self) -> crate::runtime::RuntimeUpdate {
+        crate::runtime::RuntimeUpdate {
+            installer: false,
+            commands: vec![SandboxCommand::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                self.update_script.clone().into(),
+            ])],
+        }
+    }
+    fn home_files(&self, backend: BackendKind) -> Vec<crate::runtime::HomeFile> {
+        self.inner.home_files(backend)
+    }
+    fn login(&self) -> String {
+        self.inner.login()
+    }
+    fn create_agent(&self, name: &AgentName) -> SandboxCommand {
+        self.inner.create_agent(name)
+    }
+    fn agent_files(&self, name: &AgentName) -> String {
+        self.inner.agent_files(name)
+    }
+    fn talk(&self, agent: &AgentName) -> String {
+        self.inner.talk(agent)
+    }
+    fn services(&self) -> Vec<crate::runtime::RuntimeService> {
+        self.inner.services()
+    }
+    fn agents_in(
+        &self,
+        home: &Path,
+    ) -> std::result::Result<Vec<RuntimeAgentName>, crate::runtime::Unreadable> {
+        self.inner.agents_in(home)
+    }
+    fn version_command(&self, report: &Path) -> Option<SandboxCommand> {
+        Some(SandboxCommand::new(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            self.version_script.clone().into(),
+            "sh".into(),
+            report.into(),
+        ]))
+    }
+    fn reported_version(&self, text: &str) -> std::result::Result<String, String> {
+        let v = text.trim();
+        if v.is_empty() {
+            Err("printed no version".into())
+        } else {
+            Ok(v.to_owned())
+        }
+    }
+}
+
+#[test]
+fn a_runtime_update_dry_run_lists_steps_in_order_and_changes_nothing() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let audit_before = lab.audit();
+
+    // Stopped sandbox: no service is stopped or started.
+    let Planned::DryRun(stopped_plan) = lab
+        .engine
+        .update_runtime(&alice(), &lab.name, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("dry run did not return DryRun");
+    };
+    assert_eq!(stopped_plan.changes.len(), 4);
+    assert!(stopped_plan.changes[0].contains("is stopped: no service is stopped"));
+    assert!(stopped_plan.changes[1].contains("run the hermes updater"));
+    assert!(stopped_plan.changes[2].contains("record the version hermes then reports"));
+    assert!(stopped_plan.changes[3].contains("keep sandbox"));
+    assert_eq!(lab.audit(), audit_before);
+
+    // Running sandbox: stops services, runs updater, records version, starts services again.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let Planned::DryRun(running_plan) = lab
+        .engine
+        .update_runtime(&alice(), &lab.name, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("dry run did not return DryRun");
+    };
+    assert_eq!(running_plan.changes.len(), 4);
+    assert!(running_plan.changes[0].contains("stop the services of sandbox"));
+    assert!(running_plan.changes[1].contains("run the hermes updater"));
+    assert!(running_plan.changes[2].contains("record the version hermes then reports"));
+    assert!(running_plan.changes[3].contains("start the services of sandbox"));
+    assert_eq!(lab.audit(), audit_before);
+}
+
+#[test]
+fn a_runtime_update_refuses_no_runtime_and_pending_policy_without_auditing() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    let audit_before = lab.audit();
+
+    // No runtime installed.
+    let err = lab
+        .engine
+        .update_runtime(&alice(), &lab.name, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("has no runtime yet"), "{err}");
+    assert_eq!(lab.audit(), audit_before);
+
+    // Install a runtime, then create a pending policy change with a live session.
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let sleeping = super::sandbox::Sleeping::new();
+    let mut session = super::sandbox::session_of(&lab.engine, &lab.name, sleeping.process());
+    session.compiled = Some("/compiled/at-launch.sb".into());
+    super::sandbox::put(&lab.engine, &session);
+    let current = lab.engine.layout.read_policy(lab.name.as_str()).unwrap();
+    let edited = format!("{current}\n[resources]\nopen_files = 512\n");
+    let applied = done(
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &current, &edited, Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(matches!(
+        applied.outcome,
+        crate::engine::ChangeOutcome::Pending(_)
+    ));
+    let audit_before_pending = lab.audit();
+
+    let err = lab
+        .engine
+        .update_runtime(&alice(), &lab.name, Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::PolicyPending { .. }), "{err}");
+    assert_eq!(lab.audit(), audit_before_pending);
+}
+
+#[test]
+fn a_runtime_update_moves_version_keeps_policy_and_restarts_services() {
+    use crate::engine::ServicesAfter;
+    use crate::model::runtime::RuntimeVersion;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    // Record initial version 0.23.1 in state.db.
+    let v_before = RuntimeVersion::new("0.23.1").unwrap();
+    let lock = lab.engine.state.lock().unwrap();
+    lab.engine
+        .state
+        .put_runtime_version(
+            &lock,
+            &lab.name,
+            RuntimeKind::Hermes,
+            &v_before,
+            crate::model::now(),
+        )
+        .unwrap();
+    drop(lock);
+
+    let policy_before = lab.engine.policy(&lab.name).unwrap().version.version;
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'updating to 0.23.2'".into(),
+        version_script: "printf '0.23.2\\n' > \"$1\"".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert!(end.updated);
+    assert_eq!(end.before, Some(v_before));
+    assert_eq!(end.after, Some(Ok(RuntimeVersion::new("0.23.2").unwrap())));
+    assert_eq!(end.policy, policy_before);
+    assert_eq!(end.services, ServicesAfter::StartedAgain);
+    assert!(fake.stopped.borrow().contains(&gateway));
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+
+    let audit = lab.audit();
+    assert!(audit.contains("updated from 0.23.1 to 0.23.2"), "{audit}");
+    let pos_remove = audit.rfind("services remove").unwrap();
+    let pos_updater = audit.rfind("runtime updater").unwrap();
+    let pos_start = audit.rfind("sandbox start").unwrap();
+    let pos_update = audit.rfind("updated from 0.23.1 to 0.23.2").unwrap();
+    assert!(pos_remove < pos_updater, "remove before updater:\n{audit}");
+    assert!(pos_updater < pos_start, "updater before start:\n{audit}");
+    assert!(
+        pos_start < pos_update,
+        "runtime update after start:\n{audit}"
+    );
+
+    // Second run with same version: updated == false, unchanged at 0.23.2.
+    let end2 = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end2.succeeded);
+    assert!(!end2.updated);
+    assert_eq!(end2.before, Some(RuntimeVersion::new("0.23.2").unwrap()));
+    assert_eq!(end2.after, Some(Ok(RuntimeVersion::new("0.23.2").unwrap())));
+    assert!(lab.audit().contains("unchanged at 0.23.2"));
+}
+
+#[test]
+fn a_failed_runtime_update_keeps_previous_version_restarts_services_and_names_log() {
+    use crate::engine::ServicesAfter;
+    use crate::model::runtime::RuntimeVersion;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    let v_before = RuntimeVersion::new("0.23.1").unwrap();
+    let lock = lab.engine.state.lock().unwrap();
+    lab.engine
+        .state
+        .put_runtime_version(
+            &lock,
+            &lab.name,
+            RuntimeKind::Hermes,
+            &v_before,
+            crate::model::now(),
+        )
+        .unwrap();
+    drop(lock);
+
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'boom on stdout'; echo 'boom on stderr' >&2; exit 1".into(),
+        version_script: "printf '0.23.2\\n' > \"$1\"".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(!end.succeeded);
+    assert!(!end.updated);
+    assert_eq!(end.before, Some(v_before.clone()));
+    assert_eq!(end.after, None);
+    assert_eq!(end.services, ServicesAfter::StartedAgain);
+    assert!(fake.started.borrow().iter().any(|u| u.label == gateway));
+    assert_eq!(
+        lab.engine.state.runtime_version(&lab.name).unwrap(),
+        Some((RuntimeKind::Hermes, v_before))
+    );
+    assert_eq!(end.log, lab.engine.update_log(&lab.name));
+    let log_text = std::fs::read_to_string(&end.log).unwrap();
+    assert!(log_text.contains("boom on stdout"), "{log_text}");
+    assert!(log_text.contains("boom on stderr"), "{log_text}");
+    assert!(
+        lab.audit()
+            .contains("failed: the updater exited with 1; 0.23.1 stays"),
+        "{}",
+        lab.audit()
+    );
+}
+
+#[test]
+fn an_unreadable_version_after_update_keeps_previous_version() {
+    use crate::model::runtime::RuntimeVersion;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    let v_before = RuntimeVersion::new("0.23.1").unwrap();
+    let lock = lab.engine.state.lock().unwrap();
+    lab.engine
+        .state
+        .put_runtime_version(
+            &lock,
+            &lab.name,
+            RuntimeKind::Hermes,
+            &v_before,
+            crate::model::now(),
+        )
+        .unwrap();
+    drop(lock);
+
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'updated ok'".into(),
+        version_script: "exit 3".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert!(!end.updated);
+    assert!(matches!(end.after, Some(Err(_))), "{:?}", end.after);
+    // Unlike install, update keeps the version previously recorded.
+    assert_eq!(
+        lab.engine.state.runtime_version(&lab.name).unwrap(),
+        Some((RuntimeKind::Hermes, v_before))
+    );
+}
+
+#[test]
+fn a_runtime_update_log_is_replaced_and_bounded_to_64_kib() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    let rt1 = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'first-run-marker'".into(),
+        version_script: "printf '0.23.1\\n' > \"$1\"".into(),
+    };
+    let end1 = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt1, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(
+        std::fs::read_to_string(&end1.log)
+            .unwrap()
+            .contains("first-run-marker")
+    );
+
+    // Second run writes > 80 KiB ending with a known tail marker.
+    let rt2 = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "i=0; while [ $i -lt 1200 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\n'; i=$((i+1)); done; printf 'tail-marker-end\\n'".into(),
+        version_script: "printf '0.23.2\\n' > \"$1\"".into(),
+    };
+    let end2 = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt2, Confirm::Yes)
+            .unwrap(),
+    );
+    let bytes = std::fs::read(&end2.log).unwrap();
+    assert_eq!(bytes.len(), 64 * 1024, "log bounded to 64 KiB");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("first-run-marker"));
+    assert!(text.ends_with("tail-marker-end\n"));
+}
+
+#[test]
+fn unreachable_destinations_is_empty_in_public_mode_and_lists_removed_host_in_allowlist() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    // Default Lab uses `assistant` (public mode): every adapter host is reachable on 443.
+    let missing_public = lab
+        .engine
+        .unreachable_destinations(&lab.name, &Hermes)
+        .unwrap();
+    assert!(
+        missing_public.is_empty(),
+        "public mode should have no missing destinations: {missing_public:?}"
+    );
+
+    // A person narrows the reach afterwards: allowlist mode, and an `allow`
+    // list of every adapter host but `github.com` (A9's "a person denied
+    // it") — the case `policy_missing` exists for. The sandbox's own
+    // `policy.toml` is the last layer applied, so its `allow` replaces the
+    // host the adapter's layer adds.
+    let hosts: Vec<String> = crate::policy::file::PolicyFile::parse("hermes", Hermes.endpoints())
+        .unwrap()
+        .network
+        .allow_add
+        .into_iter()
+        .filter(|h| h != "github.com")
+        .collect();
+    let allow_toml: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
+    let before_policy = lab.engine.layout.read_policy(lab.name.as_str()).unwrap();
+    let policy_text = before_policy
+        .replace("[network]\n", "[network]\nmode = \"allowlist\"\n")
+        .replace(
+            "allow_add = []",
+            &format!("allow = [{}]", allow_toml.join(", ")),
+        );
+    assert!(
+        policy_text.contains("mode = \"allowlist\"") && !policy_text.contains("\"github.com\""),
+        "{policy_text}"
+    );
+    done(
+        lab.engine
+            .policy_edit(
+                &alice(),
+                &lab.name,
+                &before_policy,
+                &policy_text,
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let missing_allowlist = lab
+        .engine
+        .unreachable_destinations(&lab.name, &Hermes)
+        .unwrap();
+    assert_eq!(missing_allowlist, vec!["github.com".to_owned()]);
+}

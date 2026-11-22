@@ -8,12 +8,15 @@ use std::time::{Duration, Instant};
 
 use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
+use super::releases::{LatestRelease, Releases};
 use super::service::STOP_GRACE;
-use super::session::{END_WAIT, SessionEnd, spoken};
+use super::session::{END_WAIT, SessionEnd, UpdateLog, spoken};
+use super::status::{Fact, bridge_activity};
 use super::usage::{Removed, read_report};
 use crate::bridge::ids::new_id;
 use crate::error::{Error, Result};
-use crate::model::audit::Actor;
+use crate::model::audit::{Actor, Outcome};
+use crate::model::count;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
@@ -75,6 +78,109 @@ impl InstallEnd {
             (None, Some(signal)) => format!("was ended by signal {signal}"),
             (None, None) => format!("exited with {}", self.end.exit),
         }
+    }
+}
+
+/// The state of the sandbox's services after `enclos runtime update` (ADR 0074).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServicesAfter {
+    /// The sandbox had services installed before the update, and they were
+    /// started again afterwards.
+    StartedAgain,
+    /// The sandbox was stopped with no services installed, and stays so.
+    NotInstalled,
+}
+
+impl ServicesAfter {
+    /// How the JSON output describes the services after the update (A12).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServicesAfter::StartedAgain => "started again",
+            ServicesAfter::NotInstalled => "not installed (the sandbox was stopped)",
+        }
+    }
+}
+
+/// What running work the bridge's activity store reports for a sandbox
+/// before `enclos runtime update` stops its services (ADR 0074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningWork {
+    /// The bridge's activity store was read (or no bridge runs), and these
+    /// `<sandbox>/<agent>` entries were reported active.
+    Count { count: usize, agents: Vec<String> },
+    /// The activity store could not be read; never reported as 0.
+    Unknown(String),
+}
+
+/// What `enclos runtime update` tells the person in text mode before the
+/// updater runs (ADR 0074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePreflight {
+    pub kind: RuntimeKind,
+    /// Adapter destinations the active policy cannot reach on port 443.
+    pub policy_missing: Vec<String>,
+    /// The latest release kept for this runtime (`Releases::kept()`), if any.
+    pub release: Option<LatestRelease>,
+    /// Running work reported by the bridge's activity store.
+    pub running_work: RunningWork,
+}
+
+/// How `enclos runtime update` ended (ADR 0074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateEnd {
+    pub kind: RuntimeKind,
+    /// Whether the updater succeeded and the version read back differs from
+    /// the one before.
+    pub updated: bool,
+    /// Whether the updater exited 0 and was not stopped at its time limit.
+    pub succeeded: bool,
+    /// The version read before the update, when readable.
+    pub before: Option<RuntimeVersion>,
+    /// The version read after a successful update, or why it could not be
+    /// read; `None` when the updater failed or the runtime provides none.
+    pub after: Option<std::result::Result<RuntimeVersion, String>>,
+    /// How the updater's session ended (the last one when the runtime runs
+    /// more than one command).
+    pub session: SessionEnd,
+    /// The latest release kept for this runtime (`Releases::kept()`), if any.
+    pub release: Option<LatestRelease>,
+    /// The sandbox's active policy version, unchanged by the update.
+    pub policy: u32,
+    /// Adapter destinations the active policy cannot reach on port 443.
+    pub policy_missing: Vec<String>,
+    /// The sandbox's services afterwards.
+    pub services: ServicesAfter,
+    /// Running work reported by the bridge's activity store before the update.
+    pub running_work: RunningWork,
+    /// The update's time limit, when the updater was still running then and
+    /// was stopped.
+    pub stopped_after: Option<Duration>,
+    /// The host path of the updater's log (`<logs>/update.log`).
+    pub log: PathBuf,
+}
+
+impl UpdateEnd {
+    /// How the updater ended, as a person reads it after "the <runtime> updater".
+    pub fn ended(&self) -> String {
+        ended_text(self.stopped_after, &self.session)
+    }
+}
+
+/// Formats how an updater session ended, matching `InstallEnd::ended` and
+/// spelling whole hours as `1 hour` / `N hours` (spec §3.3).
+fn ended_text(stopped_after: Option<Duration>, end: &SessionEnd) -> String {
+    match (stopped_after, end.signal) {
+        (Some(limit), _) => {
+            let secs = limit.as_secs();
+            let span = if secs > 0 && secs.is_multiple_of(3600) {
+                count((secs / 3600) as usize, "hour", "hours")
+            } else {
+                spoken(limit)
+            };
+            format!("did not finish within {span} and was stopped")
+        }
+        (None, Some(signal)) => format!("was ended by signal {signal}"),
+        (None, None) => format!("exited with {}", end.exit),
     }
 }
 
@@ -273,6 +379,281 @@ impl Engine {
         }))
     }
 
+    /// Read-only preflight for `enclos runtime update` (ADR 0074): checks the
+    /// same preconditions as [`Engine::update_runtime`] and returns what text
+    /// mode prints before the updater starts.
+    pub fn update_preflight(&self, name: &SandboxName) -> Result<UpdatePreflight> {
+        let kind = self.runtime_of(name)?;
+        let active = self.policy(name)?;
+        // The update writes no policy and its session runs under the active
+        // snapshot from `state.db`, so nothing is "resolved" by it; it refuses
+        // because the person's waiting change must not be overrun by a
+        // lifecycle action.
+        if active.pending.is_some() {
+            return Err(Error::PolicyPending {
+                sandbox: name.to_string(),
+            });
+        }
+        self.check_start_limits(name)?;
+        let runtime = adapter(kind);
+        let policy_missing = self.unreachable_destinations(name, runtime.as_ref())?;
+        let release = match Releases::kept().of(self, runtime.as_ref(), now()) {
+            Fact::Known(r) => Some(r),
+            _ => None,
+        };
+        let running_work = self.running_work(name);
+        Ok(UpdatePreflight {
+            kind,
+            policy_missing,
+            release,
+            running_work,
+        })
+    }
+
+    /// Updates the sandbox's runtime with its own updater, stopping its
+    /// services and sessions first and starting its services again afterwards
+    /// when they were installed (ADR 0074).
+    pub fn update_runtime(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+    ) -> Result<Planned<UpdateEnd>> {
+        let kind = self.runtime_of(name)?;
+        self.update_runtime_with(by, name, adapter(kind).as_ref(), confirm)
+    }
+
+    /// [`Engine::update_runtime`], stopping the updater and every process it
+    /// started after `limit`, for a caller with nobody watching such as the
+    /// mobile app's bridge (ADR 0074).
+    pub fn update_runtime_within(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+        limit: Duration,
+    ) -> Result<Planned<UpdateEnd>> {
+        let kind = self.runtime_of(name)?;
+        self.update_runtime_limited(by, name, adapter(kind).as_ref(), confirm, Some(limit))
+    }
+
+    /// `update_runtime` against `runtime`, so tests can substitute an adapter
+    /// whose updater is a stand-in.
+    pub(crate) fn update_runtime_with(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        confirm: Confirm,
+    ) -> Result<Planned<UpdateEnd>> {
+        self.update_runtime_limited(by, name, runtime, confirm, None)
+    }
+
+    /// `update_runtime_with`, stopping the updater `limit` after now.
+    pub(crate) fn update_runtime_limited(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        confirm: Confirm,
+        limit: Option<Duration>,
+    ) -> Result<Planned<UpdateEnd>> {
+        let kind = self.runtime_of(name)?;
+        let active = self.policy(name)?;
+        // The update writes no policy and its session runs under the active
+        // snapshot from `state.db`, so nothing is "resolved" by it; it refuses
+        // because the person's waiting change must not be overrun by a
+        // lifecycle action.
+        if active.pending.is_some() {
+            return Err(Error::PolicyPending {
+                sandbox: name.to_string(),
+            });
+        }
+        self.check_start_limits(name)?;
+        let installed = self.has_services(name)?;
+        if confirm == Confirm::DryRun {
+            return Ok(Planned::DryRun(plan_update(
+                name,
+                kind,
+                active.version.version,
+                installed,
+            )));
+        }
+
+        let before = match self.current_version(name, runtime) {
+            Fact::Known(v) => RuntimeVersion::new(&v),
+            _ => None,
+        };
+        let policy_missing = self.unreachable_destinations(name, runtime)?;
+        let release = match Releases::kept().of(self, runtime, now()) {
+            Fact::Known(r) => Some(r),
+            _ => None,
+        };
+        let running_work = self.running_work(name);
+
+        let update = runtime.update();
+        let mut commands = Vec::new();
+        let mut installer_sha256 = None;
+        if update.installer {
+            // Outside the lock and before stopping services: a download takes
+            // long and changes no state.
+            let (cmd, sha256) = self.stage_install(name, runtime)?;
+            installer_sha256 = Some(sha256);
+            commands.push(cmd);
+        }
+        commands.extend(update.commands);
+        if commands.is_empty() {
+            return Err(Error::Session {
+                what: format!("{kind} has no updater"),
+            });
+        }
+
+        let log_path = self.update_log(name);
+        let mut update_log = UpdateLog::new(log_path.clone())?;
+        let deadline = limit.map(|l| Instant::now() + l);
+
+        // Step 6: stop the sandbox's services and end its sessions.
+        self.stop_services_and_sessions(by, name)?;
+
+        // Step 7: run the updater command(s) in order. On any error, still
+        // start the services again when they were installed.
+        let mut last_end: Option<SessionEnd> = None;
+        let mut succeeded = true;
+        let mut stopped_after = None;
+        for cmd in commands {
+            let ran = self.run_update_in_sandbox(
+                by,
+                name,
+                cmd,
+                "runtime updater",
+                deadline,
+                &mut update_log,
+            );
+            let (end, timed_out) = match ran {
+                Ok(ran) => ran,
+                Err(error) => {
+                    if installed {
+                        let _ = self.start_sandbox(by, name);
+                    }
+                    return Err(error);
+                }
+            };
+            let stopped = limit.filter(|_| timed_out);
+            let failed = end.exit != 0 || stopped.is_some();
+            last_end = Some(end);
+            if failed {
+                succeeded = false;
+                stopped_after = stopped;
+                break;
+            }
+        }
+        let session = last_end.expect("updater commands was non-empty");
+
+        // Step 8: record the version the runtime then reports, only when the
+        // updater succeeded. Never forget the previously recorded version on
+        // failure (A3, A5, Q2).
+        let after = if succeeded {
+            if runtime.version_command(Path::new("")).is_some() {
+                match self.record_reported_version_with(by, name, runtime, deadline, true, "update")
+                {
+                    Ok(Some(v)) => Some(Ok(v)),
+                    Ok(None) => None,
+                    Err(why) => Some(Err(why)),
+                }
+            } else {
+                match self.current_version(name, runtime) {
+                    Fact::Known(v) => match RuntimeVersion::new(&v) {
+                        Some(version) => Some(Ok(version)),
+                        None => Some(Err(format!("it reported no version enclos reads ({v})"))),
+                    },
+                    Fact::CannotTell(why) => Some(Err(why)),
+                    Fact::Absent => Some(Err("its version file is absent".to_owned())),
+                    Fact::NotProvided => None,
+                }
+            }
+        } else {
+            None
+        };
+
+        let updated = succeeded
+            && match (&before, &after) {
+                (Some(b), Some(Ok(a))) => a != b,
+                (None, Some(Ok(_))) => true,
+                _ => false,
+            };
+
+        // Step 9: start the services again when they were installed.
+        let services = if installed {
+            self.start_sandbox(by, name)?;
+            ServicesAfter::StartedAgain
+        } else {
+            ServicesAfter::NotInstalled
+        };
+
+        // Step 10: one `runtime update` audit entry for the run, after the
+        // services are started again so it never sits between stop and start.
+        let target = Some(format!("{name} {kind}"));
+        let sha_note = installer_sha256
+            .as_deref()
+            .map(|sha| format!(", installer sha256 {sha}"))
+            .unwrap_or_default();
+        let outcome = if succeeded {
+            let text = match (&before, &after) {
+                (Some(b), Some(Ok(a))) if a != b => format!("updated from {b} to {a}{sha_note}"),
+                (Some(_), Some(Ok(a))) => format!("unchanged at {a}{sha_note}"),
+                (None, Some(Ok(a))) => format!("updated to {a}{sha_note}"),
+                (_, Some(Err(why))) => {
+                    format!("updater finished; version unreadable ({why}){sha_note}")
+                }
+                (_, None) => format!("updater finished{sha_note}"),
+            };
+            Outcome::ok(text)
+        } else {
+            let ended = ended_text(stopped_after, &session);
+            let stays = before
+                .as_ref()
+                .map(|b| format!("; {b} stays"))
+                .unwrap_or_default();
+            Outcome::failed(format!("failed: the updater {ended}{stays}{sha_note}"))
+        };
+        self.write_with_outcome(by, "runtime update", target, |_| outcome, |_| Ok(()))?;
+
+        Ok(Planned::Done(UpdateEnd {
+            kind,
+            updated,
+            succeeded,
+            before,
+            after,
+            session,
+            release,
+            policy: active.version.version,
+            policy_missing,
+            services,
+            running_work,
+            stopped_after,
+            log: log_path,
+        }))
+    }
+
+    /// Running work reported by the bridge's activity store for sandbox `name`.
+    fn running_work(&self, name: &SandboxName) -> RunningWork {
+        let (activity, unreadable) = bridge_activity(&self.layout.app_store());
+        if let Some(why) = unreadable {
+            return RunningWork::Unknown(why);
+        }
+        let prefix = format!("{name}/");
+        let mut agents: Vec<String> = activity
+            .into_iter()
+            .filter(|(k, a)| k.starts_with(&prefix) && !a.kinds().is_empty())
+            .map(|(k, _)| k)
+            .collect();
+        agents.sort();
+        RunningWork::Count {
+            count: agents.len(),
+            agents,
+        }
+    }
+
     /// Asks the runtime its version, with its own command in the sandbox,
     /// and records it (ADR 0074, proposed), for a runtime whose home holds
     /// none enclos reads: none for another. The command is stopped after
@@ -286,12 +667,38 @@ impl Engine {
         runtime: &dyn RuntimeAdapter,
         deadline: Option<Instant>,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
+        self.record_reported_version_with(by, name, runtime, deadline, false, "install")
+    }
+
+    /// Shared version-recording path for install and update. When
+    /// `keep_on_failure` is true (update semantics, ADR 0074), a version
+    /// that cannot be read keeps the version previously recorded in
+    /// `state.db` instead of forgetting it.
+    fn record_reported_version_with(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        deadline: Option<Instant>,
+        keep_on_failure: bool,
+        what: &str,
+    ) -> std::result::Result<Option<RuntimeVersion>, String> {
         let kind = runtime.kind();
         let target = Some(format!("{name} {kind}"));
-        let version = match self.ask_version(by, name, runtime, deadline) {
+        let version = match self.ask_version(by, name, runtime, deadline, what) {
             Ok(None) => return Ok(None),
             Ok(Some(version)) => version,
             Err(why) => {
+                if keep_on_failure {
+                    let _ = self.write(
+                        by,
+                        "runtime version",
+                        target,
+                        |_| format!("not reported: {why}; previous version kept"),
+                        |_| Ok(()),
+                    );
+                    return Err(why);
+                }
                 let forgot = self.write(
                     by,
                     "runtime version",
@@ -334,6 +741,7 @@ impl Engine {
         name: &SandboxName,
         runtime: &dyn RuntimeAdapter,
         deadline: Option<Instant>,
+        what: &str,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
         let home = self.sandbox_home(name);
         let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
@@ -344,7 +752,9 @@ impl Engine {
         let now = Instant::now();
         let stop = deadline.map_or(now + VERSION_TIME, |d| d.min(now + VERSION_TIME));
         if stop <= now {
-            return Err("the install's time limit left no time to ask its version".into());
+            return Err(format!(
+                "the {what}'s time limit left no time to ask its version"
+            ));
         }
         let _remove = Removed(report.clone());
         let (ended, stopped) = self
@@ -532,6 +942,32 @@ impl InstallPlan {
             changes,
             ..Plan::default()
         }
+    }
+}
+
+fn plan_update(name: &SandboxName, kind: RuntimeKind, policy: u32, installed: bool) -> Plan {
+    let mut changes = Vec::new();
+    if installed {
+        changes.push(format!(
+            "stop the services of sandbox {name} (its proxy, its namespace holder where the backend has one, and its runtime's services) and end its sessions"
+        ));
+    } else {
+        changes.push(format!("sandbox {name} is stopped: no service is stopped"));
+    }
+    changes.push(format!(
+        "run the {kind} updater in sandbox {name} under its active policy (v{policy})"
+    ));
+    changes.push(format!("record the version {kind} then reports"));
+    if installed {
+        changes.push(format!("start the services of sandbox {name} again"));
+    } else {
+        changes.push(format!(
+            "keep sandbox {name} stopped with no service installed"
+        ));
+    }
+    Plan {
+        changes,
+        ..Plan::default()
     }
 }
 
