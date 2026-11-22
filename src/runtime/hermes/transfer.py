@@ -4,8 +4,10 @@ The outer Enclos format treats this payload as opaque. Native installations,
 rebuildable caches and live process state do not belong to an agent export.
 """
 import io
+from contextlib import closing
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
@@ -54,8 +56,8 @@ def add_file(archive, source, name):
         # alone loses messages even after a gateway exits.
         with tempfile.TemporaryDirectory() as tmp:
             dst = Path(tmp) / 'state.db'
-            with sqlite3.connect(source.as_uri() + '?mode=ro', uri=True) as src:
-                with sqlite3.connect(dst) as out:
+            with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as src:
+                with closing(sqlite3.connect(dst)) as out:
                     src.backup(out)
             archive.add(dst, arcname=name, recursive=False)
     else:
@@ -80,7 +82,169 @@ class LimitedOutput:
     def tell(self): return self.size
 
 
+# tools.tool_result_storage._with_pointer emits an inline suffix or a
+# standalone text part; archive_list_for_summary appends a headed bullet list.
+# Bare cache paths in conversation prose are not durable pointers. Capture the
+# whole token before validating, so malformed real pointers cannot be truncated
+# to a safe-looking filename.
+PRUNED_POINTER = re.compile(r'(?: — full result: |^full result: )([^\s"<>]+)')
+ARCHIVE_LIST_HEADING = 'Archived tool output (exact originals; read_file a path to recover one):'
+
+
+def native_archive_paths(text):
+    yield from (match.group(1) for match in PRUNED_POINTER.finditer(text))
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != ARCHIVE_LIST_HEADING: continue
+        for bullet in lines[index + 1:]:
+            if not bullet.startswith('- '): break
+            yield bullet[2:]
+
+
+PRUNED_NAME = re.compile(r'[A-Za-z0-9_.-]+')
+RECALL_ENTRY = ('messages', 'bookend_start', 'bookend_end', 'match_message_id')
+
+
+# tools.session_search_tool stores display crops beside the full recovered
+# messages: _shape_message cuts content (content_truncated/original_content_chars)
+# and _derived_snippet windows a discovery entry's snippet. A crop may cut a
+# pointer, so it is display data: neither required nor rewritten.
+def recall_crops(item):
+    crops = set()
+    if item.get('content_truncated') is True and type(item.get('original_content_chars')) is int:
+        crops.add('content')
+    if 'session_id' in item and any(key in item for key in RECALL_ENTRY):
+        crops.add('snippet')
+    return {key for key in crops if isinstance(item.get(key), str)}
+
+
+# tools.session_search_tool _ok(mode=...) results: read/scroll messages and each
+# discover entry's messages and bookends, every one shaped by _shape_message.
+def recalled_messages(item):
+    if not isinstance(item, dict) or item.get('success') is not True:
+        return []
+    if item.get('mode') in {'read', 'scroll'} and isinstance(item.get('session_id'), str):
+        lists = [item.get('messages')]
+    elif item.get('mode') == 'discover' and isinstance(item.get('results'), list):
+        lists = [entry.get(key) for entry in item['results'] if isinstance(entry, dict) and isinstance(entry.get('session_id'), str)
+                 for key in ('messages', 'bookend_start', 'bookend_end')]
+    else:
+        return []
+    return [m for found in lists if isinstance(found, list) for m in found
+            if isinstance(m, dict) and isinstance(m.get('role'), str) and 'content' in m]
+
+
+def map_json(item, visit, recall=False, recalled=frozenset()):
+    """Apply visit(text, recall) to decoded JSON strings, leaving native crops unchanged."""
+    if isinstance(item, str): return visit(item, recall)
+    if isinstance(item, list): return [map_json(child, visit, recall, recalled) for child in item]
+    if isinstance(item, dict):
+        crops = recall_crops(item)
+        recalled = recalled | {id(m) for m in recalled_messages(item)}
+        return {key: child if key in crops else map_json(child, visit, recall or (key == 'content' and id(item) in recalled), recalled)
+                for key, child in item.items()}
+    return item
+
+
+# Native session_search reads another profile of this Hermes root (profile=,
+# @session:<profile>/<id>, root <-> named) and quotes that profile's genuine
+# pointers. Owner rule: inside recalled message content they are display text,
+# never required, read or rewritten, and that profile's files stay out.
+OTHER_HOME = re.compile(r'(?:profiles/[a-z0-9][a-z0-9_-]{0,63}/)?')  # hermes_constants.PROFILE_ID_RE
+
+
+def archive_pointers(text, origin, recall=False):
+    if not isinstance(text, str):
+        return []
+    # api_content is JSON text; decode it before examining display paths.
+    try:
+        value = json.loads(text.removeprefix('\x00json:'))
+    except (ValueError, TypeError):
+        value = None
+    if isinstance(value, (list, dict)):
+        result = []
+        map_json(value, lambda child, inner: result.extend(archive_pointers(child, origin, inner)), recall)
+        return result
+    result = []
+    for pointer in native_archive_paths(text):
+        if 'cache/pruned/' not in pointer:
+            continue
+        prefix, filename = pointer.rsplit('cache/pruned/', 1)
+        if PRUNED_NAME.fullmatch(filename) and filename not in {'.', '..'}:
+            hermes = origin.parts.index('.hermes')
+            own = {str(origin) + '/', '~/' + '/'.join(origin.parts[hermes:]) + '/'}
+            if prefix in own:
+                result.append((pointer, 'cache/pruned/' + filename))
+                continue
+            roots = (str(Path(*origin.parts[:hermes + 1])) + '/', '~/.hermes/')
+            if recall and any(prefix.startswith(root) and OTHER_HOME.fullmatch(prefix[len(root):]) for root in roots):
+                continue
+        raise ValueError('unsafe durable archive reference')
+    return result
+
+
+def message_archive_rows(dbfile):
+    with closing(sqlite3.connect(dbfile)) as db:
+        columns = {r[1] for r in db.execute('PRAGMA table_info(messages)')}
+        fields = [c for c in ('content', 'api_content') if c in columns]
+        if not fields: return []
+        return db.execute('SELECT ' + ','.join(fields) + ' FROM messages').fetchall()
+
+
+def checked_archive(profile, relative):
+    if any(parent.is_symlink() for parent in (profile, *profile.parents)):
+        raise ValueError('linked durable archive parent')
+    path = profile
+    for part in Path(relative).parts:
+        path = path / part
+        if path.is_symlink(): raise ValueError('linked durable archive')
+    if not path.is_file(): raise ValueError('missing durable archive')
+    return path
+
+
+def rewrite_archive_text(text, origin, destination, profile, referenced, recall=False):
+    if not isinstance(text, str): return text
+    prefix = '\x00json:' if text.startswith('\x00json:') else ''
+    try:
+        value = json.loads(text[len(prefix):])
+    except ValueError:
+        value = None
+    if isinstance(value, (dict, list)):
+        updated = map_json(value, lambda child, inner: rewrite_archive_text(child, origin, destination, profile, referenced, inner), recall)
+        return prefix + json.dumps(updated) if updated != value else text
+    for pointer, relative in archive_pointers(text, origin, recall):
+        checked_archive(profile, relative)
+        referenced.add(relative)
+        text = text.replace(pointer, str(destination / relative))
+    return text
+
+
+def relocate_archives(profile, origin, destination):
+    referenced = set()
+    dbfile = profile / 'state.db'
+    if dbfile.exists():
+        with closing(sqlite3.connect(dbfile)) as db:
+            columns = {r[1] for r in db.execute('PRAGMA table_info(messages)')}
+            for field in ('content', 'api_content'):
+                if field not in columns: continue
+                for rowid, text in db.execute('SELECT rowid,' + field + ' FROM messages').fetchall():
+                    updated = rewrite_archive_text(text, origin, destination, profile, referenced)
+                    if updated != text:
+                        db.execute('UPDATE messages SET ' + field + '=? WHERE rowid=?', (updated, rowid))
+            db.commit()
+    cache = profile / 'cache'
+    if cache.exists():
+        for file in cache.rglob('*'):
+            if file.is_file() and str(file.relative_to(profile)) not in referenced:
+                raise ValueError('unreferenced cache in agent data')
+
+
 def export(home, name, output, max_bytes=32 * 1024 * 1024 * 1024):
+    with tempfile.TemporaryDirectory() as temporary:
+        _export(home, name, output, max_bytes, Path(temporary))
+
+
+def _export(home, name, output, max_bytes, snapshots):
     root = home / '.hermes'
     profile = root if name == 'default' else root / 'profiles' / name
     if profile.is_symlink() or not profile.is_dir():
@@ -110,6 +274,19 @@ def export(home, name, output, max_bytes=32 * 1024 * 1024 * 1024):
             if key.parts[:2] == ('.local', 'bin') and len(key.parts) == 3 and key.name in runtime_commands:
                 continue
             selected['home/' + str(key)] = file
+    # Resolve references from the very same WAL-consistent snapshots we ship.
+    for key, file in list(selected.items()):
+        if key != 'profile/state.db': continue
+        with file.open('rb') as stream:
+            if stream.read(16) != b'SQLite format 3\0': continue
+        snapshot = snapshots / str(len(list(snapshots.iterdir())))
+        with closing(sqlite3.connect(file.as_uri() + '?mode=ro', uri=True)) as src:
+            with closing(sqlite3.connect(snapshot)) as dst: src.backup(dst)
+        selected[key] = snapshot
+        for row in message_archive_rows(snapshot):
+            for text in row:
+                for _, relative in archive_pointers(text, profile):
+                    selected['profile/' + relative] = checked_archive(profile, relative)
     meta = json.dumps({'format': FORMAT, 'home': str(home), 'profile': str(profile), 'agent': name}).encode()
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -150,7 +327,7 @@ def restore(home, name, source, context=None):
                     continue
                 if not path.parts or path.parts[0] not in {'profile', 'home', 'shared'} or len(path.parts) < 2:
                     raise ValueError('unknown runtime export entry')
-                if path.parts[0] in {'profile', 'shared'} and (path.parts[1] in RUNTIME or path.parts[1] in TRANSIENT):
+                if path.parts[0] in {'profile', 'shared'} and (path.parts[1] in RUNTIME or path.parts[1] in TRANSIENT) and not (path.parts[0] == 'profile' and len(path.parts) == 4 and path.parts[1:3] == ('cache', 'pruned') and PRUNED_NAME.fullmatch(path.name)):
                     raise ValueError('runtime installation or live state in agent data')
                 if path.parts[0] == 'home' and (path.parts[1] in HOME_SKIP or path.parts[1].startswith('.enclos-') or path.parts[1:3] == ('.local', 'lib') or path.parts[1:4] == ('.local', 'share', 'uv') or (path.parts[1:3] == ('.local', 'bin') and path.name in {'hermes', 'hermes-agent', 'hermes-acp', 'uv', 'uvx'}) or path.parts[1:3] == ('bin', 'mktemp')):
                     raise ValueError('runtime installation in shared data')
@@ -202,7 +379,7 @@ def restore(home, name, source, context=None):
         # Runtime-local session routing is owned here, never by the engine.
         mappings = context.get('conversations', {})
         for dbfile in profile.rglob('*.db'):
-            with sqlite3.connect(dbfile) as db:
+            with closing(sqlite3.connect(dbfile)) as db:
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if 'sessions' not in tables: continue
                 columns = {r[1] for r in db.execute('PRAGMA table_info(sessions)')}
@@ -212,6 +389,8 @@ def restore(home, name, source, context=None):
                             db.execute('UPDATE sessions SET ' + col + ' = replace(' + col + ',?,?) WHERE instr(' + col + ',?)>0', (old, new, old))
                 if 'profile_name' in columns:
                     db.execute('UPDATE sessions SET profile_name=?', (name,))
+                db.commit()
+        relocate_archives(profile, Path(metadata['profile']), destination)
         alias = home / '.local/bin' / name
         alias.parent.mkdir(parents=True, exist_ok=True)
         if alias.exists() or alias.is_symlink(): raise ValueError('destination command already exists')
