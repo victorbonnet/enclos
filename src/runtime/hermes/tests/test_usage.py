@@ -147,6 +147,58 @@ class UsageTests(unittest.TestCase):
         # s2: its title's row (4) and its counters beyond it (50 - 4).
         self.assertEqual(models[('gpt-5.5', 'openai')]['tokens']['input'], 50)
 
+    def test_each_chat_counts_whole_in_the_hour_of_its_last_activity_by_model(self):
+        db = self.db('default'); self.per_model(db)
+        rows = [
+            # Last active at 7300 (hour 7200), started hours before: counted at 7200.
+            ('s1', 'kanban', 'gpt', 'Card', 100, None, 7300, 3, 300, 30, 0, 0, 0, 0.0, None, 'included'),
+            # Ended, no last activity: its end, 3700, is in hour 3600.
+            ('s2', 'cli', 'flash', None, 3601, 3700, None, 1, 50, 5, 0, 0, 0, 0.01, None, 'estimated'),
+            # Out of the window: in no hour.
+            ('s3', 'cli', 'gpt', None, 10, 20, 20, 1, 1, 1, 0, 0, 0, 0.0, None, 'included'),
+        ]
+        db.executemany('insert into sessions values (' + ','.join('?' * 16) + ')', rows)
+        calls = [
+            ('s1', 'gpt', '', 2, 200, 20, 0, 0, 2, 0.0, 0.0, 'included'),
+            ('s1', 'big', '', 1, 90, 9, 0, 0, 0, 0.0, 0.0, 'included'),
+        ]
+        db.executemany('insert into session_model_usage values (' + ','.join('?' * 12) + ')', calls); db.commit()
+        default = self.run_reader(100, 'default')['default']
+        hours = [(h['at'], h['model'], h['calls'], h['tokens']['input']) for h in default['hours']]
+        # s1's gpt: its row and what its counters hold beyond its rows (300 - 290).
+        self.assertEqual(hours, [(3600, 'flash', 1, 50), (7200, 'big', 1, 90), (7200, 'gpt', 2, 210)])
+        # The hours add up to the models' totals.
+        self.assertEqual(sum(h['calls'] for h in default['hours']),
+                         sum(m['calls'] for m in default['models']))
+
+    def test_past_the_most_hours_the_oldest_are_each_summed_in_one_row_naming_no_model(self):
+        db = self.db('default')
+        rows = []
+        for i in range(6):
+            for model in ('a', 'b'):
+                rows.append(('s%d%s' % (i, model), 'cli', model, None, 0, None, i * 3600 + 1,
+                             1, 10, 1, 0, 0, 0, 0.0, None, 'included'))
+        db.executemany('insert into sessions values (' + ','.join('?' * 16) + ')', rows); db.commit()
+        with mock.patch.object(usage, 'MAX_HOURS', 8):
+            hours = self.run_reader(0, 'default')['default']['hours']
+        # Twelve rows down to eight: the four oldest hours each summed in one.
+        self.assertEqual([(h['at'], h['model'], h['calls']) for h in hours], [
+            (0, None, 2), (3600, None, 2), (7200, None, 2), (10800, None, 2),
+            (14400, 'a', 1), (14400, 'b', 1), (18000, 'a', 1), (18000, 'b', 1),
+        ])
+
+    def test_more_hours_than_the_most_rows_sum_the_oldest_in_one_and_keep_the_totals(self):
+        db = self.db('default')
+        rows = [('s%d' % i, 'cli', 'a', None, 0, None, i * 3600 + 1, 1, 10, 1, 0, 0, 0, 0.0, None, 'included')
+                for i in range(6)]
+        db.executemany('insert into sessions values (' + ','.join('?' * 16) + ')', rows); db.commit()
+        with mock.patch.object(usage, 'MAX_HOURS', 4):
+            hours = self.run_reader(0, 'default')['default']['hours']
+        # Six hours of one model in four rows: the three oldest summed in one.
+        self.assertEqual([(h['at'], h['model'], h['calls']) for h in hours],
+                         [(7200, None, 3), (10800, 'a', 1), (14400, 'a', 1), (18000, 'a', 1)])
+        self.assertEqual(sum(h['calls'] for h in hours), 6)
+
     def run_reader_again(self, since, *agents):
         self.out.unlink()
         return self.run_reader(since, *(agents or ('default',)))

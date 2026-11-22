@@ -54,6 +54,8 @@ mod policy;
 mod questions;
 #[path = "routines.rs"]
 mod routines;
+#[path = "runtime_usage.rs"]
+mod runtime_usage;
 #[path = "served.rs"]
 mod served;
 #[path = "task_board_proxy.rs"]
@@ -223,6 +225,9 @@ struct Hub {
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     task_boards: task_boards::TaskBoards,
+    /// The last read of what the agents' runtimes recorded of their usage
+    /// (issue #366).
+    runtime_usage: runtime_usage::RuntimeUsage,
     /// Task details asked of plugins for devices.
     task_details: Mutex<task_details::TaskDetailRequests>,
     /// One lock per agent, held while its plugin connection opens, never
@@ -534,6 +539,7 @@ impl Hub {
             open_item_devices: Mutex::new(HashSet::new()),
             held_tasks: Mutex::new(Default::default()),
             task_boards: task_boards::TaskBoards::default(),
+            runtime_usage: Default::default(),
             task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
@@ -3036,8 +3042,20 @@ fn run_session(
                                 prices.override_file.display()
                             );
                         }
+                        // For the host's person, every call the agents'
+                        // runtimes recorded, as `enclos usage` shows them
+                        // (issue #366): board work too, which no plugin
+                        // reports.
+                        let runtime = match outside {
+                            true => hub.runtime_hours(&authority::device_actor(
+                                person,
+                                &device.id,
+                                Some(&message.id.to_string()),
+                            )),
+                            false => None,
+                        };
                         store
-                            .usage_report(
+                            .usage_report_with(
                                 &crate::bridge::store::WindowAsk {
                                     owner: Some(person),
                                     since,
@@ -3047,12 +3065,17 @@ fn run_session(
                                     sum: scope != crate::bridge::store::Scope::Host,
                                 },
                                 &prices.list,
+                                runtime.as_deref(),
                             )
                             .and_then(|window| {
-                                let reporters = match outside {
+                                let mut reporters = match outside {
                                     true => store.outside_reporters()?,
                                     false => Vec::new(),
                                 };
+                                // Read from its records: every call counted.
+                                if let Some(runtime) = &runtime {
+                                    reporters.extend(runtime.agents.iter().cloned());
+                                }
                                 Ok((window, reporters))
                             })
                     }

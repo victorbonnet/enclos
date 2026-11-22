@@ -183,6 +183,25 @@ impl Engine {
         self.run_in_sandbox_as(by, name, command, audit_name, kind, Some(deadline))
     }
 
+    /// [`Engine::run_exec_in_sandbox_within`] for a long-running process
+    /// that does not handle signals itself, such as the app's bridge: a
+    /// Ctrl-C, Ctrl-\\, hangup or TERM it receives while the command runs
+    /// is passed on as usual, then, once the session's end is recorded,
+    /// ends this process as that signal would have, rather than being
+    /// taken by the wait.
+    pub(super) fn run_exec_in_sandbox_then_signalled(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        deadline: Instant,
+    ) -> Result<(SessionEnd, bool)> {
+        let kind = CommandKind::Exec;
+        let at = Some(deadline);
+        self.run_in_sandbox_signalled(by, name, command, audit_name, kind, at, true)
+    }
+
     /// [`Engine::run_in_sandbox`], told to end at `deadline`, as `launch`
     /// is when its service stops: every member of the session is stopped,
     /// TERM then KILL, whatever its process group, and so is what it left
@@ -211,6 +230,23 @@ impl Engine {
         audit_name: &str,
         kind: CommandKind,
         deadline: Option<Instant>,
+    ) -> Result<(SessionEnd, bool)> {
+        self.run_in_sandbox_signalled(by, name, command, audit_name, kind, deadline, false)
+    }
+
+    /// [`Engine::run_in_sandbox_as`]; with `then_end`, a signal this
+    /// process received while it waited then ends it
+    /// ([`Engine::run_exec_in_sandbox_then_signalled`]).
+    #[allow(clippy::too_many_arguments)]
+    fn run_in_sandbox_signalled(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        kind: CommandKind,
+        deadline: Option<Instant>,
+        then_end: bool,
     ) -> Result<(SessionEnd, bool)> {
         let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
@@ -244,11 +280,16 @@ impl Engine {
         // it hears the terminal's signals itself, but not a TERM sent to
         // this process alone, which is passed on to the program.
         let pgid = child.id();
+        // Every signal received, for `then_end`.
+        let mut heard = Vec::new();
         let mut pass_on = |notes: &mut Vec<String>| {
             if deadline.is_some_and(|at| Instant::now() >= at) {
                 ended.store(true, Ordering::Relaxed);
             }
             for signal in keep_waiting.received() {
+                if !heard.contains(&signal) {
+                    heard.push(signal);
+                }
                 let sent = match (group, signal) {
                     (Group::Own, _) => signal_group(&session.root, pgid, signal),
                     (_, Signal::Term) => signal_process(&session.root, signal),
@@ -265,6 +306,12 @@ impl Engine {
         };
         let waited =
             self.wait_session(&session, &mut child, deadline.map(|_| &ended), &mut pass_on);
+        // Ends this process, as the first signal it heard would have, once
+        // the session's end is recorded (or could not be), on every return.
+        let _then_end = ThenEnd(match then_end {
+            true => heard.first().copied(),
+            false => None,
+        });
         let timed_out = ended.load(Ordering::Relaxed);
         let why = timed_out.then_some("stopped at its time limit");
         let mut waited = match (waited, why) {
@@ -775,6 +822,32 @@ pub(super) fn spoken(limit: Duration) -> String {
 }
 
 struct KeepWaiting(Vec<(Signal, Arc<AtomicBool>, signal_hook::SigId)>);
+
+/// Ends this process when dropped, as the signal it holds would by
+/// default ([`Engine::run_exec_in_sandbox_then_signalled`]).
+struct ThenEnd(Option<Signal>);
+
+impl Drop for ThenEnd {
+    fn drop(&mut self) {
+        let Some(signal) = self.0 else {
+            return;
+        };
+        let number = match signal {
+            Signal::Int => SIGINT,
+            Signal::Quit => SIGQUIT,
+            Signal::Hup => SIGHUP,
+            Signal::Term => SIGTERM,
+            _ => return,
+        };
+        eprintln!(
+            "enclos: ending on {}, received while a session ran",
+            signal.name()
+        );
+        // The handler `KeepWaiting` registered stays installed, doing
+        // nothing: the default action is run instead.
+        let _ = signal_hook::low_level::emulate_default_handler(number);
+    }
+}
 
 impl KeepWaiting {
     fn new() -> Result<Self> {
