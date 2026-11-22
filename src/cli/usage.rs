@@ -120,7 +120,7 @@ fn by_day(
     agent: Option<&str>,
     since: jiff::Timestamp,
 ) -> Result<u8> {
-    let offset = jiff::Zoned::now().offset().seconds();
+    let offset = jiff::ZonedDateTime::now().offset().seconds();
     // Whole days: from the start of the host's day that holds the
     // window's start, so the first row is not part of one.
     let since = day_start(since, offset);

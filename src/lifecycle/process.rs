@@ -441,10 +441,10 @@ mod tests {
         let started = start_time(child.id()).unwrap().unwrap();
         let read = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", &started)
             .unwrap()
-            .to_zoned(jiff::tz::TimeZone::UTC)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .unwrap()
             .timestamp();
-        let off = (jiff::Timestamp::now() - read).get_seconds().abs();
+        let off = (jiff::Timestamp::now() - read).as_secs().abs();
         assert!(off < 60, "{started} is {off}s away from now in UTC");
         let _ = child.kill();
         let _ = child.wait();
