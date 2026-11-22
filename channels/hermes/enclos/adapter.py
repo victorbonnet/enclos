@@ -31,13 +31,14 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
 from . import conversations
+from . import incoming
 from . import lines, protocol
 from .outbox import Outbox
 from . import approvals
 from . import decisions
 from . import asks
 from . import held_tasks
-from . import model
+from . import model, image_eligibility
 from . import routines
 from . import questions
 from . import suggested_replies
@@ -74,6 +75,10 @@ def validate_config(config) -> bool:
     return bool(_setting(config, "socket", "MOBILE_APP_SOCKET") and _setting(config, "token", "MOBILE_APP_TOKEN"))
 
 
+class FileAdmissionRefused(Exception):
+    """The native ingress definitively did not admit this delivery."""
+
+
 class EnclosAdapter(BasePlatformAdapter):
     # Defaults for an adapter that did not run `__init__` (enclos's tests build
     # it with EnclosAdapter.__new__): no kanban pings to tell apart, and a
@@ -108,6 +113,11 @@ class EnclosAdapter(BasePlatformAdapter):
         # Whether a failure to read a session's title was logged at info already.
         self._title_failure_told = False
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
+        # The files a person sends with a message, written beside the socket
+        # (ADR 0076, proposed).
+        self._incoming = incoming.Receiver(self._path, self._agent, capture_only=True)
+        self._incoming_cleanup = None
+        self._incoming_cleanup_pass = None
         # Work beside the connection (routine controls, deletions, the report
         # after a hello), kept so that none is collected early.
         self._routine_tasks: set[asyncio.Task] = set()
@@ -167,6 +177,7 @@ class EnclosAdapter(BasePlatformAdapter):
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
+        self._incoming_cleanup = asyncio.create_task(self._expire_incoming())
         self._mark_connected()
         self._loop = asyncio.get_running_loop()
         _ADAPTERS.add(self)
@@ -180,7 +191,31 @@ class EnclosAdapter(BasePlatformAdapter):
         logger.info("[%s] Listening for the bridge", self.name)
         return True
 
+    async def _expire_incoming(self):
+        while True:
+            try:
+                self._incoming_cleanup_pass = asyncio.create_task(asyncio.to_thread(self._incoming.cleanup))
+                await asyncio.shield(self._incoming_cleanup_pass)
+            except Exception:
+                logger.exception("Incoming expiry pass failed")
+            await asyncio.sleep(60)
+
     async def disconnect(self) -> None:
+        if self._incoming_cleanup is not None:
+            self._incoming_cleanup.cancel()
+            await asyncio.gather(self._incoming_cleanup, return_exceptions=True)
+            self._incoming_cleanup = None
+        if self._incoming_cleanup_pass is not None:
+            # Cancellation of to_thread does not join its worker. Keep ownership
+            # on timeout and fail before lifecycle teardown; a caller may retry.
+            await asyncio.wait_for(asyncio.shield(self._incoming_cleanup_pass), 5)
+            self._incoming_cleanup_pass = None
+        admissions = tuple(getattr(self, "_native_admissions", ()))
+        if admissions:
+            # Join actual capture/admission, even if its original waiter was
+            # cancelled. Timeout preserves ownership and defers resource teardown.
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*admissions)), 5)
         _ADAPTERS.discard(self)
         self._interrupts.close()
         await self._reporter.stop()
@@ -257,6 +292,10 @@ class EnclosAdapter(BasePlatformAdapter):
             if self._pings is not None:
                 capabilities.append("task_events")
             capabilities.extend(self._reporter.capabilities)
+            if self._files_available():
+                capabilities.append("incoming_files")
+                if await asyncio.to_thread(self._images_available):
+                    capabilities.append("incoming_images")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
@@ -303,6 +342,8 @@ class EnclosAdapter(BasePlatformAdapter):
         finally:
             # Only the connection that holds the slot gives it back
             if self._bridge is writer:
+                # A message whose bytes did not all come: the bridge sends it again
+                self._incoming.drop()
                 self._held.stop()
                 self._bridge = None
                 self._bridge_usage = False
@@ -356,6 +397,10 @@ class EnclosAdapter(BasePlatformAdapter):
             message = protocol.decode_from_bridge(line)
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), e.message_id))
+            # A line unread, a bad part or any other, drops the message with files whole
+            dropped = self._incoming.drop()
+            if dropped is not None:
+                await self._write(protocol.error("bad_message", "a line could not be read during its files", dropped))
             # A version this plugin does not speak ends the connection
             # (docs/protocol.md, Errors); any other bad message does not
             return e.code != "version"
@@ -369,7 +414,22 @@ class EnclosAdapter(BasePlatformAdapter):
             approvals.save_context(self._path, message["text"])
             await self._write(protocol.ack(message["id"]))
         elif kind == "message.in":
-            await self._on_message(message)
+            if message.get("files") and message["id"] not in self._seen:
+                # Given to the runtime once its files' last byte came
+                try:
+                    self._incoming.begin(message)
+                except incoming.Refused as e:
+                    await self._write(protocol.error(e.code, str(e), e.message_id))
+            else:
+                await self._on_message(message)
+        elif kind == "message.part":
+            try:
+                received = self._incoming.part(message)
+            except incoming.Refused as e:
+                await self._write(protocol.error(e.code, str(e), e.message_id))
+                return True
+            if received is not None:
+                await self._on_message(received[0], received[1:])
         elif kind == "turn.abort":
             try:
                 await self._interrupts.abort(message)
@@ -453,7 +513,9 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.error("[%s] A model request could not answer", self.name, exc_info=True)
             await self._write(protocol.error("unknown", model.UNKNOWN, message["id"]))
 
-    async def _on_message(self, message: dict[str, Any]) -> None:
+    async def _on_message(self, message: dict[str, Any], media: Optional[tuple] = None) -> None:
+        """Gives the runtime a person's message; `media` is its files' paths in
+        the sandbox, their media types and their names, when it has files."""
         if message["id"] in self._seen:
             # The runtime has it: the ack was lost on the way
             await self._write(protocol.ack(message["id"]))
@@ -461,16 +523,40 @@ class EnclosAdapter(BasePlatformAdapter):
         # enclos keeps the home channel (the agent's Home): /sethome is
         # answered here, not run, which would move it into this conversation.
         if protocol.is_home_command(message["text"]):
-            await self.send(message["conversation"], protocol.HOME_ANSWER, reply_to=message["id"])
+            # The bridge refuses files with it; any that came are said to go nowhere
+            answer = protocol.HOME_ANSWER + (" The files sent with it were not given to the agent." if media else "")
+            await self.send(message["conversation"], answer, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
         self._last_in[message["conversation"]] = (message["id"], asyncio.get_running_loop().time())
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
-        event = MessageEvent(
-            text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
-            raw_message=message, timestamp=datetime.now(tz=UTC))
+        if media and any(t.startswith("image/") for t in media[1]) and not await self._conversation_images_available(source):
+            await self._write(protocol.error("unsupported", "This conversation cannot receive images.", message["id"]))
+            return
+        if media:
+            # As Hermes's own platforms hand it media: paths it reads, each with
+            # its type, so a photo goes to vision and a document is noted by path
+            paths, types, names = media
+            kind = MessageType.PHOTO if any(t.startswith("image/") for t in types) else MessageType.DOCUMENT
+            event = MessageEvent(
+                text=message["text"], message_type=kind, source=source, message_id=message["id"],
+                # The bridge supplies no producer timestamp. Native receipts hash
+                # this field: use the producer contract's epoch convention so
+                # a lost ACK/restart reconstructs the same immutable request.
+                raw_message=message, timestamp=datetime.fromtimestamp(0, tz=UTC),
+                media_urls=list(paths), media_types=list(types))
+            if hasattr(event, "media_filenames"):
+                # A newer Hermes shows the person's own names
+                event.media_filenames = list(names)
+            if hasattr(event, "media_text_inlined"):
+                # None of their text is in `text`: unflagged, Hermes says it is
+                event.media_text_inlined = [False] * len(paths)
+        else:
+            event = MessageEvent(
+                text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
+                raw_message=message, timestamp=datetime.now(tz=UTC))
         # Hermes reads its approval commands from whoever it is told speaks, and a
         # message carries no proof of its person: `host` is the bridge's word, which
         # any program with the token can send. So none is passed on, read with
@@ -505,19 +591,105 @@ class EnclosAdapter(BasePlatformAdapter):
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), message["id"]))
             return
+        if media:
+            self._incoming.admit(event.media_urls)
         try:
-            await self.handle_message(event)
+            if media:
+                await self._admit_files(event)
+            else:
+                await self.handle_message(event)
+        except FileAdmissionRefused:
+            self._interrupts.complete(event)
+            await self._write(protocol.error("unsupported", "The files could not be saved for the agent.", message["id"]))
+            return
         except BaseException:
             self._interrupts.complete(event)
             raise
         if getattr(event, "_gateway_accepted", True) is False:
             self._interrupts.complete(event)
+            if media:
+                self._incoming.release(event.media_urls)
         # Only once the runtime has it: if handle_message raised, the bridge
         # sends it again and it must not read as a duplicate
         self._seen[message["id"]] = None
         while len(self._seen) > SEEN_MESSAGES:
             self._seen.popitem(last=False)
         await self._write(protocol.ack(message["id"]))
+
+    def _files_available(self):
+        try:
+            from gateway.platforms.webhook_ingress import admit_producer
+            return callable(admit_producer)
+        except ImportError:
+            return False
+
+    async def _admit_files(self, event):
+        # Receipt ingress captures independent immutable bytes before committing.
+        # Handler return alone never establishes consumption of staging paths.
+        paths = list(event.media_urls)
+        async def admission():
+            # Shield the entire capture, including its off-loop worker: cancellation
+            # must not make staging collectible while the worker is still reading.
+            try:
+                from gateway.session_authority import native_write_started
+                native_write_started.set(False)
+                from gateway.platforms.webhook_ingress import admit_producer
+                receipt = await admit_producer(self, event)
+            except ImportError as error:
+                # Once ingress is called, even an import error can follow a write.
+                if 'admit_producer' in locals():
+                    raise
+                self._incoming.release(paths)
+                raise FileAdmissionRefused() from error
+            except OSError:
+                # Prepared ingress restores its ContextVar on exit. A false
+                # marker here cannot prove that a write never started.
+                raise
+            except Exception as error:
+                from importlib.util import find_spec
+                if find_spec("persistence_assembly") is not None:
+                    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
+                else:
+                    from hermes_state_runtime import RuntimeStoreError
+                if isinstance(error, RuntimeStoreError) and not native_write_started.get():
+                    self._incoming.release(paths)
+                    raise FileAdmissionRefused() from error
+                # Unknown errors may follow a commit. Retain the diagnostic
+                # marker; never announce definite failure.
+                raise
+            try:
+                if receipt is not None:
+                    self._incoming.captured(paths, receipt)
+                else:
+                    self._incoming.release(paths)
+            except OSError:
+                logger.warning("[%s] Admission completed; staging marker could not be saved", self.name)
+            return receipt
+
+        task = asyncio.create_task(admission())
+        tasks = getattr(self, "_native_admissions", None)
+        if tasks is None:
+            tasks = self._native_admissions = set()
+        tasks.add(task)
+        def finished(done):
+            tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # observe errors even after the caller disconnects
+                self._incoming.admission_ended(paths)
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _conversation_images_available(self, source):
+        try:
+            from gateway.platforms.webhook_ingress import producer_scope
+            from types import SimpleNamespace
+            async with producer_scope(self, SimpleNamespace(source=source)):
+                return await asyncio.to_thread(self._images_available, source)
+        except Exception:
+            return False
+
+    def _images_available(self, source=None):
+        return image_eligibility.available(self, source)
 
     def _interrupt_session_key(self, event) -> str:
         from gateway.session import build_session_key
@@ -596,6 +768,7 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome) -> None:
         self._interrupts.complete(event)
+        self._incoming.release(getattr(event, "media_urls", None))
         native_hook = getattr(super(), "on_processing_complete", None)
         if callable(native_hook):
             await native_hook(event, outcome)

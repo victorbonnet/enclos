@@ -1,0 +1,177 @@
+[
+  {
+    "name": "report.pdf",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "گزارش.pdf",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "می‌خواهم.pdf",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "👨‍👩.jpg",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "☀️.jpg",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "日本語.txt",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "é.txt",
+    "accepted": true,
+    "description": "ordinary visible filename"
+  },
+  {
+    "name": "",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": ".",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "..",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": " ",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": " a.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a.txt ",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a/b",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a\\b",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a\u0000.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a‮.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a​.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a‌ب.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "ب‍a.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "‌ب.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "ب‌",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "ب‌‍ب.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a️.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "️ب.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": " a.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a.txt　",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "a\u001c.txt",
+    "accepted": false,
+    "description": "empty, path, trim or hidden character"
+  },
+  {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "accepted": true,
+    "description": "120 scalars"
+  },
+  {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "accepted": false,
+    "description": "121 scalars"
+  },
+  {
+    "name": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+    "accepted": true,
+    "description": "255 bytes"
+  },
+  {
+    "name": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界éé",
+    "accepted": false,
+    "description": "256 bytes"
+  },
+  {
+    "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "accepted": true,
+    "description": "120 scalars under byte limit"
+  }
+]

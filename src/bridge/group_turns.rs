@@ -510,6 +510,8 @@ impl Hub {
                     person,
                     text: text.to_owned(),
                     host: Some(host),
+                    // A group refuses files (ADR 0076), so a turn has none.
+                    files: Vec::new(),
                     // A group turn is never the host's person's alone, so
                     // never signed: it grants no owner authority (ADR 0077).
                     signed: None,

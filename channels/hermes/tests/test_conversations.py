@@ -17,7 +17,7 @@ class NativeDeletion(unittest.IsolatedAsyncioTestCase):
                                       resolve=AsyncMock(return_value=types.SimpleNamespace(execution_state="idle", execution_generation=4)),
                                       cancel_queued=AsyncMock(), interrupt=AsyncMock(), _pending_rows=lambda ref: [])
         adapter = types.SimpleNamespace(name="enclos", _routines=types.SimpleNamespace(home_channel="home.lab.main"),
-                                        _write=AsyncMock(), _title_checks={}, _titles={"chat": "Title"}, _last_in={"chat": ("m", 0)})
+                                        _write=AsyncMock(), _incoming=types.SimpleNamespace(cleanup=Mock()), _title_checks={}, _titles={"chat": "Title"}, _last_in={"chat": ("m", 0)})
         ref = lambda profile, sid: types.SimpleNamespace(profile_id=profile, session_id=sid)
         cleaned = Mock()
         mutate = AsyncMock(return_value={"deleted_ids": ["session", "compressed"]})
@@ -42,6 +42,7 @@ class NativeDeletion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._write.await_args.args[0]["type"], "ack")
         self.assertNotIn("chat", adapter._titles)
         self.assertNotIn("chat", adapter._last_in)
+        adapter._incoming.cleanup.assert_called_once_with(conversation="chat")
 
     async def test_native_refusal_never_acknowledges_and_already_absent_chat_is_idempotent(self):
         adapter, owner, mutate, cleaned, modules = self.fixture()
@@ -54,6 +55,7 @@ class NativeDeletion(unittest.IsolatedAsyncioTestCase):
             reply = adapter._write.await_args.args[0]
             self.assertEqual((reply["type"], reply["code"], reply["of"]), ("error", "conflict", "request"))
             cleaned.assert_not_called()
+            adapter._incoming.cleanup.assert_not_called()
             self.assertIn("chat", adapter._titles)
             owner.db.get_session.return_value = None
             await conversations.handle(adapter, {"id": "retry", "conversation": "chat"})

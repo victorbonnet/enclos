@@ -222,11 +222,13 @@ fn a_message_reads_as_its_fields_say() {
         person,
         text,
         host,
+        files,
         signed,
     } = message.body
     else {
         panic!("not a message.in: {:?}", message.body);
     };
+    assert!(files.is_empty(), "a message.in without files has none");
     assert_eq!(conversation.as_str(), "c-42");
     assert_eq!(person.as_str(), "alice@example.com");
     assert_eq!(text, "What's the weather in Paris?");
@@ -373,6 +375,26 @@ fn a_message_reads_as_its_fields_say() {
         ),
         ("image/png", "unicorn.png", 1_962_976)
     );
+}
+
+#[test]
+fn a_message_in_carries_files_or_a_signature_each_optional() {
+    // With files (ADR 0076), as the bridge sends them, unsigned.
+    let with_files = br#"{"v":1,"id":"m-1","type":"message.in","conversation":"c-42","person":"alice@example.com","text":"look","host":true,"files":[{"name":"a.txt","mime":"text/plain","size":2}]}"#;
+    let message = decode_from_bridge(with_files).unwrap();
+    let FromBridge::MessageIn { files, signed, .. } = &message.body else {
+        panic!("not a message.in: {:?}", message.body);
+    };
+    assert_eq!((files.len(), signed), (1, &None));
+    assert_eq!(json(&encode_line(&message)), json(with_files));
+    // Signed (ADR 0077), with no files.
+    let signed_only = br#"{"v":1,"id":"m-2","type":"message.in","conversation":"c-42","person":"alice@example.com","text":"hi","host":true,"signed":{"at":1767225600,"sig":"AAAA"}}"#;
+    let message = decode_from_bridge(signed_only).unwrap();
+    let FromBridge::MessageIn { files, signed, .. } = &message.body else {
+        panic!("not a message.in: {:?}", message.body);
+    };
+    assert!(files.is_empty() && signed.is_some());
+    assert_eq!(json(&encode_line(&message)), json(signed_only));
 }
 
 #[test]
