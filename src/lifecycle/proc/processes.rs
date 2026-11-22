@@ -101,7 +101,7 @@ fn started(boot: u64, ticks: u64, per_second: u64) -> Result<String, PsError> {
         .and_then(|s| Timestamp::from_second(s).ok())
         .ok_or_else(|| PsError::Proc(format!("a start time of {seconds} s is out of range")))?;
     Ok(at
-        .to_zoned(TimeZone::UTC)
+        .to_zoned_datetime(TimeZone::UTC)
         .strftime("%a %b %-d %H:%M:%S %Y")
         .to_string())
 }
