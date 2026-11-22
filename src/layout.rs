@@ -20,6 +20,11 @@ pub const AGENT_SECRETS_SUFFIX: &str = ".env";
 /// ([`Layout::app_media`]).
 pub const APP_MEDIA_DIR: &str = "app-media";
 
+/// The bridge's per-fetch copies of sandbox artefacts, beside its database
+/// (ADR 0078, proposed): removed with the fetch and swept when the bridge
+/// starts.
+pub const APP_ARTEFACT_COPIES_DIR: &str = "app-artefact-copies";
+
 /// The side database of diagnostic provenance (ADR 0059), beside
 /// `state.db` ([`Layout::probe_sources`]).
 pub const PROBE_SOURCES_FILE: &str = "probe-sources.db";

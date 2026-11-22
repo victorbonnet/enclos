@@ -203,7 +203,7 @@ A conversation between one person and several agents of one sandbox, which the b
 _Avoid_: room (Hermes's word), channel (a messaging account), team
 
 **Artefact**:
-A page an agent makes for a person to open in the app from its conversation.
+A file an agent makes for a person to open in the app.
 _Avoid_: artifact, app (for a generated page)
 
 **Agent photo**:

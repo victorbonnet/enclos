@@ -27,6 +27,8 @@ mod task_event_tests;
 mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "artefacts.rs"]
+mod artefacts;
 #[path = "audit.rs"]
 mod audit;
 #[path = "authority.rs"]
@@ -267,6 +269,9 @@ struct Hub {
     waiting: AtomicUsize,
     /// Refusals logged per caller address in the current minute.
     refusals: Mutex<HashMap<String, (i64, u32)>>,
+    /// Artefact walk refusals already written to stderr during this bridge
+    /// run, keyed by `(sandbox, file, reason)` so repeated walks stay quiet.
+    artefact_refusals: Mutex<HashSet<String>>,
     silence: Duration,
     /// The key the bridge signs each runtime-approval decision with (ADR
     /// 0060, proposed), which the plugin checks; without it the bridge
@@ -547,6 +552,7 @@ impl Hub {
             presentation_revisions: Mutex::new(HashMap::new()),
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
+            artefact_refusals: Mutex::new(HashSet::new()),
             silence,
             approval_key: None,
             push: None,
@@ -680,6 +686,13 @@ impl Hub {
     /// beside its database.
     fn media(&self) -> std::path::PathBuf {
         self.store_path.with_file_name(crate::layout::APP_MEDIA_DIR)
+    }
+
+    /// Where the bridge keeps per-fetch copies of sandbox artefacts: beside
+    /// its database, removed with the fetch and swept when the bridge starts.
+    fn artefact_copies(&self) -> std::path::PathBuf {
+        self.store_path
+            .with_file_name(crate::layout::APP_ARTEFACT_COPIES_DIR)
     }
 
     /// Sends `message` to every connected device of `person`.
@@ -2095,6 +2108,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     if let Ok(store) = hub.store() {
         sweep_incoming(&store, &hub.media());
     }
+    artefacts::sweep_copies(&hub.artefact_copies());
     let retrying = Arc::clone(&hub);
     std::thread::spawn(move || {
         loop {
@@ -2938,6 +2952,9 @@ fn run_session(
     // The message with files being sent on this connection: dropped, with
     // its files, when the connection ends first.
     let mut upload: Option<incoming::Upload> = None;
+    // The artefact copy being fetched on this connection: dropped, removing
+    // its file, when the connection ends or another fetch starts.
+    let mut artefact_fetch: Option<artefacts::FetchCopy> = None;
     loop {
         if link.heard.elapsed() > hub.silence {
             return Err(SILENT.to_owned());
@@ -3750,6 +3767,24 @@ fn run_session(
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
             }
+            FromDevice::Artefacts { sandbox } => {
+                artefacts::list(hub, link, &sandbox, message.id)?;
+            }
+            FromDevice::ArtefactGet {
+                sandbox,
+                artefact,
+                offset,
+            } => {
+                artefacts::get(
+                    hub,
+                    link,
+                    &mut artefact_fetch,
+                    &sandbox,
+                    &artefact,
+                    offset,
+                    message.id,
+                )?;
+            }
             FromDevice::PushTokenUpdate(push) => {
                 if let Some(token) = kept_token(store, &device.id, person, push) {
                     store
@@ -3917,6 +3952,11 @@ const INCOMING: &str = ".incoming";
 /// home: `.enclos-app/media`, beside its socket
 /// (`Layout::agent_app_socket`).
 const INBOX: [&str; 2] = [".enclos-app", "media"];
+
+/// Where any process of a sandbox may drop files for the bridge to publish
+/// to paired devices (ADR 0078, proposed): `.enclos-app/artefacts`, beside
+/// the plugin's `media` folder.
+const ARTEFACTS: [&str; 2] = [".enclos-app", "artefacts"];
 
 /// The sandbox home of an agent's app socket, which is
 /// `<sandbox home>/.enclos-app/<agent>.sock`.
@@ -4739,6 +4779,8 @@ mod connection_end_tests {
     const PERSON: &str = "victor@example.com";
     const TOKEN: &str = "t0ken";
 
+    #[path = "../../artefacts_tests.rs"]
+    mod artefacts_tests;
     mod incoming_tests;
 
     /// A bridge on a free port of the loopback, serving `lab/main`, whose
