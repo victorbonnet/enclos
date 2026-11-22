@@ -414,7 +414,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
 
   # enclos-protocol also builds into the Android app (victorbonnet/enclos-app):
   # catch a dependency that does not build for Android here, first
@@ -481,7 +481,7 @@ jobs:
       # Hermes installs with uv, as Hermes itself does: from its own lock and
       # the overrides in its `[tool.uv]` (pip cannot resolve its pins without
       # them), with the Python its `.python-version` names.
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - run: uv sync --frozen --no-dev --project hermes-agent
       # `shell: bash` adds pipefail: without it the step took tee's status,
       # and passed while tests failed. No test may skip here: the summary
