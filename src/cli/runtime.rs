@@ -437,7 +437,8 @@ fn update(
         ));
     }
     if !end.succeeded {
-        eprintln!("enclos: {}", failure_message());
+        let message = failure_message();
+        eprintln!("enclos: {message}");
         return Ok(exit::ERROR);
     }
     let services_semi = match end.services {
