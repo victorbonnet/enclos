@@ -437,8 +437,24 @@ fn update(
         ));
     }
     if !end.succeeded {
-        let message = failure_message();
-        eprintln!("enclos: {message}");
+        // What the updater said about its own ending, and the path of its log,
+        // are both values the engine hands back — and the `Engine` is the
+        // object that holds the policy's secrets, so CodeQL's
+        // cleartext-logging analysis takes every value derived from it as
+        // secret-bearing when one reaches a log. Stderr therefore names
+        // neither: the updater's own output, streamed above as A7 has it, says
+        // why it stopped, `enclos logs` keeps and shows the log, and the JSON
+        // document still carries the path (`log`) and how the session ended
+        // (`session`, `stopped_after`) for the bridge and the phone.
+        let services_clause = match end.services {
+            ServicesAfter::StartedAgain => {
+                "The sandbox's services are running again on what the updater left."
+            }
+            ServicesAfter::NotInstalled => "No service was installed (the sandbox was stopped).",
+        };
+        eprintln!(
+            "enclos: the {shown} updater did not finish in sandbox {sandbox}; its output above says why, and `enclos logs {sandbox}` keeps it. {services_clause} There is no rollback: fix the cause, then run `enclos runtime update {sandbox}` again."
+        );
         return Ok(exit::ERROR);
     }
     let services_semi = match end.services {
