@@ -880,3 +880,150 @@ fn a_file_the_limits_exclude_is_not_served_by_its_id() {
         other => panic!("expected artefact.data once room appears, got {other:?}"),
     }
 }
+
+/// Pins that the artefacts read path follows `Hub::sees_agent`, not
+/// `Hub::serves`: fails if the `sees_agent` filter in `served_sandbox_home`
+/// is removed or if `person` stops being threaded through `list`/`get`. This
+/// test is the only reader of `Hub::show_to`.
+#[test]
+fn the_folder_a_person_is_shown_follows_the_audience_rule_not_what_the_bridge_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ep_lab, dir_lab) = sandbox_endpoint(dir.path(), "lab", "main");
+    let (ep_beta, dir_beta) = sandbox_endpoint(dir.path(), "beta", "main");
+    std::fs::create_dir_all(&dir_lab).unwrap();
+    std::fs::create_dir_all(&dir_beta).unwrap();
+    std::fs::write(dir_lab.join("lab.txt"), b"from-lab").unwrap();
+    std::fs::write(dir_beta.join("beta.txt"), b"from-beta").unwrap();
+
+    let b = bridge_for(dir.path(), vec![ep_lab, ep_beta]);
+    assert!(b.hub.serves("lab/main"));
+    assert!(b.hub.serves("beta/main"));
+    b.hub.show_to("victor@example.com", ["lab/main"]);
+    b.hub.show_to("guest@example.com", ["beta/main"]);
+    assert!(b.hub.sees_agent("victor@example.com", "lab/main"));
+    assert!(!b.hub.sees_agent("victor@example.com", "beta/main"));
+    assert!(!b.hub.sees_agent("guest@example.com", "lab/main"));
+    assert!(b.hub.sees_agent("guest@example.com", "beta/main"));
+
+    // Host's person (victor@example.com) sees lab, not beta.
+    let phone = paired(&b, "n-pixel");
+    let (mut device, first) = connect(&b, &phone);
+    assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+
+    device.send(
+        "v-lab-list",
+        FromDevice::Artefacts {
+            sandbox: "lab".into(),
+        },
+    );
+    let (_, lab_files, _) = receive_list(&mut device, "v-lab-list");
+    assert_eq!(lab_files.len(), 1);
+    assert_eq!(lab_files[0].name, "lab.txt");
+
+    device.send(
+        "v-lab-get",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: lab_files[0].id.clone(),
+            offset: 0,
+        },
+    );
+    match device.receive().expect("artefact.data") {
+        ToDevice::ArtefactData { data, .. } => {
+            assert_eq!(decode("data", &data).unwrap(), b"from-lab");
+        }
+        other => panic!("expected artefact.data for lab, got {other:?}"),
+    }
+
+    device.send(
+        "v-beta-list",
+        FromDevice::Artefacts {
+            sandbox: "beta".into(),
+        },
+    );
+    match device.receive().expect("error") {
+        ToDevice::Error(err) => {
+            assert_eq!(err.code, ErrorCode::NotAllowed);
+            assert_eq!(err.message, "no such artefact");
+        }
+        other => panic!("expected not_allowed for beta list, got {other:?}"),
+    }
+
+    device.send(
+        "v-beta-get",
+        FromDevice::ArtefactGet {
+            sandbox: "beta".into(),
+            artefact: artefact_id("beta", "beta.txt"),
+            offset: 0,
+        },
+    );
+    match device.receive().expect("error") {
+        ToDevice::Error(err) => {
+            assert_eq!(err.code, ErrorCode::NotAllowed);
+            assert_eq!(err.message, "no such artefact");
+        }
+        other => panic!("expected not_allowed for beta get, got {other:?}"),
+    }
+
+    // Second person (guest@example.com) sees beta, not lab.
+    *b.whois_login.lock().unwrap() = "guest@example.com".to_owned();
+    *b.node.lock().unwrap() = "n-guest".to_owned();
+    let guest = paired_as(&b, "n-guest", "guest@example.com");
+    let (mut guest_device, first) = connect_as(&b, &guest, "guest@example.com");
+    assert!(matches!(first, Some(ToDevice::Authenticated { .. })));
+
+    guest_device.send(
+        "g-beta-list",
+        FromDevice::Artefacts {
+            sandbox: "beta".into(),
+        },
+    );
+    let (_, beta_files, _) = receive_list(&mut guest_device, "g-beta-list");
+    assert_eq!(beta_files.len(), 1);
+    assert_eq!(beta_files[0].name, "beta.txt");
+
+    guest_device.send(
+        "g-beta-get",
+        FromDevice::ArtefactGet {
+            sandbox: "beta".into(),
+            artefact: beta_files[0].id.clone(),
+            offset: 0,
+        },
+    );
+    match guest_device.receive().expect("artefact.data") {
+        ToDevice::ArtefactData { data, .. } => {
+            assert_eq!(decode("data", &data).unwrap(), b"from-beta");
+        }
+        other => panic!("expected artefact.data for beta, got {other:?}"),
+    }
+
+    guest_device.send(
+        "g-lab-list",
+        FromDevice::Artefacts {
+            sandbox: "lab".into(),
+        },
+    );
+    match guest_device.receive().expect("error") {
+        ToDevice::Error(err) => {
+            assert_eq!(err.code, ErrorCode::NotAllowed);
+            assert_eq!(err.message, "no such artefact");
+        }
+        other => panic!("expected not_allowed for lab list, got {other:?}"),
+    }
+
+    guest_device.send(
+        "g-lab-get",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: artefact_id("lab", "lab.txt"),
+            offset: 0,
+        },
+    );
+    match guest_device.receive().expect("error") {
+        ToDevice::Error(err) => {
+            assert_eq!(err.code, ErrorCode::NotAllowed);
+            assert_eq!(err.message, "no such artefact");
+        }
+        other => panic!("expected not_allowed for lab get, got {other:?}"),
+    }
+}

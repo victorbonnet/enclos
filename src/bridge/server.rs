@@ -272,6 +272,11 @@ struct Hub {
     /// Artefact walk refusals already written to stderr during this bridge
     /// run, keyed by `(sandbox, file, reason)` so repeated walks stay quiet.
     artefact_refusals: Mutex<HashSet<String>>,
+    /// Test-only stand-in for the sharing rule ADR 0043 (proposed) will
+    /// bring: a person here is shown exactly the agents recorded for them,
+    /// whatever the bridge serves. `None` in a run.
+    #[cfg(test)]
+    audience: Mutex<Option<HashMap<String, HashSet<String>>>>,
     silence: Duration,
     /// The key the bridge signs each runtime-approval decision with (ADR
     /// 0060, proposed), which the plugin checks; without it the bridge
@@ -553,6 +558,8 @@ impl Hub {
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
             artefact_refusals: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            audience: Mutex::new(None),
             silence,
             approval_key: None,
             push: None,
@@ -586,6 +593,18 @@ impl Hub {
         let mut list = agents.as_ref().clone();
         list.extend(more);
         *agents = Arc::new(served::sorted(list));
+    }
+
+    /// Shows `person` exactly `agents` and nothing else: a test's stand-in
+    /// for a narrowed sharing rule (ADR 0043, proposed). A person with no
+    /// entry keeps today's audience, every served agent.
+    #[cfg(test)]
+    fn show_to(&self, person: &str, agents: impl IntoIterator<Item = &'static str>) {
+        let mut audience = self.audience.lock().expect("not poisoned");
+        audience.get_or_insert_with(HashMap::new).insert(
+            person.to_owned(),
+            agents.into_iter().map(str::to_owned).collect(),
+        );
     }
 
     /// The hub, pushing through `pusher` as host `host`.
@@ -3768,7 +3787,7 @@ fn run_session(
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
             }
             FromDevice::Artefacts { sandbox } => {
-                artefacts::list(hub, link, &sandbox, message.id)?;
+                artefacts::list(hub, link, person, &sandbox, message.id)?;
             }
             FromDevice::ArtefactGet {
                 sandbox,
@@ -3779,6 +3798,7 @@ fn run_session(
                     hub,
                     link,
                     &mut artefact_fetch,
+                    person,
                     &sandbox,
                     &artefact,
                     offset,

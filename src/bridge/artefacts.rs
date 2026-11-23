@@ -5,11 +5,12 @@
 //! fetch from a per-fetch copy in its own folder, never from the sandbox's
 //! path.
 //!
-//! Audience rule: list and fetch go to any person the bridge lists at least
-//! one agent of that sandbox to. Today the bridge has one person (the
-//! host's person) and serves every agent to them, so the `artefacts`
-//! capability is advertised to every person and a request is refused
-//! `not_allowed` when the bridge serves no agent of that sandbox.
+//! Audience rule: list and fetch go to any person the bridge shows at least
+//! one agent of that sandbox to (`Hub::sees_agent`, the one rule
+//! `agents.list` uses; every paired person sees every served agent until
+//! sharing, ADR 0043 proposed, narrows it). The `artefacts` capability is
+//! advertised to every person, and a request is refused `not_allowed` when
+//! the bridge shows no agent of that sandbox to the person asking.
 
 use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -297,12 +298,14 @@ pub(super) fn sweep_copies(copies_dir: &Path) {
     }
 }
 
-/// Resolves `sandbox`'s home from enclos's own socket path of a served
-/// agent of that sandbox, never by joining the device's text onto a path.
-fn served_sandbox_home(hub: &Hub, sandbox: &str) -> Option<PathBuf> {
+/// Resolves `sandbox`'s home from enclos's own socket path of an agent of
+/// that sandbox shown to `person` (`Hub::sees_agent`), never by joining the
+/// device's text onto a path.
+fn served_sandbox_home(hub: &Hub, person: &str, sandbox: &str) -> Option<PathBuf> {
     let agents = hub.agents();
     let endpoint = agents
         .iter()
+        .filter(|a| hub.sees_agent(person, &a.name))
         .find(|a| a.name.split_once('/').is_some_and(|(sb, _)| sb == sandbox))?;
     let home = sandbox_home(&endpoint.socket);
     (!home.as_os_str().is_empty()).then_some(home)
@@ -598,6 +601,7 @@ fn send_error(
 pub(super) fn list(
     hub: &Arc<Hub>,
     link: &mut Link,
+    person: &str,
     sandbox: &str,
     asked: MessageId,
 ) -> Result<(), String> {
@@ -609,7 +613,7 @@ pub(super) fn list(
             "A sandbox name is 1 to 128 characters.",
         );
     }
-    let Some(home) = served_sandbox_home(hub, sandbox) else {
+    let Some(home) = served_sandbox_home(hub, person, sandbox) else {
         return send_error(link, asked, ErrorCode::NotAllowed, NO_SUCH_ARTEFACT);
     };
     let (files, _) = walk_sandbox(sandbox, &home, &hub.artefact_refusals);
@@ -622,10 +626,12 @@ pub(super) fn list(
 /// Handles `FromDevice::ArtefactGet`: serves one `ATTACHMENT_CHUNK` part
 /// from a per-fetch copy in `app-artefact-copies/`, re-checking the
 /// folder's file identity on every request.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn get(
     hub: &Arc<Hub>,
     link: &mut Link,
     fetch: &mut Option<FetchCopy>,
+    person: &str,
     sandbox: &str,
     artefact: &str,
     offset: u64,
@@ -639,7 +645,7 @@ pub(super) fn get(
             "Invalid sandbox or artefact id.",
         );
     }
-    let Some(home) = served_sandbox_home(hub, sandbox) else {
+    let Some(home) = served_sandbox_home(hub, person, sandbox) else {
         return send_error(link, asked, ErrorCode::NotAllowed, NO_SUCH_ARTEFACT);
     };
 
