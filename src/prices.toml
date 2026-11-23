@@ -647,6 +647,13 @@ source = "litellm@6c5aec07b49da18435ec19ba0879552f1951cc8a"
 
 [[models]]
 model_provider = "gemini"
+id = "genie-4"
+input = 1.5
+output = 9.0
+source = "litellm@3e27fc2a88d2545a706fb9cc1a85ea99e474f18c"
+
+[[models]]
+model_provider = "gemini"
 id = "learnlm-1.5-pro-experimental"
 input = 0.0
 output = 0.0
@@ -1848,8 +1855,8 @@ id = "gpt-6-rosalind"
 input = 10.0
 output = 50.0
 cache_read = 1.0
-cache_write = 18.75
-source = "litellm@6c5aec07b49da18435ec19ba0879552f1951cc8a"
+cache_write = 12.5
+source = "litellm@3e27fc2a88d2545a706fb9cc1a85ea99e474f18c"
 
 [[models]]
 model_provider = "openai"
