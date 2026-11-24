@@ -112,9 +112,20 @@ pub(super) fn begin(
             "longer than one message on the device leg holds",
         );
     }
-    if let Err(e) = hub.plugin(&name) {
-        let why = format!("{e}: nothing was sent; send it again once the agent can be reached");
-        return refuse(&id, AgentUnavailable, &why);
+    if let Err(failure) = hub.open_plugin(&name, crate::bridge::plugin::HELLO_TIMEOUT) {
+        match hub.hold_for_restart(store, &name, &failure, Attempt::Files) {
+            Hold::Answered => {}
+            Hold::Stopped => {
+                return refuse(&id, AgentUnavailable, STOPPED);
+            }
+            Hold::Restarting | Hold::Fallback => {
+                let why = format!(
+                    "{}: nothing was sent; send it again once the agent can be reached",
+                    failure.why
+                );
+                return refuse(&id, AgentUnavailable, &why);
+            }
+        }
     }
     if !takes_files(
         hub,

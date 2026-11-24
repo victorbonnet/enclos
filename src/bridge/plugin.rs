@@ -18,7 +18,7 @@ use enclos_protocol::{
 use super::ids::new_id;
 
 /// How long the plugin has, in all, to answer the bridge's `hello`.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest `hello` the bridge reads: a few names and capabilities.
 const MAX_HELLO_BYTES: usize = 64 * 1024;
 /// How long one write to the plugin may wait for it to read: a plugin that
@@ -49,6 +49,17 @@ pub enum PluginError {
     TooLong,
     #[error("the agent's app channel speaks protocol version {0}, which this bridge does not")]
     Version(u64),
+}
+
+impl PluginError {
+    /// Whether this failure is one that a runtime restart explains: the
+    /// connection itself could not be made, or broke while the `hello` was
+    /// read (#376). A plugin that answered and refused the token, that does
+    /// not speak this protocol, or that sent something unreadable says
+    /// something else about the agent, and is never called a restart.
+    pub(super) fn may_be_restarting(&self) -> bool {
+        matches!(self, PluginError::Connect { .. } | PluginError::Io(_))
+    }
 }
 
 /// What the plugin said of itself in its `hello`.
@@ -86,7 +97,7 @@ pub fn connect(
 /// [`connect`], with `wait` for the whole of the plugin's `hello`: a plugin
 /// that sends it a byte at a time, or never ends its line, is given up on
 /// once `wait` is over.
-fn connect_within(
+pub(super) fn connect_within(
     socket: &Path,
     token: &str,
     home: &str,
