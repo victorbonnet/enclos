@@ -875,7 +875,7 @@ mod tests {
     #[test]
     fn only_a_connection_that_failed_before_the_hello_may_be_a_restart() {
         let at = |kind| PluginError::Connect {
-            path: "/home/lab/.enclos-app/main.sock".into(),
+            path: "/home/alice/.enclos-app/main.sock".into(),
             source: std::io::Error::from(kind),
         };
         // The channel is not there, or is going away: a restart explains both.
