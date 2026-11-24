@@ -518,10 +518,35 @@ class Reading(FakeBoardCase):
         entries = self.board.read("main")
         store = asks.Asks(str(Path(self.temporary.name) / "main.sock.held-asks.json"))
         store.put("t_asked", 3_000, {"decision": "Proceed?", "blocked": "Waiting", "choices": ["Yes", "No"]})
-        attached = {entry["task"]: entry for entry in store.attach(entries, 4_000)}
+        attached = {entry["task"]: entry for entry in held_tasks.for_the_person(store.attach(entries, 4_000))}
         self.assertEqual(attached["t_plain"]["waits_on"], "person")
         self.assertEqual(attached["t_asked"]["waits_on"], "person")
         self.assertIn("ask", attached["t_asked"])
+
+    def test_waits_on_team_kinds_with_ask_read_person(self):
+        for kind in ("transient", "capability", "dependency"):
+            with self.subTest(kind=kind):
+                task_id = f"t_{kind}_asked"
+                self.kb.create(task_id)
+                self.kb.hold(task_id, payload={"reason": f"Blocked on {kind}", "kind": kind}, at=3_000)
+                entries = self.board.read("main")
+                before = {entry["task"]: entry for entry in entries}[task_id]
+                self.assertEqual(before["waits_on"], "team")
+                store = asks.Asks(str(Path(self.temporary.name) / f"{kind}.held-asks.json"))
+                store.put(task_id, 3_000, {"decision": "Retry now?", "blocked": "Waiting", "choices": ["Yes", "No"]})
+                after = {entry["task"]: entry for entry in held_tasks.for_the_person(store.attach(entries, 4_000))}[task_id]
+                self.assertEqual(after["waits_on"], "person")
+                self.assertIn("ask", after)
+
+    def test_waits_on_gave_up_with_ask_stays_person(self):
+        self.kb.create("t_gu_asked")
+        self.kb.hold("t_gu_asked", "gave_up", {"failures": 3, "error": "boom"}, at=3_000)
+        entries = self.board.read("main")
+        store = asks.Asks(str(Path(self.temporary.name) / "gave_up.held-asks.json"))
+        store.put("t_gu_asked", 3_000, {"decision": "Keep trying?", "blocked": "Failed 3 times", "choices": ["Yes", "No"]})
+        [entry] = held_tasks.for_the_person(store.attach(entries, 4_000))
+        self.assertEqual(entry["waits_on"], "person")
+        self.assertIn("ask", entry)
 
     def test_waits_on_capability(self):
         self.kb.create("t_cap")
@@ -1069,6 +1094,19 @@ class Sent(FakeBoardCase, unittest.IsolatedAsyncioTestCase):
                 await task
             await asyncio.sleep(0)
         self.assertEqual(manager.tasks, set())
+
+    async def test_a_transient_hold_with_an_ask_is_sent_waiting_on_the_person(self):
+        self.kb.create("t_1")
+        self.kb.hold("t_1", payload={"reason": "Rate limited", "kind": "transient"}, at=3_000)
+        manager = self.manager()
+        manager.asks = asks.Asks(str(Path(self.temporary.name) / "main.sock.held-asks.json"))
+        manager.asks.put("t_1", 3_000, {"decision": "Retry now?", "blocked": "Rate limited", "choices": ["Yes", "No"]})
+        await manager.refresh(force=True)
+        [entry] = self.sent[-1]["tasks"]
+        self.assertEqual(entry["task"], "t_1")
+        self.assertEqual(entry["waits_on"], "person")
+        self.assertIn("ask", entry)
+        self.assertEqual(entry["ask"]["decision"], "Retry now?")
 
 
 ASK = {"task": "t_1", "decision": "Which client is the report for?",
