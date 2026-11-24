@@ -751,3 +751,207 @@ fn a_restarting_report_writes_nothing() {
     assert_eq!(state_before, SandboxState::Running);
     assert_eq!(state_after, SandboxState::Running);
 }
+
+fn link_failure(socket: &Path) -> String {
+    PluginError::Linked {
+        path: socket.display().to_string(),
+        source: std::io::Error::other(format!(
+            "{} is a link, not the channel's own socket",
+            socket.display()
+        )),
+    }
+    .to_string()
+}
+
+#[test]
+fn a_file_message_to_a_stopped_sandbox_is_not_said_to_go() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Stopped);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let phone = paired(&bridge, "n-pixel");
+    let (mut device, _) = connect(&bridge, &phone);
+    start_conversation(&mut device);
+    synced(&mut device, 0);
+
+    let expected = format!(
+        "{}: nothing was sent; send it again once the agent can be reached",
+        connect_failure(&bridge.socket)
+    );
+    let one = [file("note.txt", "text/plain", 4)];
+    let started = Instant::now();
+    begin(&mut device, "f-1", "c-1", "see attached", &one);
+    let error = the_answer(&mut device, "f-1").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_eq!(error.message, expected);
+    assert_ne!(error.message, STOPPED);
+    assert!(
+        !error.message.contains("kept"),
+        "file message must not claim to be kept: {}",
+        error.message
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "waited for a stopped sandbox on file message: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_file_message_to_a_created_sandbox_is_not_said_to_go() {
+    let folder = tempfile::tempdir().unwrap();
+    let _layout = provisioning_state(folder.path());
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let phone = paired(&bridge, "n-pixel");
+    let (mut device, _) = connect(&bridge, &phone);
+    start_conversation(&mut device);
+    synced(&mut device, 0);
+
+    let expected = format!(
+        "{}: nothing was sent; send it again once the agent can be reached",
+        connect_failure(&bridge.socket)
+    );
+    let one = [file("note.txt", "text/plain", 4)];
+    let started = Instant::now();
+    begin(&mut device, "f-1", "c-1", "see attached", &one);
+    let error = the_answer(&mut device, "f-1").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_eq!(error.message, expected);
+    assert_ne!(error.message, STOPPED);
+    assert!(
+        !error.message.contains("kept"),
+        "file message must not claim to be kept: {}",
+        error.message
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "waited for a created sandbox on file message: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_retry_that_is_refused_is_not_called_a_restart() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(2));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    // Let the first attempt fail with Connect and enter the restart wait,
+    // then bind a listener that reads the bridge's hello and closes without
+    // answering (PluginError::Refused) on the retry.
+    let socket = bridge.socket.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let listener = UnixListener::bind(&socket).unwrap();
+        for stream in listener.incoming().flatten() {
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            let _ = lines.read_until(b'\n', &mut line);
+        }
+    });
+
+    let expected = fallback_chat(&PluginError::Refused.to_string());
+    let started = Instant::now();
+    say(&mut device, "m-2", "refused on retry");
+    expect_echo(&mut device, "refused on retry");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_eq!(error.message, expected);
+    assert_ne!(error.message, RESTARTING);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "kept waiting after retry was refused: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_linked_socket_is_not_called_a_restart() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    std::os::unix::fs::symlink(folder.path().join("other.sock"), &bridge.socket).unwrap();
+
+    let expected = fallback_chat(&link_failure(&bridge.socket));
+    let started = Instant::now();
+    say(&mut device, "m-2", "linked socket");
+    expect_echo(&mut device, "linked socket");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_eq!(error.message, expected);
+    assert!(
+        error
+            .message
+            .contains("is a link, not the channel's own socket"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert_ne!(error.message, RESTARTING);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "waited for a linked socket: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_held_task_answer_is_not_held() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (_device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    let store = Store::open(&bridge.store).unwrap();
+    let device = Device {
+        id: "held-task-device".into(),
+        name: "held-task-device".into(),
+        person: PERSON.into(),
+        noise_key: b"held-task-device".to_vec(),
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+        node: None,
+    };
+    let conversation = ConversationId::new("c-1").unwrap();
+    let expected = fallback_chat(&connect_failure(&bridge.socket));
+
+    let started = Instant::now();
+    // `SendWait::Never` is the argument the held-task answer path passes.
+    let answer = send(
+        &bridge.hub,
+        &store,
+        &device,
+        &conversation,
+        MessageId::new("ht-1").unwrap(),
+        "held task answer".to_owned(),
+        SendWait::Never,
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    let Some(ToDevice::Error(error)) = answer else {
+        panic!("expected AgentUnavailable error, got {answer:?}");
+    };
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_eq!(error.message, expected);
+    assert_ne!(error.message, RESTARTING);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "held task answer waited for a restarting channel: {elapsed:?}"
+    );
+}

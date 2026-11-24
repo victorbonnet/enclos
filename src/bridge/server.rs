@@ -203,8 +203,10 @@ pub(super) enum Hold {
     /// A running sandbox whose channel had answered in this bridge run, and
     /// is still away when the wait ends.
     Restarting,
-    /// Anything else: answer as before #376.
-    Fallback,
+    /// Anything else: answer with this failure's own text, as before #376.
+    /// A retry can fail for a reason of its own — a wrong token, an agent
+    /// given up in the app — and that reason is what is said.
+    Fallback(String),
 }
 
 /// Who is at an address, as the transport says.
@@ -1009,13 +1011,15 @@ impl Hub {
                     closer,
                 },
             );
+            // It answered in this bridge run: if its channel goes away now,
+            // a runtime being started again is what that means (#376). Done
+            // while `plugins` is held, so a change of the served agents cannot
+            // be undone by this insert.
+            self.answered
+                .lock()
+                .expect("not poisoned")
+                .insert(agent.to_owned());
         }
-        // It answered in this bridge run: if its channel goes away now,
-        // a runtime being started again is what that means (#376).
-        self.answered
-            .lock()
-            .expect("not poisoned")
-            .insert(agent.to_owned());
         // A plugin that no longer lists its commands: the ones it listed
         // before are offered no more.
         let dropped = !lists_commands
@@ -1838,50 +1842,67 @@ impl Hub {
     ) -> Hold {
         use crate::model::sandbox::SandboxState;
         // The budget starts at the failed attempt itself, not after the read
-        // that follows it: the state read and every retry come out of the
-        // same 15 s (§4, A9).
+        // that follows it: the state read and every retry start inside the
+        // same 15 s (§4, A9). It bounds when a retry starts, not what that
+        // retry waits on: it can hold the per-agent `opening` lock, the
+        // plugin's write lock, or a write of `WRITE_TIMEOUT` (10 s), none of
+        // which is capped by what is left, so under contention the answer can
+        // come later. `docs/protocol.md` says so plainly.
         let deadline = Instant::now() + self.restart_wait;
         if !failure.may_be_restarting {
-            return Hold::Fallback;
+            return Hold::Fallback(failure.why.clone());
         }
         let Some((sandbox, _)) = agent.split_once('/') else {
-            return Hold::Fallback;
+            return Hold::Fallback(failure.why.clone());
         };
         let Ok(name) = sandbox.parse() else {
-            return Hold::Fallback;
+            return Hold::Fallback(failure.why.clone());
         };
+        // Read before `answered` is asked: a stopped or created sandbox is
+        // said so whether or not its channel ever answered (A3, A4), and only
+        // this read tells. A channel that never answered pays the read and
+        // then answers without waiting (A5).
         let state =
             match crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Command)
                 .sandbox_state(&name)
             {
                 Ok(state) => state,
-                Err(_) => return Hold::Fallback,
+                Err(_) => return Hold::Fallback(failure.why.clone()),
             };
         match state {
             SandboxState::Stopped | SandboxState::Created => Hold::Stopped,
             SandboxState::Running => {
-                if !self.answered.lock().expect("not poisoned").contains(agent) {
-                    return Hold::Fallback;
+                // The guard is released here, before a retry takes the plugin
+                // locks: `open_plugin` inserts into this set while it holds
+                // `plugins`, so the two are never taken the other way round.
+                let answered = self.answered.lock().expect("not poisoned").contains(agent);
+                if !answered {
+                    return Hold::Fallback(failure.why.clone());
                 }
                 while deadline > Instant::now() {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    let reached = match attempt {
-                        Attempt::Message => self
-                            .forward_within(store, agent, left.min(plugin::HELLO_TIMEOUT))
-                            .is_ok(),
-                        Attempt::Files => self
-                            .open_plugin(agent, left.min(plugin::HELLO_TIMEOUT))
-                            .is_ok(),
+                    let tried = match &attempt {
+                        Attempt::Message => {
+                            self.forward_within(store, agent, left.min(plugin::HELLO_TIMEOUT))
+                        }
+                        Attempt::Files => self.open_plugin(agent, left.min(plugin::HELLO_TIMEOUT)),
                     };
-                    if reached {
-                        return Hold::Answered;
+                    match tried {
+                        Ok(()) => return Hold::Answered,
+                        // A restart does not explain this failure, so the
+                        // retry is not called one and its own text is said at
+                        // once (§3a).
+                        Err(failed) if !failed.may_be_restarting => {
+                            return Hold::Fallback(failed.why);
+                        }
+                        Err(_) => {}
                     }
                     let sleep = deadline.saturating_duration_since(Instant::now());
                     std::thread::sleep(sleep.min(RESTART_POLL));
                 }
                 Hold::Restarting
             }
-            SandboxState::Failed { .. } => Hold::Fallback,
+            SandboxState::Failed { .. } => Hold::Fallback(failure.why.clone()),
         }
     }
 
@@ -3445,7 +3466,9 @@ fn run_session(
                     Err(error) => link.send(ToDevice::Error(error))?,
                     Ok((conversation, said, card)) => {
                         // The person's message, as a `message.send` of theirs:
-                        // kept for an agent that cannot be reached yet.
+                        // kept for an agent that cannot be reached yet. The
+                        // answer is not held, and the reply is not errored, as
+                        // before #376.
                         let given = send(
                             hub,
                             store,
@@ -3453,6 +3476,7 @@ fn run_session(
                             &conversation,
                             message.id.clone(),
                             said.text,
+                            SendWait::Never,
                         );
                         let refused = match &given {
                             Ok(Some(ToDevice::Error(error)))
@@ -3767,7 +3791,15 @@ fn run_session(
                 group_turns::stop_group(hub, store, person, conversation.as_str())?;
             }
             FromDevice::MessageSend { conversation, text } => {
-                if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
+                if let Some(answer) = send(
+                    hub,
+                    store,
+                    device,
+                    &conversation,
+                    message.id,
+                    text,
+                    SendWait::ForRestart,
+                )? {
                     // After the echo, which the outbox holds
                     drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
                     link.send(answer)?;
@@ -4775,6 +4807,24 @@ fn rename(
     Ok(())
 }
 
+/// Whether a message's send waits for a restarting agent's channel (#376).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendWait {
+    /// A conversation message: up to [`RESTART_WAIT`] for the channel of an
+    /// agent whose sandbox is recorded running and whose channel answered in
+    /// this bridge run (D1).
+    ForRestart,
+    /// Not at all: a held task's answer goes as it did before #376 (A10), and
+    /// its own silence is the person's answer.
+    Never,
+}
+
+/// What the bridge answered before #376 for a message it kept but could not
+/// give to the agent: byte-identical, whatever the failure.
+fn kept(why: &str) -> String {
+    format!("{why}: the message is kept, and goes to the agent once it can be reached")
+}
+
 /// A person's message: stored once, echoed to the person's devices with
 /// its place in the order, and given to the agent's plugin, now or once it
 /// can be reached. What to answer the device, if anything.
@@ -4785,6 +4835,7 @@ fn send(
     conversation: &ConversationId,
     id: MessageId,
     text: String,
+    waits: SendWait,
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
     if store
@@ -4903,25 +4954,25 @@ fn send(
             }),
         );
     }
-    match hub.forward_within(store, &name, plugin::HELLO_TIMEOUT) {
-        Ok(()) => Ok(None),
-        Err(failure) => {
-            let message = match hub.hold_for_restart(store, &name, &failure, Attempt::Message) {
-                Hold::Answered => return Ok(None),
-                Hold::Stopped => STOPPED.to_owned(),
-                Hold::Restarting => RESTARTING.to_owned(),
-                Hold::Fallback => format!(
-                    "{}: the message is kept, and goes to the agent once it can be reached",
-                    failure.why
-                ),
-            };
-            Ok(Some(ToDevice::Error(ErrorBody {
-                of: Some(id),
-                code: ErrorCode::AgentUnavailable,
-                message,
-            })))
+    let failure = match hub.forward_within(store, &name, plugin::HELLO_TIMEOUT) {
+        Ok(()) => return Ok(None),
+        Err(failure) => failure,
+    };
+    let message = if waits == SendWait::Never {
+        kept(&failure.why)
+    } else {
+        match hub.hold_for_restart(store, &name, &failure, Attempt::Message) {
+            Hold::Answered => return Ok(None),
+            Hold::Stopped => STOPPED.to_owned(),
+            Hold::Restarting => RESTARTING.to_owned(),
+            Hold::Fallback(why) => kept(&why),
         }
-    }
+    };
+    Ok(Some(ToDevice::Error(ErrorBody {
+        of: Some(id),
+        code: ErrorCode::AgentUnavailable,
+        message,
+    })))
 }
 
 #[cfg(test)]

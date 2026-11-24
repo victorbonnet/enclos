@@ -35,6 +35,18 @@ pub enum PluginError {
         path: String,
         source: std::io::Error,
     },
+    /// The socket, or the folder it is in, is a link: the bridge would send
+    /// the agent's token to whatever listens there, so it does not connect
+    /// (`refuse_linked_folder`). A link is nothing a restart explains, so
+    /// this failure is never called one (#376). It says what `Connect` says:
+    /// the person's diagnostic does not change.
+    #[error(
+        "cannot reach the agent's app channel at {path}: {source} (is the sandbox started, and the channel set up?)"
+    )]
+    Linked {
+        path: String,
+        source: std::io::Error,
+    },
     #[error(
         "the agent's app channel closed the connection without answering: the token it was given is not the one it holds, or another bridge is connected"
     )]
@@ -300,7 +312,7 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
         if let Ok(meta) = std::fs::symlink_metadata(path)
             && meta.file_type().is_symlink()
         {
-            return Err(PluginError::Connect {
+            return Err(PluginError::Linked {
                 path: socket.display().to_string(),
                 source: std::io::Error::other(format!("{} is a link, not {what}", path.display())),
             });
@@ -734,7 +746,7 @@ mod tests {
         let plugin = echo_plugin(UnixListener::bind(real.join("main.sock")).unwrap(), "t0ken");
         let linked = folder.path().join(".enclos-app");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        let Err(PluginError::Connect { source, .. }) =
+        let Err(PluginError::Linked { source, .. }) =
             connect(&linked.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
@@ -752,7 +764,7 @@ mod tests {
         let own = folder.path().join(".enclos-app");
         std::fs::create_dir(&own).unwrap();
         std::os::unix::fs::symlink(&elsewhere, own.join("main.sock")).unwrap();
-        let Err(PluginError::Connect { source, .. }) =
+        let Err(PluginError::Linked { source, .. }) =
             connect(&own.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
