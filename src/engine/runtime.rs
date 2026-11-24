@@ -21,7 +21,7 @@ use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
 use crate::model::runtime::{RuntimeKind, RuntimeVersion};
-use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use crate::policy::file::PolicyFile;
 use crate::runtime::{RuntimeAdapter, adapter};
 
@@ -532,8 +532,18 @@ impl Engine {
             let (end, timed_out) = match ran {
                 Ok(ran) => ran,
                 Err(error) => {
-                    if installed {
+                    // The services start again on what the updater left, as
+                    // `sandbox start` starts them, unless the sandbox is no
+                    // longer recorded running: then it stays stopped and what
+                    // the run left open is ended (ADR 0074).
+                    let running = self
+                        .record(name)
+                        .map(|r| r.state == SandboxState::Running)
+                        .unwrap_or(false);
+                    if installed && running {
                         let _ = self.start_sandbox(by, name);
+                    } else if !running {
+                        let _ = self.stop_services_and_sessions(by, name);
                     }
                     return Err(error);
                 }
@@ -554,8 +564,15 @@ impl Engine {
         // failure (A3, A5, Q2).
         let after = if succeeded {
             if runtime.version_command(Path::new("")).is_some() {
-                match self.record_reported_version_with(by, name, runtime, deadline, true, "update")
-                {
+                match self.record_reported_version_with(
+                    by,
+                    name,
+                    runtime,
+                    deadline,
+                    true,
+                    "update",
+                    Some(&mut update_log),
+                ) {
                     Ok(Some(v)) => Some(Ok(v)),
                     Ok(None) => None,
                     Err(why) => Some(Err(why)),
@@ -582,11 +599,24 @@ impl Engine {
                 _ => false,
             };
 
-        // Step 9: start the services again when they were installed.
-        let services = if installed {
+        // Step 9: start the services again when they were installed and the
+        // sandbox is still recorded running. The recorded state is read here,
+        // not only before the download: a `sandbox stop` meanwhile removes the
+        // services itself and records `Stopped`, and installing them again
+        // would leave a stopped sandbox with services (ADR 0074: one that was
+        // stopped stays stopped with none installed).
+        let running = self.record(name)?.state == SandboxState::Running;
+        let services = if installed && running {
             self.start_sandbox(by, name)?;
             ServicesAfter::StartedAgain
         } else {
+            if !running {
+                // Nothing is installed again, so end what the updater's own
+                // session left open — the proxy it started for itself — as
+                // `sandbox stop` ends sessions; its result is the update's,
+                // not a second failure.
+                self.stop_services_and_sessions(by, name)?;
+            }
             ServicesAfter::NotInstalled
         };
 
@@ -614,7 +644,7 @@ impl Engine {
                 .as_ref()
                 .map(|b| format!("; {b} stays"))
                 .unwrap_or_default();
-            Outcome::failed(format!("failed: the updater {ended}{stays}{sha_note}"))
+            Outcome::failed(format!("the updater {ended}{stays}{sha_note}"))
         };
         self.write_with_outcome(by, "runtime update", target, |_| outcome, |_| Ok(()))?;
 
@@ -667,13 +697,14 @@ impl Engine {
         runtime: &dyn RuntimeAdapter,
         deadline: Option<Instant>,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
-        self.record_reported_version_with(by, name, runtime, deadline, false, "install")
+        self.record_reported_version_with(by, name, runtime, deadline, false, "install", None)
     }
 
     /// Shared version-recording path for install and update. When
     /// `keep_on_failure` is true (update semantics, ADR 0074), a version
     /// that cannot be read keeps the version previously recorded in
     /// `state.db` instead of forgetting it.
+    #[allow(clippy::too_many_arguments)]
     fn record_reported_version_with(
         &self,
         by: &Actor,
@@ -682,10 +713,11 @@ impl Engine {
         deadline: Option<Instant>,
         keep_on_failure: bool,
         what: &str,
+        update_log: Option<&mut UpdateLog>,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
         let kind = runtime.kind();
         let target = Some(format!("{name} {kind}"));
-        let version = match self.ask_version(by, name, runtime, deadline, what) {
+        let version = match self.ask_version(by, name, runtime, deadline, what, update_log) {
             Ok(None) => return Ok(None),
             Ok(Some(version)) => version,
             Err(why) => {
@@ -742,6 +774,7 @@ impl Engine {
         runtime: &dyn RuntimeAdapter,
         deadline: Option<Instant>,
         what: &str,
+        update_log: Option<&mut UpdateLog>,
     ) -> std::result::Result<Option<RuntimeVersion>, String> {
         let home = self.sandbox_home(name);
         let id = new_id().map_err(|e| format!("cannot name its version report: {e}"))?;
@@ -757,9 +790,16 @@ impl Engine {
             ));
         }
         let _remove = Removed(report.clone());
-        let (ended, stopped) = self
-            .run_exec_in_sandbox_within(by, name, command, "runtime version", stop)
-            .map_err(|e| e.to_string())?;
+        let (ended, stopped) = match update_log {
+            // During a runtime update, run as `Starting::Update` so asking
+            // the version does not flip a stopped sandbox back to `Running`
+            // (ADR 0074).
+            Some(log) => {
+                self.run_update_in_sandbox(by, name, command, "runtime version", Some(stop), log)
+            }
+            None => self.run_exec_in_sandbox_within(by, name, command, "runtime version", stop),
+        }
+        .map_err(|e| e.to_string())?;
         match (stopped, ended.signal) {
             (true, _) => {
                 return Err(format!(
@@ -952,7 +992,9 @@ fn plan_update(name: &SandboxName, kind: RuntimeKind, policy: u32, installed: bo
             "stop the services of sandbox {name} (its proxy, its namespace holder where the backend has one, and its runtime's services) and end its sessions"
         ));
     } else {
-        changes.push(format!("sandbox {name} is stopped: no service is stopped"));
+        changes.push(format!(
+            "stop no service of sandbox {name}: it is stopped already"
+        ));
     }
     changes.push(format!(
         "run the {kind} updater in sandbox {name} under its active policy (v{policy})"

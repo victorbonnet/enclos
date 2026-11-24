@@ -5967,7 +5967,8 @@ fn a_runtime_update_dry_run_lists_steps_in_order_and_changes_nothing() {
         panic!("dry run did not return DryRun");
     };
     assert_eq!(stopped_plan.changes.len(), 4);
-    assert!(stopped_plan.changes[0].contains("is stopped: no service is stopped"));
+    assert!(stopped_plan.changes[0].contains("stop no service of sandbox"));
+    assert!(stopped_plan.changes[0].ends_with("it is stopped already"));
     assert!(stopped_plan.changes[1].contains("run the hermes updater"));
     assert!(stopped_plan.changes[2].contains("record the version hermes then reports"));
     assert!(stopped_plan.changes[3].contains("keep sandbox"));
@@ -6115,6 +6116,115 @@ fn a_runtime_update_moves_version_keeps_policy_and_restarts_services() {
 }
 
 #[test]
+fn a_runtime_update_of_a_stopped_sandbox_leaves_it_stopped_with_none_installed() {
+    use crate::engine::ServicesAfter;
+    use crate::model::sandbox::SandboxState;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    done(
+        lab.engine
+            .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Stopped
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'probe: updating'".into(),
+        version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert_eq!(end.services, ServicesAfter::NotInstalled);
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Stopped
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+    // `has_services` leaves the namespace holder out; the VM run found it
+    // still installed at the reviewed head.
+    assert!(!lab.engine.unit_installed(&lab.name, Unit::Holder).unwrap());
+    // Including the proxy session the updater started for itself.
+    let open = lab.engine.state.sessions(&lab.name, true).unwrap();
+    assert!(open.is_empty(), "open sessions left behind: {open:?}");
+}
+
+#[test]
+fn a_runtime_update_installs_no_services_for_a_sandbox_recorded_stopped() {
+    use crate::engine::ServicesAfter;
+    use crate::model::sandbox::SandboxState;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    done(
+        lab.engine
+            .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+            .unwrap(),
+    );
+    fake.started.borrow_mut().clear();
+    fake.stopped.borrow_mut().clear();
+    // This is the state a `sandbox stop` during the update's download or run
+    // leaves, arranged without a second thread.
+    fake.seed(gateway.as_str());
+    assert!(lab.engine.has_services(&lab.name).unwrap());
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Stopped
+    );
+
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'probe: updating'".into(),
+        version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert_eq!(end.services, ServicesAfter::NotInstalled);
+    assert!(fake.stopped.borrow().contains(&gateway));
+    assert!(
+        !fake.started.borrow().iter().any(|u| u.label == gateway),
+        "{:?}",
+        fake.started.borrow()
+    );
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Stopped
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+    // `has_services` leaves the namespace holder out; the VM run found it
+    // still installed at the reviewed head.
+    assert!(!lab.engine.unit_installed(&lab.name, Unit::Holder).unwrap());
+    let open = lab.engine.state.sessions(&lab.name, true).unwrap();
+    assert!(open.is_empty(), "open sessions left behind: {open:?}");
+}
+
+#[test]
 fn a_failed_runtime_update_keeps_previous_version_restarts_services_and_names_log() {
     use crate::engine::ServicesAfter;
     use crate::model::runtime::RuntimeVersion;
@@ -6170,9 +6280,17 @@ fn a_failed_runtime_update_keeps_previous_version_restarts_services_and_names_lo
     let log_text = std::fs::read_to_string(&end.log).unwrap();
     assert!(log_text.contains("boom on stdout"), "{log_text}");
     assert!(log_text.contains("boom on stderr"), "{log_text}");
+    // The stored message carries no `failed: ` of its own: `enclos audit
+    // --text` puts it in front of a failed row (src/main.rs:606-613), and
+    // before this the two together read `failed: failed: …`.
     assert!(
         lab.audit()
-            .contains("failed: the updater exited with 1; 0.23.1 stays"),
+            .contains("message: \"the updater exited with 1; 0.23.1 stays\""),
+        "{}",
+        lab.audit()
+    );
+    assert!(
+        !lab.audit().contains("failed: the updater"),
         "{}",
         lab.audit()
     );

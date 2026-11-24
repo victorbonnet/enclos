@@ -469,8 +469,12 @@ impl Engine {
                 ended_at: None,
             };
             // Running again, also after a `launch` that failed and that the
-            // service manager starts again.
-            record.state = SandboxState::Running;
+            // service manager starts again. Not for the updater's own session:
+            // a runtime update leaves the recorded state as it was, so a
+            // sandbox the person had stopped stays stopped (ADR 0074).
+            if !matches!(starting, Starting::Update { .. }) {
+                record.state = SandboxState::Running;
+            }
             session.id = self.state.start_session(lock, &session, &record)?;
             Ok((session, prepared))
         })();
