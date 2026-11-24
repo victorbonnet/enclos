@@ -18,3 +18,8 @@
 # now the rule's placeholder.
 05b0780008d811f06868d83f6c1fa6427dafb7a2:channels/hermes/tests/test_tasks.py:home-folder-path:280
 05b0780008d811f06868d83f6c1fa6427dafb7a2:channels/hermes/tests/test_tasks.py:home-folder-path:289
+
+# The same in the bridge restart tests (#376): a made-up home in one test
+# helper, now the rule's placeholder. The commit stays because the branch is
+# not force-pushed.
+a502726d8c34c829443cdf58d12ec0a62713480a:src/bridge/plugin.rs:home-folder-path:878
