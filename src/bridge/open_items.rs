@@ -145,7 +145,15 @@ impl Hub {
                 .indexed_held_tasks_for(person)
                 .map_err(|e| e.to_string())?
             {
-                let waits_on: WaitsOn = held.waits_on;
+                // An ask is the person's decision, whatever the block kind says: the
+                // plugin applies this rule and the bridge applies it again, so a hold
+                // that carries a question still shows under "Needs you" even when a
+                // sender marks it `team`.
+                let waits_on = if held.info.ask.is_some() {
+                    WaitsOn::Person
+                } else {
+                    held.waits_on
+                };
                 let h = held.info;
                 items.push(OpenItem {
                     version: format!("held:{}", h.revision),

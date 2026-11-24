@@ -2930,6 +2930,91 @@ fn open_items_carry_waits_on_for_held_tasks_and_omit_it_for_questions() {
 }
 
 #[test]
+fn open_items_read_an_asked_hold_as_waiting_on_the_person_whatever_its_kind() {
+    use enclos_protocol::held_task::{HeldTask, WaitsOn};
+    let (_dir, hub, store, _device, _rx) = fixture();
+    set_host(&hub, Some(OWNER));
+    let asked_team: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_asked_team",
+        "title": "Waiting on decision",
+        "reason": "Blocked on target choice",
+        "since": 2,
+        "revision": "e:1",
+        "resume": "Resume",
+        "waits_on": "team",
+        "ask": {
+            "decision": "Which client should I target?",
+            "blocked": "The deploy waits on this."
+        }
+    }))
+    .unwrap();
+    let plain_team: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_plain_team",
+        "title": "Waiting on dep",
+        "reason": "Blocked by dependency",
+        "since": 3,
+        "revision": "e:2",
+        "resume": "Resume",
+        "waits_on": "team"
+    }))
+    .unwrap();
+    let asked_absent: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_asked_absent",
+        "title": "Waiting on decision without waits_on",
+        "reason": "Blocked on approval",
+        "since": 4,
+        "revision": "e:3",
+        "resume": "Resume",
+        "ask": {
+            "decision": "Ship with the fallback?",
+            "blocked": "The release waits on this."
+        }
+    }))
+    .unwrap();
+    let asked_unknown: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_asked_unknown",
+        "title": "Waiting on decision with unknown waits_on",
+        "reason": "Blocked on choice",
+        "since": 5,
+        "revision": "e:4",
+        "resume": "Resume",
+        "waits_on": "bogus",
+        "ask": {
+            "decision": "Keep the legacy route?",
+            "blocked": "The cutover waits on this."
+        }
+    }))
+    .unwrap();
+    store
+        .report_held_tasks(
+            AGENT,
+            "owned",
+            &[asked_team, plain_team, asked_absent, asked_unknown],
+        )
+        .unwrap();
+    let frames = hub.open_item_frames(&store, OWNER).unwrap();
+    let items: Vec<_> = frames
+        .iter()
+        .flat_map(|frame| match frame {
+            ToDevice::OpenItems { items, .. } => items.clone(),
+            _ => panic!("expected OpenItems"),
+        })
+        .collect();
+    let asked_team_item = items.iter().find(|i| i.id == "t_asked_team").unwrap();
+    assert_eq!(asked_team_item.waits_on, Some(WaitsOn::Person));
+    assert_eq!(
+        serde_json::to_value(asked_team_item).unwrap()["waits_on"],
+        "person"
+    );
+    let plain_team_item = items.iter().find(|i| i.id == "t_plain_team").unwrap();
+    assert_eq!(plain_team_item.waits_on, Some(WaitsOn::Team));
+    let asked_absent_item = items.iter().find(|i| i.id == "t_asked_absent").unwrap();
+    assert_eq!(asked_absent_item.waits_on, Some(WaitsOn::Person));
+    let asked_unknown_item = items.iter().find(|i| i.id == "t_asked_unknown").unwrap();
+    assert_eq!(asked_unknown_item.waits_on, Some(WaitsOn::Person));
+}
+
+#[test]
 fn live_open_item_snapshots_require_opt_in_and_current_person_pairing() {
     let (_dir, hub, store, device, rx) = fixture();
     let (_guest, guest_rx) = phone(&hub, &store, "guest", "guest@example.com");
