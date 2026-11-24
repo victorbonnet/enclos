@@ -330,6 +330,7 @@ class Reading(FakeBoardCase):
         self.assertEqual(self.board.read("main"), [{
             "task": "t_mine", "title": "Write the weekly report", "reason": "Which client is it for?",
             "since": 5_000, "revision": self.revision("t_mine"), "resume": held_tasks.RESUME, "resumable": True,
+            "waits_on": "person",
         }])
         self.assertEqual([t["task"] for t in self.board.read("research")], ["t_theirs"])
 
@@ -509,6 +510,98 @@ class Reading(FakeBoardCase):
         with self.assertRaises(RuntimeError):
             self.board.read("main")
 
+    def test_waits_on_needs_input_without_and_with_ask(self):
+        self.kb.create("t_plain")
+        self.kb.hold("t_plain", payload={"reason": "Which client?", "kind": "needs_input"}, at=2_000)
+        self.kb.create("t_asked")
+        self.kb.hold("t_asked", payload={"reason": "Pick one", "kind": "needs_input"}, at=3_000)
+        entries = self.board.read("main")
+        store = asks.Asks(str(Path(self.temporary.name) / "main.sock.held-asks.json"))
+        store.put("t_asked", 3_000, {"decision": "Proceed?", "blocked": "Waiting", "choices": ["Yes", "No"]})
+        attached = {entry["task"]: entry for entry in store.attach(entries, 4_000)}
+        self.assertEqual(attached["t_plain"]["waits_on"], "person")
+        self.assertEqual(attached["t_asked"]["waits_on"], "person")
+        self.assertIn("ask", attached["t_asked"])
+
+    def test_waits_on_capability(self):
+        self.kb.create("t_cap")
+        self.kb.hold("t_cap", payload={"reason": "No network", "kind": "capability"})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "team")
+
+    def test_waits_on_dependency(self):
+        self.kb.create("t_dep")
+        self.kb.hold("t_dep", payload={"reason": "Waiting on upstream", "kind": "dependency"})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "team")
+
+    def test_waits_on_transient(self):
+        self.kb.create("t_tr")
+        self.kb.hold("t_tr", payload={"reason": "Rate limited", "kind": "transient"})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "team")
+
+    def test_waits_on_missing_kind_key(self):
+        self.kb.create("t_nokind")
+        self.kb.hold("t_nokind", payload={"reason": "Stopped"})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "person")
+
+    def test_waits_on_empty_or_non_string_kind(self):
+        for name, value in (("t_null", None), ("t_empty", ""), ("t_int", 3)):
+            self.kb.create(name)
+            self.kb.hold(name, payload={"reason": "Stopped", "kind": value})
+        got = {entry["task"]: entry["waits_on"] for entry in self.board.read("main")}
+        self.assertEqual(got, {"t_null": "person", "t_empty": "person", "t_int": "person"})
+
+    def test_waits_on_unknown_kind(self):
+        self.kb.create("t_unk")
+        self.kb.hold("t_unk", payload={"reason": "Stopped", "kind": "future_kind"})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "person")
+
+    def test_waits_on_strips_and_lowercases_kind(self):
+        self.kb.create("t_padded")
+        self.kb.hold("t_padded", payload={"reason": "Waiting", "kind": " Dependency "})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "team")
+
+    def test_waits_on_gave_up_with_and_without_carried_kind(self):
+        self.kb.create("t_gu1")
+        self.kb.hold("t_gu1", "gave_up", {"failures": 3, "error": "boom"})
+        self.kb.create("t_gu2")
+        self.kb.hold("t_gu2", "gave_up", {"failures": 3, "error": "boom", "kind": "transient"})
+        got = {entry["task"]: entry["waits_on"] for entry in self.board.read("main")}
+        self.assertEqual(got, {"t_gu1": "person", "t_gu2": "person"})
+
+    def test_waits_on_loop_triaged_card(self):
+        self.kb.create("t_loop_team")
+        self.kb.loop("t_loop_team", payload={"reason": "Looped", "kind": "transient", "recurrences": 2, "limit": 2})
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "person")
+
+    def test_waits_on_blocked_with_no_bound_event(self):
+        self.kb.create("t_nobound", status="blocked", at=4_000)
+        [entry] = self.board.read("main")
+        self.assertEqual(entry["waits_on"], "person")
+
+    def test_waits_on_report_every_entry_carries_person_or_team_and_unparseable_payload_reads_person(self):
+        self.kb.create("t_team")
+        self.kb.hold("t_team", payload={"reason": "Dep", "kind": "dependency"})
+        self.kb.create("t_person")
+        self.kb.hold("t_person", payload={"reason": "Ask", "kind": "needs_input"})
+        self.kb.create("t_badjson")
+        with self.kb.db() as conn, conn:
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = 't_badjson'")
+            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) "
+                         "VALUES ('t_badjson', 'blocked', '{not valid json', 3000)")
+        entries = self.board.read("main")
+        self.assertEqual(len(entries), 3)
+        for entry in entries:
+            self.assertIn(entry["waits_on"], ("person", "team"))
+        by_task = {entry["task"]: entry["waits_on"] for entry in entries}
+        self.assertEqual(by_task["t_badjson"], "person")
+
     def test_a_triage_task_is_held_only_while_the_loop_breaker_s_event_is_its_latest_move(self):
         self.kb.create("t_loop")
         self.kb.loop("t_loop", at=5_000)
@@ -538,7 +631,8 @@ class Reading(FakeBoardCase):
         self.kb.create("t_proposal", status="triage")
         self.assertEqual(self.board.read("main"), [{
             "task": "t_loop", "title": "Write the weekly report", "reason": "Which client?", "since": 5_000,
-            "revision": self.revision("t_loop"), "resume": "Decide on the agent's task board.", "resumable": False}])
+            "revision": self.revision("t_loop"), "resume": "Decide on the agent's task board.", "resumable": False,
+            "waits_on": "person"}])
 
     def test_a_hermes_with_no_triage_status_still_reports_its_blocked_tasks(self):
         self.kb.create("t_1")

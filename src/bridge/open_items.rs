@@ -1,5 +1,6 @@
 //! A read-only projection: no second queue and no new decision authority.
 use super::*;
+use enclos_protocol::held_task::WaitsOn;
 use enclos_protocol::open_items::{OpenItem, OpenItemKind};
 
 /// The exact discovery generation the device reviewed; not a native decision.
@@ -135,6 +136,7 @@ impl Hub {
                 summary: summary(&q.definition.text),
                 since,
                 expired: q.state == enclos_protocol::question::QuestionState::Expired,
+                waits_on: None,
             });
         }
         // These two kinds carry host-person authority; a conversation share does not.
@@ -143,6 +145,7 @@ impl Hub {
                 .indexed_held_tasks_for(person)
                 .map_err(|e| e.to_string())?
             {
+                let waits_on: WaitsOn = held.waits_on;
                 let h = held.info;
                 items.push(OpenItem {
                     version: format!("held:{}", h.revision),
@@ -154,6 +157,7 @@ impl Hub {
                     summary: summary(h.ask.as_ref().map_or(&h.reason, |ask| &ask.decision)),
                     since: h.since,
                     expired: false,
+                    waits_on: Some(waits_on),
                 });
             }
             for a in store
@@ -183,6 +187,7 @@ impl Hub {
                     )),
                     since: a.time,
                     expired: false,
+                    waits_on: None,
                 });
             }
         }

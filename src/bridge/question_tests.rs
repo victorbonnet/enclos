@@ -2871,6 +2871,65 @@ fn the_index_combines_canonical_requests_without_sharing_host_person_authority()
 }
 
 #[test]
+fn open_items_carry_waits_on_for_held_tasks_and_omit_it_for_questions() {
+    use enclos_protocol::held_task::{HeldTask, WaitsOn};
+    let (_dir, hub, store, _device, _rx) = fixture();
+    set_host(&hub, Some(OWNER));
+    let q = definition("q-no-waits-on");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &q,
+            "m-no-waits-on",
+            None,
+        )
+        .unwrap();
+    let team_task: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_team",
+        "title": "Waiting on dep",
+        "reason": "Blocked by dependency",
+        "since": 2,
+        "revision": "e:1",
+        "resume": "Resume",
+        "waits_on": "team"
+    }))
+    .unwrap();
+    let person_task: HeldTask = serde_json::from_value(serde_json::json!({
+        "task": "t_person",
+        "title": "Needs input",
+        "reason": "Which client?",
+        "since": 3,
+        "revision": "e:2",
+        "resume": "Resume",
+        "waits_on": "person"
+    }))
+    .unwrap();
+    store
+        .report_held_tasks(AGENT, "owned", &[team_task, person_task])
+        .unwrap();
+    let frames = hub.open_item_frames(&store, OWNER).unwrap();
+    let items: Vec<_> = frames
+        .iter()
+        .flat_map(|frame| match frame {
+            ToDevice::OpenItems { items, .. } => items.clone(),
+            _ => panic!("expected OpenItems"),
+        })
+        .collect();
+    let team_item = items.iter().find(|i| i.id == "t_team").unwrap();
+    assert_eq!(team_item.waits_on, Some(WaitsOn::Team));
+    let person_item = items.iter().find(|i| i.id == "t_person").unwrap();
+    assert_eq!(person_item.waits_on, Some(WaitsOn::Person));
+    let question_item = items.iter().find(|i| i.id == "q-no-waits-on").unwrap();
+    assert_eq!(question_item.waits_on, None);
+    let question_json = serde_json::to_value(question_item).unwrap();
+    assert!(
+        question_json.as_object().unwrap().get("waits_on").is_none(),
+        "question item must omit waits_on: {question_json}"
+    );
+}
+
+#[test]
 fn live_open_item_snapshots_require_opt_in_and_current_person_pairing() {
     let (_dir, hub, store, device, rx) = fixture();
     let (_guest, guest_rx) = phone(&hub, &store, "guest", "guest@example.com");

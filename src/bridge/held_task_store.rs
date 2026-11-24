@@ -4,15 +4,20 @@
 //! stored together.
 use super::*;
 use enclos_protocol::held_task::{
-    ANSWERED_IN_CONVERSATION, HeldTask, HeldTaskAsk, HeldTaskInfo, HeldTaskState,
+    ANSWERED_IN_CONVERSATION, HeldTask, HeldTaskAsk, HeldTaskInfo, HeldTaskState, WaitsOn,
 };
 use enclos_protocol::{ConversationId, HeldTaskId, HeldTaskRevision};
 
-/// A card as the bridge keeps it: what a device sees, the runtime's own
-/// revision of the hold, which only the plugin is sent, and who sees it.
+/// A card as the bridge keeps it: what a device sees, the raw task's own
+/// `waits_on` (the plugin legs' to read, which a device never sees on the
+/// card), the runtime's own revision of the hold, which only the plugin is
+/// sent, and who sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredHeldTask {
     pub info: HeldTaskInfo,
+    /// The raw task's own `waits_on`, the plugin legs' to read, which a
+    /// device never sees on the card.
+    pub waits_on: WaitsOn,
     pub runtime_revision: HeldTaskRevision,
     pub owner: String,
 }
@@ -95,6 +100,7 @@ fn read_card(row: &rusqlite::Row) -> rusqlite::Result<Row> {
             state,
             revision,
         },
+        waits_on: task.waits_on,
         runtime_revision: task.revision,
         owner,
     }))
@@ -593,6 +599,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:1").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            waits_on: WaitsOn::Person,
             ask: None,
         }
     }
@@ -918,6 +925,115 @@ mod tests {
         assert_eq!(changes[0].card.info.revision, 2);
         assert!(changes[0].message.is_none());
         assert_eq!(store.newest_seq().unwrap(), before);
+    }
+
+    /// Only who the hold waits on changes: the card is updated once each way,
+    /// with no new history, and stays as it was through a reopen.
+    #[test]
+    fn a_change_of_waits_on_alone_updates_the_card_once_each_way() {
+        let (dir, store, home) = store();
+        let team = HeldTask {
+            waits_on: WaitsOn::Team,
+            ..task("t1", "r")
+        };
+        store
+            .report_held_tasks(AGENT, &home, std::slice::from_ref(&team))
+            .unwrap();
+        let before = store.newest_seq().unwrap();
+        // Team -> person.
+        let changes = store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].card.waits_on, WaitsOn::Person);
+        assert_eq!(changes[0].card.info.state, HeldTaskState::Held);
+        assert_eq!(changes[0].card.info.revision, 1);
+        assert_eq!(changes[0].card.runtime_revision.as_str(), "e:1");
+        assert!(changes[0].message.is_none());
+        // The same report again changes nothing.
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.newest_seq().unwrap(), before);
+        // As stored across a reopen.
+        drop(store);
+        let store = Store::open(&dir.path().join("app.db")).unwrap();
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert_eq!(card.waits_on, WaitsOn::Person);
+        assert_eq!(card.info.revision, 1);
+        assert_eq!(
+            store.held_tasks_for(OWNER).unwrap()[0].waits_on,
+            WaitsOn::Person
+        );
+        // And back to team.
+        let changes = store
+            .report_held_tasks(AGENT, &home, std::slice::from_ref(&team))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].card.waits_on, WaitsOn::Team);
+        assert_eq!(changes[0].card.info.revision, 2);
+        assert!(changes[0].message.is_none());
+        assert_eq!(store.newest_seq().unwrap(), before);
+        // The same team report again changes nothing.
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, std::slice::from_ref(&team))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A card an earlier bridge stored has no `waits_on`: it reads as
+    /// `Person`, and the same task reported again is no change.
+    #[test]
+    fn a_card_stored_without_waits_on_reads_as_person_and_does_not_change() {
+        let (dir, store, home) = store();
+        store
+            .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+            .unwrap();
+        let body: String = store
+            .db
+            .query_row("SELECT body FROM held_tasks WHERE task = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut older: serde_json::Value = serde_json::from_str(&body).unwrap();
+        older.as_object_mut().unwrap().remove("waits_on");
+        store
+            .db
+            .execute(
+                "UPDATE held_tasks SET body = ?1 WHERE task = 't1'",
+                params![older.to_string()],
+            )
+            .unwrap();
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert_eq!(card.waits_on, WaitsOn::Person);
+        assert_eq!(card.info.revision, 0);
+        drop(store);
+        let store = Store::open(&dir.path().join("app.db")).unwrap();
+        let body: String = store
+            .db
+            .query_row("SELECT body FROM held_tasks WHERE task = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!body.contains("waits_on"), "{body}");
+        let card = store.held_task(AGENT, "t1").unwrap().unwrap();
+        assert_eq!(
+            (card.waits_on, card.info.revision, card.info.state),
+            (WaitsOn::Person, 0, HeldTaskState::Held)
+        );
+        let seq = store.newest_seq().unwrap();
+        assert!(
+            store
+                .report_held_tasks(AGENT, &home, &[task("t1", "r")])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.newest_seq().unwrap(), seq);
     }
 
     /// A card an earlier bridge stored has no `resumable`: it reads as

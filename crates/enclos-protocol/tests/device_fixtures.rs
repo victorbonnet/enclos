@@ -38,6 +38,10 @@ const TO_DEVICE: &[(&str, &str)] = &[
         include_str!("fixtures/device/to_device_open_items.json"),
     ),
     (
+        "to_device_open_items_held_tasks",
+        include_str!("fixtures/device/to_device_open_items_held_tasks.json"),
+    ),
+    (
         "to_device_open_items_unavailable",
         include_str!("fixtures/device/to_device_open_items_unavailable.json"),
     ),
