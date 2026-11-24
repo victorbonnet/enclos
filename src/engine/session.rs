@@ -376,7 +376,12 @@ impl Engine {
                 reads: &reads,
             };
             let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
-            self.failed_on_error(lock, name, audit_name, started)
+            // The updater failing is not the sandbox failing (F1): the sandbox
+            // was running before the update and step 9 starts its services
+            // again, so recording `Failed` here left it failed with none. This
+            // session's audit entry still closes as failed — `write` closes it
+            // with the error — and the update's own entry says why.
+            started
         })?;
         // Drop the parent's write end so the pump sees EOF as soon as the
         // updater and anything it spawned exit.

@@ -5875,6 +5875,10 @@ fn configure_stops_a_service_that_refuses_its_commands_meanwhile() {
 
 /// Stand-in adapter for `enclos runtime update` tests: runs a shell script
 /// as its updater and reads/reports a version through `version_command`.
+/// An empty `update_script` or `version_script` stands for "the command has
+/// no program", which is how a session that cannot start is arranged: it is
+/// the reviewer's probe (`reports/t_edc84e67/probe-updater-session-failure.diff`)
+/// turned into a test.
 struct UpdatingRuntime {
     inner: TestRuntime,
     update_script: String,
@@ -5897,11 +5901,15 @@ impl RuntimeAdapter for UpdatingRuntime {
     fn update(&self) -> crate::runtime::RuntimeUpdate {
         crate::runtime::RuntimeUpdate {
             installer: false,
-            commands: vec![SandboxCommand::new(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                self.update_script.clone().into(),
-            ])],
+            commands: if self.update_script.is_empty() {
+                vec![SandboxCommand::new(Vec::new())]
+            } else {
+                vec![SandboxCommand::new(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    self.update_script.clone().into(),
+                ])]
+            },
         }
     }
     fn home_files(&self, backend: BackendKind) -> Vec<crate::runtime::HomeFile> {
@@ -5929,6 +5937,9 @@ impl RuntimeAdapter for UpdatingRuntime {
         self.inner.agents_in(home)
     }
     fn version_command(&self, report: &Path) -> Option<SandboxCommand> {
+        if self.version_script.is_empty() {
+            return Some(SandboxCommand::new(Vec::new()));
+        }
         Some(SandboxCommand::new(vec![
             "/bin/sh".into(),
             "-c".into(),
@@ -5949,6 +5960,7 @@ impl RuntimeAdapter for UpdatingRuntime {
 
 #[test]
 fn a_runtime_update_dry_run_lists_steps_in_order_and_changes_nothing() {
+    use crate::model::sandbox::SandboxState;
     use crate::runtime::ServiceName;
     use crate::service::fake::FakeServices;
     use std::rc::Rc;
@@ -5958,20 +5970,38 @@ fn a_runtime_update_dry_run_lists_steps_in_order_and_changes_nothing() {
     done(lab.install(INSTALLS, Confirm::Yes).unwrap());
     let audit_before = lab.audit();
 
-    // Stopped sandbox: no service is stopped or started.
-    let Planned::DryRun(stopped_plan) = lab
+    // The sandbox a `runtime install` leaves: recorded running, with no
+    // service installed. Before F2 the plan called it stopped; it is not.
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+    let Planned::DryRun(uninstalled_plan) = lab
         .engine
         .update_runtime(&alice(), &lab.name, Confirm::DryRun)
         .unwrap()
     else {
         panic!("dry run did not return DryRun");
     };
-    assert_eq!(stopped_plan.changes.len(), 4);
-    assert!(stopped_plan.changes[0].contains("stop no service of sandbox"));
-    assert!(stopped_plan.changes[0].ends_with("it is stopped already"));
-    assert!(stopped_plan.changes[1].contains("run the hermes updater"));
-    assert!(stopped_plan.changes[2].contains("record the version hermes then reports"));
-    assert!(stopped_plan.changes[3].contains("keep sandbox"));
+    assert_eq!(uninstalled_plan.changes.len(), 4);
+    assert!(
+        uninstalled_plan.changes[0].contains("end the sessions of sandbox"),
+        "{:?}",
+        uninstalled_plan.changes
+    );
+    assert!(
+        uninstalled_plan.changes[0].ends_with("it runs with none installed"),
+        "{:?}",
+        uninstalled_plan.changes
+    );
+    assert!(uninstalled_plan.changes[1].contains("run the hermes updater"));
+    assert!(uninstalled_plan.changes[2].contains("record the version hermes then reports"));
+    assert!(
+        uninstalled_plan.changes[3].ends_with("running with no service installed"),
+        "{:?}",
+        uninstalled_plan.changes
+    );
     assert_eq!(lab.audit(), audit_before);
 
     // Running sandbox: stops services, runs updater, records version, starts services again.
@@ -5993,6 +6023,183 @@ fn a_runtime_update_dry_run_lists_steps_in_order_and_changes_nothing() {
     assert!(running_plan.changes[2].contains("record the version hermes then reports"));
     assert!(running_plan.changes[3].contains("start the services of sandbox"));
     assert_eq!(lab.audit(), audit_before);
+}
+
+#[test]
+fn a_running_sandbox_whose_updater_session_cannot_start_keeps_its_services() {
+    use crate::model::sandbox::SandboxState;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    // A running sandbox with its services actually started, as `sandbox start`
+    // leaves it.
+    lab.engine.start_sandbox(&alice(), &lab.name).unwrap();
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(
+        lab.engine.has_services(&lab.name).unwrap(),
+        "started: {:?}",
+        fake.started.borrow()
+    );
+    fake.stopped.borrow_mut().clear();
+    // `started` is not cleared: it is what `has_services` reads, so clearing
+    // it would tell the update the sandbox had nothing installed. The stop in
+    // step 6 removes these units, so a start afterwards is a real one.
+
+    // The updater has no program, so its session cannot start: F1 path (a),
+    // the reviewer's probe (`reports/t_edc84e67/probe-updater-session-failure.diff`)
+    // as a test. Before the fix this recorded the sandbox `Failed`, the state
+    // re-read said "not running", and the services were never started again.
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: String::new(),
+        version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+    };
+    let err = lab
+        .engine
+        .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("no command to run"), "{err}");
+
+    // The updater failing is not the sandbox failing: it was running before
+    // the update and step 9 starts its services again (ADR 0074).
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(
+        lab.engine.has_services(&lab.name).unwrap(),
+        "its services were installed and started again"
+    );
+    assert!(
+        fake.stopped.borrow().contains(&gateway),
+        "step 6 stopped it: {:?}",
+        fake.stopped.borrow()
+    );
+    assert!(
+        fake.started.borrow().iter().any(|u| u.label == gateway),
+        "started: {:?}",
+        fake.started.borrow()
+    );
+    let audit = lab.audit();
+    // The run is accounted for even though it never reached step 10.
+    let row = audit
+        .rsplit("runtime update Some(Finished")
+        .next()
+        .unwrap_or_default();
+    assert!(audit.contains("runtime update Some(Finished"), "{audit}");
+    assert!(row.contains("Failed"), "{audit}");
+}
+
+#[test]
+fn a_running_sandbox_whose_version_probe_cannot_start_keeps_its_services() {
+    use crate::engine::ServicesAfter;
+    use crate::model::sandbox::SandboxState;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    lab.engine.start_sandbox(&alice(), &lab.name).unwrap();
+    assert!(lab.engine.has_services(&lab.name).unwrap());
+    fake.stopped.borrow_mut().clear();
+
+    // Step 8's probe cannot start (F1 path (b)): the update succeeded but the
+    // version is unreadable. Before the fix this recorded `Failed`, so the
+    // services were not started and the command said the sandbox was stopped.
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'probe: updating'".into(),
+        version_script: String::new(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert!(
+        matches!(&end.after, Some(Err(why)) if why.contains("no command to run")),
+        "after: {:?}",
+        end.after
+    );
+    assert_eq!(end.services, ServicesAfter::StartedAgain);
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(
+        fake.stopped.borrow().contains(&gateway),
+        "step 6 stopped it: {:?}",
+        fake.stopped.borrow()
+    );
+    assert!(
+        fake.started.borrow().iter().any(|u| u.label == gateway),
+        "started: {:?}",
+        fake.started.borrow()
+    );
+}
+
+#[test]
+fn a_runtime_update_of_a_running_sandbox_without_services_is_not_called_stopped() {
+    use crate::engine::ServicesAfter;
+    use crate::model::sandbox::SandboxState;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+
+    // F2: recorded running with nothing installed is what `runtime install`
+    // or a `connect` leaves, and it is not a stopped sandbox.
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'probe: updating'".into(),
+        version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+    };
+    let end = done(
+        lab.engine
+            .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(end.succeeded);
+    assert_eq!(end.services, ServicesAfter::NotInstalledRunning);
+    assert_eq!(
+        end.services.as_str(),
+        "not installed (the sandbox runs without services)"
+    );
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(!lab.engine.has_services(&lab.name).unwrap());
+    assert!(
+        fake.started.borrow().is_empty(),
+        "{:?}",
+        fake.started.borrow()
+    );
 }
 
 #[test]

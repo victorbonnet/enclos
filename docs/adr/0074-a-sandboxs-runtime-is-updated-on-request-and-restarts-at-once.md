@@ -2,7 +2,7 @@
 status: proposed
 ---
 
-# A sandbox's runtime is updated on request, and its service restarts at once
+# A sandbox's runtime is updated on request, and its services restart at once
 
 Amends [0064](0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md), which keeps service startup a host operation, and departs from [0031](0031-a-service-restarts-when-its-runtime-settings-change.md)'s wait for running work, for this one action.
 

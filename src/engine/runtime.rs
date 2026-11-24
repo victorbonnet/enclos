@@ -87,6 +87,10 @@ pub enum ServicesAfter {
     /// The sandbox had services installed before the update, and they were
     /// started again afterwards.
     StartedAgain,
+    /// The sandbox was running with no services installed — the state after
+    /// `enclos runtime install`, or a `connect`, without a `sandbox start` —
+    /// so the update ended its sessions and left it running with none.
+    NotInstalledRunning,
     /// The sandbox was stopped with no services installed, and stays so.
     NotInstalled,
 }
@@ -96,6 +100,9 @@ impl ServicesAfter {
     pub fn as_str(self) -> &'static str {
         match self {
             ServicesAfter::StartedAgain => "started again",
+            ServicesAfter::NotInstalledRunning => {
+                "not installed (the sandbox runs without services)"
+            }
             ServicesAfter::NotInstalled => "not installed (the sandbox was stopped)",
         }
     }
@@ -470,6 +477,13 @@ impl Engine {
             });
         }
         self.check_start_limits(name)?;
+        // What the sandbox was doing when the update began. Step 9 puts it
+        // back to this, and the dry run says what it would do with it. The
+        // state read again after the updater ran cannot say what the sandbox
+        // was: the update's own steps leave their mark on it (F1 — a session
+        // that cannot start recorded it `Failed`, and reading that as "stopped
+        // by the person" left a running sandbox failed with no services).
+        let was_running = self.record(name)?.state == SandboxState::Running;
         let installed = self.has_services(name)?;
         if confirm == Confirm::DryRun {
             return Ok(Planned::DryRun(plan_update(
@@ -477,6 +491,7 @@ impl Engine {
                 kind,
                 active.version.version,
                 installed,
+                was_running,
             )));
         }
 
@@ -532,19 +547,46 @@ impl Engine {
             let (end, timed_out) = match ran {
                 Ok(ran) => ran,
                 Err(error) => {
-                    // The services start again on what the updater left, as
-                    // `sandbox start` starts them, unless the sandbox is no
-                    // longer recorded running: then it stays stopped and what
-                    // the run left open is ended (ADR 0074).
-                    let running = self
+                    // The sandbox goes back to what it was before the update
+                    // began: the services start again on what the updater
+                    // left, as `sandbox start` starts them, unless it was
+                    // stopped, or was stopped meanwhile — then it stays
+                    // stopped and what the run left open is ended (ADR 0074).
+                    // Whether it was running is the state from before step 6;
+                    // the state read here only answers "was it stopped
+                    // meanwhile", because this failure may itself have
+                    // recorded `Failed` (F1: a session that cannot start is
+                    // not the sandbox failing).
+                    let stopped = self
                         .record(name)
-                        .map(|r| r.state == SandboxState::Running)
-                        .unwrap_or(false);
-                    if installed && running {
-                        let _ = self.start_sandbox(by, name);
-                    } else if !running {
-                        let _ = self.stop_services_and_sessions(by, name);
+                        .map(|r| stopped_since(&r.state, was_running))
+                        .unwrap_or(!was_running);
+                    let mut note = None;
+                    if installed && was_running && !stopped {
+                        if let Err(e) = self.start_sandbox(by, name) {
+                            note = Some(format!("its services were not started again ({e})"));
+                        }
+                    } else if !was_running || stopped {
+                        if let Err(e) = self.stop_services_and_sessions(by, name) {
+                            note = Some(format!("its sessions were not ended ({e})"));
+                        }
                     }
+                    // A6: the run is in the audit log as failed, with the
+                    // reason the person sees, even though it never reaches
+                    // step 10 — no version was recorded and there is no
+                    // session to report.
+                    let reason = match &note {
+                        Some(note) => format!("{error}; {note}"),
+                        None => error.to_string(),
+                    };
+                    let target = Some(format!("{name} {kind}"));
+                    let _ = self.write_with_outcome(
+                        by,
+                        "runtime update",
+                        target,
+                        |_| Outcome::failed(reason),
+                        |_| Ok(()),
+                    );
                     return Err(error);
                 }
             };
@@ -599,54 +641,109 @@ impl Engine {
                 _ => false,
             };
 
-        // Step 9: start the services again when they were installed and the
-        // sandbox is still recorded running. The recorded state is read here,
-        // not only before the download: a `sandbox stop` meanwhile removes the
-        // services itself and records `Stopped`, and installing them again
-        // would leave a stopped sandbox with services (ADR 0074: one that was
-        // stopped stays stopped with none installed).
-        let running = self.record(name)?.state == SandboxState::Running;
-        let services = if installed && running {
-            self.start_sandbox(by, name)?;
-            ServicesAfter::StartedAgain
-        } else {
-            if !running {
-                // Nothing is installed again, so end what the updater's own
-                // session left open — the proxy it started for itself — as
-                // `sandbox stop` ends sessions; its result is the update's,
-                // not a second failure.
-                self.stop_services_and_sessions(by, name)?;
-            }
-            ServicesAfter::NotInstalled
-        };
-
-        // Step 10: one `runtime update` audit entry for the run, after the
-        // services are started again so it never sits between stop and start.
+        // What the run's audit entry says, built before step 9 so that a
+        // failure there still leaves the run accounted for: the version is
+        // recorded by then, and the `runtime update` entry would otherwise be
+        // missing altogether (the verdict's audit-row residual).
         let target = Some(format!("{name} {kind}"));
         let sha_note = installer_sha256
             .as_deref()
             .map(|sha| format!(", installer sha256 {sha}"))
             .unwrap_or_default();
-        let outcome = if succeeded {
-            let text = match (&before, &after) {
-                (Some(b), Some(Ok(a))) if a != b => format!("updated from {b} to {a}{sha_note}"),
-                (Some(_), Some(Ok(a))) => format!("unchanged at {a}{sha_note}"),
-                (None, Some(Ok(a))) => format!("updated to {a}{sha_note}"),
-                (_, Some(Err(why))) => {
-                    format!("updater finished; version unreadable ({why}){sha_note}")
+        let outcome = |lost: Option<String>| -> Outcome {
+            let text = if succeeded {
+                match (&before, &after) {
+                    (Some(b), Some(Ok(a))) if a != b => {
+                        format!("updated from {b} to {a}{sha_note}")
+                    }
+                    (Some(_), Some(Ok(a))) => format!("unchanged at {a}{sha_note}"),
+                    (None, Some(Ok(a))) => format!("updated to {a}{sha_note}"),
+                    (_, Some(Err(why))) => {
+                        format!("updater finished; version unreadable ({why}){sha_note}")
+                    }
+                    (_, None) => format!("updater finished{sha_note}"),
                 }
-                (_, None) => format!("updater finished{sha_note}"),
+            } else {
+                let ended = ended_text(stopped_after, &session);
+                let stays = before
+                    .as_ref()
+                    .map(|b| format!("; {b} stays"))
+                    .unwrap_or_default();
+                format!("the updater {ended}{stays}{sha_note}")
             };
-            Outcome::ok(text)
-        } else {
-            let ended = ended_text(stopped_after, &session);
-            let stays = before
-                .as_ref()
-                .map(|b| format!("; {b} stays"))
-                .unwrap_or_default();
-            Outcome::failed(format!("the updater {ended}{stays}{sha_note}"))
+            match lost {
+                // The updater ran, but the sandbox's own services could not be
+                // put back: the run failed, whatever it did to the version.
+                Some(lost) => Outcome::failed(format!("{text}; {lost}")),
+                None if succeeded => Outcome::ok(text),
+                None => Outcome::failed(text),
+            }
         };
-        self.write_with_outcome(by, "runtime update", target, |_| outcome, |_| Ok(()))?;
+
+        // Step 9: start the services again when they were installed and the
+        // sandbox was running when the update began and has not been stopped
+        // since. The state is read here for the "stopped since" part only: a
+        // `sandbox stop` meanwhile removes the services itself and records
+        // `Stopped`, and installing them again would leave a stopped sandbox
+        // with services (ADR 0074: one that was stopped stays stopped with
+        // none installed). A `Failed` state is not a stop of a sandbox that
+        // was running (see `stopped_since`).
+        let state_now = match self.record(name) {
+            Ok(record) => record.state,
+            Err(error) => {
+                let _ = self.write_with_outcome(
+                    by,
+                    "runtime update",
+                    target.clone(),
+                    |_| outcome(Some("its services were left as they were".into())),
+                    |_| Ok(()),
+                );
+                return Err(error);
+            }
+        };
+        let stopped = stopped_since(&state_now, was_running);
+        let services = if installed && was_running && !stopped {
+            if let Err(error) = self.start_sandbox(by, name) {
+                let lost = format!("its services were not started again ({error})");
+                let _ = self.write_with_outcome(
+                    by,
+                    "runtime update",
+                    target.clone(),
+                    |_| outcome(Some(lost)),
+                    |_| Ok(()),
+                );
+                return Err(error);
+            }
+            ServicesAfter::StartedAgain
+        } else {
+            if stopped {
+                // Nothing is installed again, so end what the updater's own
+                // session left open — the proxy it started for itself — as
+                // `sandbox stop` ends sessions; its result is the update's,
+                // not a second failure.
+                if let Err(error) = self.stop_services_and_sessions(by, name) {
+                    let lost = format!("its sessions were not ended ({error})");
+                    let _ = self.write_with_outcome(
+                        by,
+                        "runtime update",
+                        target.clone(),
+                        |_| outcome(Some(lost)),
+                        |_| Ok(()),
+                    );
+                    return Err(error);
+                }
+            }
+            if stopped {
+                ServicesAfter::NotInstalled
+            } else {
+                // Running with no services installed, before and after.
+                ServicesAfter::NotInstalledRunning
+            }
+        };
+
+        // Step 10: one `runtime update` audit entry for the run, after the
+        // services are started again so it never sits between stop and start.
+        self.write_with_outcome(by, "runtime update", target, |_| outcome(None), |_| Ok(()))?;
 
         Ok(Planned::Done(UpdateEnd {
             kind,
@@ -985,11 +1082,39 @@ impl InstallPlan {
     }
 }
 
-fn plan_update(name: &SandboxName, kind: RuntimeKind, policy: u32, installed: bool) -> Plan {
+/// Whether the sandbox is stopped after the update began. A sandbox that was
+/// running and is now `Stopped` was stopped meanwhile: it stays stopped, with
+/// none installed (ADR 0074). A sandbox that was not running and is not
+/// running now is stopped, `Failed` included. A `Failed` recorded on a
+/// sandbox that was running is not a stop: `stop_services_and_sessions`
+/// records it when session members survive the stop, and before F1's fix the
+/// update's own session failing to start did too.
+fn stopped_since(state: &SandboxState, was_running: bool) -> bool {
+    match state {
+        SandboxState::Stopped => true,
+        SandboxState::Running => false,
+        _ => !was_running,
+    }
+}
+
+fn plan_update(
+    name: &SandboxName,
+    kind: RuntimeKind,
+    policy: u32,
+    installed: bool,
+    running: bool,
+) -> Plan {
     let mut changes = Vec::new();
     if installed {
         changes.push(format!(
             "stop the services of sandbox {name} (its proxy, its namespace holder where the backend has one, and its runtime's services) and end its sessions"
+        ));
+    } else if running {
+        // Recorded running with nothing installed: what `runtime install` or a
+        // `connect` leaves. Calling that sandbox stopped (the wording before
+        // F2) is wrong, and it is not left stopped either.
+        changes.push(format!(
+            "end the sessions of sandbox {name} and stop no service: it runs with none installed"
         ));
     } else {
         changes.push(format!(
@@ -1002,6 +1127,10 @@ fn plan_update(name: &SandboxName, kind: RuntimeKind, policy: u32, installed: bo
     changes.push(format!("record the version {kind} then reports"));
     if installed {
         changes.push(format!("start the services of sandbox {name} again"));
+    } else if running {
+        changes.push(format!(
+            "leave sandbox {name} running with no service installed"
+        ));
     } else {
         changes.push(format!(
             "keep sandbox {name} stopped with no service installed"

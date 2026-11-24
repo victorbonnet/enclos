@@ -2,6 +2,7 @@
 //! a messaging channel. Logging it in is the runtime's own command, through
 //! `enclos connect` (ADR 0024).
 
+use std::io::{IsTerminal, Write};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -317,6 +318,19 @@ fn configure(
     Ok(exit::OK)
 }
 
+/// Whether `enclos runtime update` asks before it works: in a terminal, when
+/// nobody said `--yes`, and when the call is the person's own rather than the
+/// bridge's (the bridge passes `--time-limit`, and reads no answer anyway).
+fn asks_before_updating(confirm: Confirm, limit: Option<Duration>, terminal: bool) -> bool {
+    confirm == Confirm::Ask && limit.is_none() && terminal
+}
+
+/// Whether an answer to the question says yes. Only `y` or `yes` does, in any
+/// case; a bare Enter, `n`, anything else and end-of-input say no.
+fn answered_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 fn update(
     engine: &Engine,
     by: &Actor,
@@ -361,6 +375,28 @@ fn update(
             );
         }
     }
+    // Note 6, as Victor settled it on 2026-11-24: the command asks before it
+    // stops anything in a terminal, and never on the bridge's call — a tap on
+    // the phone must never wait on a prompt, and that call passes
+    // `--time-limit` from a process with no terminal. `--yes` therefore
+    // answers the question instead of being a no-op, and `--dry-run` already
+    // ends above without asking.
+    let mut confirm = confirm;
+    if asks_before_updating(confirm, limit, std::io::stdin().is_terminal()) {
+        if let Planned::DryRun(plan) = engine.update_runtime(by, &sandbox, Confirm::DryRun)? {
+            output::show_plan(&plan);
+        }
+        print!("Update sandbox {sandbox} now? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() || !answered_yes(&answer) {
+            println!("Nothing was changed.");
+            return Ok(exit::OK);
+        }
+        // The person answered the question the command asked; the engine is
+        // told so rather than asked again.
+        confirm = Confirm::Yes;
+    }
     let updated = match limit {
         None => engine.update_runtime(by, &sandbox, confirm)?,
         Some(limit) => engine.update_runtime_within(by, &sandbox, confirm, limit)?,
@@ -381,6 +417,11 @@ fn update(
             ServicesAfter::StartedAgain => {
                 "the sandbox's services are running again on what the updater left"
             }
+            // A sandbox recorded running with nothing installed — after
+            // `runtime install` or a `connect` — is not stopped (F2).
+            ServicesAfter::NotInstalledRunning => {
+                "no service was installed (the sandbox runs without services)"
+            }
             ServicesAfter::NotInstalled => "no service was installed (the sandbox was stopped)",
         };
         let state_sentence = match &end.before {
@@ -388,6 +429,9 @@ fn update(
             None => match end.services {
                 ServicesAfter::StartedAgain => {
                     "The sandbox's services are running again on what the updater left.".to_owned()
+                }
+                ServicesAfter::NotInstalledRunning => {
+                    "No service was installed (the sandbox runs without services).".to_owned()
                 }
                 ServicesAfter::NotInstalled => {
                     "No service was installed (the sandbox was stopped).".to_owned()
@@ -437,32 +481,35 @@ fn update(
         ));
     }
     if !end.succeeded {
-        // What the updater said about its own ending, and the path of its log,
-        // are both values the engine hands back — and the `Engine` is the
-        // object that holds the policy's secrets, so CodeQL's
-        // cleartext-logging analysis takes every value derived from it as
-        // secret-bearing when one reaches a log. Stderr therefore names
-        // neither: the updater's own output, streamed above as A7 has it, says
-        // why it stopped, `enclos logs` keeps and shows the log, and the JSON
-        // document still carries the path (`log`) and how the session ended
-        // (`session`, `stopped_after`) for the bridge and the phone.
-        let services_clause = match end.services {
-            ServicesAfter::StartedAgain => {
-                "The sandbox's services are running again on what the updater left."
-            }
-            ServicesAfter::NotInstalled => "No service was installed (the sandbox was stopped).",
-        };
-        eprintln!(
-            "enclos: the {shown} updater did not finish in sandbox {sandbox}; its output above says why, and `enclos logs {sandbox}` keeps it. {services_clause} There is no rollback: fix the cause, then run `enclos runtime update {sandbox}` again."
-        );
+        // §3.3 as Victor settled it on 2026-11-24: the line names the ending,
+        // the log's path and the version that stays recorded, exactly as the
+        // `--json` document's `error.message` does — the two modes say the
+        // same, so there is no deviation left to disclose. A stop at the time
+        // limit or by a signal is said in the line itself, so it stands alone
+        // with the log path; "its output above says why" was untrue for those.
+        //
+        // The CodeQL cleartext-logging alerts 56 and 57 that kept these values
+        // out named a property of the `Engine`, which holds the policy's
+        // secrets, not of these four values: a validated `RuntimeVersion`, a
+        // layout path, an exit status and a signal name. The same function
+        // still interpolates the engine's own `why` below, so leaving the path
+        // and version out never delivered that property, and A6/A7 ask for
+        // both.
+        eprintln!("enclos: {}", failure_message());
         return Ok(exit::ERROR);
     }
     let services_semi = match end.services {
         ServicesAfter::StartedAgain => "its services are running again.",
+        ServicesAfter::NotInstalledRunning => {
+            "its services were not installed (the sandbox runs without services)."
+        }
         ServicesAfter::NotInstalled => "its services were not installed (the sandbox was stopped).",
     };
     let services_sentence = match end.services {
         ServicesAfter::StartedAgain => "Its services are running again.",
+        ServicesAfter::NotInstalledRunning => {
+            "Its services were not installed (the sandbox runs without services)."
+        }
         ServicesAfter::NotInstalled => "Its services were not installed (the sandbox was stopped).",
     };
     if end.updated {
@@ -586,6 +633,34 @@ mod tests {
         assert_eq!(requested_by.as_deref(), Some("-alice (device d-1)"));
         // One runtime per sandbox: no --runtime flag.
         assert!(Cli::try_parse_from(["enclos", "update", "lab", "--runtime", "hermes"]).is_err());
+    }
+
+    #[test]
+    fn an_update_asks_in_a_terminal_and_never_on_the_bridge_call() {
+        // Note 6: the person's own call in a terminal asks; `--yes` answers it
+        // and `--dry-run` ends before it; the bridge's call passes
+        // `--time-limit` and reads no answer, so it must never reach a prompt.
+        let terminal = true;
+        assert!(asks_before_updating(Confirm::Ask, None, terminal));
+        assert!(!asks_before_updating(Confirm::Yes, None, terminal));
+        assert!(!asks_before_updating(Confirm::DryRun, None, terminal));
+        assert!(!asks_before_updating(
+            Confirm::Ask,
+            Some(Duration::from_secs(3600)),
+            terminal
+        ));
+        // Not a terminal: a pipe or a service manager's stdin says no.
+        assert!(!asks_before_updating(Confirm::Ask, None, false));
+    }
+
+    #[test]
+    fn only_an_explicit_yes_answers_the_question() {
+        for yes in ["y", "Y", "yes", "YES", " yes \n"] {
+            assert!(answered_yes(yes), "{yes:?}");
+        }
+        for no in ["", "\n", "n", "no", "yeah", "sure", "1"] {
+            assert!(!answered_yes(no), "{no:?}");
+        }
     }
 
     #[test]
