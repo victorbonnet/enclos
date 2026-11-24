@@ -3,6 +3,7 @@
 //! opened with the agent's token.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -35,11 +36,13 @@ pub enum PluginError {
         path: String,
         source: std::io::Error,
     },
-    /// The socket, or the folder it is in, is a link: the bridge would send
-    /// the agent's token to whatever listens there, so it does not connect
-    /// (`refuse_linked_folder`). A link is nothing a restart explains, so
-    /// this failure is never called one (#376). It says what `Connect` says:
-    /// the person's diagnostic does not change.
+    /// The path is not the channel's own socket: the socket, or the folder it
+    /// is in, is a link (`refuse_linked_folder`), or it is a file that is not
+    /// a socket, a folder, or a path this bridge cannot read
+    /// (`connect_within`, `not_a_channel`). A link is nothing a restart
+    /// explains, and neither is a path that is not a socket, so this failure
+    /// is never called one (#376). It says what `Connect` says: the person's
+    /// diagnostic does not change.
     #[error(
         "cannot reach the agent's app channel at {path}: {source} (is the sandbox started, and the channel set up?)"
     )]
@@ -68,9 +71,37 @@ impl PluginError {
     /// connection itself could not be made, or broke while the `hello` was
     /// read (#376). A plugin that answered and refused the token, that does
     /// not speak this protocol, or that sent something unreadable says
-    /// something else about the agent, and is never called a restart.
+    /// something else about the agent, and is never called a restart. Nor is a
+    /// permission this bridge never had: a socket in a folder it cannot read
+    /// is a home that is not this channel's.
     pub(super) fn may_be_restarting(&self) -> bool {
-        matches!(self, PluginError::Connect { .. } | PluginError::Io(_))
+        match self {
+            PluginError::Connect { source, .. } => {
+                source.kind() != std::io::ErrorKind::PermissionDenied
+            }
+            PluginError::Io(_) => true,
+            _ => false,
+        }
+    }
+
+    /// A `hello` write that failed because the plugin had already closed the
+    /// connection: the plugin refused this bridge without reading it — the
+    /// Hermes plugin closes the connection before the `hello` when its one
+    /// bridge slot is taken. The read side says the same of a reset before a
+    /// line (`connect_within`); this is the write side of that race, and a
+    /// restart is not its explanation (#376).
+    fn closed_before_hello(self) -> PluginError {
+        match self {
+            PluginError::Io(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                PluginError::Refused
+            }
+            other => other,
+        }
     }
 }
 
@@ -119,33 +150,50 @@ pub(super) fn connect_within(
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
     refuse_linked_folder(socket)?;
-    let stream = UnixStream::connect(socket).map_err(|source| PluginError::Connect {
-        path: socket.display().to_string(),
-        source,
-    })?;
+    let stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        // A failure of the path itself — a file that is not a socket, a
+        // folder, a folder this bridge cannot read — is nothing a restart
+        // explains: it is refused as `Linked` is, and says what `Connect`
+        // says (#376).
+        Err(source) if not_a_channel(socket, &source) => {
+            return Err(PluginError::Linked {
+                path: socket.display().to_string(),
+                source,
+            });
+        }
+        Err(source) => {
+            return Err(PluginError::Connect {
+                path: socket.display().to_string(),
+                source,
+            });
+        }
+    };
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
         lock: Arc::new(Mutex::new(())),
     };
-    writer.send(FromBridge::Hello {
-        token: token.to_owned(),
-        capabilities: vec![
-            Capability::Questions,
-            Capability::RuntimeApprovals,
-            Capability::RuntimeApprovalScopes,
-            Capability::Abort,
-            Capability::Activity,
-            Capability::Tasks,
-            Capability::HeldTaskDetails,
-            Capability::TaskDetails,
-            Capability::Usage,
-            Capability::HeldTasks,
-            Capability::AgentUsage,
-            Capability::TaskEvents,
-        ],
-        home: ConversationId::new(home).ok(),
-    })?;
+    writer
+        .send(FromBridge::Hello {
+            token: token.to_owned(),
+            capabilities: vec![
+                Capability::Questions,
+                Capability::RuntimeApprovals,
+                Capability::RuntimeApprovalScopes,
+                Capability::Abort,
+                Capability::Activity,
+                Capability::Tasks,
+                Capability::HeldTaskDetails,
+                Capability::TaskDetails,
+                Capability::Usage,
+                Capability::HeldTasks,
+                Capability::AgentUsage,
+                Capability::TaskEvents,
+            ],
+            home: ConversationId::new(home).ok(),
+        })
+        .map_err(PluginError::closed_before_hello)?;
     let mut reader = PluginReader {
         lines: BufReader::new(stream),
         answers: writer.try_clone()?,
@@ -319,6 +367,25 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
         }
     }
     Ok(())
+}
+
+/// Whether a failed connection to `socket` failed because the path is not the
+/// channel's own socket — a file that is not one, a folder, or something this
+/// bridge cannot look at — rather than because no channel is listening there.
+/// A restart explains the second, never the first (`refuse_linked_folder`
+/// refuses the link, [`not_a_channel`] the rest), so the first says what
+/// `Connect` says and is never called one (#376).
+fn not_a_channel(socket: &Path, source: &std::io::Error) -> bool {
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) => !meta.file_type().is_socket(),
+        // A socket taken away as the bridge asks for it is a channel going
+        // away, which a restart explains; anything else is a path this bridge
+        // cannot look at.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Sets how long a read on `stream` may wait. macOS refuses to change it
@@ -786,6 +853,97 @@ mod tests {
             Err(PluginError::Refused)
         ));
         plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_hello_write_that_found_the_connection_closed_is_a_refusal() {
+        use std::io::{Error, ErrorKind};
+        // The plugin closed the connection before reading the hello: the read
+        // side says `Refused` of the same close, so does the write side.
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
+            assert!(matches!(
+                PluginError::Io(Error::from(kind)).closed_before_hello(),
+                PluginError::Refused
+            ));
+        }
+        // Anything else is left as it was: a restart may still explain it.
+        let timed_out = PluginError::Io(Error::from(ErrorKind::TimedOut)).closed_before_hello();
+        assert!(matches!(timed_out, PluginError::Io(_)));
+        assert!(timed_out.may_be_restarting());
+    }
+
+    #[test]
+    fn only_a_connection_that_failed_before_the_hello_may_be_a_restart() {
+        let at = |kind| PluginError::Connect {
+            path: "/home/lab/.enclos-app/main.sock".into(),
+            source: std::io::Error::from(kind),
+        };
+        // The channel is not there, or is going away: a restart explains both.
+        assert!(at(std::io::ErrorKind::ConnectionRefused).may_be_restarting());
+        assert!(at(std::io::ErrorKind::NotFound).may_be_restarting());
+        // The bridge may not look: no restart gives a permission back.
+        assert!(!at(std::io::ErrorKind::PermissionDenied).may_be_restarting());
+        // A connection that broke while the hello was read may be a restart.
+        assert!(
+            PluginError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+                .may_be_restarting()
+        );
+        // What the plugin answered, or failed to say, is its own answer.
+        assert!(
+            !PluginError::Linked {
+                path: "p".into(),
+                source: std::io::Error::other("a link"),
+            }
+            .may_be_restarting()
+        );
+        assert!(!PluginError::Refused.may_be_restarting());
+        assert!(!PluginError::Protocol("spoke oddly".into()).may_be_restarting());
+        assert!(!PluginError::TooLong.may_be_restarting());
+        assert!(!PluginError::Version(2).may_be_restarting());
+    }
+
+    #[test]
+    fn a_file_where_the_socket_belongs_is_refused_not_called_a_restart() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        std::fs::write(&socket, b"not a socket").unwrap();
+        let Err(failed) = connect(&socket, "t0ken", "home.lab.main") else {
+            panic!("connected to a file");
+        };
+        assert!(matches!(failed, PluginError::Linked { .. }), "{failed:?}");
+        assert!(!failed.may_be_restarting(), "{failed}");
+        // The person's diagnostic is the one `Connect` gives: unchanged.
+        let said = failed.to_string();
+        assert!(
+            said.contains("cannot reach the agent's app channel at"),
+            "{said}"
+        );
+        assert!(
+            said.contains("(is the sandbox started, and the channel set up?)"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_folder_this_bridge_cannot_read_is_refused_not_called_a_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let own = folder.path().join(".enclos-app");
+        std::fs::create_dir(&own).unwrap();
+        let _plugin = UnixListener::bind(own.join("main.sock")).unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&own).is_ok() {
+            // Run as root, which reads everything.
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let failed = connect(&own.join("main.sock"), "t0ken", "home.lab.main");
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(failed) = failed else {
+            panic!("connected into a folder this bridge cannot read");
+        };
+        assert!(matches!(failed, PluginError::Linked { .. }), "{failed:?}");
+        assert!(!failed.may_be_restarting(), "{failed}");
     }
 
     #[test]

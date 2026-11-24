@@ -955,3 +955,255 @@ fn a_held_task_answer_is_not_held() {
         "held task answer waited for a restarting channel: {elapsed:?}"
     );
 }
+
+/// Hermes's own one-bridge refusal: the plugin takes the connection and closes
+/// it before reading the `hello`, so the bridge's hello write and the close
+/// race. Whichever side loses, the person is told the channel closed without
+/// answering — never that the agent is restarting.
+#[test]
+fn an_accept_and_drop_channel_is_never_called_a_restart() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(2));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+    the_channel_goes(&bridge, &bridge.socket);
+
+    let listener = UnixListener::bind(&bridge.socket).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            drop(stream);
+        }
+    });
+    let refused = fallback_chat(&PluginError::Refused.to_string());
+    for n in 2..22 {
+        let id = format!("m-{n}");
+        let text = format!("slot taken {n}");
+        let started = Instant::now();
+        say(&mut device, &id, &text);
+        expect_echo(&mut device, &text);
+        let error = the_answer(&mut device, &id).expect("error frame");
+        let elapsed = started.elapsed();
+        assert_eq!(error.message, refused, "attempt {n}");
+        assert_ne!(error.message, RESTARTING, "attempt {n}");
+        assert!(elapsed < Duration::from_secs(1), "attempt {n}: {elapsed:?}");
+    }
+}
+
+/// A listener at `socket` that counts every connection and every line the
+/// bridge writes to it (a hello carries the agent's token).
+fn counting_listener(socket: &Path) -> (Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
+    let listener = UnixListener::bind(socket).unwrap();
+    let conns = Arc::new(Mutex::new(0usize));
+    let lines_seen = Arc::new(Mutex::new(0usize));
+    let (c, l) = (Arc::clone(&conns), Arc::clone(&lines_seen));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            *c.lock().unwrap() += 1;
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                *l.lock().unwrap() += 1;
+                line.clear();
+            }
+        }
+    });
+    (conns, lines_seen)
+}
+
+/// The socket is replaced by a link to a live listener elsewhere, which would
+/// take the token: the person gets the link refusal, never the restart
+/// notice, at once, and nothing connects to the link's target.
+#[test]
+fn a_link_where_the_socket_was_gets_the_links_own_text() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    let elsewhere = folder.path().join("elsewhere.sock");
+    let (conns, lines_seen) = counting_listener(&elsewhere);
+    std::os::unix::fs::symlink(&elsewhere, &bridge.socket).unwrap();
+
+    let started = Instant::now();
+    say(&mut device, "m-2", "to a link");
+    expect_echo(&mut device, "to a link");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert!(
+        error
+            .message
+            .contains("is a link, not the channel's own socket"),
+        "{}",
+        error.message
+    );
+    assert_ne!(error.message, RESTARTING);
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        *conns.lock().unwrap(),
+        0,
+        "bridge connected through the link"
+    );
+    assert_eq!(*lines_seen.lock().unwrap(), 0);
+}
+
+/// The first attempt fails as a restart does (socket gone) and the bridge
+/// waits; during the wait the socket comes back as a link to a live listener.
+/// The retry refuses the link and ends the wait at once with its own text.
+#[test]
+fn a_link_that_appears_during_the_wait_ends_it_with_its_own_text() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    let elsewhere = folder.path().join("elsewhere.sock");
+    let (conns, lines_seen) = counting_listener(&elsewhere);
+    let socket = bridge.socket.clone();
+    let target = elsewhere.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        std::os::unix::fs::symlink(&target, &socket).unwrap();
+    });
+
+    let started = Instant::now();
+    say(&mut device, "m-2", "link during wait");
+    expect_echo(&mut device, "link during wait");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert!(
+        error
+            .message
+            .contains("is a link, not the channel's own socket"),
+        "{}",
+        error.message
+    );
+    assert_ne!(error.message, RESTARTING);
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "did not wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "kept waiting: {elapsed:?}"
+    );
+    assert_eq!(
+        *conns.lock().unwrap(),
+        0,
+        "bridge connected through the link"
+    );
+    assert_eq!(*lines_seen.lock().unwrap(), 0);
+}
+
+/// Same, for a message with files: the link ends the wait with its own text,
+/// and the file message says nothing was sent.
+#[test]
+fn a_file_message_that_meets_a_link_during_the_wait_is_not_kept() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+
+    the_channel_goes(&bridge, &bridge.socket);
+    let elsewhere = folder.path().join("elsewhere.sock");
+    let (conns, _lines) = counting_listener(&elsewhere);
+    let socket = bridge.socket.clone();
+    let target = elsewhere.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        std::os::unix::fs::symlink(&target, &socket).unwrap();
+    });
+    let one = [file("note.txt", "text/plain", 4)];
+    let started = Instant::now();
+    begin(&mut device, "f-1", "c-1", "see attached", &one);
+    let error = the_answer(&mut device, "f-1").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert!(
+        error
+            .message
+            .contains("is a link, not the channel's own socket"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .ends_with("nothing was sent; send it again once the agent can be reached")
+    );
+    assert!(!error.message.contains("restarting"));
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(*conns.lock().unwrap(), 0);
+}
+
+/// A channel that reads the hello and then closes unanswered, in place before
+/// the first attempt: refused at once, never called a restart.
+#[test]
+fn a_channel_that_reads_the_hello_and_closes_is_not_called_a_restart() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+    the_channel_goes(&bridge, &bridge.socket);
+
+    let listener = UnixListener::bind(&bridge.socket).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            let _ = lines.read_until(b'\n', &mut line);
+        }
+    });
+    let started = Instant::now();
+    say(&mut device, "m-2", "refused first");
+    expect_echo(&mut device, "refused first");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        error.message,
+        fallback_chat(&PluginError::Refused.to_string())
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+}
+
+/// A path where a channel's socket belongs that is a file, not a socket, is
+/// refused with its own text at once, and never called a restart.
+#[test]
+fn a_file_where_the_socket_belongs_is_not_called_a_restart() {
+    let folder = tempfile::tempdir().unwrap();
+    let layout = provisioning_state(folder.path());
+    record_state(&layout, SandboxState::Running);
+    let bridge = bridge_restarting(folder.path(), Duration::from_secs(5));
+    let (mut device, _got) = talking_to_the_agent(&bridge, &bridge.socket);
+    the_channel_goes(&bridge, &bridge.socket);
+    std::fs::write(&bridge.socket, b"not a socket").unwrap();
+
+    let started = Instant::now();
+    say(&mut device, "m-2", "to a file");
+    expect_echo(&mut device, "to a file");
+    let error = the_answer(&mut device, "m-2").expect("error frame");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+    assert_ne!(error.message, RESTARTING);
+    assert!(
+        error
+            .message
+            .contains("cannot reach the agent's app channel"),
+        "{}",
+        error.message
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+}
