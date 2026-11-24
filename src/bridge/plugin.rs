@@ -68,12 +68,15 @@ pub enum PluginError {
 
 impl PluginError {
     /// Whether this failure is one that a runtime restart explains: the
-    /// connection itself could not be made, or broke while the `hello` was
-    /// read (#376). A plugin that answered and refused the token, that does
-    /// not speak this protocol, or that sent something unreadable says
-    /// something else about the agent, and is never called a restart. Nor is a
-    /// permission this bridge never had: a socket in a folder it cannot read
-    /// is a home that is not this channel's.
+    /// connection could not be made, or sending over it failed. A send only
+    /// reaches the restart notice for a channel that answered in this bridge
+    /// run and whose sandbox is running (`Hub::hold_for_restart` asks both),
+    /// so the notice is said of an agent that answered and then went away,
+    /// never of one that refused. A plugin that answered and refused the
+    /// token, that does not speak this protocol, or that sent something
+    /// unreadable says something else about the agent, and is never called a
+    /// restart. Nor is a permission this bridge never had: a socket in a
+    /// folder it cannot read is a home that is not this channel's.
     pub(super) fn may_be_restarting(&self) -> bool {
         match self {
             PluginError::Connect { source, .. } => {
