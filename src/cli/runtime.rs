@@ -12,6 +12,7 @@ use serde_json::json;
 use super::output;
 use enclos::engine::{ChannelRequest, ChannelSet, Engine, RunningWork, ServicesAfter, Setting};
 use enclos::error::{Result, exit};
+use enclos::layout::Layout;
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
@@ -88,7 +89,13 @@ enum RuntimeVerb {
     },
 }
 
-pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
+pub fn run(
+    engine: &Engine,
+    layout: &Layout,
+    by: &Actor,
+    confirm: Confirm,
+    args: RuntimeArgs,
+) -> Result<u8> {
     let (runtime, sandbox, limit, requested_by) = match args.verb {
         RuntimeVerb::Install {
             runtime,
@@ -122,7 +129,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         } => {
             let by = &requester(by, requested_by);
             let limit = time_limit.map(Duration::from_secs);
-            return update(engine, by, confirm, sandbox, limit);
+            return update(engine, layout, by, confirm, sandbox, limit);
         }
     };
     let by = &requester(by, requested_by);
@@ -333,6 +340,7 @@ fn answered_yes(answer: &str) -> bool {
 
 fn update(
     engine: &Engine,
+    layout: &Layout,
     by: &Actor,
     confirm: Confirm,
     sandbox: SandboxName,
@@ -410,7 +418,11 @@ fn update(
     };
     let shown = end.kind.display_name();
     let user_home = std::env::var("HOME").ok();
-    let log_shown = super::status::tilde(&end.log, user_home.as_deref());
+    // The log's path is the layout's, not the engine's: the engine holds the
+    // policy's secrets, and CodeQL's cleartext-logging analysis follows every
+    // value that comes back out of it into a log.
+    let log_shown =
+        super::status::tilde(&layout.update_log(sandbox.as_str()), user_home.as_deref());
     let failure_message = || {
         let ended = end.ended();
         let services_clause = match end.services {
@@ -488,13 +500,10 @@ fn update(
         // limit or by a signal is said in the line itself, so it stands alone
         // with the log path; "its output above says why" was untrue for those.
         //
-        // The CodeQL cleartext-logging alerts 56 and 57 that kept these values
-        // out named a property of the `Engine`, which holds the policy's
-        // secrets, not of these four values: a validated `RuntimeVersion`, a
-        // layout path, an exit status and a signal name. The same function
-        // still interpolates the engine's own `why` below, so leaving the path
-        // and version out never delivered that property, and A6/A7 ask for
-        // both.
+        // CodeQL's alert 56 follows the `Engine` — which holds the policy's
+        // secrets — into any log, and it fired on this line for the whole
+        // message. The path it names is now the layout's, built from the
+        // validated sandbox name, rather than read off the engine.
         eprintln!("enclos: {}", failure_message());
         return Ok(exit::ERROR);
     }

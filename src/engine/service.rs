@@ -133,7 +133,7 @@ impl Engine {
     /// output on the host (ADR 0074). `enclos logs` already tails every
     /// `*.log` in this folder.
     pub fn update_log(&self, name: &SandboxName) -> PathBuf {
-        self.logs_dir(name).join("update.log")
+        self.layout.update_log(name.as_str())
     }
 
     /// Makes the folder of the sandbox's logs, which a service's unit
