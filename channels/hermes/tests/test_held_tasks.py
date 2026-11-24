@@ -538,6 +538,18 @@ class Reading(FakeBoardCase):
                 self.assertEqual(after["waits_on"], "person")
                 self.assertIn("ask", after)
 
+    def test_waits_on_an_ask_wins_before_the_kind_is_read(self):
+        # `for_the_person` admits an entry because of its ask and passes no
+        # kind with it, so what reaches the app cannot tell that shortcut from
+        # the "no bound event" one: pin the order where a kind is known, so a
+        # caller that later passes one keeps the ask the person's.
+        for kind in ("transient", "capability", "dependency"):
+            with self.subTest(kind=kind):
+                self.assertEqual(held_tasks._waits_on("blocked", {"kind": kind}, asked=True), "person")
+                self.assertEqual(held_tasks._waits_on("blocked", {"kind": kind}), "team")
+        self.assertEqual(held_tasks._waits_on("blocked", {"kind": "needs_input"}, asked=True), "person")
+        self.assertEqual(held_tasks._waits_on("gave_up", {}, asked=True), "person")
+
     def test_waits_on_gave_up_with_ask_stays_person(self):
         self.kb.create("t_gu_asked")
         self.kb.hold("t_gu_asked", "gave_up", {"failures": 3, "error": "boom"}, at=3_000)
