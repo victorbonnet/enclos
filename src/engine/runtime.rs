@@ -562,14 +562,16 @@ impl Engine {
                         .map(|r| stopped_since(&r.state, was_running))
                         .unwrap_or(!was_running);
                     let mut note = None;
-                    if installed && was_running && !stopped {
-                        if let Err(e) = self.start_sandbox(by, name) {
-                            note = Some(format!("its services were not started again ({e})"));
-                        }
-                    } else if !was_running || stopped {
-                        if let Err(e) = self.stop_services_and_sessions(by, name) {
-                            note = Some(format!("its sessions were not ended ({e})"));
-                        }
+                    if installed
+                        && was_running
+                        && !stopped
+                        && let Err(e) = self.start_sandbox(by, name)
+                    {
+                        note = Some(format!("its services were not started again ({e})"));
+                    } else if (!was_running || stopped)
+                        && let Err(e) = self.stop_services_and_sessions(by, name)
+                    {
+                        note = Some(format!("its sessions were not ended ({e})"));
                     }
                     // A6: the run is in the audit log as failed, with the
                     // reason the person sees, even though it never reaches
