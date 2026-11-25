@@ -242,9 +242,12 @@ fn connect_until(
             Err(e) if std::io::Error::from(e).kind() == std::io::ErrorKind::WouldBlock => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(PluginError::Protocol(format!(
-                        "it did not accept a connection within {} ms",
-                        wait.as_millis()
+                    return Err(PluginError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "it did not accept a connection within {} ms",
+                            wait.as_millis()
+                        ),
                     )));
                 }
                 std::thread::sleep(left.min(CONNECT_RETRY));
@@ -450,10 +453,11 @@ impl PluginCloser {
 /// (including across retries when the accept queue is full), so the race
 /// window is the gap between check and connect on each attempt, and this
 /// holds across retries. A sandbox that rewrites its own folder or socket
-/// link between them can still win on one attempt — measured at about one
-/// in three on Linux with a full-rate swap loop in a security review of
-/// commit `a59cb1c9` (single attempts; macOS is not measured) — so the
-/// number of attempts is not what bounds it.
+/// link between them can still win on one attempt. A security review of
+/// commit `a59cb1c9` won about one attempt in three on Linux with a
+/// full-rate swap loop in a native program that repeats the same
+/// check-then-connect sequence; it did not measure this Rust code or macOS.
+/// The number of attempts is not what bounds the exposure.
 ///
 /// The race is accepted, not closed. If a sandbox wins it, the exposure is
 /// one fixed `hello` (the agent's own token, which the sandbox already holds,
@@ -1297,10 +1301,14 @@ mod tests {
             panic!("expected Protocol error on full queue, got Ok");
         };
         assert!(!err.may_be_restarting(), "{err}");
-        let PluginError::Protocol(reason) = err else {
-            panic!("expected Protocol error on full queue, got {err:?}");
+        let PluginError::Io(source) = &err else {
+            panic!("expected a timed-out Io error on full queue, got {err:?}");
         };
-        assert!(reason.contains("did not accept a connection"), "{reason}");
+        assert_eq!(source.kind(), std::io::ErrorKind::TimedOut, "{source}");
+        assert!(
+            source.to_string().contains("did not accept a connection"),
+            "{source}"
+        );
         assert!(
             elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
             "elapsed: {elapsed:?}"
@@ -1315,8 +1323,9 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let own = folder.path().join(".enclos-app");
         std::fs::create_dir(&own).unwrap();
+        // Nothing listens behind the link: if a connect ever follows it, the
+        // attempt fails at once instead of waiting out the hello.
         let elsewhere = folder.path().join("elsewhere.sock");
-        let _other = UnixListener::bind(&elsewhere).unwrap();
         let socket = own.join("main.sock");
         let (listener, held) = full_queue_listener(&socket);
 
