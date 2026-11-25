@@ -233,6 +233,28 @@ impl HeldTaskAnswer {
     }
 }
 
+/// Who a hold waits for: the person, or the team's own schedule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitsOn {
+    /// The person decides; the hold belongs under "Needs you".
+    #[default]
+    Person,
+    /// The team's own schedule resolves it; the app keeps it out of "Needs you".
+    Team,
+}
+
+impl<'de> Deserialize<'de> for WaitsOn {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Lenient by design: refusing a task's `waits_on` would release every
+        // held card of that agent, which is far worse than one extra row.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(value) if value == "team" => Ok(Self::Team),
+            _ => Ok(Self::Person),
+        }
+    }
+}
+
 /// One held task, as the plugin reads it from its runtime's own state
 /// (never from the text of the runtime's notifications).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +286,12 @@ pub struct HeldTask {
     /// as from an older plugin, it reads as true.
     #[serde(default = "resumable")]
     pub resumable: bool,
+    /// Who this hold waits for: the person, or the team's own schedule.
+    /// Absent or any value other than `"team"` reads as [`WaitsOn::Person`]
+    /// and never refuses the message (unlike `resumable`, which gates an
+    /// action and refuses a non-boolean).
+    #[serde(default)]
+    pub waits_on: WaitsOn,
     /// What the agent wrote for the person when it handed this hold to
     /// them (ADR 0073), if it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +475,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:42").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            waits_on: WaitsOn::Person,
             ask: None,
         }
     }
@@ -630,6 +659,45 @@ mod tests {
                     "{line}"
                 );
             }
+        }
+    }
+
+    /// `waits_on` on the plugin leg: absent or anything other than `"team"`
+    /// reads as `Person` without refusing the message, and encoding always
+    /// writes `"person"` or `"team"`.
+    #[test]
+    fn waits_on_reads_leniently_and_always_encodes() {
+        let with = |waits_on: Option<serde_json::Value>| {
+            let mut task = serde_json::json!({"task":"t_1","title":"t","reason":"r","since":1,
+                "revision":"e:42","resume":""});
+            if let Some(value) = waits_on {
+                task["waits_on"] = value;
+            }
+            serde_json::json!({"v":1,"id":"h","type":"held_tasks","tasks":[task]})
+        };
+        let cases: &[(Option<serde_json::Value>, WaitsOn, &str)] = &[
+            (None, WaitsOn::Person, "person"),
+            (Some("person".into()), WaitsOn::Person, "person"),
+            (Some("team".into()), WaitsOn::Team, "team"),
+            (Some("TEAM".into()), WaitsOn::Person, "person"),
+            (Some("other".into()), WaitsOn::Person, "person"),
+            (Some(serde_json::Value::Null), WaitsOn::Person, "person"),
+            (Some(3.into()), WaitsOn::Person, "person"),
+            (Some(true.into()), WaitsOn::Person, "person"),
+            (Some(serde_json::json!([])), WaitsOn::Person, "person"),
+            (Some(serde_json::json!({})), WaitsOn::Person, "person"),
+        ];
+        for (given, expected, wire) in cases {
+            let line = with(given.clone());
+            let decoded = decode_from_plugin(line.to_string().as_bytes())
+                .unwrap_or_else(|e| panic!("given {given:?}: {e}"));
+            let FromPlugin::HeldTasks { ref tasks } = decoded.body else {
+                panic!("a held_tasks snapshot");
+            };
+            assert_eq!(tasks.len(), 1, "given {given:?}");
+            assert_eq!(tasks[0].waits_on, *expected, "given {given:?}");
+            let again: serde_json::Value = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(again["tasks"][0]["waits_on"], *wire, "given {given:?}");
         }
     }
 

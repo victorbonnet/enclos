@@ -1160,6 +1160,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:7").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            waits_on: enclos_protocol::held_task::WaitsOn::Person,
             ask: None,
         }
     }

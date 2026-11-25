@@ -1,5 +1,6 @@
 //! A person's current requests, projected from the bridge's canonical records.
 use crate::ConversationId;
+use crate::held_task::WaitsOn;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ pub struct OpenItem {
     pub summary: String,
     pub since: i64,
     pub expired: bool,
+    /// Who a held task waits for: the team's own schedule, or the person. Only on
+    /// `held_task` items; absent elsewhere and in older bridges, it reads as `person`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waits_on: Option<WaitsOn>,
 }
 
 impl OpenItemKind {

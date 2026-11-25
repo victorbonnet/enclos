@@ -75,6 +75,8 @@ MAX_SINCE = 2**63 - 1
 # block`), and the dispatcher giving up after its retry limit. The others
 # bound which of them holds it now.
 _HOLDS = ("blocked", "gave_up")
+# The block kinds that mean the team's own schedule resolves the hold, not the person's decision.
+_TEAM_KINDS = ("capability", "dependency", "transient")
 _BOUNDS = (*_HOLDS, "unblocked", "created")
 # Hermes's loop breaker: a task blocked again for the same kind after an
 # unblock, `BLOCK_RECURRENCE_LIMIT` times, goes to `triage` with this event,
@@ -261,6 +263,18 @@ def _reason(kind: str, payload: dict) -> str:
     return ""
 
 
+def _waits_on(kind: str, payload: dict, asked: bool = False) -> str:
+    """Who the hold waits for: the person, or the team's own schedule."""
+    if asked:
+        return "person"           # the agent put a question to the person: that is their decision
+    if kind != "blocked":
+        return "person"           # gave_up, block_loop_detected, no bound at all
+    block_kind = payload.get("kind")
+    if isinstance(block_kind, str) and block_kind.strip().lower() in _TEAM_KINDS:
+        return "team"
+    return "person"
+
+
 class Board:
     """Hermes's kanban boards, through its own `kanban_db` (`kb`), read
     read-only; `connect` is Hermes's writer, for a resume alone. Blocking:
@@ -376,6 +390,7 @@ class Board:
             "revision": revision,
             "resume": NOT_RESUMABLE if looped else RESUME,
             "resumable": not looped,
+            "waits_on": _waits_on(kind, payload),
         }
         assignee = _line(getattr(task, "assignee", None), MAX_ASSIGNEE_CHARS)
         if assignee and assignee != profile:
@@ -471,8 +486,15 @@ def for_the_person(held: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ask = entry.get("ask")
         return isinstance(ask, dict) and "asked" in ask
 
-    return [{key: value for key, value in entry.items() if key != WOKEN}
-            for entry in held if not entry.get(WOKEN) or asked(entry)]
+    def reported(entry: dict[str, Any]) -> dict[str, Any]:
+        out = {key: value for key, value in entry.items() if key != WOKEN}
+        if asked(entry):
+            # The ask is the person's decision: `_waits_on` returns before it
+            # reads the kind, and the kind is not carried on the entry here.
+            out["waits_on"] = _waits_on("", {}, asked=True)
+        return out
+
+    return [reported(entry) for entry in held if not entry.get(WOKEN) or asked(entry)]
 
 
 def _fresh(function: Callable[..., Any], *args: Any) -> Any:
