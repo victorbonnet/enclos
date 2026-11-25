@@ -130,9 +130,9 @@ fn bubblewrap_alone() -> Output {
 const AGAIN: &str = "a mount of the host changed while bubblewrap set up, so it starts again";
 
 /// How long the churn holds its mount, and how long it leaves it away: at
-/// this pace bubblewrap alone failed about one start in twenty on the
-/// runners (5 to 11%), often enough to show and rarely enough that five
-/// starts in a row all fail almost never.
+/// this pace bubblewrap alone failed from under 1% (arm) to about 15% (x86)
+/// of starts on the runners, often enough to show and rarely enough that
+/// five starts in a row all fail almost never.
 const PACE: Duration = Duration::from_millis(1);
 
 /// Hard cap on the number of sessions started in one test run.
@@ -144,7 +144,7 @@ const MAX_DURATION: Duration = Duration::from_secs(240);
 /// Minimum number of sessions to start when the control rate is high, so
 /// both the first session (which installs the namespace holder) and
 /// subsequent sessions are exercised.
-const MIN_SESSIONS: usize = 10;
+const MIN_SESSIONS: usize = 30;
 
 /// Minimum number of control starts to sample: stopping at the third
 /// failure alone over-reads the rate, so take at least this many starts.
@@ -154,28 +154,36 @@ const MIN_CONTROL: usize = 100;
 /// than bubblewrap alone and the control rate is only an estimate.
 const MIN_BUDGET: usize = 100;
 
+/// A session meets the race less often than bubblewrap alone (measured about
+/// half as often on x86 runners, less on arm), so size the budget for a
+/// quarter of the control's rate.
+const SESSION_RATE_DIVISOR: f64 = 4.0;
+
 /// Target upper bound on the probability that no session meets the churn
-/// when each session faces the same per-start rate as the control (1 in
-/// 10,000).
+/// under the conservative per-start session rate `control_rate /
+/// SESSION_RATE_DIVISOR` (1 in 10,000).
 const MISS_PROB: f64 = 1e-4;
 
 /// Derives the session budget from the control's measured failure rate
 /// (`failed` of `alone` `bubblewrap_alone` starts), capped at `MAX_SESSIONS`
 /// and floored at `MIN_BUDGET`.
 ///
-/// Assumption: each session's bubblewrap setup faces the same independent
-/// per-start probability `p = failed / alone` of hitting the mount-table-to-
-/// remount race as `bubblewrap_alone`. Under that assumption, the chance
-/// that `N` sessions all miss the race is `(1 - p)^N`; solving
-/// `(1 - p)^N <= MISS_PROB` gives `N = ceil(ln(MISS_PROB) / ln(1 - p))`.
+/// Uses the conservative per-start session rate
+/// `p = (failed / alone) / SESSION_RATE_DIVISOR`. Under that rate, the
+/// chance that `N` independent sessions all miss the race is `(1 - p)^N`;
+/// solving `(1 - p)^N <= MISS_PROB` gives
+/// `N = ceil(ln(MISS_PROB) / ln(1 - p))`, keeping the miss probability at or
+/// below `1e-4`.
 ///
 /// Comparison with arm CI run 44533972837, where the control failed 3 of
-/// 397 starts (`p ≈ 0.76%`) and 0 of 150 sessions started again: at that
-/// rate 150 sessions still had a `(1 - 3/397)^150 ≈ 32%` chance of seeing
-/// zero retries. This function derives a budget of 1215 sessions (reducing
-/// the miss probability to `<= 0.01%`), while at the 5–11% rate seen on
-/// x86 runners it derives 180–100 sessions (ceil values below `MIN_BUDGET`
-/// are raised to 100).
+/// 397 starts (`~0.76%`) and 0 of 150 sessions started again: with
+/// `p = (3/397) / 4 ≈ 0.19%`, 150 sessions had a `(1 - p)^150 ≈ 75%` chance
+/// of seeing zero retries. Reaching `MISS_PROB` at that rate needs 4871
+/// sessions, which exceeds `MAX_SESSIONS` and is therefore capped at
+/// `MAX_SESSIONS` (3000); `MAX_SESSIONS` and the 240 s `MAX_DURATION` limit
+/// are the hard bound. At the 5–15% control rates seen on x86 runners, this
+/// derives 733–241 sessions (ceil values below `MIN_BUDGET` are raised to
+/// 100).
 fn session_budget(failed: usize, alone: usize) -> usize {
     if failed == 0 || alone == 0 {
         return MAX_SESSIONS;
@@ -183,7 +191,7 @@ fn session_budget(failed: usize, alone: usize) -> usize {
     if failed >= alone {
         return MIN_BUDGET;
     }
-    let p = failed as f64 / alone as f64;
+    let p = (failed as f64 / alone as f64) / SESSION_RATE_DIVISOR;
     let needed = (MISS_PROB.ln() / (-p).ln_1p()).ceil();
     if !needed.is_finite() || needed >= MAX_SESSIONS as f64 {
         MAX_SESSIONS
@@ -216,9 +224,9 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
     }
     let budget = session_budget(failed, alone);
     // Check field 5 (mount point) of `/proc/self/mountinfo` in pure POSIX sh
-    // without spawning a subprocess, so the session records whether
-    // bubblewrap's setup read and bound `CHURNED` while keeping stdout and
-    // exit status unchanged.
+    // without spawning a subprocess, so the session records whether `CHURNED`
+    // reaches its mount namespace while keeping stdout and exit status
+    // unchanged.
     let script = format!(
         "while read -r _ _ _ _ m _; do [ \"$m\" = {CHURNED} ] && {{ echo saw >>\"$HOME/saw\"; break; }}; done </proc/self/mountinfo; echo ran >>\"$HOME/runs\"; echo ran"
     );
@@ -261,9 +269,9 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
         "bubblewrap alone never failed in {alone} starts: the churn did not reach its setup"
     );
     let diagnosis = if saw == 0 {
-        "none of the sessions saw the churned mount in /proc/self/mountinfo (session setup never read it)"
+        "none of the sessions saw the churned mount in /proc/self/mountinfo (the churned mount never reached the session's mount namespace)"
     } else {
-        "sessions saw the churned mount in /proc/self/mountinfo, so setup read it, but none lost the race"
+        "the churned mount reaches the session's mount namespace, but none lost the race"
     };
     assert!(
         again > 0,
@@ -274,24 +282,34 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
 
 #[test]
 fn session_budget_scales_with_control_rate() {
-    // Arm CI run 44533972837: 3 of 397 (~0.76%) -> 1215 sessions.
+    // Arm CI run 44533972837: 3 of 397 (~0.76%), conservative p = 0.0076/4
+    // needs 4871 sessions, so it is capped at MAX_SESSIONS.
     let arm = session_budget(3, 397);
-    assert_eq!(arm, 1215);
-    assert!(arm > 150 && arm < MAX_SESSIONS);
+    assert_eq!(arm, MAX_SESSIONS);
 
     // Higher control rates need fewer sessions, down to the MIN_BUDGET floor.
     let mid = session_budget(3, 192);
     let five_pct = session_budget(3, 60);
+    let ten_pct = session_budget(10, 100);
     let eleven_pct = session_budget(3, 27);
-    assert_eq!(mid, 585);
-    assert_eq!(five_pct, 180);
-    assert_eq!(eleven_pct, 100);
-    assert!(arm > mid && mid > five_pct && five_pct > eleven_pct);
+    assert_eq!(mid, 2354);
+    assert_eq!(five_pct, 733);
+    assert_eq!(ten_pct, 364);
+    assert_eq!(eleven_pct, 327);
+    assert!(
+        arm >= mid
+            && mid >= five_pct
+            && five_pct >= ten_pct
+            && ten_pct >= eleven_pct
+            && eleven_pct >= MIN_BUDGET
+    );
 
-    // Every uncapped, unfloored budget satisfies (1 - p)^N <= MISS_PROB.
-    for (failed, alone) in [(3, 397), (3, 192), (3, 60)] {
-        let p = failed as f64 / alone as f64;
+    // Every unclamped budget satisfies (1 - p')^N <= MISS_PROB and
+    // (1 - p')^(N - 1) > MISS_PROB for p' = (failed / alone) / SESSION_RATE_DIVISOR.
+    for (failed, alone) in [(3, 192), (3, 60), (10, 100), (3, 27)] {
+        let p = (failed as f64 / alone as f64) / SESSION_RATE_DIVISOR;
         let n = session_budget(failed, alone);
+        assert!(n > MIN_BUDGET && n < MAX_SESSIONS);
         assert!((1.0 - p).powi(n as i32) <= MISS_PROB);
         assert!((1.0 - p).powi((n - 1) as i32) > MISS_PROB);
     }
