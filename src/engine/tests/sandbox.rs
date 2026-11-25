@@ -46,8 +46,11 @@ fn each_sandbox_gets_its_own_port_and_names_are_unique() {
 fn free_port_except_skips_the_ports_it_is_given() {
     static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let used = engine.state.get(&name).unwrap().unwrap().proxy_port;
     let first = engine.free_port().unwrap();
+    // The port a sandbox here has is never handed out again.
+    assert_ne!(first, used);
     let next = engine.free_port_except(&[first]).unwrap();
     assert_ne!(next, first);
     let third = engine.free_port_except(&[first, next]).unwrap();

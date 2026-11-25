@@ -548,15 +548,6 @@ fn a_proxy_that_loses_its_port_at_start_takes_the_next_one() {
 
     assert_ne!(updated.proxy_port, old_port);
     assert!((PORT_FIRST..=PORT_LAST).contains(&updated.proxy_port));
-    assert!(
-        engine
-            .state
-            .list()
-            .unwrap()
-            .iter()
-            .filter(|r| r.name != name)
-            .all(|r| r.proxy_port != updated.proxy_port)
-    );
     assert_eq!(
         engine.state.get(&name).unwrap().unwrap().proxy_port,
         updated.proxy_port
@@ -644,6 +635,13 @@ fn the_profile_of_a_start_that_took_another_port_allows_that_port_alone() {
     let old_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
     let held = bind_never_listening(old_port);
 
+    // Ends any proxy the start recorded, even if it then fails.
+    let mut guard = RecordedProxyGuard {
+        engine: &engine,
+        name: name.clone(),
+        port: old_port,
+        stopped: false,
+    };
     let lock = engine.state.lock().unwrap();
     let mut started = engine
         .start_session(
@@ -661,12 +659,7 @@ fn the_profile_of_a_start_that_took_another_port_allows_that_port_alone() {
     drop(lock);
 
     let new_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
-    let guard = RecordedProxyGuard {
-        engine: &engine,
-        name: name.clone(),
-        port: new_port,
-        stopped: false,
-    };
+    guard.port = new_port;
     assert!(started.child.wait().unwrap().success());
     assert_ne!(new_port, old_port);
 
@@ -689,13 +682,46 @@ fn the_profile_of_a_start_that_took_another_port_allows_that_port_alone() {
 }
 
 #[test]
+fn a_proxy_that_loses_its_port_while_a_session_runs_keeps_the_port_and_fails() {
+    use super::sandbox::{Sleeping, put, session_of};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
+    let script = write_proxy_exe(dir.path(), &engine, &name);
+    let engine = engine.with_exe(script);
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let old_port = record.proxy_port;
+    // A session that started with the old port allowed and in its proxy
+    // variables would go on sending to whatever holds it.
+    let running = Sleeping::new();
+    put(&engine, &session_of(&engine, &name, running.process()));
+    let held = bind_never_listening(old_port);
+
+    let lock = engine.state.lock().unwrap();
+    let err = engine.ensure_proxy(&lock, &record).unwrap_err();
+    drop(lock);
+
+    let text = err.to_string();
+    assert!(
+        text.contains("still runs") && text.contains("enclos sandbox stop"),
+        "{text}"
+    );
+    assert_eq!(
+        engine.state.get(&name).unwrap().unwrap().proxy_port,
+        old_port
+    );
+    assert!(!engine.proxy_runs(&name).unwrap());
+    drop(held);
+}
+
+#[test]
 fn a_proxy_that_exits_while_its_port_is_free_keeps_its_port_and_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
     let runs = dir.path().join("runs");
-    let script = dir.path().join("fail-once.sh");
+    let script = dir.path().join("fails.sh");
     let quoted_runs = format!("'{}'", runs.display().to_string().replace('\'', "'\\''"));
     std::fs::write(
         &script,

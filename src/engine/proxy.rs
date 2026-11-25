@@ -258,6 +258,28 @@ impl Engine {
             // Only a bind that lost is retried: its port is still held now.
             let lost = tried.len() < PROXY_PORT_TRIES
                 && !super::loopback::free(addr, Duration::from_millis(200));
+            // A session still running keeps the profile and the proxy
+            // variables it started with, so it would go on sending to the
+            // old port, which another program holds: the sandbox stays on it
+            // and the start fails until those sessions end.
+            if lost
+                && self
+                    .state
+                    .sessions(&current.name, true)?
+                    .iter()
+                    .any(|s| s.kind != SessionKind::Proxy)
+            {
+                return Err(abandon(
+                    child,
+                    Error::Session {
+                        what: format!(
+                            "{exited}; another program holds port {} and a session of sandbox {} still runs with it, so the sandbox keeps it: run `enclos sandbox stop {}`, then start again",
+                            current.proxy_port, current.name, current.name
+                        ),
+                    },
+                    "the proxy",
+                ));
+            }
             let Some(next) = lost.then(|| self.free_port_except(&tried).ok()).flatten() else {
                 return Err(abandon(child, exited, "the proxy"));
             };
