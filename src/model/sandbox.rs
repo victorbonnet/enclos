@@ -204,8 +204,8 @@ pub struct SandboxRecord {
     /// another since; the active policy's inputs say which it is built on.
     pub created_from: TemplateName,
     pub state: SandboxState,
-    /// The sandbox's proxy port on loopback (design §4), reserved when it
-    /// is created.
+    /// The sandbox's proxy port on loopback (design §4), chosen when it is
+    /// created and updated if a Seatbelt proxy's bind loses a race at start.
     pub proxy_port: u16,
     /// The runtime installed in it, if any (at most one, ADR 0003).
     pub runtime: Option<RuntimeKind>,

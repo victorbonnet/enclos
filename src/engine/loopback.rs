@@ -12,8 +12,15 @@
 //! `nc -lk` does, refuses connections for a moment after each client. So a
 //! port is taken for free only when it is refused twice, [`SECOND_LOOK`]
 //! apart.
+//!
+//! A socket that is bound to a port and never listens refuses connections
+//! just the same, yet the proxy cannot bind that port. So a port is free
+//! only when this process can bind it too, which it does last and lets go
+//! at once.
 
-use std::net::{SocketAddr, TcpStream};
+use std::io;
+use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 /// How long after a refused connection a port is looked at again before it
@@ -28,10 +35,81 @@ pub(super) fn listens(addr: SocketAddr, wait: Duration) -> bool {
     TcpStream::connect_timeout(&addr, wait).is_ok_and(reached_another)
 }
 
-/// Whether nothing listens at `addr`: [`listens`] says no, and says no again
-/// [`SECOND_LOOK`] later. A port something listens on is looked at once.
+/// Whether nothing listens at `addr` and nothing else holds it on either
+/// loopback: [`listens`] says no, and says no again [`SECOND_LOOK`] later,
+/// and [`bindable`] says yes for both `addr` and `[::1]` on the same port.
+/// A port something listens on is looked at once.
 pub(super) fn free(addr: SocketAddr, wait: Duration) -> bool {
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
     free_after(addr, wait, || std::thread::sleep(SECOND_LOOK))
+        && bindable(addr)
+        && (addr == v6 || bindable(v6))
+}
+
+/// Outcome of trying to bind an address to see whether anything holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// Bound and released at once: nothing held the address.
+    Bound,
+    /// `EADDRINUSE`: another socket holds the address.
+    Held,
+    /// Another error (such as `EAFNOSUPPORT`, `EADDRNOTAVAIL`, `EMFILE`, or
+    /// `EACCES`): not evidence that the address is held, so leave the real
+    /// cause to the proxy's own bind.
+    Other,
+}
+
+/// A TCP socket for probing whether a port is held, created with `FD_CLOEXEC`.
+#[cfg(not(target_vendor = "apple"))]
+fn probe_socket(family: rustix::net::AddressFamily) -> io::Result<OwnedFd> {
+    Ok(rustix::net::socket_with(
+        family,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?)
+}
+
+/// A TCP socket for probing whether a port is held, created with `FD_CLOEXEC`.
+#[cfg(target_vendor = "apple")]
+fn probe_socket(family: rustix::net::AddressFamily) -> io::Result<OwnedFd> {
+    let socket = rustix::net::socket(family, rustix::net::SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+    Ok(socket)
+}
+
+/// Probe `addr` by binding a fresh socket without `SO_REUSEADDR` and dropping
+/// it at once.
+fn probe(addr: SocketAddr) -> Probe {
+    let family = match addr {
+        SocketAddr::V4(_) => rustix::net::AddressFamily::INET,
+        SocketAddr::V6(_) => rustix::net::AddressFamily::INET6,
+    };
+    let Ok(socket) = probe_socket(family) else {
+        return Probe::Other;
+    };
+    match rustix::net::bind(&socket, &addr) {
+        Ok(()) => Probe::Bound,
+        Err(rustix::io::Errno::ADDRINUSE) => Probe::Held,
+        Err(_) => Probe::Other,
+    }
+}
+
+/// Whether nothing is known to hold `addr`, listening or not. The socket is
+/// closed on return, and a socket that never connected or listened leaves no
+/// `TIME-WAIT`.
+///
+/// Only `EADDRINUSE` reads as held; any other failure (such as a host without
+/// IPv6, `EMFILE`, or `EACCES`) reads as not held so the proxy's own bind
+/// reports the real cause rather than `NoFreePorts`.
+///
+/// It does not set `SO_REUSEADDR`. On Linux two sockets that both set it
+/// share a port while neither listens, which is how a stand-in that binds
+/// first and listens later holds its port: a probe that set it would bind
+/// beside that one and call the port free. Without it, a port left in
+/// `TIME-WAIT` reads as held for its minute, and the next one is taken.
+pub(super) fn bindable(addr: SocketAddr) -> bool {
+    probe(addr) != Probe::Held
 }
 
 /// [`free`], with `between` run between the two looks.
@@ -97,6 +175,143 @@ mod tests {
         });
         assert!(reopened.is_some());
         assert!(!free);
+    }
+
+    /// A socket bound to a port on 127.0.0.1 outside the proxy range that
+    /// never listens, with `SO_REUSEADDR` set or not, and the port it holds.
+    fn bound_never_listening(reuse: bool) -> (std::os::fd::OwnedFd, SocketAddr) {
+        use rustix::net::{AddressFamily, SocketType};
+
+        let socket = crate::test_ports::clear_of_proxies(|| {
+            let socket =
+                rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+            rustix::net::sockopt::set_socket_reuseaddr(&socket, reuse).unwrap();
+            rustix::net::bind(&socket, &SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let port = TcpStream::from(socket.try_clone().unwrap())
+                .local_addr()
+                .unwrap()
+                .port();
+            (socket, port)
+        });
+        let addr = TcpStream::from(socket.try_clone().unwrap())
+            .local_addr()
+            .unwrap();
+        (socket, addr)
+    }
+
+    /// A port held by a socket that is bound and never listens refuses
+    /// every connection, so the connect looks take it for free: the same
+    /// port was then given to every sandbox, and the proxy of each failed to
+    /// bind it. Whether the holder set `SO_REUSEADDR`, as a stand-in that
+    /// listens later does, or not.
+    #[test]
+    fn a_port_bound_and_never_listened_on_is_not_free() {
+        let wait = Duration::from_millis(200);
+        for reuse in [false, true] {
+            let (held, addr) = bound_never_listening(reuse);
+            assert!(!listens(addr, wait), "reuse {reuse}: the control refuses");
+            assert!(!super::free(addr, wait), "reuse {reuse}");
+            drop(held);
+        }
+    }
+
+    /// A socket bound to a port on `[::1]` outside the proxy range that never
+    /// listens, whose port is free on `127.0.0.1`, returning the socket and
+    /// the corresponding `127.0.0.1:port`.
+    fn bound_never_listening_v6(reuse: bool) -> (OwnedFd, SocketAddr) {
+        use rustix::net::{AddressFamily, SocketType};
+
+        let mut rejected = Vec::new();
+        for _ in 0..64 {
+            let socket = crate::test_ports::clear_of_proxies(|| {
+                let socket =
+                    rustix::net::socket(AddressFamily::INET6, SocketType::STREAM, None).unwrap();
+                rustix::net::sockopt::set_socket_reuseaddr(&socket, reuse).unwrap();
+                rustix::net::bind(&socket, &SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
+                let port = TcpStream::from(socket.try_clone().unwrap())
+                    .local_addr()
+                    .unwrap()
+                    .port();
+                (socket, port)
+            });
+            let port = TcpStream::from(socket.try_clone().unwrap())
+                .local_addr()
+                .unwrap()
+                .port();
+            let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            if std::net::TcpListener::bind(v4).is_ok() {
+                return (socket, v4);
+            }
+            rejected.push(socket);
+        }
+        panic!("no [::1] port free on 127.0.0.1 too");
+    }
+
+    /// The proxy binds both `[::1]:P` and `127.0.0.1:P`, so a holder on
+    /// `[::1]:P` (bound-never-listening or listening) must make `free` say no
+    /// for `127.0.0.1:P`.
+    #[test]
+    fn a_port_held_on_ipv6_loopback_is_not_free() {
+        if probe(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) != Probe::Bound {
+            // Host has no IPv6 loopback; skip.
+            return;
+        }
+        let wait = Duration::from_millis(200);
+        for reuse in [false, true] {
+            let (held, v4) = bound_never_listening_v6(reuse);
+            assert_eq!(probe(v4), Probe::Bound, "reuse {reuse}: 127.0.0.1 is free");
+            assert!(!super::free(v4, wait), "reuse {reuse}: [::1] is held");
+            drop(held);
+        }
+        let listener =
+            crate::test_ports::tcp_listener_free_at(Ipv6Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()));
+        assert_eq!(probe(v4), Probe::Bound, "127.0.0.1 is free");
+        assert!(!super::free(v4, wait), "[::1] listener holds the port");
+        drop(listener);
+    }
+
+    /// The probe socket is created with `FD_CLOEXEC` so a concurrent child
+    /// process cannot inherit it.
+    #[test]
+    fn probe_socket_sets_cloexec() {
+        let socket = probe_socket(rustix::net::AddressFamily::INET).unwrap();
+        let flags = rustix::io::fcntl_getfd(&socket).unwrap();
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "probe socket must have FD_CLOEXEC set: {flags:?}"
+        );
+    }
+
+    /// Only `EADDRINUSE` counts as held; other bind errors (such as
+    /// `EADDRNOTAVAIL` for an address not configured on this host) must not
+    /// read as held, while a bound-never-listening port still does.
+    #[test]
+    fn only_addr_in_use_counts_as_held() {
+        let unassignable = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 0));
+        assert_eq!(probe(unassignable), Probe::Other);
+        assert!(bindable(unassignable));
+
+        let (held, addr) = bound_never_listening(false);
+        assert_eq!(probe(addr), Probe::Held);
+        assert!(!bindable(addr));
+        drop(held);
+    }
+
+    /// Looking at a port leaves it as it was: it is free the next time, and
+    /// a listener can still bind it. Other tests connect from the system's
+    /// ports at the same time, one of which may take the one chosen here, so
+    /// a few are tried; a probe that held its port would fail them all.
+    #[test]
+    fn a_port_is_not_held_by_having_been_looked_at() {
+        let wait = Duration::from_millis(200);
+        let left_alone = (0..8).any(|_| {
+            let addr = free();
+            super::free(addr, wait)
+                && super::free(addr, wait)
+                && std::net::TcpListener::bind(addr).is_ok()
+        });
+        assert!(left_alone);
     }
 
     #[test]

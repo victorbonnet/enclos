@@ -301,10 +301,14 @@ impl Engine {
             return Err(Error::Session { what });
         }
         let mut record = self.record(name)?;
-        let compiled = self.compile_policy(name, record.proxy_port)?;
+        let mut compiled = self.compile_policy(name, record.proxy_port)?;
         // A service's `launch` waited for both before it took the lock.
         if starting.starts_as_a_command() {
-            self.ensure_proxy(lock, &record)?;
+            let ready = self.ensure_proxy_for_start(lock, &record)?;
+            record = ready.record;
+            if ready.port_changed {
+                compiled = self.compile_policy(name, record.proxy_port)?;
+            }
             self.ensure_holder(&record)?;
         }
         let (version, snapshot) = self.active_policy(name)?;

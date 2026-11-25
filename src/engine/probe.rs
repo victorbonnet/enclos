@@ -281,19 +281,25 @@ impl Engine {
             let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
             })?;
-            let compiled = self.compile_policy(name, record.proxy_port)?;
             let backend = self.backend_of(name)?;
-            // Read before anything starts: the backend's probes depend on
-            // what was compiled.
-            let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
-                path: compiled.clone(),
-                source,
-            })?;
-            let mut own = backend
-                .own_probes(Some(&text))
-                .map_err(|why| Error::Session {
-                    what: format!("{} {why}", compiled.display()),
-                })?;
+            let compile_for_probes =
+                |proxy_port: u16| -> Result<(PathBuf, Box<dyn crate::probes::OwnProbes>)> {
+                    let compiled = self.compile_policy(name, proxy_port)?;
+                    // Read before anything starts: the backend's probes depend on
+                    // what was compiled.
+                    let text =
+                        std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
+                            path: compiled.clone(),
+                            source,
+                        })?;
+                    let own = backend
+                        .own_probes(Some(&text))
+                        .map_err(|why| Error::Session {
+                            what: format!("{} {why}", compiled.display()),
+                        })?;
+                    Ok((compiled, own))
+                };
+            let (mut compiled, mut own) = compile_for_probes(record.proxy_port)?;
             // The limits the sandbox's processes run under, which the
             // resource probes show, without what this host does not
             // enforce: the report names each, and fails on one not
@@ -301,7 +307,11 @@ impl Engine {
             let policy = self.active_policy(name)?.1.policy;
             let not_enforced = self.not_enforced(name, record.backend, &policy)?;
             let limits = leaving_out(self.checked_limits(&record, &policy)?, &not_enforced);
-            self.ensure_proxy(lock, &record)?;
+            let ready = self.ensure_proxy_for_start(lock, &record)?;
+            let record = ready.record;
+            if ready.port_changed {
+                (compiled, own) = compile_for_probes(record.proxy_port)?;
+            }
             self.ensure_holder(&record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             // TMPDIR inside the sandbox (the policy denies /tmp): without it,
