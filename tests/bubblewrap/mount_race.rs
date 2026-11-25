@@ -135,6 +135,31 @@ const AGAIN: &str = "a mount of the host changed while bubblewrap set up, so it 
 /// starts in a row all fail almost never.
 const PACE: Duration = Duration::from_millis(1);
 
+/// Whether to start another session, after `sessions` of them with `again`
+/// started again, `spent` into the loop. A session meets the churn only
+/// when a mount goes between bubblewrap's read of the mount table and its
+/// remount, a window of microseconds in a start of some 100 ms: on the arm
+/// runners 150 sessions went by without one in two of the runs that failed
+/// here, and in 40 recent arm runs 2 had none and 6 only one or two
+/// (the control failed 3 of 192 and 3 of 64 starts in the two). So the
+/// test keeps starting sessions until one has met the churn,
+/// and fails only when none has in `MOST` sessions or `LONGEST`, by when
+/// that is as likely as never. Every session started, however many,
+/// is still checked to have run its command once. On a runner where the
+/// churn is met readily this ends where it always did: 30 sessions at
+/// least, 3 started again, 150 at most.
+fn more_sessions(sessions: usize, again: usize, spent: Duration) -> bool {
+    const MOST: usize = 3000;
+    const LONGEST: Duration = Duration::from_secs(240);
+    if sessions < 30 {
+        return true;
+    }
+    if again == 0 {
+        return sessions < MOST && spent < LONGEST;
+    }
+    again < 3 && sessions < 150
+}
+
 /// Under a tmpfs mounted and taken away every millisecond under the
 /// runner's `/run`, as the runner's own sessions start: bubblewrap alone,
 /// the control, fails to set up at times; every session starts, the first
@@ -158,7 +183,8 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
         }
     }
     let (mut sessions, mut again) = (0, 0);
-    while (again < 3 || sessions < 30) && sessions < 150 {
+    let began = Instant::now();
+    while more_sessions(sessions, again, began.elapsed()) {
         let out = lab
             .command(&[
                 "exec",
@@ -187,6 +213,10 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
         failed > 0,
         "bubblewrap alone never failed in {alone} starts: the churn did not reach its setup"
     );
-    assert!(again > 0, "no session of {sessions} met the churn");
+    assert!(
+        again > 0,
+        "no session of {sessions} met the churn in {:?}",
+        began.elapsed()
+    );
     assert_eq!(runs.lines().count(), sessions, "{runs}");
 }
