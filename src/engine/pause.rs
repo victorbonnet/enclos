@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use super::Engine;
 use super::pause_state::{
-    HostPauseRead, HostPauseView, SandboxPauseInput, SandboxPauseRead, SandboxPauseView,
-    derive_host, derive_sandbox,
+    HostPauseRead, HostPauseView, HostPauseWord, SandboxPauseInput, SandboxPauseRead,
+    SandboxPauseView, derive_host, derive_sandbox,
 };
 use super::service::{IfUnrecorded, Unit};
 use crate::error::{Error, Result};
@@ -321,6 +321,12 @@ impl Engine {
                 found: current_rev,
             });
         }
+        // Decide whether a pause is in force the same way `derive_host` does
+        // (a dead record with `pause_all = false` and no covered member reads
+        // `Running` and is not in force). Safe under the held lock because
+        // `pause_state_snapshot` takes no lock.
+        let in_force = self.pause_state_snapshot()?.host.word != HostPauseWord::Running;
+        let supersede = current_host.is_some() && !in_force;
 
         // Plan per-target work under the lock before opening the audit entry
         // or writing any row.
@@ -404,10 +410,8 @@ impl Engine {
         // at least one named sandbox has services to stop. When a record IS in
         // force, membership grows to include newly named stopped sandboxes and
         // clears `released` on previously released members.
-        let write_record = is_all
-            || any_to_stop
-            || any_repause_owed
-            || (current_host.is_some() && any_membership_change);
+        let write_record =
+            is_all || any_to_stop || any_repause_owed || (in_force && any_membership_change);
 
         // Open one audit entry BEFORE the first row is written.
         let subject = scope.subject();
@@ -510,7 +514,7 @@ impl Engine {
                 }
                 if let Some(lock_ref) = held_lock.as_ref() {
                     self.state
-                        .begin_pause(lock_ref, is_all, by, at, &rows_to_write)?;
+                        .begin_pause(lock_ref, is_all, supersede, by, at, &rows_to_write)?;
                 }
             } else {
                 // Subset with no services to stop and no record in force (I13),
@@ -964,23 +968,29 @@ impl Engine {
     /// transiently holds it (used for post-work record clean-up and finishing
     /// an already-opened audit entry).
     fn lock_with_retry(&self) -> Result<StateLock> {
-        retry_lock(POST_WORK_LOCK_ATTEMPTS, || self.state.lock())
+        Self::lock_with_retry_using(POST_WORK_LOCK_ATTEMPTS, || self.state.lock())
     }
 
-    #[cfg(not(test))]
-    fn lock_for_cleanup(&self) -> Result<StateLock> {
-        self.lock_with_retry()
+    fn lock_with_retry_using(
+        attempts: usize,
+        acquire: impl FnMut() -> std::result::Result<StateLock, StateError>,
+    ) -> Result<StateLock> {
+        retry_lock(attempts, acquire)
     }
 
-    #[cfg(test)]
     fn lock_for_cleanup(&self) -> Result<StateLock> {
+        #[cfg(test)]
         if let Some(err) = test_hooks::take_cleanup_error() {
             return Err(err);
         }
-        if let Some((attempts, fake_acquire)) = test_hooks::take_cleanup_lock_hook() {
-            retry_lock(attempts, fake_acquire)?;
+        #[cfg(test)]
+        if let Some((attempts, mut fake_acquire)) = test_hooks::take_cleanup_lock_hook() {
+            return Self::lock_with_retry_using(attempts, || {
+                fake_acquire()?;
+                self.state.lock()
+            });
         }
-        self.lock_with_retry()
+        Self::lock_with_retry_using(POST_WORK_LOCK_ATTEMPTS, || self.state.lock())
     }
 
     /// Reads one sandbox's pause state for display without swallowing read

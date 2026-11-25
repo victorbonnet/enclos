@@ -6027,12 +6027,12 @@ mod pause {
                     }],
                     host: crate::engine::pause_state::HostPauseRead::Readable(
                         crate::engine::pause_state::HostPauseView {
-                            word: crate::engine::pause_state::HostPauseWord::Paused,
+                            word: crate::engine::pause_state::HostPauseWord::Running,
                             revision: 77,
                             since: None,
                             by: None,
                             pause_all: false,
-                            runs: Vec::new(),
+                            runs: vec!["lab".parse().unwrap()],
                             owed: Vec::new(),
                             nothing_to_pause_all: false,
                         },

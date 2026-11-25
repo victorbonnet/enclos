@@ -254,13 +254,22 @@ pub trait StateStore: NetLogStore {
     fn sandbox_pauses(&self) -> Result<Vec<SandboxPauseRecord>>;
     /// One sandbox's `sandbox_pauses` row, if any.
     fn sandbox_pause(&self, sandbox: &SandboxName) -> Result<Option<SandboxPauseRecord>>;
-    /// Creates or updates `host_pause` (OR'ing `pause_all` and advancing
-    /// `revision` monotonically) and upserts all `rows` into `sandbox_pauses`
-    /// inside a single transaction, rolling back wholly on any failure.
+    /// Creates or updates `host_pause` and upserts all `rows` into
+    /// `sandbox_pauses` inside a single transaction, rolling back wholly on
+    /// any failure.
+    ///
+    /// When a `host_pause` row already exists:
+    /// - if `supersede` is `false`, `pause_all` is OR'd (never cleared back to
+    ///   `false`) and the existing `by`/`at` are preserved while `revision`
+    ///   advances monotonically;
+    /// - if `supersede` is `true` (replacing a dead record that is no longer
+    ///   in force), `pause_all`, `by` and `at` are overwritten with the new
+    ///   pause's values while `revision` still advances monotonically.
     fn begin_pause(
         &self,
         lock: &StateLock,
         pause_all: bool,
+        supersede: bool,
         by: &Actor,
         at: Timestamp,
         rows: &[SandboxPauseRecord],

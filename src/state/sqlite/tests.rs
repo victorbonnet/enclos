@@ -1502,6 +1502,7 @@ fn begin_pause_is_atomic_and_rolls_back_wholly_on_row_failure() {
         .begin_pause(
             &lock,
             true,
+            false,
             &alice,
             t0,
             &[
@@ -1537,6 +1538,7 @@ fn begin_pause_is_atomic_and_rolls_back_wholly_on_row_failure() {
         .begin_pause(
             &lock,
             false,
+            false,
             &alice,
             t0,
             &[SandboxPauseRecord {
@@ -1559,6 +1561,7 @@ fn begin_pause_is_atomic_and_rolls_back_wholly_on_row_failure() {
             .begin_pause(
                 &lock,
                 true,
+                false,
                 &alice,
                 t1,
                 &[
@@ -1588,6 +1591,115 @@ fn begin_pause_is_atomic_and_rolls_back_wholly_on_row_failure() {
     let rows = store.sandbox_pauses().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].sandbox, alpha);
+}
+
+#[test]
+fn begin_pause_supersede_overwrites_actor_and_time_and_rolls_back_on_error() {
+    use crate::model::audit::Actor;
+    use crate::model::pause::SandboxPauseRecord;
+
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("alpha")).unwrap();
+    store.put(&lock, &record("beta")).unwrap();
+
+    let alice = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let bob = Actor {
+        user: "bob".into(),
+        host: "linux".into(),
+    };
+    let t0: Timestamp = "2026-11-25T12:00:00.000Z".parse().unwrap();
+    let t1: Timestamp = "2026-11-25T12:05:00.000Z".parse().unwrap();
+    let t2: Timestamp = "2026-11-25T12:10:00.000Z".parse().unwrap();
+    let alpha: SandboxName = "alpha".parse().unwrap();
+    let beta: SandboxName = "beta".parse().unwrap();
+    let missing: SandboxName = "missing".parse().unwrap();
+
+    let dead = store
+        .begin_pause(
+            &lock,
+            false,
+            false,
+            &alice,
+            t0,
+            &[SandboxPauseRecord {
+                sandbox: alpha.clone(),
+                labels: vec!["enclos.alpha.gateway".into()],
+                kept: vec![],
+                released: None,
+                at: t0,
+                by: alice.clone(),
+            }],
+        )
+        .unwrap();
+
+    // A failing supersede rolls back `by`, `at`, `revision`, `pause_all` and rows wholly.
+    assert!(
+        store
+            .begin_pause(
+                &lock,
+                true,
+                true,
+                &bob,
+                t1,
+                &[
+                    SandboxPauseRecord {
+                        sandbox: beta.clone(),
+                        labels: vec!["enclos.beta.gateway".into()],
+                        kept: vec![],
+                        released: None,
+                        at: t1,
+                        by: bob.clone(),
+                    },
+                    SandboxPauseRecord {
+                        sandbox: missing,
+                        labels: vec![],
+                        kept: vec![],
+                        released: None,
+                        at: t1,
+                        by: bob.clone(),
+                    },
+                ],
+            )
+            .is_err()
+    );
+    let unchanged = store.host_pause().unwrap().unwrap();
+    assert_eq!(unchanged.revision, dead.revision);
+    assert_eq!(unchanged.by, alice);
+    assert_eq!(unchanged.at, t0);
+    assert!(!unchanged.pause_all);
+    assert!(store.sandbox_pause(&beta).unwrap().is_none());
+
+    // A succeeding supersede overwrites `by`, `at`, sets `pause_all`, and advances revision.
+    let fresh = store
+        .begin_pause(
+            &lock,
+            false,
+            true,
+            &bob,
+            t2,
+            &[SandboxPauseRecord {
+                sandbox: beta.clone(),
+                labels: vec!["enclos.beta.gateway".into()],
+                kept: vec![],
+                released: None,
+                at: t2,
+                by: bob.clone(),
+            }],
+        )
+        .unwrap();
+    assert!(fresh.revision > dead.revision);
+    assert_eq!(fresh.by, bob);
+    assert_eq!(fresh.at, t2);
+    assert!(!fresh.pause_all);
+
+    let stored = store.host_pause().unwrap().unwrap();
+    assert_eq!(stored, fresh);
+    assert!(store.sandbox_pause(&beta).unwrap().is_some());
 }
 
 #[test]

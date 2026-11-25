@@ -133,11 +133,39 @@ fn bump_revision(tx: &rusqlite::Transaction<'_>, at: Timestamp) -> Result<u64, R
 fn upsert_host_in_tx(
     tx: &rusqlite::Transaction<'_>,
     pause_all: bool,
+    supersede: bool,
     by: &Actor,
     at: Timestamp,
 ) -> Result<HostPauseRecord, ReadError> {
     let existing = get_host(tx)?;
     let record = match existing {
+        Some(mut prev) if supersede => {
+            let revision = next_revision(prev.revision, at);
+            let rev_i64 = i64::try_from(revision).map_err(|_| {
+                ReadError::Corrupt(format!("host_pause revision overflow `{revision}`"))
+            })?;
+            // Superseding a dead record starts a fresh pause: overwrite actor,
+            // timestamp, and `pause_all` directly (a dead record always has
+            // `pause_all = false`, so setting it directly rather than OR'ing
+            // yields the same value while making the fresh start explicit).
+            tx.execute(
+                "UPDATE host_pause
+                 SET revision = ?1, pause_all = ?2, by_user = ?3, by_host = ?4, at = ?5
+                 WHERE id = 1",
+                params![
+                    rev_i64,
+                    i64::from(pause_all),
+                    &by.user,
+                    &by.host,
+                    at.to_string(),
+                ],
+            )?;
+            prev.revision = revision;
+            prev.pause_all = pause_all;
+            prev.by = by.clone();
+            prev.at = at;
+            prev
+        }
         Some(mut prev) => {
             prev.revision = next_revision(prev.revision, at);
             prev.pause_all = prev.pause_all || pause_all;
@@ -214,12 +242,13 @@ fn upsert_sandbox_in_tx(
 pub fn begin_pause(
     conn: &mut Connection,
     pause_all: bool,
+    supersede: bool,
     by: &Actor,
     at: Timestamp,
     rows: &[SandboxPauseRecord],
 ) -> Result<HostPauseRecord, ReadError> {
     let tx = conn.transaction()?;
-    let record = upsert_host_in_tx(&tx, pause_all, by, at)?;
+    let record = upsert_host_in_tx(&tx, pause_all, supersede, by, at)?;
     for rec in rows {
         upsert_sandbox_in_tx(&tx, rec)?;
     }
@@ -234,7 +263,7 @@ pub fn ensure_host(
     at: Timestamp,
 ) -> Result<HostPauseRecord, ReadError> {
     let tx = conn.transaction()?;
-    let record = upsert_host_in_tx(&tx, pause_all, by, at)?;
+    let record = upsert_host_in_tx(&tx, pause_all, false, by, at)?;
     tx.commit()?;
     Ok(record)
 }

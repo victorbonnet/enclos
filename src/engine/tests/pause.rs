@@ -1256,3 +1256,205 @@ fn resume_cleanup_retries_lock_and_surfaces_lock_error_as_cleanup_error() {
     assert!(!rerun.cleanup_failed());
     assert_eq!(readable_host(&rerun.host).revision, 0);
 }
+
+#[test]
+fn i13_subset_pause_after_dead_record_writes_nothing_and_keeps_running() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    let lab = create_sandbox(&engine, "lab");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Stopped, false);
+
+    // Pause alpha, then stop and remove it: cascade deletes alpha's row while
+    // `host_pause` lingers as a dead record (pause_all = false, nothing covered).
+    let first = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert_eq!(readable_host(&first.host).word, HostPauseWord::Paused);
+    let dead_rev = readable_host(&first.host).revision;
+    assert_ne!(dead_rev, 0);
+
+    done(engine.stop_sandbox(&alice(), &alpha, Confirm::Yes).unwrap());
+    done(
+        engine
+            .remove_sandbox(&alice(), &alpha, false, Confirm::Yes)
+            .unwrap(),
+    );
+
+    // Host now derives Running with the lingering record's revision.
+    let before = engine.derive_host_pause().unwrap();
+    assert_eq!(before.word, HostPauseWord::Running);
+    assert_eq!(before.revision, dead_rev);
+
+    // I13: pausing `lab` (no services) must write nothing and leave host Running.
+    let report = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, lab);
+    assert_eq!(report.sandboxes[0].outcome, PauseOutcome::NothingToPause);
+    assert!(
+        engine.state.sandbox_pause(&lab).unwrap().is_none(),
+        "must not write an empty sandbox_pauses row for lab"
+    );
+    let after = readable_host(&report.host);
+    assert_eq!(after.word, HostPauseWord::Running);
+    assert_eq!(after.revision, dead_rev);
+    assert_eq!(
+        engine.state.host_pause().unwrap().unwrap().revision,
+        dead_rev
+    );
+}
+
+#[test]
+fn subset_pause_supersedes_dead_record_with_fresh_actor_and_since() {
+    let fake = Rc::new(FakeServices::default());
+    let (dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    let beta = create_sandbox(&engine, "beta");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &beta, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    done(engine.stop_sandbox(&alice(), &alpha, Confirm::Yes).unwrap());
+    done(
+        engine
+            .remove_sandbox(&alice(), &alpha, false, Confirm::Yes)
+            .unwrap(),
+    );
+
+    // Backdate the dead record's timestamp so the fresh pause's `since` is
+    // deterministically distinct even within the same millisecond.
+    let old_at = "2026-01-01T00:00:00Z";
+    let conn = rusqlite::Connection::open(dir.path().join("enclos/state.db")).unwrap();
+    conn.execute("UPDATE host_pause SET at = ?1 WHERE id = 1", [old_at])
+        .unwrap();
+    drop(conn);
+
+    let dead = engine.state.host_pause().unwrap().unwrap();
+    assert_eq!(dead.by, alice());
+    assert_eq!(dead.at.to_string(), old_at);
+    assert_eq!(
+        engine.derive_host_pause().unwrap().word,
+        HostPauseWord::Running
+    );
+
+    let bob = crate::model::audit::Actor {
+        user: "bob".into(),
+        host: "linux".into(),
+    };
+    let report = engine
+        .pause_sandboxes(&bob, PauseScope::Names(vec![beta.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, beta);
+    assert_eq!(report.sandboxes[0].outcome, PauseOutcome::Paused);
+
+    let host = readable_host(&report.host);
+    assert_eq!(host.word, HostPauseWord::Paused);
+    assert!(report.host.in_force());
+    assert!(host.revision > dead.revision);
+    assert_eq!(host.by.as_ref(), Some(&bob));
+    assert_ne!(host.since.map(|t| t.to_string()).as_deref(), Some(old_at));
+    assert!(host.since.is_some());
+}
+
+#[test]
+fn i13_subset_pause_after_cleanup_failure_writes_nothing_and_keeps_running() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    done(engine.stop_sandbox(&alice(), &alpha, Confirm::Yes).unwrap());
+
+    crate::engine::pause::test_hooks::fail_next_cleanup_with(crate::error::Error::State(
+        crate::state::StateError::Locked {
+            path: std::path::PathBuf::from("state.lock"),
+        },
+    ));
+    let resumed = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert!(resumed.cleanup_failed());
+    let lingering = readable_host(&resumed.host);
+    assert_eq!(lingering.word, HostPauseWord::Running);
+    assert_ne!(lingering.revision, 0);
+
+    // Pausing alpha (which now has no services) over the lingering clean-up-failed
+    // record must write nothing and keep the host Running at the same revision.
+    let report = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, alpha);
+    assert_eq!(report.sandboxes[0].outcome, PauseOutcome::NothingToPause);
+
+    let after = readable_host(&report.host);
+    assert_eq!(after.word, HostPauseWord::Running);
+    assert_eq!(after.revision, lingering.revision);
+    assert!(
+        engine
+            .state
+            .sandbox_pause(&alpha)
+            .unwrap()
+            .unwrap()
+            .released
+            .is_some(),
+        "lingering released row must not have been cleared"
+    );
+}
+
+#[test]
+fn i13_subset_pause_after_start_of_only_owed_member_writes_nothing_and_keeps_running() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    let lab = create_sandbox(&engine, "lab");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Stopped, false);
+
+    engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+
+    // Make `resume alpha` fail so alpha is owed (still covered).
+    *fake.refuse.borrow_mut() = Some("alpha.gateway".into());
+    let r = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert_eq!(r.sandboxes[0].outcome, ResumeOutcome::WouldNotStart);
+    *fake.refuse.borrow_mut() = None;
+    assert_eq!(
+        readable_host(&r.host).word,
+        HostPauseWord::PartlyPaused,
+        "an owed member keeps the pause in force"
+    );
+
+    // `sandbox start` of the only owed member releases it; the record lingers
+    // and the host reads Running.
+    engine.start_sandbox(&alice(), &alpha).unwrap();
+    let lingering = engine.derive_host_pause().unwrap();
+    assert_eq!(lingering.word, HostPauseWord::Running);
+    assert_ne!(lingering.revision, 0);
+
+    // I13: pausing an empty sandbox must write nothing and keep the host Running.
+    let report = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert_eq!(report.sandboxes[0].outcome, PauseOutcome::NothingToPause);
+    assert!(engine.state.sandbox_pause(&lab).unwrap().is_none());
+    let after = readable_host(&report.host);
+    assert_eq!(after.word, HostPauseWord::Running);
+    assert_eq!(after.revision, lingering.revision);
+}

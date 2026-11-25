@@ -484,7 +484,7 @@ mod tests {
                 error: None,
             }],
             host: HostPauseRead::Readable(HostPauseView {
-                word: HostPauseWord::Paused,
+                word: HostPauseWord::Running,
                 revision: 42,
                 since: None,
                 by: None,

@@ -982,7 +982,19 @@ fn resume_exit_code(report: &ResumeReport) -> u8 {
     }
 }
 
-fn resume_cleanup_notice(scope: &PauseScope, err: &str) -> String {
+fn resume_cleanup_prefix(report: &ResumeReport) -> &'static str {
+    if report
+        .sandboxes
+        .iter()
+        .any(|s| s.outcome == ResumeOutcome::Resumed)
+    {
+        "the services were resumed"
+    } else {
+        "the resume ran"
+    }
+}
+
+fn resume_cleanup_notice(scope: &PauseScope, report: &ResumeReport, err: &str) -> String {
     let args = match scope {
         PauseScope::All => "--all".to_owned(),
         PauseScope::Names(names) => names
@@ -992,7 +1004,8 @@ fn resume_cleanup_notice(scope: &PauseScope, err: &str) -> String {
             .join(" "),
     };
     format!(
-        "error: the services were resumed but the pause record could not be cleaned up: {err}. Run `enclos sandbox resume {args}` again."
+        "error: {} but the pause record could not be cleaned up: {err}. Run `enclos sandbox resume {args}` again.",
+        resume_cleanup_prefix(report)
     )
 }
 
@@ -1010,15 +1023,38 @@ fn resume_json_error_message(report: &ResumeReport) -> String {
     } else if let HostPauseRead::Unreadable(why) = &report.host {
         format!("pause state unreadable: {why}")
     } else if let Some(err) = &report.cleanup_error {
-        format!("the services were resumed but the pause record could not be cleaned up: {err}")
+        format!(
+            "{} but the pause record could not be cleaned up: {err}",
+            resume_cleanup_prefix(report)
+        )
     } else {
         "resume failed".to_owned()
     }
 }
 
 fn emit_resume(scope: &PauseScope, report: &ResumeReport) -> u8 {
+    let mut out = std::io::stdout().lock();
+    let mut err_out = std::io::stderr().lock();
+    emit_resume_with(
+        scope,
+        report,
+        output::json(),
+        |doc| output::emit(&doc),
+        &mut out,
+        &mut err_out,
+    )
+}
+
+fn emit_resume_with(
+    scope: &PauseScope,
+    report: &ResumeReport,
+    json_mode: bool,
+    emit_json: impl FnOnce(Value),
+    out: &mut impl std::io::Write,
+    err_out: &mut impl std::io::Write,
+) -> u8 {
     let code = resume_exit_code(report);
-    if output::json() {
+    if json_mode {
         let items: Vec<Value> = report
             .sandboxes
             .iter()
@@ -1057,14 +1093,14 @@ fn emit_resume(scope: &PauseScope, report: &ResumeReport) -> u8 {
             code,
             || resume_json_error_message(report),
         );
-        output::emit(&doc);
+        emit_json(doc);
         return code;
     }
 
     if report.no_record {
-        println!("No pause in force: nothing to resume.");
+        let _ = writeln!(out, "No pause in force: nothing to resume.");
         if let HostPauseRead::Unreadable(why) = &report.host {
-            eprintln!("error: pause state unreadable: {why}.");
+            let _ = writeln!(err_out, "error: pause state unreadable: {why}.");
         }
         return code;
     }
@@ -1076,9 +1112,10 @@ fn emit_resume(scope: &PauseScope, report: &ResumeReport) -> u8 {
         match s.outcome {
             ResumeOutcome::Resumed => {
                 if s.services.is_empty() {
-                    println!("Resumed sandbox {}{agents_note}.", s.sandbox);
+                    let _ = writeln!(out, "Resumed sandbox {}{agents_note}.", s.sandbox);
                 } else {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "Resumed sandbox {}: installed {}{agents_note}.",
                         s.sandbox,
                         s.services.join(", ")
@@ -1086,27 +1123,35 @@ fn emit_resume(scope: &PauseScope, report: &ResumeReport) -> u8 {
                 }
             }
             ResumeOutcome::NothingToResume => {
-                println!("Sandbox {}: nothing to resume{agents_note}.", s.sandbox);
+                let _ = writeln!(
+                    out,
+                    "Sandbox {}: nothing to resume{agents_note}.",
+                    s.sandbox
+                );
             }
             ResumeOutcome::LeftAsItWas => {
-                println!("Sandbox {}: left as it was{agents_note}.", s.sandbox);
+                let _ = writeln!(out, "Sandbox {}: left as it was{agents_note}.", s.sandbox);
             }
             ResumeOutcome::WouldNotStart => {
                 let err = s.error.as_deref().unwrap_or("could not start");
-                eprintln!("error: sandbox {}: {err}", s.sandbox);
+                let _ = writeln!(err_out, "error: sandbox {}: {err}", s.sandbox);
             }
         }
     }
     if let Some(err) = &report.cleanup_error {
-        eprintln!("{}", resume_cleanup_notice(scope, err));
+        let _ = writeln!(err_out, "{}", resume_cleanup_notice(scope, report, err));
     }
     match &report.host {
         HostPauseRead::Readable(h) => match h.summary_line() {
-            Some(line) => println!("{line}."),
-            None => println!("Running."),
+            Some(line) => {
+                let _ = writeln!(out, "{line}.");
+            }
+            None => {
+                let _ = writeln!(out, "Running.");
+            }
         },
         HostPauseRead::Unreadable(why) => {
-            eprintln!("error: pause state unreadable: {why}.");
+            let _ = writeln!(err_out, "error: pause state unreadable: {why}.");
         }
     }
     code
@@ -1370,12 +1415,24 @@ mod tests {
     }
 
     #[test]
-    fn resume_cleanup_failure_exits_nonzero_with_notice_and_json_message() {
+    fn emit_resume_cleanup_failure_exits_nonzero_prints_notice_and_emits_json() {
         use enclos::engine::SandboxResumeResult;
         use enclos::engine::pause_state::HostPauseView;
 
         let alpha: SandboxName = "alpha".parse().unwrap();
         let beta: SandboxName = "beta".parse().unwrap();
+        let base_host = HostPauseRead::Readable(HostPauseView {
+            word: HostPauseWord::Running,
+            revision: 42,
+            since: None,
+            by: None,
+            pause_all: false,
+            runs: Vec::new(),
+            owed: Vec::new(),
+            nothing_to_pause_all: false,
+        });
+
+        // 1. Clean resume without cleanup_error exits 0 and emits no notice.
         let ok_report = ResumeReport {
             no_record: false,
             sandboxes: vec![SandboxResumeResult {
@@ -1385,37 +1442,110 @@ mod tests {
                 agents: Vec::new(),
                 error: None,
             }],
-            host: HostPauseRead::Readable(HostPauseView {
-                word: HostPauseWord::Running,
-                revision: 0,
-                since: None,
-                by: None,
-                pause_all: false,
-                runs: Vec::new(),
-                owed: Vec::new(),
-                nothing_to_pause_all: false,
-            }),
+            host: base_host.clone(),
             cleanup_error: None,
         };
-        assert_eq!(resume_exit_code(&ok_report), exit::OK);
-
-        let mut fail_report = ok_report;
-        fail_report.cleanup_error = Some("state lock busy".into());
-        assert_eq!(resume_exit_code(&fail_report), exit::ERROR);
-
-        let notice_names =
-            resume_cleanup_notice(&PauseScope::Names(vec![alpha, beta]), "state lock busy");
-        assert_eq!(
-            notice_names,
-            "error: the services were resumed but the pause record could not be cleaned up: state lock busy. Run `enclos sandbox resume alpha beta` again."
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = emit_resume_with(
+            &PauseScope::Names(vec![alpha.clone()]),
+            &ok_report,
+            false,
+            |_| unreachable!(),
+            &mut out,
+            &mut err_out,
         );
-        let notice_all = resume_cleanup_notice(&PauseScope::All, "state lock busy");
-        assert_eq!(
-            notice_all,
-            "error: the services were resumed but the pause record could not be cleaned up: state lock busy. Run `enclos sandbox resume --all` again."
+        assert_eq!(code, exit::OK);
+        assert!(err_out.is_empty());
+
+        // 2. Clean-up failure when nothing was resumed (LeftAsItWas only) says
+        //    "the resume ran", exits non-zero, and carries cleanup_error in --json.
+        let mut no_services_report = ok_report;
+        no_services_report.cleanup_error = Some("state lock busy".into());
+        let scope_names = PauseScope::Names(vec![alpha.clone(), beta]);
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = emit_resume_with(
+            &scope_names,
+            &no_services_report,
+            false,
+            |_| unreachable!(),
+            &mut out,
+            &mut err_out,
         );
+        assert_eq!(code, exit::ERROR);
+        let stderr = String::from_utf8(err_out).unwrap();
+        assert!(
+            stderr.contains(
+                "error: the resume ran but the pause record could not be cleaned up: state lock busy. Run `enclos sandbox resume alpha beta` again."
+            ),
+            "unexpected stderr: {stderr:?}"
+        );
+
+        let mut captured = None;
+        let json_code = emit_resume_with(
+            &scope_names,
+            &no_services_report,
+            true,
+            |doc| captured = Some(doc),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(json_code, exit::ERROR);
+        let doc = captured.expect("json doc emitted");
+        assert_eq!(doc["cleanup_error"], "state lock busy");
         assert_eq!(
-            resume_json_error_message(&fail_report),
+            doc["error"]["message"],
+            "the resume ran but the pause record could not be cleaned up: state lock busy"
+        );
+
+        // 3. Clean-up failure when at least one sandbox was Resumed keeps
+        //    "the services were resumed" in both text and --json.
+        let resumed_report = ResumeReport {
+            no_record: false,
+            sandboxes: vec![SandboxResumeResult {
+                sandbox: alpha,
+                outcome: ResumeOutcome::Resumed,
+                services: vec!["enclos.alpha.gateway".into()],
+                agents: Vec::new(),
+                error: None,
+            }],
+            host: base_host,
+            cleanup_error: Some("state lock busy".into()),
+        };
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = emit_resume_with(
+            &PauseScope::All,
+            &resumed_report,
+            false,
+            |_| unreachable!(),
+            &mut out,
+            &mut err_out,
+        );
+        assert_eq!(code, exit::ERROR);
+        let stderr = String::from_utf8(err_out).unwrap();
+        assert!(
+            stderr.contains(
+                "error: the services were resumed but the pause record could not be cleaned up: state lock busy. Run `enclos sandbox resume --all` again."
+            ),
+            "unexpected stderr: {stderr:?}"
+        );
+
+        let mut captured = None;
+        let json_code = emit_resume_with(
+            &PauseScope::All,
+            &resumed_report,
+            true,
+            |doc| captured = Some(doc),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(json_code, exit::ERROR);
+        let doc = captured.expect("json doc emitted");
+        assert_eq!(doc["cleanup_error"], "state lock busy");
+        assert_eq!(
+            doc["error"]["message"],
             "the services were resumed but the pause record could not be cleaned up: state lock busy"
         );
     }
