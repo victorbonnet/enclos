@@ -68,21 +68,34 @@ pub enum PluginError {
 
 impl PluginError {
     /// Whether this failure is one that a runtime restart explains: the
-    /// connection could not be made, or sending over it failed. A send only
-    /// reaches the restart notice for a channel that answered in this bridge
-    /// run and whose sandbox is running (`Hub::hold_for_restart` asks both),
-    /// so the notice is said of an agent that answered and then went away,
-    /// never of one that refused. A plugin that answered and refused the
-    /// token, that does not speak this protocol, or that sent something
-    /// unreadable says something else about the agent, and is never called a
-    /// restart. Nor is a permission this bridge never had: a socket in a
-    /// folder it cannot read is a home that is not this channel's.
+    /// connection could not be made, or the peer went away on it
+    /// (`BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, `NotConnected`,
+    /// `UnexpectedEof`). A read or write timeout is not one of these and falls
+    /// back through the existing diagnostic text. A send only reaches the
+    /// restart notice for a channel that answered in this bridge run and whose
+    /// sandbox is running (`Hub::hold_for_restart` asks both), so the notice is
+    /// said of an agent that answered and then went away, never of one that
+    /// refused. A plugin that answered and refused the token, that does not
+    /// speak this protocol, or that sent something unreadable says something
+    /// else about the agent, and is never called a restart. `PermissionDenied`
+    /// on connect is routed to `Linked` by `not_a_channel` before it can become
+    /// `Connect`, so it never reaches the `Connect` arm here.
+    ///
+    /// Known remainder: the attachment-file read error in
+    /// `incoming.rs::send_with_files` (`opened.read_exact`, a bridge-side file)
+    /// also arrives as `Io`; only these kinds are restart-eligible, any other
+    /// kind of it falls back, and a bridge-side `UnexpectedEof`/similar there
+    /// still reads as a restart. That is documented behaviour, not fixed here.
     pub(super) fn may_be_restarting(&self) -> bool {
+        use std::io::ErrorKind::{
+            BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+        };
         match self {
-            PluginError::Connect { source, .. } => {
-                source.kind() != std::io::ErrorKind::PermissionDenied
-            }
-            PluginError::Io(_) => true,
+            PluginError::Connect { .. } => true,
+            PluginError::Io(e) => matches!(
+                e.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+            ),
             _ => false,
         }
     }
@@ -172,7 +185,18 @@ pub(super) fn connect_within(
             });
         }
     };
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    open_on(stream, token, home, wait, deadline)
+}
+
+/// Runs the plugin `hello` exchange on an already-connected `stream`.
+fn open_on(
+    stream: UnixStream,
+    token: &str,
+    home: &str,
+    wait: Duration,
+    deadline: Instant,
+) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    write_wait(&stream, Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
         lock: Arc::new(Mutex::new(())),
@@ -391,20 +415,34 @@ fn not_a_channel(socket: &Path, source: &std::io::Error) -> bool {
     }
 }
 
+/// Tolerates macOS's `EINVAL` from `set_{read,write}_timeout` once the peer
+/// has closed the connection; Rust's own zero-duration refusal is
+/// `InvalidInput` too, but carries no OS error and stays an error.
+fn tolerate_closed_timeout(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Sets how long a read on `stream` may wait. macOS refuses to change it
 /// (`EINVAL`) once the connection is shut both ways, which it is as soon
 /// as the plugin has closed its end: a plugin may send its `hello` and
 /// close before the bridge has read it. A read there never waits, it gets
 /// what is left and then the end, so that refusal is no failure.
 fn read_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
-    match stream.set_read_timeout(wait) {
-        // Rust's own refusal (a zero wait) is `InvalidInput` too, but
-        // carries no OS error.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
-            Ok(())
-        }
-        other => other,
-    }
+    tolerate_closed_timeout(stream.set_read_timeout(wait))
+}
+
+/// Sets how long a write on `stream` may wait. macOS refuses to change it
+/// (`EINVAL`) once the peer has closed its end (for instance, a plugin that
+/// accepts and drops the connection because its one bridge slot is taken).
+/// The write that follows then fails with `BrokenPipe`/`ConnectionReset` and
+/// `closed_before_hello` turns it into `Refused`.
+fn write_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
+    tolerate_closed_timeout(stream.set_write_timeout(wait))
 }
 
 impl PluginReader {
@@ -869,33 +907,60 @@ mod tests {
                 PluginError::Refused
             ));
         }
-        // Anything else is left as it was: a restart may still explain it.
+        // Anything else is left as it was: a timeout is not a restart either.
         let timed_out = PluginError::Io(Error::from(ErrorKind::TimedOut)).closed_before_hello();
         assert!(matches!(timed_out, PluginError::Io(_)));
-        assert!(timed_out.may_be_restarting());
+        assert!(!timed_out.may_be_restarting());
+    }
+
+    /// Deterministic companion to the racy end-to-end
+    /// `restart_tests::an_accept_and_drop_channel_is_never_called_a_restart`:
+    /// dropping the peer before `open_on` guarantees the `hello` write hits a
+    /// closed socket (`BrokenPipe`) and exercises `write_wait` +
+    /// `closed_before_hello` -> `Refused` on every run.
+    #[test]
+    fn a_hello_write_to_an_already_closed_stream_is_refused() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        let wait = Duration::from_secs(1);
+        let result = open_on(ours, "t0ken", "home.lab.main", wait, Instant::now() + wait);
+        assert!(matches!(result, Err(PluginError::Refused)));
     }
 
     #[test]
     fn only_a_connection_that_failed_before_the_hello_may_be_a_restart() {
+        use std::io::{Error, ErrorKind};
         let at = |kind| PluginError::Connect {
             path: "/home/alice/.enclos-app/main.sock".into(),
-            source: std::io::Error::from(kind),
+            source: Error::from(kind),
         };
         // The channel is not there, or is going away: a restart explains both.
-        assert!(at(std::io::ErrorKind::ConnectionRefused).may_be_restarting());
-        assert!(at(std::io::ErrorKind::NotFound).may_be_restarting());
-        // The bridge may not look: no restart gives a permission back.
-        assert!(!at(std::io::ErrorKind::PermissionDenied).may_be_restarting());
-        // A connection that broke while the hello was read may be a restart.
-        assert!(
-            PluginError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-                .may_be_restarting()
-        );
+        assert!(at(ErrorKind::ConnectionRefused).may_be_restarting());
+        assert!(at(ErrorKind::NotFound).may_be_restarting());
+        // Only the I/O kinds a peer going away produces may be a restart;
+        // timeouts and other I/O failures fall back.
+        for (kind, expected) in [
+            (ErrorKind::BrokenPipe, true),
+            (ErrorKind::ConnectionReset, true),
+            (ErrorKind::ConnectionAborted, true),
+            (ErrorKind::NotConnected, true),
+            (ErrorKind::UnexpectedEof, true),
+            (ErrorKind::TimedOut, false),
+            (ErrorKind::InvalidInput, false),
+            (ErrorKind::PermissionDenied, false),
+            (ErrorKind::Other, false),
+        ] {
+            assert_eq!(
+                PluginError::Io(Error::from(kind)).may_be_restarting(),
+                expected,
+                "Io({kind:?})"
+            );
+        }
         // What the plugin answered, or failed to say, is its own answer.
         assert!(
             !PluginError::Linked {
                 path: "p".into(),
-                source: std::io::Error::other("a link"),
+                source: Error::other("a link"),
             }
             .may_be_restarting()
         );
@@ -1041,6 +1106,18 @@ mod tests {
         assert_eq!((&stream).read(&mut [0; 8]).unwrap(), 0);
         // A zero wait is still refused, as Rust refuses it.
         assert!(read_wait(&stream, Some(Duration::ZERO)).is_err());
+    }
+
+    #[test]
+    fn a_write_wait_on_a_closed_connection_is_no_failure() {
+        let (stream, other) = UnixStream::pair().unwrap();
+        drop(other);
+        write_wait(&stream, Some(Duration::from_secs(5))).unwrap();
+        write_wait(&stream, None).unwrap();
+        // A zero wait is still refused, as Rust refuses it (no OS error).
+        let zero = write_wait(&stream, Some(Duration::ZERO)).unwrap_err();
+        assert_eq!(zero.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(zero.raw_os_error().is_none());
     }
 
     #[test]

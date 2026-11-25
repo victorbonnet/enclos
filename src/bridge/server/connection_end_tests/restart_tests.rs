@@ -960,6 +960,8 @@ fn a_held_task_answer_is_not_held() {
 /// it before reading the `hello`, so the bridge's hello write and the close
 /// race. Whichever side loses, the person is told the channel closed without
 /// answering — never that the agent is restarting.
+/// The deterministic write-side check is
+/// `bridge::plugin::tests::a_hello_write_to_an_already_closed_stream_is_refused`.
 #[test]
 fn an_accept_and_drop_channel_is_never_called_a_restart() {
     let folder = tempfile::tempdir().unwrap();
