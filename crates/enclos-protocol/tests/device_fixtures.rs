@@ -61,6 +61,14 @@ const TO_DEVICE: &[(&str, &str)] = &[
         "model_models",
         include_str!("fixtures/device/to_device_model_models.json"),
     ),
+    (
+        "pause_state",
+        include_str!("fixtures/device/to_device_pause_state.json"),
+    ),
+    (
+        "pause_result",
+        include_str!("fixtures/device/to_device_pause_result.json"),
+    ),
 ];
 
 const FROM_DEVICE: &[(&str, &str)] = &[
@@ -99,6 +107,14 @@ const FROM_DEVICE: &[(&str, &str)] = &[
     (
         "model_set",
         include_str!("fixtures/device/from_device_model_set.json"),
+    ),
+    (
+        "pause",
+        include_str!("fixtures/device/from_device_pause.json"),
+    ),
+    (
+        "resume",
+        include_str!("fixtures/device/from_device_resume.json"),
     ),
 ];
 

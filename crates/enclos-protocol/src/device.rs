@@ -200,6 +200,23 @@ pub enum FromDevice {
     SandboxCreate { sandbox: String, template: String },
     #[serde(rename = "runtime.install")]
     RuntimeInstall { sandbox: String, runtime: String },
+    /// Pause the named sandboxes, or every sandbox of this host when
+    /// `sandboxes` is absent. Live and correlated; never queued offline.
+    #[serde(rename = "pause")]
+    Pause {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandboxes: Option<Vec<String>>,
+    },
+    /// Resume the named members, or every member when `sandboxes` is absent.
+    #[serde(rename = "resume")]
+    Resume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandboxes: Option<Vec<String>>,
+    },
     #[serde(rename = "conversation.new")]
     ConversationNew {
         conversation: ConversationId,
@@ -300,6 +317,12 @@ pub const HELD_TASK_ANSWER: &str = "held_task.answer";
 /// The bridge takes a message with files (`message.begin`, ADR 0076,
 /// proposed), for an agent whose capabilities name `incoming_files`.
 pub const MESSAGE_BEGIN: &str = "message.begin";
+/// The bridge offers host-level `pause`/`resume` to the host's person, and
+/// a device that declares it receives `pause.state`.
+pub const PAUSE: &str = "pause";
+/// The bridge accepts `pause`/`resume` with a `sandboxes` subset field,
+/// offered to the host's person only.
+pub const PAUSE_SUBSET: &str = "pause.subset";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
@@ -330,6 +353,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "runtimes",
     "sandbox.create",
     "runtime.install",
+    "pause",
+    "resume",
     "audit",
     "usage.get",
     "conversation.new",
@@ -502,6 +527,31 @@ pub enum ToDevice {
         runtime: String,
         login: String,
     },
+    /// Canonical host pause state, sent to devices that declared `pause` at
+    /// `sync` and after a pause/resume the bridge ran. Carries no `of`.
+    #[serde(rename = "pause.state")]
+    PauseState {
+        paused: bool,
+        partly: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        revision: u64,
+        sandboxes: Vec<PauseSandboxState>,
+    },
+    /// Correlated confirmation of this device's own `pause`/`resume`.
+    #[serde(rename = "pause.result")]
+    PauseResult {
+        of: MessageId,
+        paused: bool,
+        partly: bool,
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandboxes: Option<Vec<PauseSandboxOutcome>>,
+    },
     /// A permanent deletion, repeated at sync even when there are no new messages.
     #[serde(rename = "conversation.deleted")]
     ConversationDeleted { conversation: ConversationId },
@@ -638,6 +688,8 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "operation.progress",
     "sandbox.created",
     "runtime.installed",
+    "pause.state",
+    "pause.result",
     "conversation",
     "conversation.deleted",
     "message",
@@ -871,6 +923,49 @@ pub struct RuntimeInfo {
     pub runtime: String,
     pub name: String,
     pub description: String,
+}
+
+/// Closed five-word reason why a sandbox in `pause.state.sandboxes[]` is not
+/// paused. An unknown value on read is refused, never defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseWhy {
+    NotCovered,
+    Released,
+    NothingToPause,
+    WouldNotStop,
+    WouldNotStart,
+}
+
+/// Closed seven-word per-sandbox outcome in `pause.result.sandboxes[]`. An
+/// unknown value on read is refused, never defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseOutcome {
+    Paused,
+    Resumed,
+    NothingToPause,
+    NothingToResume,
+    WouldNotStop,
+    WouldNotStart,
+    LeftAsItWas,
+}
+
+/// One sandbox's presented pause state in `pause.state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseSandboxState {
+    pub sandbox: String,
+    pub paused: bool,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<PauseWhy>,
+}
+
+/// One named sandbox's outcome in `pause.result`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseSandboxOutcome {
+    pub sandbox: String,
+    pub outcome: PauseOutcome,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -1904,4 +1999,187 @@ fn old_auth_packets_negotiate_no_native_scope_extension() {
     let old = br#"{"v":1,"id":"auth","type":"auth","device":"phone","sig":"sig"}"#;
     assert!(matches!(decode_from_device(old).unwrap().body,
             FromDevice::Auth { capabilities, .. } if capabilities.is_empty()));
+}
+
+#[test]
+fn pause_device_messages_and_capabilities_round_trip() {
+    assert_eq!(PAUSE, "pause");
+    assert_eq!(PAUSE_SUBSET, "pause.subset");
+    assert!(FROM_DEVICE_TYPES.contains(&"pause"));
+    assert!(FROM_DEVICE_TYPES.contains(&"resume"));
+    assert!(TO_DEVICE_TYPES.contains(&"pause.state"));
+    assert!(TO_DEVICE_TYPES.contains(&"pause.result"));
+
+    let auth = br#"{"v":1,"id":"a1","type":"auth","device":"d1","sig":"s","capabilities":["pause","pause.subset"]}"#;
+    let decoded = decode_from_device(auth).unwrap();
+    assert_eq!(
+        decoded.body,
+        FromDevice::Auth {
+            device: "d1".into(),
+            sig: "s".into(),
+            capabilities: vec![Capability::Pause, Capability::PauseSubset],
+        }
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_line(&decoded)).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(auth).unwrap()
+    );
+
+    let id = MessageId::new("p-1").unwrap();
+    for (fixture, expected) in [
+        (
+            r#"{"v":1,"id":"p-1","type":"pause"}"#,
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: None,
+            },
+        ),
+        (
+            r#"{"v":1,"id":"p-1","type":"pause","revision":7,"sandboxes":["lab","home"]}"#,
+            FromDevice::Pause {
+                revision: Some(7),
+                sandboxes: Some(vec!["lab".into(), "home".into()]),
+            },
+        ),
+        (
+            r#"{"v":1,"id":"p-1","type":"resume"}"#,
+            FromDevice::Resume {
+                revision: None,
+                sandboxes: None,
+            },
+        ),
+        (
+            r#"{"v":1,"id":"p-1","type":"resume","revision":8,"sandboxes":["lab"]}"#,
+            FromDevice::Resume {
+                revision: Some(8),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        ),
+    ] {
+        let decoded = decode_from_device(fixture.as_bytes()).unwrap();
+        assert_eq!(decoded.body, expected);
+        let wire = encode_line(&Envelope::new(id.clone(), expected));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&wire).unwrap(),
+            serde_json::from_str::<serde_json::Value>(fixture).unwrap()
+        );
+    }
+}
+
+#[test]
+fn pause_state_and_result_round_trip_and_refuse_unknown_words() {
+    let id = MessageId::new("s-1").unwrap();
+    let of = MessageId::new("p-1").unwrap();
+
+    let state = ToDevice::PauseState {
+        paused: false,
+        partly: true,
+        waiting: None,
+        since: Some("2026-11-25T17:00:00Z".into()),
+        by: Some("alice@example.com (device d1, request p-1)".into()),
+        revision: 42,
+        sandboxes: vec![
+            PauseSandboxState {
+                sandbox: "lab".into(),
+                paused: true,
+                state: "running".into(),
+                why: None,
+            },
+            PauseSandboxState {
+                sandbox: "home".into(),
+                paused: false,
+                state: "running".into(),
+                why: Some(PauseWhy::NotCovered),
+            },
+            PauseSandboxState {
+                sandbox: "rel".into(),
+                paused: false,
+                state: "running".into(),
+                why: Some(PauseWhy::Released),
+            },
+            PauseSandboxState {
+                sandbox: "idle".into(),
+                paused: false,
+                state: "stopped".into(),
+                why: Some(PauseWhy::NothingToPause),
+            },
+            PauseSandboxState {
+                sandbox: "stuck".into(),
+                paused: false,
+                state: "running".into(),
+                why: Some(PauseWhy::WouldNotStop),
+            },
+            PauseSandboxState {
+                sandbox: "owed".into(),
+                paused: false,
+                state: "running".into(),
+                why: Some(PauseWhy::WouldNotStart),
+            },
+        ],
+    };
+    let wire = encode_line(&Envelope::new(id.clone(), state.clone()));
+    assert_eq!(decode_to_device(&wire).unwrap().body, state);
+    let val: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert!(val.get("waiting").is_none());
+    assert!(val["sandboxes"][0].get("why").is_none());
+
+    // Host switch result: `sandboxes` is absent.
+    let host_result = ToDevice::PauseResult {
+        of: of.clone(),
+        paused: true,
+        partly: false,
+        revision: 43,
+        sandboxes: None,
+    };
+    let wire = encode_line(&Envelope::new(id.clone(), host_result.clone()));
+    assert_eq!(decode_to_device(&wire).unwrap().body, host_result);
+    let val: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert!(val.get("sandboxes").is_none());
+
+    // Subset result with all seven closed outcomes.
+    let subset_result = ToDevice::PauseResult {
+        of,
+        paused: false,
+        partly: true,
+        revision: 44,
+        sandboxes: Some(vec![
+            PauseSandboxOutcome {
+                sandbox: "a".into(),
+                outcome: PauseOutcome::Paused,
+            },
+            PauseSandboxOutcome {
+                sandbox: "b".into(),
+                outcome: PauseOutcome::Resumed,
+            },
+            PauseSandboxOutcome {
+                sandbox: "c".into(),
+                outcome: PauseOutcome::NothingToPause,
+            },
+            PauseSandboxOutcome {
+                sandbox: "d".into(),
+                outcome: PauseOutcome::NothingToResume,
+            },
+            PauseSandboxOutcome {
+                sandbox: "e".into(),
+                outcome: PauseOutcome::WouldNotStop,
+            },
+            PauseSandboxOutcome {
+                sandbox: "f".into(),
+                outcome: PauseOutcome::WouldNotStart,
+            },
+            PauseSandboxOutcome {
+                sandbox: "g".into(),
+                outcome: PauseOutcome::LeftAsItWas,
+            },
+        ]),
+    };
+    let wire = encode_line(&Envelope::new(id, subset_result.clone()));
+    assert_eq!(decode_to_device(&wire).unwrap().body, subset_result);
+
+    // Closed vocabularies: unknown `why` or `outcome` is refused, never defaulted.
+    let bad_why = br#"{"v":1,"id":"s-2","type":"pause.state","paused":false,"partly":true,"revision":1,"sandboxes":[{"sandbox":"lab","paused":false,"state":"running","why":"invented"}]}"#;
+    assert!(decode_to_device(bad_why).is_err());
+
+    let bad_outcome = br#"{"v":1,"id":"r-2","type":"pause.result","of":"p-1","paused":false,"partly":true,"revision":1,"sandboxes":[{"sandbox":"lab","outcome":"invented"}]}"#;
+    assert!(decode_to_device(bad_outcome).is_err());
 }

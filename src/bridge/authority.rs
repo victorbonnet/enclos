@@ -37,6 +37,10 @@ impl Hub {
             if self.provisioning.is_some() {
                 capabilities.push("sandboxes".to_owned());
             }
+            if self.pausing.is_some() {
+                capabilities.push(enclos_protocol::device::PAUSE.to_owned());
+                capabilities.push(enclos_protocol::device::PAUSE_SUBSET.to_owned());
+            }
         }
         capabilities
     }

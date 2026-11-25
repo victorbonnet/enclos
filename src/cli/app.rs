@@ -12,6 +12,7 @@ use super::output;
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
 use enclos::bridge::keys::{approval_key, bridge_keypair};
+use enclos::bridge::pausing::HostPausing;
 use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::provisioning::Host;
 use enclos::bridge::server::{self, AgentSource, AgentWatch};
@@ -275,6 +276,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         approvals,
         watch,
         Host::new(engine.app_layout(), executable),
+        std::sync::Arc::new(HostPausing::new(engine.app_layout())),
         server::Push {
             key: engine.app_push_key_path(),
             host,

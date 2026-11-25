@@ -111,6 +111,21 @@ pub struct ResumeReport {
     pub host: HostPauseView,
 }
 
+/// One sandbox's derived pause state alongside its lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPauseEntry {
+    pub sandbox: SandboxName,
+    pub state: SandboxState,
+    pub view: SandboxPauseView,
+}
+
+/// Complete derived pause snapshot for the host and every sandbox on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseStateSnapshot {
+    pub host: HostPauseView,
+    pub sandboxes: Vec<SandboxPauseEntry>,
+}
+
 impl ResumeReport {
     pub fn any_failed(&self) -> bool {
         self.sandboxes
@@ -818,6 +833,12 @@ impl Engine {
     /// Reads the host pause record and derives the host-level pause view across
     /// every sandbox.
     pub fn derive_host_pause(&self) -> Result<HostPauseView> {
+        Ok(self.pause_state_snapshot()?.host)
+    }
+
+    /// Reads the host pause record and derives both the host-level pause view
+    /// and each sandbox's presented pause state in one pass.
+    pub fn pause_state_snapshot(&self) -> Result<PauseStateSnapshot> {
         let host = self.state.host_pause()?;
         let rows = self.state.sandbox_pauses()?;
         let row_map: BTreeMap<&SandboxName, &SandboxPauseRecord> =
@@ -837,7 +858,20 @@ impl Engine {
                 row: row_map.get(&rec.name).copied(),
             })
             .collect();
-        Ok(derive_host(host.as_ref(), &inputs))
+        let host_view = derive_host(host.as_ref(), &inputs);
+        let sandboxes = records
+            .iter()
+            .zip(inputs.iter())
+            .map(|(rec, input)| SandboxPauseEntry {
+                sandbox: rec.name.clone(),
+                state: rec.state.clone(),
+                view: derive_sandbox(host.as_ref(), *input),
+            })
+            .collect();
+        Ok(PauseStateSnapshot {
+            host: host_view,
+            sandboxes,
+        })
     }
 
     /// Derives the pause view for one sandbox given already-read pause records

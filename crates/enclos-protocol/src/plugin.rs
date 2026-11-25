@@ -472,6 +472,14 @@ pub enum Capability {
     /// device that draws them in its `auth`, and each gets them as `notify`
     /// otherwise (ADR 0071, proposed).
     TaskEvents,
+    /// A device that renders the host's paused state (`pause.state`) names
+    /// this in its `auth.capabilities`.
+    Pause,
+    /// A device that may send `pause`/`resume` with a `sandboxes` subset
+    /// names this in its `auth.capabilities` (and checks that the bridge
+    /// advertised it in `authenticated.capabilities`).
+    #[serde(rename = "pause.subset")]
+    PauseSubset,
     #[serde(other)]
     Unknown,
 }

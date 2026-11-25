@@ -100,6 +100,7 @@ use super::groups::{
 };
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
+use super::pausing::Pausing;
 use super::plugin::{self, PluginCloser, PluginError, PluginWriter, connect_within};
 use super::provisioning::{Completed, Host, Operation};
 #[cfg(test)]
@@ -275,6 +276,13 @@ struct Hub {
     watch: Option<AgentWatch>,
     provisioning: Option<Host>,
     provisioning_busy: Mutex<HashSet<String>>,
+    /// Host pause/resume seam (slice A wire).
+    pausing: Option<Arc<dyn Pausing>>,
+    /// Single-flight guard for pause/resume operations per bridge.
+    pausing_busy: AtomicBool,
+    /// Connected devices whose `auth.capabilities` declared `pause`,
+    /// keyed by device id and connection generation.
+    pause_devices: Mutex<HashMap<String, u64>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
     /// The agents whose channel answered in this bridge run, by `sandbox/name`:
@@ -522,6 +530,207 @@ impl Hub {
         }
     }
 
+    fn with_pausing(self, pausing: Arc<dyn Pausing>) -> Hub {
+        Hub {
+            pausing: Some(pausing),
+            ..self
+        }
+    }
+
+    /// Validates and runs a `pause` or `resume` request off the socket thread.
+    ///
+    /// Failure order (each answers one correlated `error` and changes nothing):
+    /// (a) seam absent → `not_allowed`
+    /// (b) `host_authority` → `not_allowed` (rechecked every request)
+    /// (c) `sandboxes` present: undeclared `pause.subset`, empty, >64, or invalid name → `bad_message`
+    /// (d) single-flight per bridge → `conflict`
+    /// (e) unknown sandbox name → `not_found` (checked before calling engine pause/resume)
+    /// (f) stale `revision` → `conflict`
+    #[allow(clippy::too_many_arguments)]
+    fn begin_pause(
+        self: &Arc<Self>,
+        store: &Store,
+        is_resume: bool,
+        revision: Option<u64>,
+        sandboxes: Option<Vec<String>>,
+        pause_subset_declared: bool,
+        of: MessageId,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), ErrorBody> {
+        // (a) seam absent
+        if self.pausing.is_none() {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::NotAllowed,
+                message: "This bridge does not offer pause.".to_owned(),
+            });
+        }
+        // (b) host_authority (person and pairing, rechecked on every request)
+        self.host_authority(store, device, person)
+            .map_err(|(code, message)| ErrorBody {
+                of: Some(of.clone()),
+                code,
+                message,
+            })?;
+        // (c) `sandboxes` present validation + `pause.subset` capability guard
+        let is_subset = sandboxes.is_some();
+        if is_subset && !pause_subset_declared {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::BadMessage,
+                message: "This device did not declare pause.subset.".to_owned(),
+            });
+        }
+        let scope = super::pausing::parse_scope(sandboxes).map_err(|message| ErrorBody {
+            of: Some(of.clone()),
+            code: ErrorCode::BadMessage,
+            message,
+        })?;
+        // Single-flight per bridge
+        if self.pausing_busy.swap(true, Ordering::SeqCst) {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Conflict,
+                message: "Another pause or resume operation is already running on this host."
+                    .to_owned(),
+            });
+        }
+        let hub = Arc::clone(self);
+        let by = authority::device_actor(person, &device.id, Some(of.as_str()));
+        let person = person.to_owned();
+        let device_id = device.id.clone();
+        let verb = if is_resume { "resume" } else { "pause" };
+        std::thread::spawn(move || {
+            struct BusyGuard<'a>(&'a AtomicBool);
+            impl Drop for BusyGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = BusyGuard(&hub.pausing_busy);
+            let Some(pausing) = hub.pausing.as_ref() else {
+                hub.deliver_device(
+                    &device_id,
+                    ToDevice::Error(ErrorBody {
+                        of: Some(of),
+                        code: ErrorCode::NotAllowed,
+                        message: "This bridge does not offer pause.".to_owned(),
+                    }),
+                );
+                return;
+            };
+            // Pre-check names (d) and revision (e) against current state before
+            // invoking pause/resume so a missing name or stale revision refuses
+            // the whole request without touching any sandbox. The engine also
+            // rechecks both under its state lock.
+            match pausing.state() {
+                Ok(current) => {
+                    if let crate::engine::PauseScope::Names(ref names) = scope {
+                        for name in names {
+                            if !current.sandboxes.iter().any(|s| s.sandbox == name.as_str()) {
+                                hub.deliver_device(
+                                    &device_id,
+                                    ToDevice::Error(ErrorBody {
+                                        of: Some(of),
+                                        code: ErrorCode::NotFound,
+                                        message: format!(
+                                            "no sandbox named `{}` on this host",
+                                            name.as_str()
+                                        ),
+                                    }),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(expected) = revision
+                        && expected != current.revision
+                    {
+                        hub.deliver_device(
+                            &device_id,
+                            ToDevice::Error(ErrorBody {
+                                of: Some(of),
+                                code: ErrorCode::Conflict,
+                                message: format!(
+                                    "pause state changed since revision {expected} (now {})",
+                                    current.revision
+                                ),
+                            }),
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    hub.deliver_device(
+                        &device_id,
+                        ToDevice::Error(ErrorBody {
+                            of: Some(of),
+                            code: err.code(),
+                            message: err.message().to_owned(),
+                        }),
+                    );
+                    return;
+                }
+            }
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device_id),
+                    Some(&person),
+                    &format!("{verb} started"),
+                    None,
+                );
+            }
+            let result = if is_resume {
+                pausing.resume(&by, scope, revision)
+            } else {
+                pausing.pause(&by, scope, revision)
+            };
+            match result {
+                Ok(done) => {
+                    if let Ok(store) = hub.store() {
+                        let _ = store.log(
+                            Some(&device_id),
+                            Some(&person),
+                            &format!("{verb} completed"),
+                            None,
+                        );
+                    }
+                    hub.deliver_device(
+                        &device_id,
+                        ToDevice::PauseResult {
+                            of,
+                            paused: done.paused,
+                            partly: done.partly,
+                            revision: done.revision,
+                            sandboxes: if is_subset { Some(done.outcomes) } else { None },
+                        },
+                    );
+                    hub.broadcast_pause_state();
+                }
+                Err(err) => {
+                    if let Ok(store) = hub.store() {
+                        let _ = store.log(
+                            Some(&device_id),
+                            Some(&person),
+                            &format!("{verb} failed"),
+                            Some(err.message()),
+                        );
+                    }
+                    hub.deliver_device(
+                        &device_id,
+                        ToDevice::Error(ErrorBody {
+                            of: Some(of),
+                            code: err.code(),
+                            message: err.message().to_owned(),
+                        }),
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Returns once `agent` may have one more message stored ([`Pace`]):
     /// at once in a burst, else after a wait, in which its plugin's
     /// connection is not read.
@@ -593,6 +802,9 @@ impl Hub {
             watch: None,
             provisioning: None,
             provisioning_busy: Mutex::new(HashSet::new()),
+            pausing: None,
+            pausing_busy: AtomicBool::new(false),
+            pause_devices: Mutex::new(HashMap::new()),
             plugins: Mutex::new(HashMap::new()),
             answered: Mutex::new(HashSet::new()),
             restart_wait: RESTART_WAIT,
@@ -765,6 +977,64 @@ impl Hub {
     /// beside its database.
     fn media(&self) -> std::path::PathBuf {
         self.store_path.with_file_name(crate::layout::APP_MEDIA_DIR)
+    }
+
+    /// Sends `message` to one connected device by id, if still connected.
+    fn deliver_device(&self, device_id: &str, message: ToDevice) {
+        let devices = self.devices.lock().expect("not poisoned");
+        if let Some((_, sender, _)) = devices.get(device_id) {
+            let _ = sender.send(message);
+        }
+    }
+
+    /// Reads the canonical pause state and broadcasts it to every connected
+    /// device that declared `pause`. The host's person gets every sandbox row;
+    /// other persons get only the rows covered by the pause. If the state
+    /// cannot be read, logs and sends nothing.
+    fn broadcast_pause_state(&self) {
+        let Some(pausing) = self.pausing.as_ref() else {
+            return;
+        };
+        let view = match pausing.state() {
+            Ok(view) => view,
+            Err(err) => {
+                eprintln!(
+                    "enclos app: pause state could not be read: {}",
+                    err.message()
+                );
+                return;
+            }
+        };
+        let host_person = self.known_host();
+        let host_msg = view.to_device_message(true);
+        let other_msg = view.to_device_message(false);
+        let host_fits = fits_device(&host_msg);
+        let other_fits = fits_device(&other_msg);
+        if !host_fits {
+            eprintln!(
+                "enclos app: pause.state for host person does not fit one device message; skipped"
+            );
+        }
+        if !other_fits {
+            eprintln!(
+                "enclos app: pause.state for shared person does not fit one device message; skipped"
+            );
+        }
+        let devices = self.devices.lock().expect("not poisoned");
+        let pause_devices = self.pause_devices.lock().expect("not poisoned");
+        for (device_id, (owner, sender, generation)) in devices.iter() {
+            if pause_devices.get(device_id) != Some(generation) {
+                continue;
+            }
+            let is_host = host_person.as_deref() == Some(owner.as_str());
+            if is_host {
+                if host_fits {
+                    let _ = sender.send(host_msg.clone());
+                }
+            } else if other_fits {
+                let _ = sender.send(other_msg.clone());
+            }
+        }
     }
 
     /// Sends `message` to every connected device of `person`.
@@ -2236,6 +2506,7 @@ pub fn serve(
     approval_key: enclos_protocol::decision::DecisionKey,
     watch: AgentWatch,
     provisioning: Host,
+    pausing: Arc<dyn Pausing>,
     push: Push,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -2265,6 +2536,7 @@ pub fn serve(
         .with_approval_key(approval_key)
         .with_agent_watch(watch)
         .with_provisioning(provisioning)
+        .with_pausing(pausing)
         .with_push(pusher, push.host),
     );
     serve_on(listener, hub, RETRY);
@@ -2518,6 +2790,10 @@ struct Link {
     /// Whether the device draws task events (`task_events` in its `auth`);
     /// one that does not gets each as a `notify`, its text alone.
     task_events: bool,
+    /// Whether the device declared `pause` in its `auth` (receives `pause.state`).
+    pause_state: bool,
+    /// Whether the device declared `pause.subset` in its `auth`.
+    pause_subset: bool,
 }
 
 impl Link {
@@ -2801,6 +3077,8 @@ fn connection(
         heard: std::time::Instant::now(),
         scoped_approvals: false,
         task_events: false,
+        pause_state: false,
+        pause_subset: false,
     };
     let known = store
         .device_by_noise_key(&noise_key)
@@ -2933,11 +3211,19 @@ fn connection(
     let (sender, outbox) = channel();
     link.scoped_approvals = device_capabilities.contains(&Capability::RuntimeApprovalScopes);
     link.task_events = device_capabilities.contains(&Capability::TaskEvents);
+    link.pause_state = device_capabilities.contains(&Capability::Pause);
+    link.pause_subset = device_capabilities.contains(&Capability::PauseSubset);
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
     {
         let mut devices = hub.devices.lock().expect("not poisoned");
         hub.question_device_capabilities(&device.id, &device_capabilities);
         devices.insert(device.id.clone(), (person.clone(), sender, this));
+        let mut pause_devices = hub.pause_devices.lock().expect("not poisoned");
+        if link.pause_state {
+            pause_devices.insert(device.id.clone(), this);
+        } else {
+            pause_devices.remove(&device.id);
+        }
     }
     link.socket
         .get_ref()
@@ -2950,6 +3236,10 @@ fn connection(
         if devices.get(&device.id).map(|d| d.2) == Some(this) {
             devices.remove(&device.id);
             hub.question_device_capabilities(&device.id, &[]);
+            let mut pause_devices = hub.pause_devices.lock().expect("not poisoned");
+            if pause_devices.get(&device.id) == Some(&this) {
+                pause_devices.remove(&device.id);
+            }
         }
     }
     let _ = store.device_seen(&device.id);
@@ -3718,6 +4008,40 @@ fn run_session(
                     }))?,
                 }
             }
+            FromDevice::Pause {
+                revision,
+                sandboxes,
+            } => {
+                if let Err(error) = hub.begin_pause(
+                    store,
+                    false,
+                    revision,
+                    sandboxes,
+                    link.pause_subset,
+                    message.id,
+                    device,
+                    person,
+                ) {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::Resume {
+                revision,
+                sandboxes,
+            } => {
+                if let Err(error) = hub.begin_pause(
+                    store,
+                    true,
+                    revision,
+                    sandboxes,
+                    link.pause_subset,
+                    message.id,
+                    device,
+                    person,
+                ) {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::ApprovalClose { request } => {
                 match hub.close_access(store, device, person, &request) {
                     Ok(()) => link.send(ToDevice::Ack { of: message.id })?,
@@ -3957,6 +4281,27 @@ fn run_session(
                 if open_items {
                     for frame in hub.open_item_frames(store, person)? {
                         link.send(frame)?;
+                    }
+                }
+                if link.pause_state
+                    && let Some(pausing) = hub.pausing.as_ref()
+                {
+                    match pausing.state() {
+                        Ok(view) => {
+                            let is_host = hub.known_host().as_deref() == Some(person);
+                            let body = view.to_device_message(is_host);
+                            if fits_device(&body) {
+                                link.send(body)?;
+                            } else {
+                                log_too_large(store, &device.id, person, "pause state", &body);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "enclos app: pause state could not be read: {}",
+                                err.message()
+                            );
+                        }
                     }
                 }
                 link.send(ToDevice::Synced { seq: last })?;
@@ -4989,7 +5334,7 @@ mod connection_end_tests {
     use std::path::{Path, PathBuf};
     use tungstenite::client::IntoClientRequest;
 
-    const PERSON: &str = "victor@example.com";
+    pub(super) const PERSON: &str = "victor@example.com";
     const TOKEN: &str = "t0ken";
 
     mod incoming_tests;
@@ -4998,16 +5343,61 @@ mod connection_end_tests {
     /// A bridge on a free port of the loopback, serving `lab/main`, whose
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs
     /// answering `node`.
-    struct Bridge {
-        hub: Arc<Hub>,
+    pub(super) struct Bridge {
+        pub(super) hub: Arc<Hub>,
         port: u16,
         public: Vec<u8>,
-        store: PathBuf,
+        pub(super) store: PathBuf,
         socket: PathBuf,
         /// The node `whois` names.
         node: Arc<Mutex<String>>,
         /// The login `whois` names.
-        whois_login: Arc<Mutex<String>>,
+        pub(super) whois_login: Arc<Mutex<String>>,
+    }
+
+    /// A bridge configured with an optional pausing seam for wire tests.
+    pub(super) fn bridge_with_pausing(folder: &Path, pausing: Option<Arc<dyn Pausing>>) -> Bridge {
+        let keys = generate_keypair().unwrap();
+        let node = Arc::new(Mutex::new("n-pixel".to_owned()));
+        let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
+        let (answer, login) = (Arc::clone(&node), Arc::clone(&whois_login));
+        let whois: Whois = Arc::new(move |address: &str| {
+            assert_eq!(address, "100.64.0.9");
+            Ok(Caller {
+                login: login.lock().unwrap().clone(),
+                node_id: answer.lock().unwrap().clone(),
+                node: "pixel".to_owned(),
+            })
+        });
+        let socket = folder.join("main.sock");
+        let store = folder.join("app.db");
+        let mut hub = Hub::new(
+            Transport::Tailscale,
+            whois,
+            store.clone(),
+            crate::layout::Layout::at(folder.join("enclos")),
+            keys.private.to_vec(),
+            Vec::new(),
+            None,
+            SILENCE,
+        );
+        if let Some(pausing) = pausing {
+            hub = hub.with_pausing(pausing);
+        }
+        let hub = Arc::new(hub);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::clone(&hub);
+        std::thread::spawn(move || serve_on(listener, served, Duration::from_secs(60)));
+        Bridge {
+            hub,
+            port,
+            public: keys.public,
+            store,
+            socket,
+            node,
+            whois_login,
+        }
     }
 
     fn bridge(folder: &Path) -> Bridge {
@@ -5149,18 +5539,18 @@ mod connection_end_tests {
     }
 
     /// A paired device, as the store keeps it, and its private keys.
-    struct Phone {
-        id: String,
+    pub(super) struct Phone {
+        pub(super) id: String,
         noise_private: Vec<u8>,
         signing: SigningKey,
     }
 
-    fn paired(bridge: &Bridge, node: &str) -> Phone {
+    pub(super) fn paired(bridge: &Bridge, node: &str) -> Phone {
         paired_as(bridge, node, PERSON)
     }
 
     /// A device paired for `person`.
-    fn paired_as(bridge: &Bridge, node: &str, person: &str) -> Phone {
+    pub(super) fn paired_as(bridge: &Bridge, node: &str, person: &str) -> Phone {
         let noise = generate_keypair().unwrap();
         let signing = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let id = new_id().unwrap();
@@ -5191,13 +5581,13 @@ mod connection_end_tests {
     }
 
     /// The device's side of one connection.
-    struct PhoneLink {
+    pub(super) struct PhoneLink {
         socket: WebSocket<TcpStream>,
         session: Session,
     }
 
     impl PhoneLink {
-        fn send(&mut self, id: &str, body: FromDevice) {
+        pub(super) fn send(&mut self, id: &str, body: FromDevice) {
             let plain = encode_line(&Envelope::new(MessageId::new(id).unwrap(), body));
             let sealed = self.session.encrypt(&plain).unwrap();
             self.socket.send(Message::Binary(sealed.into())).unwrap();
@@ -5213,7 +5603,7 @@ mod connection_end_tests {
         /// The next message, `None` once the bridge closed the connection.
         /// A conversation's details (`conversation`, sent when one starts
         /// or is named) are passed over: these tests are about messages.
-        fn receive(&mut self) -> Option<ToDevice> {
+        pub(super) fn receive(&mut self) -> Option<ToDevice> {
             loop {
                 match self.receive_any()? {
                     ToDevice::Conversation(_) => continue,
@@ -5295,7 +5685,7 @@ mod connection_end_tests {
     }
 
     /// As [`connect_as`], the device's `auth` naming `capabilities`.
-    fn connect_with(
+    pub(super) fn connect_with(
         bridge: &Bridge,
         phone: &Phone,
         login: &str,
@@ -8266,7 +8656,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
         assert_ne!(other, CLOSED);
     }
     /// The code and `of` of an `error`, or a panic naming what came.
-    fn error_of(message: Option<ToDevice>) -> (ErrorCode, Option<String>) {
+    pub(super) fn error_of(message: Option<ToDevice>) -> (ErrorCode, Option<String>) {
         match message {
             Some(ToDevice::Error(error)) => (error.code, error.of.map(|of| of.as_str().to_owned())),
             other => panic!("not an error: {other:?}"),

@@ -134,7 +134,7 @@ The app makes its **device key**, a P-256 key in the phone's hardware (Android K
 | `type` | From | Fields |
 | --- | --- | --- |
 | `auth` | device | `device`, `sig` (base64url DER signature of `enclos auth v1` ‖ the handshake hash) |
-| `authenticated` | bridge | `person`, optional `capabilities` (`usage` for usage windows, `usage.series` for their series over time and `usage.cost` for their costs and windows of one sandbox or agent, and `message.begin` for [sending files](#sending-files), offered to every person; `sandboxes` for provisioning, `audit` for audit pages, `approval.close` for closing policy requests and `agent.forget` for forgetting removed agents, offered to the host's person) |
+| `authenticated` | bridge | `person`, optional `capabilities` (`usage` for usage windows, `usage.series` for their series over time and `usage.cost` for their costs and windows of one sandbox or agent, and `message.begin` for [sending files](#sending-files), offered to every person; `sandboxes` for provisioning, `pause` for host pause/resume, `pause.subset` for pausing or resuming a named subset of sandboxes, `audit` for audit pages, `approval.close` for closing policy requests and `agent.forget` for forgetting removed agents, offered to the host's person) |
 | `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of `enclos pair proof v1` ‖ the handshake hash, keyed with `code`), `sig` (base64url DER signature, by `device_key`, of `enclos pair v1` ‖ the handshake hash), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `bad_signature`, `declined` |
@@ -344,6 +344,44 @@ Only the host's person, authenticated on a still-paired device, may use these me
 | `operation.progress` | bridge | `of`, `operation` (`sandbox.create` or `runtime.install`), `sandbox`, `message` | The request identified by `of` is running; milestones only, no raw installer output |
 | `sandbox.created` | bridge | `of`, `sandbox` | Creation completed |
 | `runtime.installed` | bridge | `of`, `sandbox`, `runtime`, `login` | Installation completed; `login` is the remaining host setup command, e.g. `enclos connect lab -- hermes setup` |
+| `pause` | device | `revision`? (the revision the device last saw), `sandboxes`? (the sandboxes to pause: one to 64 names, each a valid sandbox name; **absent means every sandbox of this host**) | Pause the named sandboxes, or every sandbox of the host when `sandboxes` is absent. Live and correlated; never queued offline, never resent automatically (A8). A present-but-empty `sandboxes`, more than 64 names, or a name that is not a valid sandbox name is refused `bad_message` and changes nothing |
+| `resume` | device | `revision`?, `sandboxes`? | Resume the named members, or every member when `sandboxes` is absent |
+| `pause.state` | bridge | `paused` (bool), `partly` (bool), `waiting`?, `since`, `by`, `revision`, `sandboxes`: `[{sandbox, paused (bool), state (the fixed-set lifecycle word), why?}]` — one row per sandbox of the host | to a device that declared `pause`, at `sync` and whenever anything in it changes |
+| `pause.result` | bridge | `of` (the device request), `paused`, `partly`, `revision`, `sandboxes`? (`[{sandbox, outcome}]`, one row per sandbox the request **named**, in the order named; absent for a request that named none) | The exact correlated confirmation of this device's own `pause`/`resume`. `paused`, `partly` and `revision` are the host's state after it; the rows say what happened to each sandbox this request named |
+
+**Host pause and per-sandbox pause (`pause`, `pause.subset`).**
+
+**Two forms, never both, and the field is the form.** `sandboxes` absent is the host switch (`--all`); `sandboxes` present names a subset (`pause <name>...`) and must hold at least one name. There is no request that names a subset and also means "the whole host".
+
+`pause.subset` in `authenticated.capabilities` means **this bridge accepts a `pause`/`resume` whose `sandboxes` field names a subset**. It is offered only to the host's person, like `pause` itself, and like `pause` it is feature support, not authority: the host's person and the device's pairing are still rechecked on every request (`src/bridge/authority.rs`). **A device must not send a `sandboxes` field to a bridge that did not advertise `pause.subset`**, and the app shows no per-sandbox control against such a bridge (A11, A9). A bridge that advertises `pause.subset` understands the field; a bridge that does not never receives one from a correct device. Belt and braces: the bridge also refuses `sandboxes` with `bad_message` from a device whose `auth.capabilities` did not declare `pause.subset`, changing nothing.
+
+`revision` is optional and, when given, is checked against **the one `host_pause` row**, for a subset request exactly as for a host-wide one: a stale one is answered `conflict` and changes nothing. The bridge advances the revision on **every** change to the record — a pause that adds members, a resume that releases one, the record's creation, its deletion — so the revision a device sends is always the `pause.state.revision` of the state it last read. Only one pause or resume operation runs per bridge at a time; a second request arriving while one is in flight is answered `conflict` and changes nothing.
+
+A `sandboxes` field is checked whole before anything is done with it. A name that is not a valid sandbox name, an empty list, a list of more than 64 names, or a field that is not an array of strings is refused `bad_message`; a valid name for which this host has no sandbox (one removed included) is refused `not_found`, naming it. **In both cases the whole request is refused and nothing is carried out** — the same rule as `enclos sandbox start|stop|restart`, whose names are all checked before any sandbox is touched. A correct device reads the result with `sandboxes` and repairs its list, or retries without the name.
+
+`why` is present only on a sandbox that is not paused, and is one of five fixed words, no other value ever legal:
+- `not_covered` — no pause of this host covers it and none ever did (a subset pause did not name it, or it was created after it);
+- `released` — a pause covered it, its services are installed again, and the person resumed it;
+- `nothing_to_pause` — a pause covers it and it was already stopped, created or failed: left as it was;
+- `would_not_stop` — a pause covers it and its runtime service did not stop (H11);
+- `would_not_start` — a pause covers it and a resume asked for it and its services are not installed again (A19).
+
+The `why` a sandbox runs is the presented, durable reason, and the app renders only from it: it says "you left it running" only for `not_covered`, "you resumed it" only for `released`, and "it would not stop" only for `would_not_stop` (A13, A14, A18).
+
+The `outcome` vocabulary in `pause.result.sandboxes[]` is a fixed set closed at seven words (an unknown value on read is refused, never defaulted):
+
+| `outcome` | for a `pause` | for a `resume` |
+| --- | --- | --- |
+| `paused` / `resumed` | its runtime services were removed | its runtime services are installed again |
+| `nothing_to_pause` / `nothing_to_resume` | it was already stopped, created or failed; left as it was | it was already running; nothing to restore |
+| `would_not_stop` / `would_not_start` | its runtime service would not stop (H11) | its services would not start (A19) |
+| `left_as_it_was` (resume only) | — | a member the pause found stopped, left stopped (H2) |
+
+*Slice A wire interpretations:*
+- **Other persons' `pause.state` rows:** for the host's person `pause.state.sandboxes[]` carries one row per sandbox of the host; for a device of another person that declared `pause`, `pause.state` carries the host-level facts and only the rows of sandboxes the pause covers, so a shared person never learns how many other sandboxes the host has.
+- **Partial failures are `pause.result`:** when a pause or resume runs and one or more sandboxes fail to stop or start, the bridge still answers with `pause.result` (with `partly: true` and `would_not_stop`/`would_not_start` in any subset rows) rather than withholding the result as an `error`; an `error` (`internal` or `operation_failed`) is sent only when an engine error kept the operation from starting at all.
+- **CLI changes while connected:** a change made on the host with the CLI reaches a connected phone at its next sync.
+- **`waiting`:** stays optional in `pause.state` and is never sent in this slice (bounded drain is not built yet).
 
 **Runtime versions** (proposed, [ADR 0074](adr/0074-a-sandboxs-runtime-is-updated-on-request-and-restarts-at-once.md), issue #335). `runtime_version` is the version of the sandbox's runtime installed, as `enclos status` shows it, left out when the host does not know it. `runtime_release` is the runtime's latest release, the one its installer installs by default, the same for every sandbox of that runtime: `version` and `checked` (this host's enclos was checked with it). It is left out when the host has no release to tell: none kept, its lookups failed with none found before, or lookups are off. A failed lookup keeps the release found before. `runtime_outdated` says whether that release is newer than `runtime_version`, left out when the host cannot tell, such as when it does not know either. The bridge answers `sandboxes` at once with what it has kept of each runtime's latest release, however old; when that is missing or older than its keep time, it looks the releases up on a thread of its own, one lookup at a time, which can take up to 10 seconds a runtime, then reads the sandboxes and sends a fresh `sandboxes.list`, with no `of`, to the host's person's connected devices, unless it does not fit one message. A lookup that fails, or releases it cannot keep, are written to the bridge's log (`enclos app log`), and the device keeps the list it has. A device shows a newer release next to the version installed, with whether this enclos was checked with it. Older devices ignore these fields.
 
@@ -450,7 +488,7 @@ The counts come from inside the sandbox, which the agent writes: they guide the 
 | `operation_failed` | The engine or installer refused or failed; the message says why, and whether a policy edit was saved anyway. Check the sandbox on the host before retrying |
 | `internal` | The receiver failed on its side; nothing was changed, and trying again later may work |
 | `unsupported` | The runtime does not offer this routine control, delivery, question control or model choice, or the answer would be too large for one device-leg message; nothing was changed |
-| `not_found` | No such routine, question or held task for this agent (one removed included), or a model provider or model its runtime does not list; nothing was changed |
+| `not_found` | No such routine, question or held task for this agent (one removed included), a model provider or model its runtime does not list, or a sandbox this host does not have (`pause`, `resume`); nothing was changed |
 | `unknown` | A runtime could not confirm a routine control or model change it received, or the bridge could not check the runtime's answer to one, and the outcome is not known; a later sync, or for a model reading `options` again, shows it, and an idempotent request may be retried. Also what a receiver reads for a code it does not know |
 
 ## Versions
