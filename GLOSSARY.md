@@ -119,6 +119,26 @@ _Avoid_: run, job, instance
 A session whose end is not recorded though none of its members runs any more, because nothing was left to record it, as after a crash or a restart of the Mac.
 _Avoid_: stale session, zombie session
 
+**Pause**:
+A record on the host that the runtime services of all its sandboxes, or of named ones, were stopped by the user, and what is needed to start them again. A pause is not a lifecycle state of a sandbox, and it does not touch a sandbox's home, policy or secrets.
+_Avoid_: freeze, suspend, hibernate
+
+**Resume**:
+Starting again what a pause stopped, as the pause recorded it. A sandbox that was already stopped when the pause ran stays stopped.
+_Avoid_: unpause, wake
+
+**Pause member**:
+A sandbox a pause names. It is paused when the pause stopped its runtime service, and covered but not paused when it had none to stop.
+_Avoid_: paused sandbox (for one that was already stopped)
+
+**Covered sandbox**:
+A sandbox a pause in force holds: a member not yet resumed, a member whose resume did not complete, and, under a pause of the whole host, any sandbox of the host, including one created after the pause.
+_Avoid_: locked, frozen
+
+**Partly paused**:
+What a host with a pause in force is called while some sandbox still runs or still owes a restart. It names them and is never called paused.
+_Avoid_: half paused
+
 **Native chat**:
 The runtime's own record of one exchange with an agent, whatever started it: a conversation in the app, a talk in the sandbox, a routine's run. Hermes calls it a session.
 _Avoid_: session (a sandbox's word), thread

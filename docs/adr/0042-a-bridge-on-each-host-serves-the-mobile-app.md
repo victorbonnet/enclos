@@ -18,7 +18,7 @@ Decision (proposed):
 
 Not built yet: the bridge as a service of the host's service manager. It runs in the foreground, `enclos app serve`, until Ctrl-C, and the user puts it on the tailnet with `tailscale serve` (design §4).
 
-Proposed [0064](0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person.
+Proposed [0064](0064-the-hosts-person-can-provision-sandboxes-from-a-paired-phone.md) also amends the read-only sandbox boundary for creation and runtime installation by the host's person. Proposed [0079](0079-a-paused-host-is-a-recorded-state-and-the-hosts-person-may-set-it.md) amends it again for pausing and resuming the host's work, all of it or named sandboxes.
 
 Reason: one listener per host is the least that reaches the phone, and dialing in keeps the sandbox's routes as they are. Every runtime then needs only its own plugin, and the app works with every agent.
 
