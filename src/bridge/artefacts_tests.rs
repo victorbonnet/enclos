@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::bridge::server::artefacts::{
-    Candidate, ExcludedReason, MAX_ARTEFACT_BYTES, MAX_ARTEFACT_TOTAL, MAX_ARTEFACTS,
+    Candidate, Excluded, ExcludedReason, MAX_ARTEFACT_BYTES, MAX_ARTEFACT_TOTAL, MAX_ARTEFACTS,
     MAX_REFUSALS_REMEMBERED, apply_limits, artefact_id, artefact_mime, exclusion_line, log_once,
     walk_sandbox,
 };
@@ -355,6 +355,74 @@ fn count_and_total_limits_are_exclusions_named_in_the_log() {
             && total_line.contains(&expected_used.to_string()),
         "unexpected total exclusion line: {total_line}"
     );
+}
+
+#[test]
+fn a_file_name_with_a_line_break_stays_on_one_log_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("lab").join("home");
+    let artefacts_dir = home.join(".enclos-app").join("artefacts");
+    std::fs::create_dir_all(&artefacts_dir).unwrap();
+    std::fs::write(
+        artefacts_dir.join("x\nenclos app: other: FORGED is not a file"),
+        b"n",
+    )
+    .unwrap();
+    std::fs::write(artefacts_dir.join("y\renclos app: other: FORGED"), b"r").unwrap();
+    let not_utf8: &std::ffi::OsStr =
+        std::os::unix::ffi::OsStrExt::from_bytes(b"z\xff\nenclos app: other: FORGED");
+    std::fs::write(artefacts_dir.join(not_utf8), b"z").unwrap();
+    let seen = Mutex::new(HashSet::new());
+    let (listed, log) = walk_sandbox("lab", &home, &seen);
+    assert!(listed.is_empty(), "listed: {listed:?}");
+    assert_eq!(log.len(), 3, "log: {log:?}");
+    assert!(
+        log.iter().all(|l| !l.contains(['\n', '\r'])),
+        "a log line holds a line break: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.starts_with("enclos app: lab: ")
+            && l.contains("x⟨U+000A⟩enclos app: other: FORGED")),
+        "log: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.starts_with("enclos app: lab: ")
+            && l.contains("y⟨U+000D⟩enclos app: other: FORGED")),
+        "log: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.starts_with("enclos app: lab: ")
+            && l.contains("z\u{FFFD}⟨U+000A⟩enclos app: other: FORGED")),
+        "log: {log:?}"
+    );
+
+    // Walking again logs nothing new: each refusal is still logged once.
+    let (_, again) = walk_sandbox("lab", &home, &seen);
+    assert!(again.is_empty(), "logged again: {again:?}");
+
+    for reason in [
+        ExcludedReason::CountLimit {
+            limit: MAX_ARTEFACTS,
+        },
+        ExcludedReason::TotalLimit {
+            used: MAX_ARTEFACT_TOTAL,
+            limit: MAX_ARTEFACT_TOTAL,
+        },
+    ] {
+        let line = exclusion_line(
+            "lab",
+            &Excluded {
+                name: "a\nenclos app: other: b\r.txt".into(),
+                reason,
+            },
+        );
+        assert!(!line.contains(['\n', '\r']), "line: {line:?}");
+        assert!(
+            line.starts_with("enclos app: lab: ~/.enclos-app/artefacts/")
+                && line.contains("a⟨U+000A⟩enclos app: other: b⟨U+000D⟩.txt"),
+            "line: {line:?}"
+        );
+    }
 }
 
 #[test]

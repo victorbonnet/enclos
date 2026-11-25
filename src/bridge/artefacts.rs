@@ -216,9 +216,14 @@ pub(super) fn apply_limits(mut candidates: Vec<Candidate>) -> (Vec<Candidate>, V
     (kept, excluded)
 }
 
+/// `text` as shown in a log line: escape control characters in log lines.
+fn log_name(text: &str) -> String {
+    enclos_protocol::visible::revealed(text).replace('\n', "⟨U+000A⟩")
+}
+
 /// Formats one limit-exclusion log line.
 pub(super) fn exclusion_line(sandbox: &str, excluded: &Excluded) -> String {
-    let shown = enclos_protocol::visible::revealed(&excluded.name);
+    let shown = log_name(&excluded.name);
     let path = format!("~/{}/{shown}", ARTEFACTS.join("/"));
     match excluded.reason {
         ExcludedReason::CountLimit { limit } => {
@@ -484,7 +489,7 @@ fn walk_kept(
         }
         let Ok(name) = raw_name.to_str() else {
             let lossy = String::from_utf8_lossy(raw_name.to_bytes());
-            let shown = enclos_protocol::visible::revealed(&lossy);
+            let shown = log_name(&lossy);
             let reason = "is not a name of the folder";
             let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
             if let Some(l) = log_once(seen, sandbox, &shown, reason, line) {
@@ -493,7 +498,7 @@ fn walk_kept(
             continue;
         };
         if !eligible_name(name) {
-            let shown = enclos_protocol::visible::revealed(name);
+            let shown = log_name(name);
             let reason = "is not a name of the folder";
             let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
             if let Some(l) = log_once(seen, sandbox, &shown, reason, line) {
@@ -510,7 +515,7 @@ fn walk_kept(
                 });
             }
             Err(reason) => {
-                let shown = enclos_protocol::visible::revealed(name);
+                let shown = log_name(name);
                 let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
                 if let Some(l) = log_once(seen, sandbox, name, reason, line) {
                     logged.push(l);
