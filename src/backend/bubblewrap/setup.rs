@@ -138,6 +138,10 @@ struct Start {
 
 impl Start {
     fn met_a_changed_mount(&self) -> bool {
+        // MUTATION: throwaway branch, never merge.
+        #[allow(clippy::needless_return)]
+        return false;
+        #[allow(unreachable_code)]
         self.unset
             .as_deref()
             .is_some_and(|said| mount_changed(self.status.code(), said))
