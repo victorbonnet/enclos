@@ -42,6 +42,10 @@ pub(super) const MAX_ARTEFACT_TOTAL: u64 = 1024 * 1024 * 1024;
 /// The most directory entries read in one walk of an artefacts folder.
 pub(super) const MAX_ARTEFACT_ENTRIES: usize = 4096;
 
+/// The most distinct `(sandbox, file, reason)` refusal keys remembered per
+/// bridge run before the deduplication set is cleared.
+pub(super) const MAX_REFUSALS_REMEMBERED: usize = 8192;
+
 /// Exact length of an artefact id (base64url-encoded SHA-256 prefix).
 const ARTEFACT_ID_LEN: usize = 22;
 
@@ -213,15 +217,17 @@ pub(super) fn apply_limits(mut candidates: Vec<Candidate>) -> (Vec<Candidate>, V
 }
 
 /// Formats one limit-exclusion log line.
-pub(super) fn exclusion_line(excluded: &Excluded) -> String {
+pub(super) fn exclusion_line(sandbox: &str, excluded: &Excluded) -> String {
     let shown = enclos_protocol::visible::revealed(&excluded.name);
     let path = format!("~/{}/{shown}", ARTEFACTS.join("/"));
     match excluded.reason {
         ExcludedReason::CountLimit { limit } => {
-            format!("enclos app: {path} is left out: more than {limit} artefacts")
+            format!("enclos app: {sandbox}: {path} is left out: more than {limit} artefacts")
         }
         ExcludedReason::TotalLimit { used, .. } => {
-            format!("enclos app: {path} is left out: total in use ({used} bytes) exceeds 1 GiB")
+            format!(
+                "enclos app: {sandbox}: {path} is left out: total in use ({used} bytes) exceeds 1 GiB"
+            )
         }
     }
 }
@@ -229,6 +235,11 @@ pub(super) fn exclusion_line(excluded: &Excluded) -> String {
 /// Splits `files` into one or more `artefacts.list` frames that each fit
 /// one device-leg message, keeping newest entries first and repeating `of`,
 /// `sandbox` and `count` on every frame.
+///
+/// Assumes a single `Artefact` entry (~1 KB: `name` ≤ 120 characters, media
+/// type ≤ 255 bytes, `id` 22 bytes) always fits within the 65,519-byte device
+/// message budget; the splitting loop relies on that and does not check it,
+/// so widening the name or media type bound must revisit this function.
 pub(super) fn list_frames(of: &MessageId, sandbox: &str, files: Vec<Artefact>) -> Vec<ToDevice> {
     let count = u32::try_from(files.len()).unwrap_or(u32::MAX);
     if files.is_empty() {
@@ -333,7 +344,7 @@ fn open_artefacts(home: &Path) -> Result<Option<OwnedFd>, String> {
 
 /// Records a refusal once per `(sandbox, file, reason)` per bridge run and
 /// writes it to stderr. Returns the logged line when it is new.
-fn log_once(
+pub(super) fn log_once(
     seen: &Mutex<HashSet<String>>,
     sandbox: &str,
     file: &str,
@@ -342,12 +353,15 @@ fn log_once(
 ) -> Option<String> {
     let key = format!("{sandbox}\0{file}\0{reason}");
     let mut set = seen.lock().expect("not poisoned");
-    if set.insert(key) {
-        eprintln!("{line}");
-        Some(line)
-    } else {
-        None
+    if set.contains(&key) {
+        return None;
     }
+    if set.len() >= MAX_REFUSALS_REMEMBERED {
+        set.clear();
+    }
+    set.insert(key);
+    eprintln!("{line}");
+    Some(line)
 }
 
 fn arrived_from_stat(stat: &Stat) -> u64 {
@@ -421,7 +435,7 @@ fn walk_kept(
         Ok(Some(dir)) => dir,
         Ok(None) => return (Vec::new(), logged),
         Err(why) => {
-            let line = format!("enclos app: ~/{}: {why}", ARTEFACTS.join("/"));
+            let line = format!("enclos app: {sandbox}: ~/{}: {why}", ARTEFACTS.join("/"));
             if let Some(l) = log_once(seen, sandbox, "", &why, line) {
                 logged.push(l);
             }
@@ -432,7 +446,7 @@ fn walk_kept(
         Ok(entries) => entries,
         Err(e) => {
             let why = e.to_string();
-            let line = format!("enclos app: ~/{}: {why}", ARTEFACTS.join("/"));
+            let line = format!("enclos app: {sandbox}: ~/{}: {why}", ARTEFACTS.join("/"));
             if let Some(l) = log_once(seen, sandbox, "", &why, line) {
                 logged.push(l);
             }
@@ -448,7 +462,7 @@ fn walk_kept(
             Ok(e) => e,
             Err(e) => {
                 let why = e.to_string();
-                let line = format!("enclos app: ~/{prefix}: {why}");
+                let line = format!("enclos app: {sandbox}: ~/{prefix}: {why}");
                 if let Some(l) = log_once(seen, sandbox, "", &why, line) {
                     logged.push(l);
                 }
@@ -462,7 +476,7 @@ fn walk_kept(
         read_count += 1;
         if read_count > MAX_ARTEFACT_ENTRIES {
             let reason = format!("has more than {MAX_ARTEFACT_ENTRIES} entries");
-            let line = format!("enclos app: ~/{prefix} {reason}; stopping");
+            let line = format!("enclos app: {sandbox}: ~/{prefix} {reason}; stopping");
             if let Some(l) = log_once(seen, sandbox, "", &reason, line) {
                 logged.push(l);
             }
@@ -472,7 +486,7 @@ fn walk_kept(
             let lossy = String::from_utf8_lossy(raw_name.to_bytes());
             let shown = enclos_protocol::visible::revealed(&lossy);
             let reason = "is not a name of the folder";
-            let line = format!("enclos app: ~/{prefix}/{shown} {reason}");
+            let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
             if let Some(l) = log_once(seen, sandbox, &shown, reason, line) {
                 logged.push(l);
             }
@@ -481,7 +495,7 @@ fn walk_kept(
         if !eligible_name(name) {
             let shown = enclos_protocol::visible::revealed(name);
             let reason = "is not a name of the folder";
-            let line = format!("enclos app: ~/{prefix}/{shown} {reason}");
+            let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
             if let Some(l) = log_once(seen, sandbox, &shown, reason, line) {
                 logged.push(l);
             }
@@ -497,7 +511,7 @@ fn walk_kept(
             }
             Err(reason) => {
                 let shown = enclos_protocol::visible::revealed(name);
-                let line = format!("enclos app: ~/{prefix}/{shown} {reason}");
+                let line = format!("enclos app: {sandbox}: ~/{prefix}/{shown} {reason}");
                 if let Some(l) = log_once(seen, sandbox, name, reason, line) {
                     logged.push(l);
                 }
@@ -511,7 +525,7 @@ fn walk_kept(
             ExcludedReason::CountLimit { .. } => "count_limit",
             ExcludedReason::TotalLimit { .. } => "total_limit",
         };
-        let line = exclusion_line(ex);
+        let line = exclusion_line(sandbox, ex);
         if let Some(l) = log_once(seen, sandbox, &ex.name, reason_key, line) {
             logged.push(l);
         }
@@ -661,18 +675,27 @@ pub(super) fn get(
     };
     let current_identity = FileIdentity::from_stat(&stat);
 
-    let matches_existing = fetch
+    let reuse_existing = if fetch
         .as_ref()
-        .is_some_and(|f| f.sandbox == sandbox && f.artefact == artefact);
-
-    if matches_existing {
+        .is_some_and(|f| f.sandbox == sandbox && f.artefact == artefact)
+    {
         let same_file = fetch
             .as_ref()
             .is_some_and(|f| f.name == name && f.identity == current_identity);
-        if !same_file {
+        if same_file {
+            true
+        } else {
             *fetch = None;
-            return send_error(link, asked, ErrorCode::NotAllowed, NO_SUCH_ARTEFACT);
+            if offset > 0 {
+                return send_error(link, asked, ErrorCode::NotAllowed, NO_SUCH_ARTEFACT);
+            }
+            false
         }
+    } else {
+        false
+    };
+
+    if reuse_existing {
         // We already have a valid copy for this exact file identity.
         drop(fd);
     } else {

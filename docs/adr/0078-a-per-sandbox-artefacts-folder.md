@@ -26,14 +26,19 @@ Decision (proposed):
   a time without following a link, and a file is eligible only if it is a
   regular file, with no other link to it, one name of the folder, not hidden,
   of at most 120 characters with no control or hidden character, and of at most
-  25 MiB. Everything else is left out and named in the bridge's log.
+  25 MiB. Everything else is left out and written once per
+  `(sandbox, file, reason)` per bridge run to the bridge's standard error (the
+  terminal of `enclos app serve` or its service journal), not to
+  `enclos app log`.
 - **A fetch is of one copy.** The bridge copies the file for that fetch, hashing
   it while it copies, and serves every part from the copy; each part carries the
   digest of the whole file, so the phone verifies what it assembled. A part is
   served only while the folder still holds that file with the same identity.
 - **Limits, enforced where the bridge is**: 25 MiB a file, 256 files a sandbox,
-  1 GiB a sandbox. Reaching one leaves the file out of the list and names it in
-  the bridge's log; the sandbox's own writes are not restricted (a limit that
+  1 GiB a sandbox. Reaching one leaves the file out of the list and writes it
+  once per `(sandbox, file, reason)` per bridge run to the bridge's standard
+  error (the terminal of `enclos app serve` or its service journal), not to
+  `enclos app log`; the sandbox's own writes are not restricted (a limit that
   bounds what the host publishes and what the phone receives, not what an agent
   may keep in its own home).
 - **A small protocol**: the bridge advertises `artefacts`; a device asks

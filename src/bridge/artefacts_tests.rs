@@ -2,8 +2,9 @@
 
 use super::*;
 use crate::bridge::server::artefacts::{
-    Candidate, ExcludedReason, MAX_ARTEFACT_BYTES, MAX_ARTEFACT_TOTAL, MAX_ARTEFACTS, apply_limits,
-    artefact_id, artefact_mime, exclusion_line, sweep_copies, walk_sandbox,
+    Candidate, ExcludedReason, MAX_ARTEFACT_BYTES, MAX_ARTEFACT_TOTAL, MAX_ARTEFACTS,
+    MAX_REFUSALS_REMEMBERED, apply_limits, artefact_id, artefact_mime, exclusion_line, log_once,
+    walk_sandbox,
 };
 use enclos_protocol::device::{
     ARTEFACTS as ARTEFACTS_CAP, Artefact, FROM_DEVICE_TYPES, TO_DEVICE_TYPES, decode_from_device,
@@ -207,50 +208,55 @@ fn every_refusal_is_excluded_and_logged_once_per_bridge_run() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "good.txt");
 
-    // Every refusal is named once with the expected reason.
+    // Every refusal is named once with the sandbox and expected reason.
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/link.txt") && l.contains("is not a file")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/link.txt")
+                && l.contains("is not a file")
+        }),
         "missing symlink refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/pipe.fifo") && l.contains("is not a file")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/pipe.fifo")
+                && l.contains("is not a file")
+        }),
         "missing FIFO refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/subdir") && l.contains("is not a file")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/subdir")
+                && l.contains("is not a file")
+        }),
         "missing directory refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/.hidden")
-                && l.contains("is not a name of the folder")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/.hidden")
+                && l.contains("is not a name of the folder")
+        }),
         "missing leading-dot refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("⟨U+202E⟩") && l.contains("is not a name of the folder")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ")
+                && l.contains("⟨U+202E⟩")
+                && l.contains("is not a name of the folder")
+        }),
         "missing hidden-char refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/huge.bin")
-                && l.contains("is larger than 25 MiB")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/huge.bin")
+                && l.contains("is larger than 25 MiB")
+        }),
         "missing size refusal: {first_log:?}"
     );
     assert!(
-        first_log
-            .iter()
-            .any(|l| l.contains("~/.enclos-app/artefacts/hardlinked.txt")
-                && l.contains("has other links to it")),
+        first_log.iter().any(|l| {
+            l.contains("enclos app: lab: ~/.enclos-app/artefacts/hardlinked.txt")
+                && l.contains("has other links to it")
+        }),
         "missing hard-link refusal: {first_log:?}"
     );
     assert_eq!(first_log.len(), 7, "expected 7 refusals: {first_log:?}");
@@ -259,6 +265,28 @@ fn every_refusal_is_excluded_and_logged_once_per_bridge_run() {
     let (listed_again, second_log) = walk_sandbox("lab", &home, &seen);
     assert_eq!(listed_again.len(), 1);
     assert!(second_log.is_empty(), "second walk logged: {second_log:?}");
+
+    // Another sandbox with the same refused file name produces its own line
+    // naming that sandbox.
+    let other_home = dir.path().join("other").join("home");
+    let other_artefacts = other_home.join(".enclos-app").join("artefacts");
+    std::fs::create_dir_all(&other_artefacts).unwrap();
+    std::fs::write(other_artefacts.join(".hidden"), b"dot").unwrap();
+    let (_, other_log) = walk_sandbox("other", &other_home, &seen);
+    assert_eq!(other_log.len(), 1);
+    let lab_hidden = first_log
+        .iter()
+        .find(|l| l.contains("/.hidden"))
+        .expect("lab .hidden line");
+    assert_eq!(
+        lab_hidden,
+        "enclos app: lab: ~/.enclos-app/artefacts/.hidden is not a name of the folder"
+    );
+    assert_eq!(
+        other_log[0],
+        "enclos app: other: ~/.enclos-app/artefacts/.hidden is not a name of the folder"
+    );
+    assert_ne!(lab_hidden, &other_log[0]);
 }
 
 #[test]
@@ -283,8 +311,13 @@ fn count_and_total_limits_are_exclusions_named_in_the_log() {
             limit: MAX_ARTEFACTS
         }
     );
-    let line = exclusion_line(&excluded[0]);
-    assert!(line.contains("file-000.txt") && line.contains("left out") && line.contains("256"));
+    let line = exclusion_line("lab", &excluded[0]);
+    assert!(
+        line.contains("enclos app: lab: ~/.enclos-app/artefacts/file-000.txt")
+            && line.contains("left out")
+            && line.contains("256"),
+        "unexpected count exclusion line: {line}"
+    );
 
     // Synthetic set crossing 1 GiB: 45 files of 25 MiB each (40 fit = 1000 MiB,
     // 41st would reach 1025 MiB > 1024 MiB), plus a tiny older file that must
@@ -315,9 +348,9 @@ fn count_and_total_limits_are_exclusions_named_in_the_log() {
             limit: MAX_ARTEFACT_TOTAL,
         }
     );
-    let total_line = exclusion_line(&excluded[0]);
+    let total_line = exclusion_line("lab", &excluded[0]);
     assert!(
-        total_line.contains("chunk-04.bin")
+        total_line.contains("enclos app: lab: ~/.enclos-app/artefacts/chunk-04.bin")
             && total_line.contains("left out")
             && total_line.contains(&expected_used.to_string()),
         "unexpected total exclusion line: {total_line}"
@@ -329,14 +362,24 @@ fn byte_budget_splits_256_long_names_across_frames_with_exact_count() {
     let dir = tempfile::tempdir().unwrap();
     let (ep, artefacts_dir) = sandbox_endpoint(dir.path(), "lab", "main");
     std::fs::create_dir_all(&artefacts_dir).unwrap();
+    let mut expected = Vec::with_capacity(MAX_ARTEFACTS);
     for i in 0..MAX_ARTEFACTS {
-        // 120 characters exactly: prefix + 3-digit index + ".txt" = 120 chars.
-        let name = format!("{}-{i:03}.txt", "a".repeat(112));
+        // 120 characters with 2-byte UTF-8 padding: 3-digit index + "-" + 112 × 'é' + ".txt".
+        let name = format!("{i:03}-{}.txt", "é".repeat(112));
         assert_eq!(name.chars().count(), MAX_ATTACHMENT_NAME_CHARS);
         let path = artefacts_dir.join(&name);
         std::fs::write(&path, b"x").unwrap();
-        set_mtime(&path, 1_700_000_000 + i as i64);
+        // Distinct mtimes with one tie pair (i = 9 and i = 10) to verify both
+        // arrived-descending and name-ascending tie-breaking across frames.
+        let mtime = if i == 10 {
+            1_700_000_009
+        } else {
+            1_700_000_000 + i as i64
+        };
+        set_mtime(&path, mtime);
+        expected.push((name, mtime as u64));
     }
+    expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let b = bridge_for(dir.path(), vec![ep]);
     let phone = paired(&b, "n-pixel");
@@ -363,6 +406,13 @@ fn byte_budget_splits_256_long_names_across_frames_with_exact_count() {
                 assert_eq!(of.as_str(), "l-big");
                 assert_eq!(sandbox, "lab");
                 assert_eq!(count, MAX_ARTEFACTS as u32);
+                if frame_count == 0 {
+                    assert!(
+                        files.len() < count as usize,
+                        "first frame should hold fewer than {count} entries, got {}",
+                        files.len()
+                    );
+                }
                 frame_count += 1;
                 got.extend(files);
                 if got.len() >= count as usize {
@@ -372,11 +422,15 @@ fn byte_budget_splits_256_long_names_across_frames_with_exact_count() {
             other => panic!("expected artefacts.list, got {other:?}"),
         }
     }
+    assert!(
+        frame_count > 1,
+        "expected list to split across multiple frames, got {frame_count}"
+    );
     assert_eq!(got.len(), MAX_ARTEFACTS);
-    assert!(frame_count >= 1);
-    // Verify newest-first order preserved across frames.
-    assert!(got[0].name.ends_with("-255.txt"));
-    assert!(got[MAX_ARTEFACTS - 1].name.ends_with("-000.txt"));
+    let got_order: Vec<(String, u64)> = got.iter().map(|f| (f.name.clone(), f.arrived)).collect();
+    assert_eq!(got_order, expected);
+    let unique_ids: HashSet<&str> = got.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(unique_ids.len(), MAX_ARTEFACTS);
 }
 
 #[test]
@@ -392,18 +446,24 @@ fn fetch_serves_chunks_with_whole_file_digest_past_eof_and_resume() {
     let expected_digest = encode(&Sha256::digest(&payload));
     std::fs::write(artefacts_dir.join("app.apk"), &payload).unwrap();
 
-    // Plant a leftover copy before bridge start to verify startup sweep.
+    // Plant a leftover copy in the bridge's own copies directory before starting
+    // the bridge so serve_on's startup sweep is exercised end-to-end.
     let copies_dir = dir.path().join(crate::layout::APP_ARTEFACT_COPIES_DIR);
     std::fs::create_dir_all(&copies_dir).unwrap();
     let stale = copies_dir.join("leftover-copy");
     std::fs::write(&stale, b"stale").unwrap();
-    sweep_copies(&copies_dir);
-    assert!(
-        !stale.exists(),
-        "startup sweep should remove leftover copies"
-    );
 
     let b = bridge_for(dir.path(), vec![ep]);
+    assert_eq!(b.hub.artefact_copies(), copies_dir);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stale.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !stale.exists(),
+        "bridge startup sweep should remove leftover copies from {}",
+        copies_dir.display()
+    );
     let phone = paired(&b, "n-pixel");
     let (mut device, _) = connect(&b, &phone);
 
@@ -1025,5 +1085,183 @@ fn the_folder_a_person_is_shown_follows_the_audience_rule_not_what_the_bridge_se
             assert_eq!(err.message, "no such artefact");
         }
         other => panic!("expected not_allowed for lab get, got {other:?}"),
+    }
+}
+
+#[test]
+fn refusal_memory_is_bounded_at_max_refusals_remembered() {
+    let seen = Mutex::new(HashSet::new());
+    let total = MAX_REFUSALS_REMEMBERED * 3;
+    for i in 0..total {
+        let file = format!("bad-{i}.bin");
+        let line = format!("enclos app: lab: ~/.enclos-app/artefacts/{file} is not a file");
+        let first = log_once(&seen, "lab", &file, "is not a file", line.clone());
+        assert_eq!(first.as_deref(), Some(line.as_str()));
+        let len = seen.lock().unwrap().len();
+        assert!(
+            len <= MAX_REFUSALS_REMEMBERED,
+            "refusal set grew to {len} > {MAX_REFUSALS_REMEMBERED}"
+        );
+        // Repeating the same key while it is remembered produces no second line.
+        let repeat = log_once(&seen, "lab", &file, "is not a file", line);
+        assert!(repeat.is_none(), "expected None for already-seen key {i}");
+        assert!(seen.lock().unwrap().len() <= MAX_REFUSALS_REMEMBERED);
+    }
+    // A brand-new key past the cap is still logged.
+    let extra = "enclos app: lab: ~/.enclos-app/artefacts/after-cap.bin is not a file".to_owned();
+    assert_eq!(
+        log_once(
+            &seen,
+            "lab",
+            "after-cap.bin",
+            "is not a file",
+            extra.clone()
+        ),
+        Some(extra)
+    );
+    assert!(seen.lock().unwrap().len() <= MAX_REFUSALS_REMEMBERED);
+}
+
+#[test]
+fn replacing_a_file_serves_new_bytes_at_offset_zero_and_refuses_mid_fetch_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ep, artefacts_dir) = sandbox_endpoint(dir.path(), "lab", "main");
+    std::fs::create_dir_all(&artefacts_dir).unwrap();
+
+    // Case 1: replace file, then re-fetch at offset 0 on the same connection.
+    let path = artefacts_dir.join("report.txt");
+    let v1 = b"version-one".to_vec();
+    std::fs::write(&path, &v1).unwrap();
+    set_mtime(&path, 1_700_000_100);
+
+    let b = bridge_for(dir.path(), vec![ep]);
+    let phone = paired(&b, "n-pixel");
+    let (mut device, _) = connect(&b, &phone);
+
+    let id = artefact_id("lab", "report.txt");
+    device.send(
+        "g-v1",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: id.clone(),
+            offset: 0,
+        },
+    );
+    match device.receive().expect("v1 artefact.data") {
+        ToDevice::ArtefactData {
+            size, sha256, data, ..
+        } => {
+            assert_eq!(size, v1.len() as u64);
+            assert_eq!(sha256, encode(&Sha256::digest(&v1)));
+            assert_eq!(decode("data", &data).unwrap(), v1);
+        }
+        other => panic!("expected v1 artefact.data, got {other:?}"),
+    }
+
+    let v2 = b"version-two-with-different-bytes-and-size".to_vec();
+    let v2_digest = encode(&Sha256::digest(&v2));
+    std::fs::write(&path, &v2).unwrap();
+    set_mtime(&path, 1_700_000_200);
+
+    device.send(
+        "g-v2-zero",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: id,
+            offset: 0,
+        },
+    );
+    match device.receive().expect("v2 artefact.data on first attempt") {
+        ToDevice::ArtefactData {
+            of,
+            offset,
+            size,
+            sha256,
+            data,
+            ..
+        } => {
+            assert_eq!(of.as_str(), "g-v2-zero");
+            assert_eq!(offset, 0);
+            assert_eq!(size, v2.len() as u64);
+            assert_eq!(sha256, v2_digest);
+            assert_eq!(decode("data", &data).unwrap(), v2);
+        }
+        other => panic!("expected v2 artefact.data at offset 0, got {other:?}"),
+    }
+
+    // Case 2: replace multi-part file, then continue at offset > 0 -> not_allowed,
+    // followed by offset 0 -> serves new bytes.
+    let multi_path = artefacts_dir.join("bundle.bin");
+    let old_big: Vec<u8> = (0..(ATTACHMENT_CHUNK + 512))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&multi_path, &old_big).unwrap();
+    set_mtime(&multi_path, 1_700_000_300);
+
+    let multi_id = artefact_id("lab", "bundle.bin");
+    device.send(
+        "g-big-0",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: multi_id.clone(),
+            offset: 0,
+        },
+    );
+    match device.receive().expect("first part of old_big") {
+        ToDevice::ArtefactData { size, data, .. } => {
+            assert_eq!(size, old_big.len() as u64);
+            assert_eq!(decode("data", &data).unwrap(), &old_big[..ATTACHMENT_CHUNK]);
+        }
+        other => panic!("expected first part of old_big, got {other:?}"),
+    }
+
+    let new_small = b"replaced-bundle-bytes".to_vec();
+    let new_small_digest = encode(&Sha256::digest(&new_small));
+    std::fs::write(&multi_path, &new_small).unwrap();
+    set_mtime(&multi_path, 1_700_000_400);
+
+    device.send(
+        "g-big-cont",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: multi_id.clone(),
+            offset: ATTACHMENT_CHUNK as u64,
+        },
+    );
+    match device
+        .receive()
+        .expect("not_allowed for changed continuation")
+    {
+        ToDevice::Error(err) => {
+            assert_eq!(err.of.as_ref().map(MessageId::as_str), Some("g-big-cont"));
+            assert_eq!(err.code, ErrorCode::NotAllowed);
+        }
+        other => panic!("expected not_allowed at offset > 0, got {other:?}"),
+    }
+
+    device.send(
+        "g-big-restart",
+        FromDevice::ArtefactGet {
+            sandbox: "lab".into(),
+            artefact: multi_id,
+            offset: 0,
+        },
+    );
+    match device.receive().expect("new_small artefact.data") {
+        ToDevice::ArtefactData {
+            of,
+            offset,
+            size,
+            sha256,
+            data,
+            ..
+        } => {
+            assert_eq!(of.as_str(), "g-big-restart");
+            assert_eq!(offset, 0);
+            assert_eq!(size, new_small.len() as u64);
+            assert_eq!(sha256, new_small_digest);
+            assert_eq!(decode("data", &data).unwrap(), new_small);
+        }
+        other => panic!("expected new_small artefact.data at offset 0, got {other:?}"),
     }
 }
