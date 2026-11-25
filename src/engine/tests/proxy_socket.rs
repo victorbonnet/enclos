@@ -434,6 +434,291 @@ fn a_proxy_whose_sessions_reach_it_over_its_socket_starts_whatever_holds_its_por
     }
 }
 
+/// A socket bound to `127.0.0.1:port` without `SO_REUSEADDR` that never
+/// listens: connection probes are refused, yet another bind on `port` fails.
+fn bind_never_listening(port: u16) -> std::os::fd::OwnedFd {
+    use rustix::net::{AddressFamily, SocketType};
+
+    let socket = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+    rustix::net::bind(
+        &socket,
+        &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+    )
+    .unwrap();
+    socket
+}
+
+/// Writes an executable shell script in `dir` that `ensure_proxy` can spawn
+/// (`<script> proxy run <name> --port <port>`) to run this test binary's
+/// [`runs_a_proxy_when_asked`].
+fn write_proxy_exe(
+    dir: &std::path::Path,
+    engine: &Engine,
+    name: &SandboxName,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let folder = engine.layout.state_db().parent().unwrap().to_owned();
+    let exe = std::env::current_exe().unwrap();
+    let script = dir.join("fake-enclos-proxy.sh");
+    let body = format!(
+        "#!/bin/sh\nexport {PROXY_FOLDER}={}\nexport {PROXY_SANDBOX}={}\nexport {PROXY_PORT}=\"$5\"\nexec {} --exact engine::tests::proxy_socket::runs_a_proxy_when_asked --test-threads=1\n",
+        quote(&folder.display().to_string()),
+        quote(name.as_str()),
+        quote(&exe.display().to_string()),
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+/// Ends a proxy that `ensure_proxy` started and recorded, even if an
+/// assertion panics, so no proxy leaks to other tests.
+struct RecordedProxyGuard<'a> {
+    engine: &'a Engine,
+    name: SandboxName,
+    port: u16,
+    stopped: bool,
+}
+
+impl RecordedProxyGuard<'_> {
+    fn kill_group(&self) {
+        if let Ok(sessions) = self.engine.state.sessions(&self.name, true) {
+            for session in sessions
+                .into_iter()
+                .filter(|s| s.kind == crate::model::session::SessionKind::Proxy)
+            {
+                if let Some(pgid) = session.pgid
+                    && let Some(pid) = rustix::process::Pid::from_raw(pgid as i32)
+                {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                    let _ =
+                        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
+                }
+            }
+        }
+    }
+
+    fn end(mut self) {
+        self.kill_group();
+        self.stopped = true;
+        let started = std::time::Instant::now();
+        while self.engine.proxy_runs(&self.name).unwrap() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "proxy of {} did not stop",
+                self.name
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_nothing_listens(self.port);
+    }
+}
+
+impl Drop for RecordedProxyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.stopped {
+            self.kill_group();
+        }
+    }
+}
+
+#[test]
+fn a_proxy_that_loses_its_port_at_start_takes_the_next_one() {
+    use crate::model::sandbox::{PORT_FIRST, PORT_LAST};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
+    let script = write_proxy_exe(dir.path(), &engine, &name);
+    let engine = engine.with_exe(script);
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let old_port = record.proxy_port;
+    let held = bind_never_listening(old_port);
+
+    let lock = engine.state.lock().unwrap();
+    let updated = engine.ensure_proxy(&lock, &record).unwrap();
+    drop(lock);
+    let guard = RecordedProxyGuard {
+        engine: &engine,
+        name: name.clone(),
+        port: updated.proxy_port,
+        stopped: false,
+    };
+
+    assert_ne!(updated.proxy_port, old_port);
+    assert!((PORT_FIRST..=PORT_LAST).contains(&updated.proxy_port));
+    assert!(
+        engine
+            .state
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|r| r.name != name)
+            .all(|r| r.proxy_port != updated.proxy_port)
+    );
+    assert_eq!(
+        engine.state.get(&name).unwrap().unwrap().proxy_port,
+        updated.proxy_port
+    );
+    assert!(engine.proxy_runs(&name).unwrap());
+    let conn = TcpStream::connect((Ipv4Addr::LOCALHOST, updated.proxy_port)).unwrap();
+    assert!(reached_another(conn));
+    assert!(!crate::engine::loopback::free(
+        std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, old_port)),
+        std::time::Duration::from_millis(200),
+    ));
+
+    guard.end();
+    drop(held);
+}
+
+#[test]
+fn the_profile_of_a_start_that_took_another_port_allows_that_port_alone() {
+    use crate::backend::{
+        Backend, Capabilities, CompileError, Compiled, Launch, Probe, SandboxContext, WrapError,
+    };
+    use crate::engine::start::{CommandKind, Group, Starting};
+    use crate::model::policy::Policy;
+    use crate::probes::OwnProbes;
+
+    /// Compiles real Seatbelt profiles on Linux while delegating launch and
+    /// availability to [`FakeBackend`] so `start_session` can run end to end.
+    struct SeatbeltCompileBackend {
+        fake: FakeBackend,
+        seatbelt: crate::backend::seatbelt::Seatbelt,
+    }
+
+    impl Backend for SeatbeltCompileBackend {
+        fn kind(&self) -> BackendKind {
+            self.fake.kind()
+        }
+        fn probe(&self) -> Probe {
+            self.fake.probe()
+        }
+        fn try_run(&self) -> Probe {
+            self.fake.try_run()
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.fake.capabilities()
+        }
+        fn compile(
+            &self,
+            policy: &Policy,
+            ctx: &SandboxContext,
+        ) -> std::result::Result<Compiled, CompileError> {
+            self.seatbelt.compile(policy, ctx)
+        }
+        fn wrap(
+            &self,
+            compiled: &std::path::Path,
+            ctx: &SandboxContext,
+            launch: &Launch,
+        ) -> std::result::Result<Command, WrapError> {
+            self.fake.wrap(compiled, ctx, launch)
+        }
+        fn own_probes(
+            &self,
+            compiled: Option<&str>,
+        ) -> std::result::Result<Box<dyn OwnProbes>, String> {
+            self.fake.own_probes(compiled)
+        }
+    }
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let backend = SeatbeltCompileBackend {
+        fake: FakeBackend::available(BackendKind::Seatbelt),
+        seatbelt: crate::backend::seatbelt::Seatbelt::default(),
+    };
+    let (dir, engine) = engine_with(vec![Box::new(backend)]);
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "home".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    let script = write_proxy_exe(dir.path(), &engine, &name);
+    let engine = engine.with_exe(script);
+    let old_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    let held = bind_never_listening(old_port);
+
+    let lock = engine.state.lock().unwrap();
+    let mut started = engine
+        .start_session(
+            &lock,
+            &name,
+            &[std::ffi::OsString::from("/bin/true")],
+            Starting::Command {
+                kind: CommandKind::Exec,
+                group: Group::Own,
+                reads: &[],
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    drop(lock);
+
+    let new_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    let guard = RecordedProxyGuard {
+        engine: &engine,
+        name: name.clone(),
+        port: new_port,
+        stopped: false,
+    };
+    assert!(started.child.wait().unwrap().success());
+    assert_ne!(new_port, old_port);
+
+    let compiled_path = std::path::PathBuf::from(started.session.compiled.as_deref().unwrap());
+    assert_eq!(
+        compiled_path,
+        engine.compile_policy(&name, new_port).unwrap()
+    );
+    let text = std::fs::read_to_string(&compiled_path).unwrap();
+    assert!(
+        text.contains(&format!(
+            "(allow network-outbound (remote tcp \"localhost:{new_port}\"))"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("localhost:{old_port}")), "{text}");
+
+    guard.end();
+    drop(held);
+}
+
+#[test]
+fn a_proxy_that_exits_while_its_port_is_free_keeps_its_port_and_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
+    let runs = dir.path().join("runs");
+    let script = dir.path().join("fail-once.sh");
+    let quoted_runs = format!("'{}'", runs.display().to_string().replace('\'', "'\\''"));
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho run >> {quoted_runs}\nexit 1\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = engine.with_exe(script);
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let old_port = record.proxy_port;
+
+    let lock = engine.state.lock().unwrap();
+    let err = engine.ensure_proxy(&lock, &record).unwrap_err();
+    drop(lock);
+
+    assert!(err.to_string().contains("exited"), "{err}");
+    assert_eq!(
+        engine.state.get(&name).unwrap().unwrap().proxy_port,
+        old_port
+    );
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+}
+
 #[test]
 fn a_started_proxy_is_waited_for_where_its_sessions_reach_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());

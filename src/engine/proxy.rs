@@ -2,7 +2,7 @@
 //! (ADR 0007, ADR 0021).
 
 use std::fs::OpenOptions;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -23,6 +23,34 @@ use crate::state::StateLock;
 
 /// How long the proxy has to start listening.
 const PROXY_START: Duration = Duration::from_secs(5);
+
+/// How many candidate ports a Seatbelt proxy start tries when another program
+/// holds its port at bind time.
+const PROXY_PORT_TRIES: usize = 5;
+
+/// The sandbox's record once its proxy runs, and whether starting the proxy
+/// moved it to another port (so a profile already compiled for the old port
+/// must be compiled again).
+pub(super) struct ProxyReady {
+    pub record: SandboxRecord,
+    pub port_changed: bool,
+}
+
+/// Why [`Engine::wait_and_record_proxy`] failed.
+enum ProxyStartError {
+    /// The proxy exited before it was seen listening.
+    Exited(Error),
+    /// Timed out waiting for it to listen, or another failure.
+    Other(Error),
+}
+
+impl ProxyStartError {
+    fn into_error(self) -> Error {
+        match self {
+            ProxyStartError::Exited(e) | ProxyStartError::Other(e) => e,
+        }
+    }
+}
 
 /// Where the sandbox's sessions reach its proxy, so where a proxy just
 /// started is seen to listen.
@@ -107,11 +135,34 @@ impl Engine {
         Ok(())
     }
 
+    /// Ensures the sandbox's proxy runs, and says whether starting it moved
+    /// the sandbox to another proxy port.
+    pub(super) fn ensure_proxy_for_start(
+        &self,
+        lock: &StateLock,
+        record: &SandboxRecord,
+    ) -> Result<ProxyReady> {
+        let before = record.proxy_port;
+        let record = self.ensure_proxy(lock, record)?;
+        let port_changed = record.proxy_port != before;
+        Ok(ProxyReady {
+            record,
+            port_changed,
+        })
+    }
+
     /// Starts the sandbox's proxy unless it runs already, and records it as
-    /// a session, so that `sandbox stop` ends it too.
-    pub(super) fn ensure_proxy(&self, lock: &StateLock, record: &SandboxRecord) -> Result<()> {
+    /// a session, so that `sandbox stop` ends it too. Returns the sandbox
+    /// record as it stands once the proxy runs (for a Seatbelt sandbox, its
+    /// `proxy_port` may have moved if another program held the old one when
+    /// the proxy tried to bind).
+    pub(super) fn ensure_proxy(
+        &self,
+        lock: &StateLock,
+        record: &SandboxRecord,
+    ) -> Result<SandboxRecord> {
         if self.proxy_runs(&record.name)? {
-            return Ok(());
+            return Ok(record.clone());
         }
         // With services installed, the proxy is the service's to start.
         if self.has_services(&record.name)? {
@@ -148,38 +199,77 @@ impl Engine {
             .mode(0o600)
             .open(&log_path)
             .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
+        let spawn = |port: u16| -> Result<Child> {
+            let stderr = log
+                .try_clone()
+                .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
+            // Holding no session's marker, it never ends with one.
+            spawn_unmarked(
+                Command::new(&exe)
+                    .args([
+                        "proxy",
+                        "run",
+                        record.name.as_str(),
+                        "--port",
+                        &port.to_string(),
+                    ])
+                    .process_group(0)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(stderr),
+            )
+            .map_err(|e| failed(format!("could not start the proxy: {e}")))
+        };
         let reached = self.proxy_reached_at(record);
-        if let Reached::Port(addr) = &reached {
+        let Reached::Port(mut addr) = reached else {
+            let mut child = spawn(record.proxy_port)?;
+            return match self.record_started_proxy(lock, record, &mut child, &reached, &log_path) {
+                Ok(()) => Ok(record.clone()),
+                Err(e) => Err(abandon(child, e, "the proxy")),
+            };
+        };
+        // Over TCP the port can be lost between the check that made it free
+        // and the proxy's bind: the proxy then exits, and the start takes the
+        // next free port, saves it and starts the proxy again.
+        let mut current = record.clone();
+        let mut tried = vec![current.proxy_port];
+        loop {
             // Anything else on this port, on either loopback, would receive
             // the sandbox's traffic.
             let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
-            if let Some(taken) = [*addr, v6]
+            if let Some(taken) = [addr, v6]
                 .into_iter()
                 .find(|a| listens(*a, Duration::from_millis(200)))
             {
-                return Err(Error::proxy_port_taken(record.name.as_str(), taken));
+                return Err(Error::proxy_port_taken(current.name.as_str(), taken));
             }
-        }
-        // Holding no session's marker, it never ends with one.
-        let child = spawn_unmarked(
-            Command::new(exe)
-                .args([
-                    "proxy",
-                    "run",
-                    record.name.as_str(),
-                    "--port",
-                    &record.proxy_port.to_string(),
-                ])
-                .process_group(0)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(log),
-        )
-        .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
-        let mut child = child;
-        match self.record_started_proxy(lock, record, &mut child, &reached, &log_path) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(abandon(child, e, "the proxy")),
+            let mut child = spawn(current.proxy_port)?;
+            let exited = match self.wait_and_record_proxy(
+                lock,
+                &current,
+                &mut child,
+                &Reached::Port(addr),
+                &log_path,
+            ) {
+                Ok(()) => return Ok(current),
+                Err(ProxyStartError::Other(e)) => return Err(abandon(child, e, "the proxy")),
+                Err(ProxyStartError::Exited(e)) => e,
+            };
+            // Only a bind that lost is retried: its port is still held now.
+            let lost = tried.len() < PROXY_PORT_TRIES
+                && !super::loopback::free(addr, Duration::from_millis(200));
+            let Some(next) = lost.then(|| self.free_port_except(&tried).ok()).flatten() else {
+                return Err(abandon(child, exited, "the proxy"));
+            };
+            let old = current.proxy_port;
+            tried.push(next);
+            current.proxy_port = next;
+            self.state.put(lock, &current)?;
+            crate::notes::say(&format!(
+                "the proxy port {old} of sandbox {} was taken by another program; using {next}",
+                current.name
+            ));
+            addr = SocketAddr::from((Ipv4Addr::LOCALHOST, next));
         }
     }
 
@@ -201,22 +291,40 @@ impl Engine {
         reached: &Reached,
         log_path: &std::path::Path,
     ) -> Result<()> {
+        self.wait_and_record_proxy(lock, record, child, reached, log_path)
+            .map_err(ProxyStartError::into_error)
+    }
+
+    /// Waits for the proxy this command started to listen where `reached`
+    /// says, and records it, telling apart a proxy that exited before it
+    /// listened from any other failure.
+    fn wait_and_record_proxy(
+        &self,
+        lock: &StateLock,
+        record: &SandboxRecord,
+        child: &mut Child,
+        reached: &Reached,
+        log_path: &std::path::Path,
+    ) -> std::result::Result<(), ProxyStartError> {
         let failed = |what: String| Error::Session { what };
         let start = Instant::now();
         loop {
             // Listening is not enough: it must be this proxy, still running.
-            let exited = |child: &mut Child| -> Result<()> {
+            let exited = |child: &mut Child| -> std::result::Result<(), ProxyStartError> {
                 let status = child.try_wait().map_err(|e| {
-                    failed(format!("lost the proxy of sandbox {}: {e}", record.name))
+                    ProxyStartError::Other(failed(format!(
+                        "lost the proxy of sandbox {}: {e}",
+                        record.name
+                    )))
                 })?;
                 match status {
                     None => Ok(()),
-                    Some(status) => Err(failed(format!(
+                    Some(status) => Err(ProxyStartError::Exited(failed(format!(
                         "the proxy of sandbox {} exited ({status}): {}; see {}",
                         record.name,
                         last_log_line(log_path),
                         log_path.display()
-                    ))),
+                    )))),
                 }
             };
             exited(child)?;
@@ -231,15 +339,17 @@ impl Engine {
                 break;
             }
             if start.elapsed() > PROXY_START {
-                return Err(failed(format!(
+                return Err(ProxyStartError::Other(failed(format!(
                     "the proxy of sandbox {} did not start listening on {reached}; see {}",
                     record.name,
                     log_path.display()
-                )));
+                ))));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (version, snapshot) = self.active_policy(&record.name)?;
+        let (version, snapshot) = self
+            .active_policy(&record.name)
+            .map_err(ProxyStartError::Other)?;
         let session = SessionRecord {
             id: SessionId(0),
             sandbox: record.name.clone(),
@@ -248,14 +358,16 @@ impl Engine {
             version: version.version,
             snapshot: snapshot.id,
             compiled: None,
-            root: reference_of_child(child)?,
+            root: reference_of_child(child).map_err(|e| ProxyStartError::Other(e.into()))?,
             pgid: Some(child.id()),
             cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
         };
-        self.state.put_session(lock, &session)?;
+        self.state
+            .put_session(lock, &session)
+            .map_err(|e| ProxyStartError::Other(e.into()))?;
         Ok(())
     }
 }

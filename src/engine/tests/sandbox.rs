@@ -43,6 +43,20 @@ fn each_sandbox_gets_its_own_port_and_names_are_unique() {
 }
 
 #[test]
+fn free_port_except_skips_the_ports_it_is_given() {
+    static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let first = engine.free_port().unwrap();
+    let next = engine.free_port_except(&[first]).unwrap();
+    assert_ne!(next, first);
+    let third = engine.free_port_except(&[first, next]).unwrap();
+    assert_ne!(third, first);
+    assert_ne!(third, next);
+    assert_eq!(engine.free_port().unwrap(), first);
+}
+
+#[test]
 fn removing_asks_first_and_deletes_the_folder() {
     let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
     let dir = engine.layout.sandbox_dir("home");

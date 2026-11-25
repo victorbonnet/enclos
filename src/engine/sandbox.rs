@@ -254,14 +254,22 @@ impl Engine {
     /// The first port no sandbox here uses and nothing on this host listens
     /// on (other enclos installs or users included), seen twice so that a
     /// listener reopening its socket is not taken for none.
-    fn free_port(&self) -> Result<u16> {
+    pub(super) fn free_port(&self) -> Result<u16> {
+        self.free_port_except(&[])
+    }
+
+    /// The first port in [`PORT_FIRST`]..=[`PORT_LAST`] that no sandbox here
+    /// uses, is not in `skip`, and nothing on this host holds on either
+    /// loopback (other enclos installs or users included), seen twice so that
+    /// a listener reopening its socket is not taken for none.
+    pub(super) fn free_port_except(&self, skip: &[u16]) -> Result<u16> {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let free = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             super::loopback::free(addr, std::time::Duration::from_millis(100))
         };
         (PORT_FIRST..=PORT_LAST)
-            .find(|port| !used.contains(port) && free(*port))
+            .find(|port| !used.contains(port) && !skip.contains(port) && free(*port))
             .ok_or(Error::NoFreePorts)
     }
 
