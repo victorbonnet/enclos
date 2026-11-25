@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { createChannel, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
+import { createChannel, sessionPeer } from '../channel.js';
 import { commandCatalog } from '../features.js';
 import { stageMedia } from '../media.js';
 import { createNativeTitles } from '../native-titles.js';
@@ -13,6 +13,9 @@ import { createNativeApprovals } from '../native-approvals.js';
 import { message } from '../protocol.js';
 import { accountFixture, bridge, waitFor } from './helpers.js';
 
+import { expectedOpenClawVersion, assertOpenClawVersion } from './openclaw-version.js';
+
+const expectedVersion = expectedOpenClawVersion();
 const installed = process.env.ENCLOS_OPENCLAW_PACKAGE;
 // Native database helpers also own a shared schema/lease registry. Select a
 // disposable native state root before importing any SDK runtime, not just a
@@ -36,14 +39,14 @@ test('the installed package exports what enclos usage\'s reader loads from it (#
 });
 
 test('the installed public SDK registers the package and builds isolated session keys', { skip: !installed }, async () => {
-  assert.equal(JSON.parse(readFileSync(path.join(installed, 'package.json'))).version, TESTED_OPENCLAW);
+  assertOpenClawVersion(JSON.parse(readFileSync(path.join(installed, 'package.json'))).version, expectedVersion);
   const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/channel-core.js')));
   const routing = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/routing.js')));
   const channel = createChannel();
   const entry = sdk.defineChannelPluginEntry({ id: 'enclos', name: 'enclos app', description: 'enclos',
     plugin: channel.plugin, setRuntime: channel.setRuntime });
   let registered;
-  entry.register({ registrationMode: 'full', runtime: { version: TESTED_OPENCLAW }, registerChannel(value) { registered = value.plugin; } });
+  entry.register({ registrationMode: 'full', runtime: { version: expectedVersion }, registerChannel(value) { registered = value.plugin; } });
   assert.equal(registered.id, 'enclos');
   const route = conversation => routing.buildAgentSessionKey({ agentId: 'main', channel: 'enclos', accountId: 'main',
     peer: { kind: 'direct', id: sessionPeer(conversation, 'alice') }, dmScope: 'per-account-channel-peer' });
@@ -79,7 +82,7 @@ test('the combined channel registers the native approval context with its actual
     runtimeContexts: { register(params) { registration = params; return { dispose() { disposed = true; } }; } } };
   const channel = createChannel({ nativeApprovals });
   assert.equal(channel.plugin.approvalCapability, nativeApprovals.approvalCapability);
-  channel.setRuntime({ version: TESTED_OPENCLAW, channel: channelRuntime, config: { current: () => cfg } });
+  channel.setRuntime({ version: expectedVersion, channel: channelRuntime, config: { current: () => cfg } });
   const abort = new AbortController();
   const lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: 'main', abortSignal: abort.signal, setStatus() {} });
   t.after(async () => { abort.abort(); await lifetime; });
@@ -249,7 +252,7 @@ test('an installed native resolver failure reaches the app and settles answering
     session: { store: path.join(folder, 'sessions.json') } };
   let resolverCalls = 0;
   const channel = createChannel();
-  channel.setRuntime({ version: TESTED_OPENCLAW, config: { current: () => cfg }, channel: { routing,
+  channel.setRuntime({ version: expectedVersion, config: { current: () => cfg }, channel: { routing,
     inbound: {
       ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true }, activationAccess: {}, commandAccess: {} }) },
       buildContext: sdk.buildChannelInboundEventContext,
@@ -293,7 +296,7 @@ test('the native message target resolver accepts owned bridge conversations with
   const channel = createChannel();
   const targets = [];
   let resolve;
-  channel.setRuntime({ version: TESTED_OPENCLAW, config: { current: () => cfg }, channel: { routing,
+  channel.setRuntime({ version: expectedVersion, config: { current: () => cfg }, channel: { routing,
     inbound: { ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true } }) },
       buildContext: value => value, dispatch: async () => {
         for (const input of [account.home, `enclos:${account.home}`, 'home', conversation, 'home.other.scout', 'alice@example.com']) {
