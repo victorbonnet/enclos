@@ -374,8 +374,24 @@ impl PluginCloser {
 
 /// Refuses a socket whose folder, or which itself, is a link
 /// (`docs/protocol.md`, the plugin leg: the bridge sends the agent's token
-/// to whatever listens there). Checked just before connecting: a link put
-/// in place between this check and the connection is not caught.
+/// to whatever listens there).
+///
+/// The check runs before every connection attempt because every attempt goes
+/// through [`connect_within`]; the bridge's restart wait
+/// (`Hub::hold_for_restart`, up to about 60 attempts in 15 s) re-checks
+/// before each connect rather than relying on one check for the whole wait.
+/// The window between this check and `UnixStream::connect` is the same on
+/// each attempt as it was on the single attempt before #376: the wait gives
+/// a sandbox more attempts at it, not a longer window.
+///
+/// The race is accepted, not closed: closing it requires connecting through
+/// a directory descriptor opened without following links (a `/proc/self/fd`
+/// path on Linux, nothing equivalent on macOS), which is a design decision
+/// rather than a mapping and is left to its own card. If a sandbox wins the
+/// race, the bridge writes its `hello` (the agent's own token, which the
+/// sandbox already holds, and the bridge's capabilities) to the socket the
+/// link points to, and then the person's messages only if that listener
+/// answers a valid `hello`.
 fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     let Some(folder) = socket.parent() else {
         return Ok(());
@@ -902,10 +918,15 @@ mod tests {
         // The plugin closed the connection before reading the hello: the read
         // side says `Refused` of the same close, so does the write side.
         for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
-            assert!(matches!(
-                PluginError::Io(Error::from(kind)).closed_before_hello(),
-                PluginError::Refused
-            ));
+            let err = PluginError::Io(Error::from(kind)).closed_before_hello();
+            assert!(matches!(err, PluginError::Refused), "{err:?}");
+            assert!(!err.may_be_restarting(), "{err}");
+            let said = err.to_string();
+            assert!(
+                said.contains("closed the connection without answering"),
+                "{said}"
+            );
+            assert!(!said.contains("restart"), "{said}");
         }
         // Anything else is left as it was: a timeout is not a restart either.
         let timed_out = PluginError::Io(Error::from(ErrorKind::TimedOut)).closed_before_hello();
@@ -923,8 +944,17 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         drop(theirs);
         let wait = Duration::from_secs(1);
-        let result = open_on(ours, "t0ken", "home.lab.main", wait, Instant::now() + wait);
-        assert!(matches!(result, Err(PluginError::Refused)));
+        let Err(err) = open_on(ours, "t0ken", "home.lab.main", wait, Instant::now() + wait) else {
+            panic!("opened on a closed stream");
+        };
+        assert!(matches!(err, PluginError::Refused), "{err:?}");
+        assert!(!err.may_be_restarting(), "{err}");
+        let said = err.to_string();
+        assert!(
+            said.contains("closed the connection without answering"),
+            "{said}"
+        );
+        assert!(!said.contains("restart"), "{said}");
     }
 
     #[test]
