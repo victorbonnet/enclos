@@ -268,9 +268,7 @@ impl Engine {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             super::loopback::free(addr, std::time::Duration::from_millis(100))
         };
-        (PORT_FIRST..=PORT_LAST)
-            .find(|port| !used.contains(port) && !skip.contains(port) && free(*port))
-            .ok_or(Error::NoFreePorts)
+        first_port_except(&used, skip, free).ok_or(Error::NoFreePorts)
     }
 
     pub fn list_sandboxes(&self) -> Result<Vec<SandboxView>> {
@@ -698,6 +696,18 @@ impl Engine {
             _ => Error::SandboxRunning { name },
         })
     }
+}
+
+/// The first port in [`PORT_FIRST`]..=[`PORT_LAST`] that is not in `used`,
+/// not in `skip`, and that `free` says nothing holds. Apart from the engine
+/// so a test can say which ports are free instead of asking the host.
+pub(super) fn first_port_except(
+    used: &[u16],
+    skip: &[u16],
+    free: impl Fn(u16) -> bool,
+) -> Option<u16> {
+    (PORT_FIRST..=PORT_LAST)
+        .find(|port| !used.contains(port) && !skip.contains(port) && free(*port))
 }
 
 /// What an audit summary adds for the sessions of which nothing ran any

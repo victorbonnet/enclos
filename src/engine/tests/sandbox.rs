@@ -44,19 +44,40 @@ fn each_sandbox_gets_its_own_port_and_names_are_unique() {
 
 #[test]
 fn free_port_except_skips_the_ports_it_is_given() {
+    // Which ports are free is the host's to say, and it changes while the
+    // test runs, so the choice is made here with a host that holds nothing.
+    use super::super::sandbox::first_port_except;
+    use crate::model::sandbox::PORT_FIRST;
+    let all_free = |_: u16| true;
+    let first = first_port_except(&[], &[], all_free).unwrap();
+    assert_eq!(first, PORT_FIRST);
+    let next = first_port_except(&[], &[first], all_free).unwrap();
+    assert_eq!(next, first + 1);
+    let third = first_port_except(&[], &[first, next], all_free).unwrap();
+    assert_eq!(third, first + 2);
+    // A port a sandbox here has is skipped too, and so is one the host holds.
+    assert_eq!(first_port_except(&[first], &[], all_free), Some(first + 1));
+    assert_eq!(
+        first_port_except(&[], &[], |port| port != first),
+        Some(first + 1)
+    );
+    assert_eq!(first_port_except(&[], &[], |_| false), None);
+}
+
+#[test]
+fn the_engine_hands_out_a_port_it_was_not_told_to_skip() {
     static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
     let used = engine.state.get(&name).unwrap().unwrap().proxy_port;
     let first = engine.free_port().unwrap();
-    // The port a sandbox here has is never handed out again.
+    // The port a sandbox here has is never handed out again, and neither
+    // is one given to skip. Only these differences are asserted: whether
+    // the port `first` is still free a moment later is the host's to say.
     assert_ne!(first, used);
     let next = engine.free_port_except(&[first]).unwrap();
     assert_ne!(next, first);
-    let third = engine.free_port_except(&[first, next]).unwrap();
-    assert_ne!(third, first);
-    assert_ne!(third, next);
-    assert_eq!(engine.free_port().unwrap(), first);
+    assert_ne!(next, used);
 }
 
 #[test]
