@@ -6156,6 +6156,177 @@ fn a_running_sandbox_whose_version_probe_cannot_start_keeps_its_services() {
     );
 }
 
+/// The `runtime update` audit entries for `lab`'s sandbox, as their results
+/// and messages, oldest first. An entry that never finished has none.
+fn runtime_update_rows(lab: &Lab) -> Vec<(AuditResult, String)> {
+    let target = format!("{} {}", lab.name, RuntimeKind::Hermes);
+    lab.engine
+        .audit(None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            e.intent.command == "runtime update" && e.intent.target.as_deref() == Some(&target)
+        })
+        .filter_map(|e| e.finished.map(|f| (f.outcome.result, f.outcome.message)))
+        .collect()
+}
+
+/// Makes the sandbox's record say `state` as the version record lands. That
+/// is after step 8 and before step 9 of an update, the one point between
+/// them that no hook of the update reaches: every enclos read of the record
+/// after it then sees `state`. A value no state is spelled with makes that
+/// read fail.
+fn change_record_when_version_lands(lab: &Lab, state: &str) {
+    let conn = rusqlite::Connection::open(lab.engine.layout.state_db()).unwrap();
+    for (event, when) in [("INSERT", "insert"), ("UPDATE", "update")] {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER change_record_on_version_{when} AFTER {event} ON runtime_versions
+             BEGIN UPDATE sandboxes SET state = '{state}' WHERE name = NEW.sandbox; END;"
+        ))
+        .unwrap();
+    }
+}
+
+/// A running sandbox with its services started, as `sandbox start` leaves
+/// it, and an updater that succeeds and reports 9.9.9.
+fn running_lab_with_services_and_updater(
+    fake: &std::rc::Rc<crate::service::fake::FakeServices>,
+) -> (Lab, UpdatingRuntime) {
+    use crate::model::sandbox::SandboxState;
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(fake))));
+    done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+    lab.engine.start_sandbox(&alice(), &lab.name).unwrap();
+    assert_eq!(
+        lab.engine.record(&lab.name).unwrap().state,
+        SandboxState::Running
+    );
+    assert!(
+        lab.engine.has_services(&lab.name).unwrap(),
+        "started: {:?}",
+        fake.started.borrow()
+    );
+    fake.stopped.borrow_mut().clear();
+    let rt = UpdatingRuntime {
+        inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+        update_script: "echo 'probe: updating'".into(),
+        version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+    };
+    (lab, rt)
+}
+
+#[test]
+fn a_failed_step_nine_record_read_writes_exactly_one_failed_audit_row() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let (lab, rt) = running_lab_with_services_and_updater(&fake);
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+
+    // The version is recorded in step 8, then the record is unreadable when
+    // step 9 reads it: the updater and the version record both succeeded.
+    change_record_when_version_lands(&lab, "corrupt");
+    let before = runtime_update_rows(&lab);
+    let err = lab
+        .engine
+        .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown sandbox state"), "{err}");
+
+    // Exactly one row for the run, and it says the services were left as
+    // they were. Nothing was stopped or started after the failed read.
+    let after = runtime_update_rows(&lab);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let (result, message) = after.last().unwrap();
+    assert_eq!(*result, AuditResult::Failed, "{after:?}");
+    assert!(message.contains("to 9.9.9"), "{message}");
+    assert!(
+        message.ends_with("; its services were left as they were"),
+        "{message}"
+    );
+    assert!(!fake.started.borrow().iter().any(|u| u.label == gateway));
+}
+
+#[test]
+fn a_failed_step_nine_start_writes_exactly_one_failed_audit_row() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let (lab, rt) = running_lab_with_services_and_updater(&fake);
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+
+    // Steps 6 to 8 start nothing, so the refusal first meets the restart
+    // at step 9.
+    *fake.refuse.borrow_mut() = Some(gateway.as_str().to_owned());
+    let before = runtime_update_rows(&lab);
+    let err = lab
+        .engine
+        .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("refused"), "{err}");
+
+    let after = runtime_update_rows(&lab);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let (result, message) = after.last().unwrap();
+    assert_eq!(*result, AuditResult::Failed, "{after:?}");
+    assert!(message.contains("to 9.9.9"), "{message}");
+    assert!(
+        message.contains("; its services were not started again (") && message.ends_with(')'),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_failed_step_nine_session_end_writes_exactly_one_failed_audit_row() {
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = Rc::new(FakeServices::default());
+    let (lab, rt) = running_lab_with_services_and_updater(&fake);
+    // The holder is the one installed unit `has_services` leaves out, so it
+    // can stand in for the service that step 9 fails to stop without making
+    // steps 7 and 8 start the proxy differently from a stopped sandbox.
+    let holder = lab.engine.label(&lab.name, Unit::Holder).unwrap();
+    fake.seed(holder.as_str());
+
+    // Step 6 stops the holder. It is put back as installed, and its next stop
+    // refused, so the stop that fails is step 9's, which runs because the
+    // sandbox reads as stopped by then.
+    let (fake_again, held) = (Rc::clone(&fake), holder.clone());
+    *fake.on_stop.borrow_mut() = Some(Box::new(move |l| {
+        if *l == held {
+            fake_again.seed(held.as_str());
+            *fake_again.refuse_stop.borrow_mut() = Some(held.as_str().to_owned());
+        }
+    }));
+    change_record_when_version_lands(&lab, "stopped");
+    let before = runtime_update_rows(&lab);
+    let err = lab
+        .engine
+        .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("would not stop"), "{err}");
+
+    let after = runtime_update_rows(&lab);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    let (result, message) = after.last().unwrap();
+    assert_eq!(*result, AuditResult::Failed, "{after:?}");
+    assert!(message.contains("to 9.9.9"), "{message}");
+    assert!(
+        message.contains("; its sessions were not ended (") && message.ends_with(')'),
+        "{message}"
+    );
+}
+
 #[test]
 fn a_runtime_update_of_a_running_sandbox_without_services_is_not_called_stopped() {
     use crate::engine::ServicesAfter;
