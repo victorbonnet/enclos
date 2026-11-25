@@ -62,7 +62,7 @@ enclos audit verify [OPTIONS]
 
 ### `enclos sandbox`
 
-Create, list, show, start, stop, restart or remove sandboxes
+Create, list, show, start, stop, restart, pause, resume or remove sandboxes
 
 #### `enclos sandbox create`
 
@@ -124,6 +124,28 @@ enclos sandbox restart [OPTIONS] <NAMES>...
 ```
 
 - `<NAMES>...`
+
+#### `enclos sandbox pause`
+
+Pause runtime services so agents stop running, keeping sandboxes and open sessions in place
+
+```text
+enclos sandbox pause [OPTIONS] [NAMES]...
+```
+
+- `--all`: Pause every sandbox on this host.
+- `[NAMES]...`: Sandboxes to pause.
+
+#### `enclos sandbox resume`
+
+Resume runtime services stopped by `sandbox pause`
+
+```text
+enclos sandbox resume [OPTIONS] [NAMES]...
+```
+
+- `--all`: Resume every paused sandbox on this host.
+- `[NAMES]...`: Sandboxes to resume.
 
 #### `enclos sandbox rm`
 

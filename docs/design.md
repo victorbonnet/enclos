@@ -1146,7 +1146,7 @@ The Pi did not show Landlock's layer, the memory limit or libsecret, since it ha
 
 The design depends on these, and they have not been shown yet. Items the milestone 1 prototype (`prototype/m1/`, issue #5) settled moved into the sections above, with what was shown: how Hermes keeps agents and shares one login per sandbox, its single gateway ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)), the host-service rules (§5), the device-code login and its endpoints, DNS through the proxy only, the proxy variables, and denials in the unified log. Items marked **VM** run in a disposable macOS VM: escape probes that could act on the host, and member-tracking experiments, no longer run on a development Mac.
 
-**For the host pause** ([ADR 0079](adr/0079-a-paused-host-is-a-recorded-state-and-the-hosts-person-may-set-it.md), slice A built; nothing below is shown by a run yet):
+**For the host pause** ([ADR 0079](adr/0079-a-paused-host-is-a-recorded-state-and-the-hosts-person-may-set-it.md), proposed, slice A built; nothing below is shown by a run yet):
 
 - That a pause of a host whose agents are running removes the runtime's service on both backends and leaves the proxy and open sessions: only a stand-in service manager has run it, in the tests.
 - That a turn in flight finishes and its answer lands whole before the service goes (the drain, and that the stop does not take ADR 0031's restart path).
