@@ -71,16 +71,18 @@ impl PluginError {
     /// Whether this failure is one that a runtime restart explains: the
     /// connection could not be made, or the peer went away on it
     /// (`BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, `NotConnected`,
-    /// `UnexpectedEof`). A read or write timeout is not one of these and falls
-    /// back through the existing diagnostic text. A send only reaches the
-    /// restart notice for a channel that answered in this bridge run and whose
-    /// sandbox is running (`Hub::hold_for_restart` asks both), so the notice is
-    /// said of an agent that answered and then went away, never of one that
-    /// refused. A plugin that answered and refused the token, that does not
-    /// speak this protocol, or that sent something unreadable says something
-    /// else about the agent, and is never called a restart. `PermissionDenied`
-    /// on connect is routed to `Linked` by `not_a_channel` before it can become
-    /// `Connect`, so it never reaches the `Connect` arm here.
+    /// `UnexpectedEof`). A connect, hello, read or write timeout is not one of
+    /// these and falls back through the existing diagnostic text (a connect
+    /// timeout is routed to `Protocol` rather than `Connect`). A send only
+    /// reaches the restart notice for a channel that answered in this bridge
+    /// run and whose sandbox is running (`Hub::hold_for_restart` asks both), so
+    /// the notice is said of an agent that answered and then went away, never
+    /// of one that refused. A plugin that answered and refused the token, that
+    /// does not speak this protocol, or that sent something unreadable says
+    /// something else about the agent, and is never called a restart.
+    /// `PermissionDenied` on connect is routed to `Linked` by `not_a_channel`
+    /// before it can become `Connect`, so it never reaches the `Connect` arm
+    /// here.
     ///
     /// Known remainder: the attachment-file read error in
     /// `incoming.rs::send_with_files` (`opened.read_exact`, a bridge-side file)
@@ -169,28 +171,7 @@ pub(super) fn connect_within(
     wait: Duration,
 ) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
     let deadline = Instant::now() + wait;
-    // The folder is in the sandbox home, which the sandbox writes: a link
-    // there would send the agent's token to another socket of the host
-    refuse_linked_folder(socket)?;
-    let stream = match connect_until(socket, deadline, wait) {
-        Ok(stream) => stream,
-        // A failure of the path itself — a file that is not a socket, a
-        // folder, a folder this bridge cannot read — is nothing a restart
-        // explains: it is refused as `Linked` is, and says what `Connect`
-        // says (#376).
-        Err(source) if not_a_channel(socket, &source) => {
-            return Err(PluginError::Linked {
-                path: socket.display().to_string(),
-                source,
-            });
-        }
-        Err(source) => {
-            return Err(PluginError::Connect {
-                path: socket.display().to_string(),
-                source,
-            });
-        }
-    };
+    let stream = connect_until(socket, deadline, wait)?;
     open_on(stream, token, home, wait, deadline)
 }
 
@@ -224,31 +205,56 @@ fn nonblocking_unix_socket() -> std::io::Result<OwnedFd> {
 /// On Linux a non-blocking Unix connect reports a full accept queue as
 /// `EAGAIN`; macOS reports a full queue differently (not tested here), so
 /// this bound matters most where it is `EAGAIN`.
-fn connect_until(socket: &Path, deadline: Instant, wait: Duration) -> std::io::Result<UnixStream> {
-    let address = rustix::net::SocketAddrUnix::new(socket)?;
-    let fd = nonblocking_unix_socket()?;
+fn connect_until(
+    socket: &Path,
+    deadline: Instant,
+    wait: Duration,
+) -> Result<UnixStream, PluginError> {
+    let map_connect_err = |source: std::io::Error| {
+        // A failure of the path itself — a file that is not a socket, a
+        // folder, a folder this bridge cannot read — is nothing a restart
+        // explains: it is refused as `Linked` is, and says what `Connect`
+        // says (#376).
+        if not_a_channel(socket, &source) {
+            PluginError::Linked {
+                path: socket.display().to_string(),
+                source,
+            }
+        } else {
+            PluginError::Connect {
+                path: socket.display().to_string(),
+                source,
+            }
+        }
+    };
+    let address =
+        rustix::net::SocketAddrUnix::new(socket).map_err(|e| map_connect_err(e.into()))?;
+    let fd = nonblocking_unix_socket().map_err(map_connect_err)?;
     loop {
+        // The folder is in the sandbox home, which the sandbox writes: a link
+        // there would send the agent's token to another socket of the host.
+        // Re-check before every attempt so a swap during EAGAIN retries is
+        // refused on the next iteration.
+        refuse_linked_folder(socket)?;
         match rustix::net::connect(&fd, &address) {
             Ok(()) => break,
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) if std::io::Error::from(e).kind() == std::io::ErrorKind::WouldBlock => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "the channel's accept queue stayed full for {} ms",
-                            wait.as_millis()
-                        ),
-                    ));
+                    return Err(PluginError::Protocol(format!(
+                        "it did not accept a connection within {} ms",
+                        wait.as_millis()
+                    )));
                 }
                 std::thread::sleep(left.min(CONNECT_RETRY));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_connect_err(e.into())),
         }
     }
-    let flags = rustix::fs::fcntl_getfl(&fd)?;
-    rustix::fs::fcntl_setfl(&fd, flags.difference(rustix::fs::OFlags::NONBLOCK))?;
+    let flags = rustix::fs::fcntl_getfl(&fd).map_err(|e| map_connect_err(e.into()))?;
+    rustix::fs::fcntl_setfl(&fd, flags.difference(rustix::fs::OFlags::NONBLOCK))
+        .map_err(|e| map_connect_err(e.into()))?;
     Ok(UnixStream::from(fd))
 }
 
@@ -440,21 +446,24 @@ impl PluginCloser {
 /// (`docs/protocol.md`, the plugin leg: the bridge sends the agent's token
 /// to whatever listens there).
 ///
-/// The check runs before every connection attempt because every attempt goes
-/// through [`connect_within`], but the check and the connect
-/// ([`connect_until`]) are two steps. A sandbox that rewrites its own folder
-/// or socket link between them can win on one attempt — about one in three
-/// under a full-rate flip on Linux — so the number of attempts is not what
-/// bounds it.
+/// The check runs before each `connect` attempt inside [`connect_until`]
+/// (including across retries when the accept queue is full), so the race
+/// window is the gap between check and connect on each attempt, and this
+/// holds across retries. A sandbox that rewrites its own folder or socket
+/// link between them can still win on one attempt — measured at about one
+/// in three on Linux with a full-rate swap loop in a security review of
+/// commit `a59cb1c9` (single attempts; macOS is not measured) — so the
+/// number of attempts is not what bounds it.
 ///
 /// The race is accepted, not closed. If a sandbox wins it, the exposure is
 /// one fixed `hello` (the agent's own token, which the sandbox already holds,
 /// plus the bridge's capabilities) written to a socket the sandbox could not
-/// reach itself; the person's messages follow only if that listener answers a
-/// valid `hello` with the agent's token. A directory descriptor alone would
-/// not close the race: the leaf `main.sock` stays followable, so closing it
-/// needs the peer checked after connect (its own card), not only a
-/// descriptor.
+/// reach itself; the person's messages follow only if that listener answers
+/// with a well-formed plugin `hello`, and the bridge checks no token or
+/// agent name in it (the peer check is its own card). A directory descriptor
+/// alone would not close the race: the leaf `main.sock` stays followable, so
+/// closing it needs the peer checked after connect (its own card), not only
+/// a descriptor.
 fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     let Some(folder) = socket.parent() else {
         return Ok(());
@@ -1224,12 +1233,24 @@ mod tests {
         assert!(path.ends_with("main.sock"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn a_listener_with_a_full_accept_queue_is_given_up_on_in_time() {
+    fn connect_until_returns_a_blocking_stream() {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
-        let addr = rustix::net::SocketAddrUnix::new(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let wait = Duration::from_secs(1);
+        let stream = connect_until(&socket, Instant::now() + wait, wait).unwrap();
+        let flags = rustix::fs::fcntl_getfl(&stream).unwrap();
+        assert!(
+            !flags.contains(rustix::fs::OFlags::NONBLOCK),
+            "expected blocking stream, got flags: {flags:?}"
+        );
+        let (_peer, _) = listener.accept().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_queue_listener(socket: &Path) -> (OwnedFd, Vec<OwnedFd>) {
+        let addr = rustix::net::SocketAddrUnix::new(socket).unwrap();
         let listener = rustix::net::socket_with(
             rustix::net::AddressFamily::UNIX,
             rustix::net::SocketType::STREAM,
@@ -1254,6 +1275,15 @@ mod tests {
                 Err(e) => panic!("unexpected connect error while filling queue: {e}"),
             }
         }
+        (listener, held)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listener_with_a_full_accept_queue_is_given_up_on_in_time() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let (listener, held) = full_queue_listener(&socket);
 
         let started = Instant::now();
         let failed = connect_within(
@@ -1263,16 +1293,64 @@ mod tests {
             Duration::from_millis(400),
         );
         let elapsed = started.elapsed();
-        let Err(PluginError::Connect { source, .. }) = failed else {
-            panic!(
-                "expected Connect error on full queue, got {:?}",
-                failed.map(|(hello, ..)| hello)
-            );
+        let Err(err) = failed else {
+            panic!("expected Protocol error on full queue, got Ok");
         };
-        assert_eq!(source.kind(), std::io::ErrorKind::TimedOut, "{source}");
+        assert!(!err.may_be_restarting(), "{err}");
+        let PluginError::Protocol(reason) = err else {
+            panic!("expected Protocol error on full queue, got {err:?}");
+        };
+        assert!(reason.contains("did not accept a connection"), "{reason}");
         assert!(
             elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
             "elapsed: {elapsed:?}"
+        );
+        drop(held);
+        drop(listener);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_replaced_with_a_link_during_queue_retry_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let own = folder.path().join(".enclos-app");
+        std::fs::create_dir(&own).unwrap();
+        let elsewhere = folder.path().join("elsewhere.sock");
+        let _other = UnixListener::bind(&elsewhere).unwrap();
+        let socket = own.join("main.sock");
+        let (listener, held) = full_queue_listener(&socket);
+
+        let (entered, ready) = std::sync::mpsc::channel();
+        let socket_for_thread = socket.clone();
+        let started = Instant::now();
+        let connecting = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            connect_within(
+                &socket_for_thread,
+                "t0ken",
+                "home.lab.main",
+                Duration::from_secs(1),
+            )
+        });
+
+        ready.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        let staged = own.join("main.sock.link");
+        std::os::unix::fs::symlink(&elsewhere, &staged).unwrap();
+        std::fs::rename(&staged, &socket).unwrap();
+
+        let result = connecting.join().unwrap();
+        let elapsed = started.elapsed();
+        let Err(PluginError::Linked { source, .. }) = result else {
+            panic!(
+                "expected Linked error after swap during retry, got {:?}",
+                result.map(|(hello, ..)| hello)
+            );
+        };
+        assert!(source.to_string().contains("is a link"), "{source}");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "expected refusal before wait ended, elapsed: {elapsed:?}"
         );
         drop(held);
         drop(listener);
