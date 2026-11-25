@@ -6675,6 +6675,115 @@ fn a_failed_runtime_update_keeps_previous_version_restarts_services_and_names_lo
 }
 
 #[test]
+fn a_failed_update_is_worded_from_what_was_recorded() {
+    use crate::engine::ServicesAfter;
+    use crate::model::sandbox::SandboxState;
+    use crate::service::fake::FakeServices;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy)]
+    enum Setup {
+        RunningWithServices,
+        RunningWithoutServices,
+        Stopped,
+    }
+
+    struct Row {
+        name: &'static str,
+        setup: Setup,
+        expected_services: ServicesAfter,
+        expected_str: &'static str,
+        expected_state: SandboxState,
+        expected_has_services: bool,
+        mentions_stopped: bool,
+    }
+
+    let rows = [
+        Row {
+            name: "running with services",
+            setup: Setup::RunningWithServices,
+            expected_services: ServicesAfter::StartedAgain,
+            expected_str: "started again",
+            expected_state: SandboxState::Running,
+            expected_has_services: true,
+            mentions_stopped: false,
+        },
+        Row {
+            name: "running without services",
+            setup: Setup::RunningWithoutServices,
+            expected_services: ServicesAfter::NotInstalledRunning,
+            expected_str: "not installed (the sandbox runs without services)",
+            expected_state: SandboxState::Running,
+            expected_has_services: false,
+            mentions_stopped: false,
+        },
+        Row {
+            name: "stopped",
+            setup: Setup::Stopped,
+            expected_services: ServicesAfter::NotInstalled,
+            expected_str: "not installed (the sandbox was stopped)",
+            expected_state: SandboxState::Stopped,
+            expected_has_services: false,
+            mentions_stopped: true,
+        },
+    ];
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for row in rows {
+        let fake = Rc::new(FakeServices::default());
+        let lab = Lab::with_services(Some(Box::new(Rc::clone(&fake))));
+        done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+        match row.setup {
+            Setup::RunningWithServices => {
+                lab.engine.start_sandbox(&alice(), &lab.name).unwrap();
+            }
+            Setup::RunningWithoutServices => {}
+            Setup::Stopped => {
+                done(
+                    lab.engine
+                        .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+                        .unwrap(),
+                );
+            }
+        }
+
+        let rt = UpdatingRuntime {
+            inner: TestRuntime::new(lab._dir.path(), INSTALLS),
+            update_script: "echo 'boom'; exit 1".into(),
+            version_script: "printf '9.9.9\\n' > \"$1\"".into(),
+        };
+        let end = done(
+            lab.engine
+                .update_runtime_with(&alice(), &lab.name, &rt, Confirm::Yes)
+                .unwrap(),
+        );
+
+        assert!(!end.succeeded, "{}: updater should have failed", row.name);
+        assert_eq!(end.services, row.expected_services, "{}", row.name);
+        assert_eq!(end.services.as_str(), row.expected_str, "{}", row.name);
+        assert_eq!(
+            lab.engine.record(&lab.name).unwrap().state,
+            row.expected_state,
+            "{}",
+            row.name
+        );
+        assert_eq!(
+            lab.engine.has_services(&lab.name).unwrap(),
+            row.expected_has_services,
+            "{}",
+            row.name
+        );
+        assert_eq!(
+            end.services.as_str().contains("stopped"),
+            row.mentions_stopped,
+            "{}: {:?}",
+            row.name,
+            end.services.as_str()
+        );
+    }
+}
+
+#[test]
 fn an_unreadable_version_after_update_keeps_previous_version() {
     use crate::model::runtime::RuntimeVersion;
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());

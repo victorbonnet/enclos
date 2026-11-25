@@ -18,7 +18,7 @@ use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
 use enclos::model::count;
 use enclos::model::plan::{Confirm, Planned};
-use enclos::model::runtime::RuntimeKind;
+use enclos::model::runtime::{RuntimeKind, RuntimeVersion};
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -338,6 +338,46 @@ fn answered_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// The failure message for `enclos runtime update`, worded from the services
+/// outcome recorded at step 9 of the update (F2).
+fn update_failure_message(
+    shown: &str,
+    ended: &str,
+    sandbox: &SandboxName,
+    log_shown: &str,
+    before: Option<&RuntimeVersion>,
+    services: ServicesAfter,
+) -> String {
+    let services_clause = match services {
+        ServicesAfter::StartedAgain => {
+            "the sandbox's services are running again on what the updater left"
+        }
+        // A sandbox recorded running with nothing installed — after
+        // `runtime install` or a `connect` — is not stopped (F2).
+        ServicesAfter::NotInstalledRunning => {
+            "no service was installed (the sandbox runs without services)"
+        }
+        ServicesAfter::NotInstalled => "no service was installed (the sandbox was stopped)",
+    };
+    let state_sentence = match before {
+        Some(v) => format!("{shown} {v} stays recorded, and {services_clause}."),
+        None => match services {
+            ServicesAfter::StartedAgain => {
+                "The sandbox's services are running again on what the updater left.".to_owned()
+            }
+            ServicesAfter::NotInstalledRunning => {
+                "No service was installed (the sandbox runs without services).".to_owned()
+            }
+            ServicesAfter::NotInstalled => {
+                "No service was installed (the sandbox was stopped).".to_owned()
+            }
+        },
+    };
+    format!(
+        "the {shown} updater {ended} in sandbox {sandbox}. Its log is {log_shown} (`enclos logs {sandbox}`). {state_sentence} There is no rollback: fix the cause, then run `enclos runtime update {sandbox}` again."
+    )
+}
+
 fn update(
     engine: &Engine,
     layout: &Layout,
@@ -424,34 +464,13 @@ fn update(
     let log_shown =
         super::status::tilde(&layout.update_log(sandbox.as_str()), user_home.as_deref());
     let failure_message = || {
-        let ended = end.ended();
-        let services_clause = match end.services {
-            ServicesAfter::StartedAgain => {
-                "the sandbox's services are running again on what the updater left"
-            }
-            // A sandbox recorded running with nothing installed — after
-            // `runtime install` or a `connect` — is not stopped (F2).
-            ServicesAfter::NotInstalledRunning => {
-                "no service was installed (the sandbox runs without services)"
-            }
-            ServicesAfter::NotInstalled => "no service was installed (the sandbox was stopped)",
-        };
-        let state_sentence = match &end.before {
-            Some(v) => format!("{shown} {v} stays recorded, and {services_clause}."),
-            None => match end.services {
-                ServicesAfter::StartedAgain => {
-                    "The sandbox's services are running again on what the updater left.".to_owned()
-                }
-                ServicesAfter::NotInstalledRunning => {
-                    "No service was installed (the sandbox runs without services).".to_owned()
-                }
-                ServicesAfter::NotInstalled => {
-                    "No service was installed (the sandbox was stopped).".to_owned()
-                }
-            },
-        };
-        format!(
-            "the {shown} updater {ended} in sandbox {sandbox}. Its log is {log_shown} (`enclos logs {sandbox}`). {state_sentence} There is no rollback: fix the cause, then run `enclos runtime update {sandbox}` again."
+        update_failure_message(
+            shown,
+            &end.ended(),
+            &sandbox,
+            &log_shown,
+            end.before.as_ref(),
+            end.services,
         )
     };
     if output::json() {
@@ -680,6 +699,114 @@ mod tests {
         assert_eq!(target.agent.unwrap().as_str(), "main");
         for bad in ["home/", "/main", "home/main/x", "Home"] {
             assert!(bad.parse::<ChannelTarget>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_failed_update_is_worded_from_the_services_it_recorded() {
+        struct Row {
+            name: &'static str,
+            services: ServicesAfter,
+            before: Option<&'static str>,
+            must_contain: &'static str,
+            must_not_contain: &'static [&'static str],
+        }
+
+        let rows = [
+            Row {
+                name: "started again with prior version",
+                services: ServicesAfter::StartedAgain,
+                before: Some("0.23.1"),
+                must_contain: "services are running again",
+                must_not_contain: &["stopped", "without services"],
+            },
+            Row {
+                name: "started again without prior version",
+                services: ServicesAfter::StartedAgain,
+                before: None,
+                must_contain: "services are running again",
+                must_not_contain: &["stopped", "without services"],
+            },
+            Row {
+                name: "running without services with prior version",
+                services: ServicesAfter::NotInstalledRunning,
+                before: Some("0.23.1"),
+                must_contain: "the sandbox runs without services",
+                must_not_contain: &["stopped", "running again"],
+            },
+            Row {
+                name: "running without services without prior version",
+                services: ServicesAfter::NotInstalledRunning,
+                before: None,
+                must_contain: "the sandbox runs without services",
+                must_not_contain: &["stopped", "running again"],
+            },
+            Row {
+                name: "stopped with prior version",
+                services: ServicesAfter::NotInstalled,
+                before: Some("0.23.1"),
+                must_contain: "the sandbox was stopped",
+                must_not_contain: &["running again", "runs without services"],
+            },
+            Row {
+                name: "stopped without prior version",
+                services: ServicesAfter::NotInstalled,
+                before: None,
+                must_contain: "the sandbox was stopped",
+                must_not_contain: &["running again", "runs without services"],
+            },
+        ];
+
+        let sandbox: SandboxName = "lab".parse().unwrap();
+        let log_shown = "~/sandboxes/lab/logs/update.log";
+
+        for row in rows {
+            let before = row.before.map(|v| RuntimeVersion::new(v).unwrap());
+            let msg = update_failure_message(
+                "Hermes",
+                "exited with 1",
+                &sandbox,
+                log_shown,
+                before.as_ref(),
+                row.services,
+            );
+            assert!(
+                msg.contains(row.must_contain),
+                "{}: expected {:?} in {:?}",
+                row.name,
+                row.must_contain,
+                msg
+            );
+            for forbidden in row.must_not_contain {
+                assert!(
+                    !msg.contains(forbidden),
+                    "{}: did not expect {:?} in {:?}",
+                    row.name,
+                    forbidden,
+                    msg
+                );
+            }
+            assert!(
+                msg.contains(log_shown),
+                "{}: expected log path {:?} in {:?}",
+                row.name,
+                log_shown,
+                msg
+            );
+            assert!(
+                msg.contains("There is no rollback"),
+                "{}: expected rollback notice in {:?}",
+                row.name,
+                msg
+            );
+            if row.before.is_some() {
+                assert!(
+                    msg.contains("Hermes 0.23.1 stays recorded"),
+                    "{}: expected recorded version in {:?}",
+                    row.name,
+                    msg
+                );
+            }
         }
     }
 }
