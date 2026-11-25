@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use super::output;
 use enclos::engine::{
     Engine, HostPauseRead, HostPauseWord, PROXY_WAIT, PauseOutcome, PauseReport, PauseScope,
-    ResumeOutcome, ResumeReport, SandboxSpec, SandboxStarted, SandboxView, ServiceLine, StopReport,
-    printable_line,
+    ResumeOutcome, ResumeReport, SandboxPauseRead, SandboxSpec, SandboxStarted, SandboxView,
+    ServiceLine, StopReport, printable_line,
 };
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
@@ -338,14 +338,20 @@ fn list_json(v: &SandboxView) -> Value {
         "template": v.template.to_string(),
         "policy_version": v.policy.as_ref().map(|p| p.version),
         "state": state_json(&v.record.state),
-        "paused": v.paused,
         "sessions_running": running,
         "sessions_gone": v.sessions.len() - running,
     });
-    if !v.paused
-        && let Some(why) = v.pause_why
-    {
-        obj["why"] = json!(why);
+    match &v.pause {
+        SandboxPauseRead::Readable { paused, why } => {
+            obj["paused"] = json!(paused);
+            if !paused && let Some(why) = why {
+                obj["why"] = json!(why);
+            }
+        }
+        SandboxPauseRead::Unreadable(reason) => {
+            obj["paused"] = Value::Null;
+            obj["pause_unreadable"] = json!(reason);
+        }
     }
     obj
 }
@@ -355,7 +361,6 @@ fn show_json(v: &SandboxView) -> Value {
     let mut obj = json!({
         "name": r.name.to_string(),
         "state": state_json(&r.state),
-        "paused": v.paused,
         "backend": r.backend.to_string(),
         "template": v.template.to_string(),
         "proxy_port": r.proxy_port,
@@ -378,10 +383,17 @@ fn show_json(v: &SandboxView) -> Value {
             })
         }).collect::<Vec<_>>(),
     });
-    if !v.paused
-        && let Some(why) = v.pause_why
-    {
-        obj["why"] = json!(why);
+    match &v.pause {
+        SandboxPauseRead::Readable { paused, why } => {
+            obj["paused"] = json!(paused);
+            if !paused && let Some(why) = why {
+                obj["why"] = json!(why);
+            }
+        }
+        SandboxPauseRead::Unreadable(reason) => {
+            obj["paused"] = Value::Null;
+            obj["pause_unreadable"] = json!(reason);
+        }
     }
     obj
 }
@@ -430,12 +442,20 @@ fn print_list(views: &[SandboxView], host_pause: &HostPauseRead) {
                 count(n, "session", "sessions")
             ),
         };
-        let state_col = if v.paused {
-            format!("paused (resume: `enclos sandbox resume {}`)", v.record.name)
-        } else if pause_in_force && let Some(why) = v.pause_why {
-            format!("{} (not paused: {})", state(&v.record.state), why.plain())
-        } else {
-            state(&v.record.state)
+        let state_col = match &v.pause {
+            SandboxPauseRead::Readable { paused: true, .. } => {
+                format!("paused (resume: `enclos sandbox resume {}`)", v.record.name)
+            }
+            SandboxPauseRead::Readable {
+                paused: false,
+                why: Some(why),
+            } if pause_in_force => {
+                format!("{} (not paused: {})", state(&v.record.state), why.plain())
+            }
+            SandboxPauseRead::Readable { .. } => state(&v.record.state),
+            SandboxPauseRead::Unreadable(why) => {
+                format!("{} (pause state unreadable: {why})", state(&v.record.state))
+            }
         };
         println!(
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {state_col}{sessions}",
@@ -446,7 +466,7 @@ fn print_list(views: &[SandboxView], host_pause: &HostPauseRead) {
 
 fn print_show(v: &SandboxView, host_pause: &HostPauseRead) {
     let r = &v.record;
-    if v.paused {
+    if v.pause.is_paused() {
         println!(
             "Sandbox {}: paused (resume with `enclos sandbox resume {}` or `--all`)",
             r.name, r.name
@@ -454,19 +474,23 @@ fn print_show(v: &SandboxView, host_pause: &HostPauseRead) {
     } else {
         println!("Sandbox {}: {}", r.name, state(&r.state));
     }
-    match host_pause {
-        HostPauseRead::Unreadable(why) => println!("  pause state unreadable: {why}"),
-        HostPauseRead::Readable(h) if h.word != HostPauseWord::Running => {
-            if !v.paused
-                && let Some(why) = v.pause_why
-            {
-                println!("  not paused: {}", why.plain());
+    if let Some(why) = v.pause.unreadable() {
+        println!("  pause state unreadable: {why}");
+    } else {
+        match host_pause {
+            HostPauseRead::Unreadable(why) => println!("  pause state unreadable: {why}"),
+            HostPauseRead::Readable(h) if h.word != HostPauseWord::Running => {
+                if !v.pause.is_paused()
+                    && let Some(why) = v.pause.why()
+                {
+                    println!("  not paused: {}", why.plain());
+                }
+                if let Some(line) = h.summary_line() {
+                    println!("  host: {line}");
+                }
             }
-            if let Some(line) = h.summary_line() {
-                println!("  host: {line}");
-            }
+            _ => {}
         }
-        _ => {}
     }
     println!(
         "  backend {}, template {}, proxy port {}",
@@ -846,7 +870,7 @@ fn member_line(pid: u32, command: &str) -> String {
 }
 
 fn emit_pause(report: &PauseReport) -> u8 {
-    let code = if report.any_failed() {
+    let code = if report.any_failed() || report.host_unreadable() {
         exit::ERROR
     } else {
         exit::OK
@@ -877,19 +901,32 @@ fn emit_pause(report: &PauseReport) -> u8 {
             .iter()
             .filter(|s| s.outcome == PauseOutcome::WouldNotStop)
             .count();
+        let (paused, partly) = match &report.host {
+            HostPauseRead::Readable(h) => (
+                json!(h.word == HostPauseWord::Paused),
+                json!(h.word == HostPauseWord::PartlyPaused),
+            ),
+            HostPauseRead::Unreadable(_) => (Value::Null, Value::Null),
+        };
         let doc = output::with_error(
             json!({
                 "sandboxes": items,
-                "paused": report.host.word == HostPauseWord::Paused,
-                "partly": report.host.word == HostPauseWord::PartlyPaused,
-                "host": HostPauseRead::Readable(report.host.clone()),
+                "paused": paused,
+                "partly": partly,
+                "host": &report.host,
             }),
             code,
             || {
-                format!(
-                    "{} could not stop: see each one's error",
-                    count(failed, "sandbox", "sandboxes")
-                )
+                if failed > 0 {
+                    format!(
+                        "{} could not stop: see each one's error",
+                        count(failed, "sandbox", "sandboxes")
+                    )
+                } else if let HostPauseRead::Unreadable(why) = &report.host {
+                    format!("pause state unreadable: {why}")
+                } else {
+                    "pause failed".to_owned()
+                }
             },
         );
         output::emit(&doc);
@@ -925,15 +962,20 @@ fn emit_pause(report: &PauseReport) -> u8 {
             }
         }
     }
-    match report.host.summary_line() {
-        Some(line) => println!("{line}."),
-        None => println!("Running."),
+    match &report.host {
+        HostPauseRead::Readable(h) => match h.summary_line() {
+            Some(line) => println!("{line}."),
+            None => println!("Running."),
+        },
+        HostPauseRead::Unreadable(why) => {
+            eprintln!("error: pause state unreadable: {why}.");
+        }
     }
     code
 }
 
 fn emit_resume(report: &ResumeReport) -> u8 {
-    let code = if report.any_failed() {
+    let code = if report.any_failed() || report.host_unreadable() {
         exit::ERROR
     } else {
         exit::OK
@@ -964,19 +1006,32 @@ fn emit_resume(report: &ResumeReport) -> u8 {
             .iter()
             .filter(|s| s.outcome == ResumeOutcome::WouldNotStart)
             .count();
+        let (paused, partly) = match &report.host {
+            HostPauseRead::Readable(h) => (
+                json!(h.word == HostPauseWord::Paused),
+                json!(h.word == HostPauseWord::PartlyPaused),
+            ),
+            HostPauseRead::Unreadable(_) => (Value::Null, Value::Null),
+        };
         let doc = output::with_error(
             json!({
                 "sandboxes": items,
-                "paused": report.host.word == HostPauseWord::Paused,
-                "partly": report.host.word == HostPauseWord::PartlyPaused,
-                "host": HostPauseRead::Readable(report.host.clone()),
+                "paused": paused,
+                "partly": partly,
+                "host": &report.host,
             }),
             code,
             || {
-                format!(
-                    "{} could not start: see each one's error",
-                    count(failed, "sandbox", "sandboxes")
-                )
+                if failed > 0 {
+                    format!(
+                        "{} could not start: see each one's error",
+                        count(failed, "sandbox", "sandboxes")
+                    )
+                } else if let HostPauseRead::Unreadable(why) = &report.host {
+                    format!("pause state unreadable: {why}")
+                } else {
+                    "resume failed".to_owned()
+                }
             },
         );
         output::emit(&doc);
@@ -985,7 +1040,10 @@ fn emit_resume(report: &ResumeReport) -> u8 {
 
     if report.no_record {
         println!("No pause in force: nothing to resume.");
-        return exit::OK;
+        if let HostPauseRead::Unreadable(why) = &report.host {
+            eprintln!("error: pause state unreadable: {why}.");
+        }
+        return code;
     }
     for s in &report.sandboxes {
         let agents_note = match s.agents.is_empty() {
@@ -1016,9 +1074,14 @@ fn emit_resume(report: &ResumeReport) -> u8 {
             }
         }
     }
-    match report.host.summary_line() {
-        Some(line) => println!("{line}."),
-        None => println!("Running."),
+    match &report.host {
+        HostPauseRead::Readable(h) => match h.summary_line() {
+            Some(line) => println!("{line}."),
+            None => println!("Running."),
+        },
+        HostPauseRead::Unreadable(why) => {
+            eprintln!("error: pause state unreadable: {why}.");
+        }
     }
     code
 }

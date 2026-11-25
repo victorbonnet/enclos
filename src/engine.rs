@@ -67,7 +67,8 @@ pub use pause::{
     SandboxResumeResult,
 };
 pub use pause_state::{
-    HostPauseRead, HostPauseView, HostPauseWord, NotPausedWhy, SandboxPauseInput, SandboxPauseView,
+    HostPauseRead, HostPauseView, HostPauseWord, NotPausedWhy, SandboxPauseInput, SandboxPauseRead,
+    SandboxPauseView,
 };
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};

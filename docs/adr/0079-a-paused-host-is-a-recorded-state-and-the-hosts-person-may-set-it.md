@@ -45,7 +45,7 @@ The state has to be a record because a paused sandbox's services are *removed*: 
 | A sandbox the pause names | `sandbox_pauses` row, key the sandbox | `labels` it stopped (empty when it found none), `kept` services, `released` |
 | **Member** | derived | a sandbox with a `sandbox_pauses` row |
 | **Covered** | derived | a member not released; a member whose resume did not take (owed); under `pause_all`, any sandbox with no row |
-| **Owed** | derived | a member with labels, `released` set, state `running`, and no runtime service installed again |
+| **Owed** | derived | a member with labels, `released` set, and no runtime service installed again |
 | **Paused** (presented) | derived | a member not released, with labels, state `running`, no runtime service installed |
 | **Presented host word** | derived | `Running`, `Paused`, `Partly paused` |
 
@@ -53,7 +53,7 @@ All of a sandbox's agents are paused together; there is no per-agent state (ADR 
 
 ### Membership, coverage and the reason a sandbox is not paused
 
-A member is decided when the pause runs. A sandbox with runtime services installed is stopped and marked paused. One with none (already stopped, created, or failed) is *covered but not paused*: left exactly as it was, named so, and a later resume says it left it as it was. A subset pause writes a record **only when it stopped something** (or was asked for the whole host), so a subset over sandboxes that all lack services writes no record and leaves the host's word unchanged. A sandbox *created* while a host-wide pause is in force has no row and is covered, because `pause_all` is never cleared by a later pause.
+A member is decided when the pause runs. A sandbox with runtime services installed is stopped and marked paused. One with none (already stopped, created, or failed) is *covered but not paused*: left exactly as it was, named so, and a later resume says it left it as it was. When no record is in force, a subset pause writes a record **only when it stopped something** (or was asked for the whole host), so a subset over sandboxes that all lack services writes no record and leaves the host's word unchanged; when a record is already in force, a subset pause grows membership to include newly named stopped sandboxes (with empty `labels`) and clears `released` on previously released members. A sandbox *created* while a host-wide pause is in force has no row and is covered, because `pause_all` is never cleared by a later pause.
 
 A sandbox that is not paused carries exactly one of five words, `why`, in `pause.state` and in the CLI's JSON: `not_covered`, `released`, `nothing_to_pause`, `would_not_stop`, `would_not_start`. `released` persists after a resume (its row stays, with `released` set) until the record ends, so the reason survives a reconnect.
 
@@ -61,7 +61,7 @@ A sandbox that is not paused carries exactly one of five words, `why`, in `pause
 
 | From | Event | To | What is written, in what order |
 | --- | --- | --- | --- |
-| host: not in force | `sandbox pause --all` | in force, `pause_all` | (1) the audit entry opens; (2) the `host_pause` row with a new `revision`; (3) per member, its row **before** its services are removed, so a crash leaves a pause that is *named* rather than a stop nobody can undo |
+| host: not in force | `sandbox pause --all` | in force, `pause_all` | (1) the audit entry opens; (2) the `host_pause` row (with a new `revision`) and all member rows are written together in **one transaction** **before** any service is removed, so a database failure rolls back wholly and a crash leaves a pause that is *named* rather than a stop nobody can undo |
 | host: not in force | `sandbox pause <name>...` | in force if a named sandbox had services, else unchanged | as above; the named sandboxes with no services become members with empty `labels` |
 | host: in force | `sandbox pause` again | membership grows; `pause_all` set when `--all` | never shrinks; a released member paused again has `released` cleared |
 | member: covered | a service will not stop | member named, host Partly paused | the row stays; the audit entry closes `failed` naming it |
@@ -113,10 +113,10 @@ The stopped labels are stored, not derived: an upgrade may change what a runtime
 
 The rule that decides every field: an optional field, `type` or capability does not raise `v`; a new *value* of a fixed-set field is legal only behind a capability on both legs. `sandboxes.state` and the CLI's `state` are fixed sets, so the pause is carried by an optional sibling (`paused`, `why`) and capability-guarded messages, never a new wording of `state`. The messages are specified in [protocol.md](../protocol.md):
 
-- `pause` and `resume`: an optional `revision` (one fence, host-wide, for both forms) and an optional `sandboxes` (absent means every sandbox; present means exactly those names; present but empty is `bad_message`). A name that is malformed is `bad_message`; a name this host has no sandbox of is `not_found`, and the whole request is refused with nothing carried out.
+- `pause` and `resume`: an optional `revision` (one fence, host-wide, for both forms) and an optional `sandboxes` (absent means every sandbox; present means exactly those names; present but empty or explicit `null` is `bad_message`; duplicate names are deduplicated in first-occurrence order). A name that is malformed is `bad_message`; a name this host has no sandbox of is `not_found`, and the whole request is refused with nothing carried out.
 - `pause.subset`: a second capability, advertised beside `pause` to the host's person only, and required of the device before it may send `sandboxes`. An older bridge that does not advertise it never receives a subset request.
-- `pause.state`: canonical, no `of`, with a row per sandbox carrying `paused`, `state` and, exactly when not paused, `why`.
-- `pause.result`: correlated by `of`, carrying a row per named sandbox, never inferred from `pause.state`.
+- `pause.state`: canonical, no `of`, with a row per sandbox carrying `paused`, `state` and, exactly when not paused, `why`; `by` carries only the person's name or login without device or request identifiers.
+- `pause.result`: correlated by `of`, carrying a row per named sandbox, never inferred from `pause.state`. If the host's state cannot be read back after the work completes, `pause.result` is still sent with the per-sandbox rows (`paused: false`, `partly: true`, `revision: 0`) rather than withheld as an `error`.
 
 ## Authority and audit
 
@@ -124,11 +124,11 @@ The CLI is the local user, as every command. The phone is the host's person on a
 
 ## Durability and truthful reporting
 
-- **A pause interrupted part-way** leaves a named pause: rows are written before services are removed, so the host reads Partly paused naming the member still running; a later pause finishes it and is idempotent. The audit entry is left unfinished, which `audit verify` lists.
-- **A failed pause leaves no unnamed half-state.** A name, fence, lock or audit failure writes no row. A service that will not stop leaves its member *named and covered*, the host Partly paused, and the command non-zero.
+- **A pause interrupted part-way** leaves a named pause: the host row and all member rows are written together in one transaction before services are removed, so the host reads Partly paused naming the member still running; a later pause finishes it and is idempotent. Every error path after the audit entry opens closes it `failed`; an unfinished entry remains only on a crash, which `audit verify` lists.
+- **A failed pause leaves no unnamed half-state.** A name, fence, lock, database-write or audit failure writes no row. A service that will not stop leaves its member *named and covered*, the host Partly paused, and the command non-zero.
 - **A resume that fails on one sandbox** keeps that member owed and covered and exits non-zero; the members that did resume are released. The message names `enclos sandbox resume`, not `sandbox start`.
 - **Presented words.** Paused: the record says so and nothing of the host runs. Partly paused: it names what still runs and what is owed — never "paused". `Paused · nothing to pause: every sandbox is already stopped` for a host-wide pause over nothing. Never Paused while anything runs. A sandbox "runs" when its record state is `running` and it is not paused, so a running sandbox with no runtime service keeps the host Partly paused and is named with `nothing_to_pause`.
-- **Cannot tell** is said as such, never as zero or as Running.
+- **Cannot tell** is said as such, never as zero, as Running, or as not paused: an unreadable `host_pause` or `sandbox_pauses` row is reported as unreadable in `status`, `sandbox list`, `sandbox show` and `state check` (which treats the pause state as unknown and does not flag paused services as missing or offer `RecordStopped`), and a failed post-work host read still returns the per-sandbox report.
 
 ## Testable invariants
 

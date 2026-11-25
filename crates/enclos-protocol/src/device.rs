@@ -206,7 +206,11 @@ pub enum FromDevice {
     Pause {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_non_null_sandboxes"
+        )]
         sandboxes: Option<Vec<String>>,
     },
     /// Resume the named members, or every member when `sandboxes` is absent.
@@ -214,7 +218,11 @@ pub enum FromDevice {
     Resume {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_non_null_sandboxes"
+        )]
         sandboxes: Option<Vec<String>>,
     },
     #[serde(rename = "conversation.new")]
@@ -291,6 +299,17 @@ pub enum FromDevice {
     Ack { of: MessageId },
     #[serde(rename = "error")]
     Error(ErrorBody),
+}
+
+/// Deserializes `sandboxes` when the key is present: requires an array of
+/// strings and refuses explicit `null` so a nil-encoding client can never
+/// widen a subset request into a host-wide pause or resume. Absent uses
+/// `#[serde(default)]` (`None`).
+fn deserialize_non_null_sandboxes<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 /// The host feature of closing a policy request: the message type a device
@@ -2182,4 +2201,24 @@ fn pause_state_and_result_round_trip_and_refuse_unknown_words() {
 
     let bad_outcome = br#"{"v":1,"id":"r-2","type":"pause.result","of":"p-1","paused":false,"partly":true,"revision":1,"sandboxes":[{"sandbox":"lab","outcome":"invented"}]}"#;
     assert!(decode_to_device(bad_outcome).is_err());
+}
+
+#[test]
+fn pause_and_resume_refuse_explicit_null_sandboxes() {
+    for (raw, expected_id) in [
+        (
+            br#"{"v":1,"id":"p-null","type":"pause","sandboxes":null}"#.as_slice(),
+            "p-null",
+        ),
+        (
+            br#"{"v":1,"id":"r-null","type":"resume","sandboxes":null}"#.as_slice(),
+            "r-null",
+        ),
+    ] {
+        let err = decode_from_device(raw).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Bad { ref id, .. } if id.as_deref() == Some(expected_id)),
+            "expected DecodeError::Bad for {expected_id}, got {err:?}"
+        );
+    }
 }

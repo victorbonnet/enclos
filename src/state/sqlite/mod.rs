@@ -674,6 +674,18 @@ impl StateStore for SqliteStateStore {
         pause::get_sandbox(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 
+    fn begin_pause(
+        &self,
+        _lock: &StateLock,
+        pause_all: bool,
+        by: &Actor,
+        at: Timestamp,
+        rows: &[SandboxPauseRecord],
+    ) -> Result<HostPauseRecord> {
+        let mut conn = self.open()?;
+        pause::begin_pause(&mut conn, pause_all, by, at, rows).map_err(|e| self.read_err(e))
+    }
+
     fn ensure_host_pause(
         &self,
         _lock: &StateLock,

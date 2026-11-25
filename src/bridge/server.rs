@@ -5595,7 +5595,7 @@ mod connection_end_tests {
 
         /// `bytes`, sealed as they are: a message the bridge may not be
         /// able to read.
-        fn send_raw(&mut self, bytes: &[u8]) {
+        pub(super) fn send_raw(&mut self, bytes: &[u8]) {
             let sealed = self.session.encrypt(bytes).unwrap();
             self.socket.send(Message::Binary(sealed.into())).unwrap();
         }

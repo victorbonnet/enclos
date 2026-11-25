@@ -9,7 +9,7 @@ use enclos_protocol::device::{
 };
 use enclos_protocol::plugin::ErrorCode;
 
-use crate::engine::pause_state::{HostPauseWord, NotPausedWhy};
+use crate::engine::pause_state::{HostPauseRead, HostPauseWord, NotPausedWhy};
 use crate::engine::{
     Engine, PauseOutcome as EnginePauseOutcome, PauseScope, ResumeOutcome as EngineResumeOutcome,
 };
@@ -132,12 +132,33 @@ pub trait Pausing: Send + Sync {
     ) -> Result<PauseActionResult, PauseError>;
 }
 
+/// Formats `host_pause.by_user` for `pause.state.by`: strips the audit
+/// suffix `" (device ..., request ...)"` or `" (device ...)"` so paired
+/// devices (including other persons') see only the person's name/login,
+/// while the audit log keeps the full actor string.
+fn display_pause_by(user: &str) -> String {
+    match user.split_once(" (device ") {
+        Some((person, _)) => person.to_owned(),
+        None => user.to_owned(),
+    }
+}
+
+fn dedup_names(names: &[SandboxName]) -> Vec<SandboxName> {
+    let mut seen = Vec::with_capacity(names.len());
+    for name in names {
+        if !seen.contains(name) {
+            seen.push(name.clone());
+        }
+    }
+    seen
+}
+
 /// Validates and parses an optional `sandboxes` wire field into a `PauseScope`.
 ///
 /// Enforces:
 /// - absent → `PauseScope::All`
 /// - present → non-empty, at most [`MAX_PAUSE_SANDBOXES`] names, each a valid
-///   [`SandboxName`].
+///   [`SandboxName`], deduplicated in first-occurrence order.
 pub fn parse_scope(sandboxes: Option<Vec<String>>) -> Result<PauseScope, String> {
     let Some(names) = sandboxes else {
         return Ok(PauseScope::All);
@@ -155,7 +176,9 @@ pub fn parse_scope(sandboxes: Option<Vec<String>>) -> Result<PauseScope, String>
         let name = raw
             .parse::<SandboxName>()
             .map_err(|e| format!("invalid sandbox name `{raw}`: {e}"))?;
-        parsed.push(name);
+        if !parsed.contains(&name) {
+            parsed.push(name);
+        }
     }
     Ok(PauseScope::Names(parsed))
 }
@@ -239,7 +262,7 @@ impl Pausing for HostPausing {
             paused: snapshot.host.word == HostPauseWord::Paused,
             partly: snapshot.host.word == HostPauseWord::PartlyPaused,
             since: snapshot.host.since.map(|t| t.to_string()),
-            by: snapshot.host.by.map(|a| a.user),
+            by: snapshot.host.by.map(|a| display_pause_by(&a.user)),
             revision: snapshot.host.revision,
             sandboxes,
         })
@@ -253,7 +276,7 @@ impl Pausing for HostPausing {
     ) -> Result<PauseActionResult, PauseError> {
         let named = match &scope {
             PauseScope::All => None,
-            PauseScope::Names(names) => Some(names.clone()),
+            PauseScope::Names(names) => Some(dedup_names(names)),
         };
         let report = self
             .engine()
@@ -279,10 +302,21 @@ impl Pausing for HostPausing {
                     .collect()
             }
         };
+        let (paused, partly, revision) = match report.host {
+            HostPauseRead::Readable(ref h) => (
+                h.word == HostPauseWord::Paused,
+                h.word == HostPauseWord::PartlyPaused,
+                h.revision,
+            ),
+            HostPauseRead::Unreadable(ref why) => {
+                eprintln!("enclos app: pause state unreadable after pause: {why}");
+                (false, true, 0)
+            }
+        };
         Ok(PauseActionResult {
-            paused: report.host.word == HostPauseWord::Paused,
-            partly: report.host.word == HostPauseWord::PartlyPaused,
-            revision: report.host.revision,
+            paused,
+            partly,
+            revision,
             outcomes,
         })
     }
@@ -295,7 +329,7 @@ impl Pausing for HostPausing {
     ) -> Result<PauseActionResult, PauseError> {
         let named = match &scope {
             PauseScope::All => None,
-            PauseScope::Names(names) => Some(names.clone()),
+            PauseScope::Names(names) => Some(dedup_names(names)),
         };
         let report = self
             .engine()
@@ -321,11 +355,49 @@ impl Pausing for HostPausing {
                     .collect()
             }
         };
+        let (paused, partly, revision) = match report.host {
+            HostPauseRead::Readable(ref h) => (
+                h.word == HostPauseWord::Paused,
+                h.word == HostPauseWord::PartlyPaused,
+                h.revision,
+            ),
+            HostPauseRead::Unreadable(ref why) => {
+                eprintln!("enclos app: pause state unreadable after resume: {why}");
+                (false, true, 0)
+            }
+        };
         Ok(PauseActionResult {
-            paused: report.host.word == HostPauseWord::Paused,
-            partly: report.host.word == HostPauseWord::PartlyPaused,
-            revision: report.host.revision,
+            paused,
+            partly,
+            revision,
             outcomes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_pause_by_strips_device_and_request_ids() {
+        assert_eq!(
+            display_pause_by("owner@example.org (device d1, request p-1)"),
+            "owner@example.org"
+        );
+        assert_eq!(
+            display_pause_by("owner@example.org (device d1)"),
+            "owner@example.org"
+        );
+        assert_eq!(display_pause_by("victor"), "victor");
+    }
+
+    #[test]
+    fn parse_scope_deduplicates_preserving_first_occurrence_order() {
+        let scope = parse_scope(Some(vec!["home".into(), "lab".into(), "home".into()])).unwrap();
+        assert_eq!(
+            scope,
+            PauseScope::Names(vec!["home".parse().unwrap(), "lab".parse().unwrap()])
+        );
     }
 }

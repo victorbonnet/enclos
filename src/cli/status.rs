@@ -179,7 +179,7 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp, pause_in_force
             text
         }
     };
-    let shown_state = if s.paused {
+    let shown_state = if s.pause.is_paused() {
         "paused".to_owned()
     } else {
         state_text(&s.state)
@@ -193,13 +193,23 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp, pause_in_force
     );
 
     let mut facts = Vec::new();
-    if s.paused {
-        facts.push(format!(
-            "resume with `enclos sandbox resume {}` or `--all`",
-            s.name
-        ));
-    } else if pause_in_force && let Some(why) = s.pause_why {
-        facts.push(format!("not paused: {}", why.plain()));
+    match &s.pause {
+        enclos::engine::SandboxPauseRead::Readable { paused: true, .. } => {
+            facts.push(format!(
+                "resume with `enclos sandbox resume {}` or `--all`",
+                s.name
+            ));
+        }
+        enclos::engine::SandboxPauseRead::Readable {
+            paused: false,
+            why: Some(why),
+        } if pause_in_force => {
+            facts.push(format!("not paused: {}", why.plain()));
+        }
+        enclos::engine::SandboxPauseRead::Readable { .. } => {}
+        enclos::engine::SandboxPauseRead::Unreadable(why) => {
+            facts.push(format!("pause state unreadable: {why}"));
+        }
     }
     match &s.services {
         Fact::Known(list) if !list.is_empty() => {

@@ -130,14 +130,13 @@ fn bump_revision(tx: &rusqlite::Transaction<'_>, at: Timestamp) -> Result<u64, R
     Ok(next)
 }
 
-pub fn ensure_host(
-    conn: &mut Connection,
+fn upsert_host_in_tx(
+    tx: &rusqlite::Transaction<'_>,
     pause_all: bool,
     by: &Actor,
     at: Timestamp,
 ) -> Result<HostPauseRecord, ReadError> {
-    let tx = conn.transaction()?;
-    let existing = get_host(&tx)?;
+    let existing = get_host(tx)?;
     let record = match existing {
         Some(mut prev) => {
             prev.revision = next_revision(prev.revision, at);
@@ -175,21 +174,18 @@ pub fn ensure_host(
             }
         }
     };
-    tx.commit()?;
     Ok(record)
 }
 
-pub fn put_sandbox(
-    conn: &mut Connection,
+fn upsert_sandbox_in_tx(
+    tx: &rusqlite::Transaction<'_>,
     rec: &SandboxPauseRecord,
-    at: Timestamp,
-) -> Result<u64, ReadError> {
+) -> Result<(), ReadError> {
     let labels_json = serde_json::to_string(&rec.labels)
         .map_err(|e| ReadError::Corrupt(format!("sandbox_pauses labels encode: {e}")))?;
     let kept_json = serde_json::to_string(&rec.kept)
         .map_err(|e| ReadError::Corrupt(format!("sandbox_pauses kept encode: {e}")))?;
     let released = rec.released.map(|t| t.to_string());
-    let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO sandbox_pauses (sandbox, labels, kept, released, at, by_user, by_host)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -210,6 +206,46 @@ pub fn put_sandbox(
             &rec.by.host,
         ],
     )?;
+    Ok(())
+}
+
+/// Creates or updates `host_pause` and upserts all `rows` into `sandbox_pauses`
+/// in a single transaction, rolling back wholly on any error.
+pub fn begin_pause(
+    conn: &mut Connection,
+    pause_all: bool,
+    by: &Actor,
+    at: Timestamp,
+    rows: &[SandboxPauseRecord],
+) -> Result<HostPauseRecord, ReadError> {
+    let tx = conn.transaction()?;
+    let record = upsert_host_in_tx(&tx, pause_all, by, at)?;
+    for rec in rows {
+        upsert_sandbox_in_tx(&tx, rec)?;
+    }
+    tx.commit()?;
+    Ok(record)
+}
+
+pub fn ensure_host(
+    conn: &mut Connection,
+    pause_all: bool,
+    by: &Actor,
+    at: Timestamp,
+) -> Result<HostPauseRecord, ReadError> {
+    let tx = conn.transaction()?;
+    let record = upsert_host_in_tx(&tx, pause_all, by, at)?;
+    tx.commit()?;
+    Ok(record)
+}
+
+pub fn put_sandbox(
+    conn: &mut Connection,
+    rec: &SandboxPauseRecord,
+    at: Timestamp,
+) -> Result<u64, ReadError> {
+    let tx = conn.transaction()?;
+    upsert_sandbox_in_tx(&tx, rec)?;
     let rev = bump_revision(&tx, at)?;
     tx.commit()?;
     Ok(rev)

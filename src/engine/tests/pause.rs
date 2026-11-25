@@ -5,7 +5,9 @@
 use std::rc::Rc;
 
 use super::*;
-use crate::engine::pause_state::{HostPauseWord, NotPausedWhy, derive_sandbox};
+use crate::engine::pause_state::{
+    HostPauseRead, HostPauseView, HostPauseWord, NotPausedWhy, SandboxPauseRead, derive_sandbox,
+};
 use crate::engine::{PauseOutcome, PauseScope, ResumeOutcome, Unit};
 use crate::model::audit::AuditResult;
 use crate::model::plan::Confirm;
@@ -13,6 +15,13 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use crate::runtime::ServiceName;
 use crate::service::fake::FakeServices;
+
+fn readable_host(read: &HostPauseRead) -> &HostPauseView {
+    match read {
+        HostPauseRead::Readable(v) => v,
+        HostPauseRead::Unreadable(why) => panic!("expected readable host pause, got: {why}"),
+    }
+}
 
 fn sb(name: &str) -> SandboxName {
     name.parse().unwrap()
@@ -110,8 +119,8 @@ fn i13_subset_over_services_less_sandboxes_writes_no_record() {
             .iter()
             .all(|s| s.outcome == PauseOutcome::NothingToPause)
     );
-    assert_eq!(report.host.word, HostPauseWord::Running);
-    assert_eq!(report.host.revision, 0);
+    assert_eq!(readable_host(&report.host).word, HostPauseWord::Running);
+    assert_eq!(readable_host(&report.host).revision, 0);
     assert!(engine.state.host_pause().unwrap().is_none());
     assert!(engine.state.sandbox_pauses().unwrap().is_empty());
 }
@@ -140,9 +149,12 @@ fn i14_and_i15_mixed_subset_pause_and_never_paused_while_anything_runs() {
     assert_eq!(report.sandboxes[1].outcome, PauseOutcome::NothingToPause);
 
     // I15: gamma still runs, so host is Partly paused naming gamma.
-    assert_eq!(report.host.word, HostPauseWord::PartlyPaused);
-    assert_eq!(report.host.runs, vec![run_c.clone()]);
-    assert!(!report.host.pause_all);
+    assert_eq!(
+        readable_host(&report.host).word,
+        HostPauseWord::PartlyPaused
+    );
+    assert_eq!(readable_host(&report.host).runs, vec![run_c.clone()]);
+    assert!(!readable_host(&report.host).pause_all);
 
     // I14: beta is a member with empty labels, covered, not paused, why = nothing_to_pause.
     let host_rec = engine.state.host_pause().unwrap().unwrap();
@@ -191,16 +203,19 @@ fn i16_pause_all_then_resume_one_keeps_released_reason_across_reopen() {
     let paused = engine
         .pause_sandboxes(&alice(), PauseScope::All, None)
         .unwrap();
-    assert_eq!(paused.host.word, HostPauseWord::Paused);
-    assert!(paused.host.pause_all);
+    assert_eq!(readable_host(&paused.host).word, HostPauseWord::Paused);
+    assert!(readable_host(&paused.host).pause_all);
 
     // Resume only alpha: pause_all record stays in force; alpha is released.
     let resumed = engine
         .resume_sandboxes(&alice(), PauseScope::Names(vec![a.clone()]), None)
         .unwrap();
     assert_eq!(resumed.sandboxes[0].outcome, ResumeOutcome::Resumed);
-    assert_eq!(resumed.host.word, HostPauseWord::PartlyPaused);
-    assert_eq!(resumed.host.runs, vec![a.clone()]);
+    assert_eq!(
+        readable_host(&resumed.host).word,
+        HostPauseWord::PartlyPaused
+    );
+    assert_eq!(readable_host(&resumed.host).runs, vec![a.clone()]);
 
     // Reopen store from disk: alpha's row and released reason survive (I16, H12).
     drop(engine);
@@ -283,7 +298,7 @@ fn h2_and_h12_running_restored_stopped_and_failed_left_and_rows_survive_reopen()
     let paused = engine
         .pause_sandboxes(&alice(), PauseScope::All, None)
         .unwrap();
-    assert_eq!(paused.host.word, HostPauseWord::Paused);
+    assert_eq!(readable_host(&paused.host).word, HostPauseWord::Paused);
     assert!(
         engine
             .installed_runtime_services(&running)
@@ -332,7 +347,7 @@ fn h2_and_h12_running_restored_stopped_and_failed_left_and_rows_survive_reopen()
             .unwrap()
             .is_empty()
     );
-    assert_eq!(resumed.host.word, HostPauseWord::Running);
+    assert_eq!(readable_host(&resumed.host).word, HostPauseWord::Running);
     assert!(engine2.state.host_pause().unwrap().is_none());
 }
 
@@ -359,8 +374,11 @@ fn resume_failure_keeps_member_covered_and_host_partly_paused() {
     assert!(!err_msg.contains("sandbox start"), "{err_msg}");
 
     // Member is owed and covered; host is Partly paused naming it; record kept.
-    assert_eq!(resumed.host.word, HostPauseWord::PartlyPaused);
-    assert_eq!(resumed.host.owed, vec![a.clone()]);
+    assert_eq!(
+        readable_host(&resumed.host).word,
+        HostPauseWord::PartlyPaused
+    );
+    assert_eq!(readable_host(&resumed.host).owed, vec![a.clone()]);
     assert!(engine.state.host_pause().unwrap().is_some());
 
     // Re-pausing an owed member clears `released` and restores it to paused.
@@ -368,7 +386,7 @@ fn resume_failure_keeps_member_covered_and_host_partly_paused() {
         .pause_sandboxes(&alice(), PauseScope::Names(vec![a.clone()]), None)
         .unwrap();
     assert_eq!(repaused.sandboxes[0].outcome, PauseOutcome::Paused);
-    assert_eq!(repaused.host.word, HostPauseWord::Paused);
+    assert_eq!(readable_host(&repaused.host).word, HostPauseWord::Paused);
     assert!(
         engine
             .state
@@ -386,7 +404,7 @@ fn resume_failure_keeps_member_covered_and_host_partly_paused() {
         .unwrap();
     assert!(!ok.any_failed());
     assert_eq!(ok.sandboxes[0].outcome, ResumeOutcome::Resumed);
-    assert_eq!(ok.host.word, HostPauseWord::Running);
+    assert_eq!(readable_host(&ok.host).word, HostPauseWord::Running);
     assert!(engine.state.host_pause().unwrap().is_none());
 }
 
@@ -401,8 +419,8 @@ fn pause_all_over_stopped_sandboxes_presents_nothing_to_pause() {
         .pause_sandboxes(&alice(), PauseScope::All, None)
         .unwrap();
     assert_eq!(report.sandboxes[0].outcome, PauseOutcome::NothingToPause);
-    assert_eq!(report.host.word, HostPauseWord::Paused);
-    assert!(report.host.nothing_to_pause_all);
+    assert_eq!(readable_host(&report.host).word, HostPauseWord::Paused);
+    assert!(readable_host(&report.host).nothing_to_pause_all);
     assert_eq!(
         report.host.summary_line().as_deref(),
         Some("Paused · nothing to pause: every sandbox is already stopped")
@@ -423,14 +441,14 @@ fn pause_all_over_subset_never_clears_and_covers_sandbox_created_afterwards() {
     let r1 = engine
         .pause_sandboxes(&alice(), PauseScope::Names(vec![a.clone()]), None)
         .unwrap();
-    assert!(!r1.host.pause_all);
+    assert!(!readable_host(&r1.host).pause_all);
 
     // Upgrade to --all: sets pause_all = true.
     let r2 = engine
         .pause_sandboxes(&alice(), PauseScope::All, None)
         .unwrap();
-    assert!(r2.host.pause_all);
-    assert_eq!(r2.host.word, HostPauseWord::Paused);
+    assert!(readable_host(&r2.host).pause_all);
+    assert_eq!(readable_host(&r2.host).word, HostPauseWord::Paused);
 
     // A sandbox created afterwards has no row yet, but is covered because pause_all = 1.
     let c = create_sandbox(&engine, "gamma");
@@ -452,7 +470,7 @@ fn pause_all_over_subset_never_clears_and_covers_sandbox_created_afterwards() {
     let r3 = engine
         .pause_sandboxes(&alice(), PauseScope::Names(vec![a.clone()]), None)
         .unwrap();
-    assert!(r3.host.pause_all);
+    assert!(readable_host(&r3.host).pause_all);
     assert_eq!(r3.sandboxes[0].outcome, PauseOutcome::Paused);
 }
 
@@ -499,7 +517,7 @@ fn names_first_refusal_and_revision_fence_change_nothing() {
     let ok = engine
         .pause_sandboxes(&alice(), PauseScope::All, Some(0))
         .unwrap();
-    let rev = ok.host.revision;
+    let rev = readable_host(&ok.host).revision;
     assert!(rev > 0);
 
     // Stale expected_revision on resume refuses and changes nothing.
@@ -590,11 +608,21 @@ fn status_and_views_present_paused_state_and_unreadable_record() {
 
     // SandboxView & StatusView agree on derived pause state.
     let view_a = engine.show_sandbox(&a).unwrap();
-    assert!(view_a.paused);
-    assert_eq!(view_a.pause_why, None);
+    assert_eq!(
+        view_a.pause,
+        SandboxPauseRead::Readable {
+            paused: true,
+            why: None
+        }
+    );
     let view_b = engine.show_sandbox(&b).unwrap();
-    assert!(!view_b.paused);
-    assert_eq!(view_b.pause_why, Some(NotPausedWhy::NotCovered));
+    assert_eq!(
+        view_b.pause,
+        SandboxPauseRead::Readable {
+            paused: false,
+            why: Some(NotPausedWhy::NotCovered)
+        }
+    );
 
     let status = engine.status(None).unwrap();
     assert!(matches!(
@@ -602,11 +630,21 @@ fn status_and_views_present_paused_state_and_unreadable_record() {
         HostPauseRead::Readable(h) if h.word == HostPauseWord::PartlyPaused && h.runs == vec![b.clone()]
     ));
     let st_a = status.sandboxes.iter().find(|s| s.name == a).unwrap();
-    assert!(st_a.paused);
-    assert_eq!(st_a.pause_why, None);
+    assert_eq!(
+        st_a.pause,
+        SandboxPauseRead::Readable {
+            paused: true,
+            why: None
+        }
+    );
     let st_b = status.sandboxes.iter().find(|s| s.name == b).unwrap();
-    assert!(!st_b.paused);
-    assert_eq!(st_b.pause_why, Some(NotPausedWhy::NotCovered));
+    assert_eq!(
+        st_b.pause,
+        SandboxPauseRead::Readable {
+            paused: false,
+            why: Some(NotPausedWhy::NotCovered)
+        }
+    );
 
     // Corrupt the host_pause row so it cannot be read: status still prints
     // sandboxes and reports pause state as Unreadable (never Running).
@@ -625,4 +663,347 @@ fn status_and_views_present_paused_state_and_unreadable_record() {
     let json_val = serde_json::to_value(&unreadable.pause).unwrap();
     assert_eq!(json_val["state"], "unreadable");
     assert!(json_val["error"].as_str().unwrap().contains("pause_all"));
+}
+
+#[test]
+fn subset_pause_while_in_force_adds_stopped_sandbox_and_clears_released() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let grid = create_sandbox(&engine, "grid");
+    let lab = create_sandbox(&engine, "lab");
+    seed_sandbox(&engine, &fake, &grid, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Stopped, false);
+
+    // Pause running `grid`: host record comes into force.
+    let r1 = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![grid.clone()]), None)
+        .unwrap();
+    assert_eq!(r1.sandboxes[0].outcome, PauseOutcome::Paused);
+    assert!(engine.state.sandbox_pause(&lab).unwrap().is_none());
+
+    // Pause stopped `lab` while record is in force: membership grows, `lab`
+    // gets an empty row and reads covered, not paused, why = nothing_to_pause.
+    let r2 = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert_eq!(r2.sandboxes[0].outcome, PauseOutcome::NothingToPause);
+    let host = engine.state.host_pause().unwrap().unwrap();
+    let row_lab = engine.state.sandbox_pause(&lab).unwrap().unwrap();
+    assert!(row_lab.labels.is_empty());
+    assert!(row_lab.released.is_none());
+    let derived_lab = derive_sandbox(
+        Some(&host),
+        SandboxPauseInput {
+            name: &lab,
+            state: &SandboxState::Stopped,
+            has_runtime_services: false,
+            row: Some(&row_lab),
+        },
+    );
+    assert!(derived_lab.member && derived_lab.covered && !derived_lab.paused);
+    assert_eq!(derived_lab.why, Some(NotPausedWhy::NothingToPause));
+
+    // Resume `lab` (sets `released`), keep `grid` paused so host record stays
+    // in force, then pause stopped `lab` again: `released` is cleared.
+    engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert!(
+        engine
+            .state
+            .sandbox_pause(&lab)
+            .unwrap()
+            .unwrap()
+            .released
+            .is_some()
+    );
+    engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert!(
+        engine
+            .state
+            .sandbox_pause(&lab)
+            .unwrap()
+            .unwrap()
+            .released
+            .is_none()
+    );
+
+    // Also test a released member that HAS labels and is now stopped:
+    // resume `grid` with failure -> stop `grid` -> pause `grid` -> `released`
+    // cleared and labels kept!
+    *fake.refuse.borrow_mut() = Some(".gateway".into());
+    engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![grid.clone()]), None)
+        .unwrap();
+    *fake.refuse.borrow_mut() = None;
+    done(engine.stop_sandbox(&alice(), &grid, Confirm::Yes).unwrap());
+    let before = engine.state.sandbox_pause(&grid).unwrap().unwrap();
+    assert!(before.released.is_some());
+    assert!(!before.labels.is_empty());
+
+    let r3 = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![grid.clone()]), None)
+        .unwrap();
+    assert_eq!(r3.sandboxes[0].outcome, PauseOutcome::NothingToPause);
+    let after = engine.state.sandbox_pause(&grid).unwrap().unwrap();
+    assert!(after.released.is_none());
+    assert_eq!(after.labels, before.labels);
+}
+
+#[test]
+fn owed_member_stays_covered_when_stopped_and_keeps_record_on_other_resume() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let grid = create_sandbox(&engine, "grid");
+    let lab = create_sandbox(&engine, "lab");
+    seed_sandbox(&engine, &fake, &grid, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Running, true);
+
+    // Subset pause (pause_all = 0) of grid and lab.
+    engine
+        .pause_sandboxes(
+            &alice(),
+            PauseScope::Names(vec![grid.clone(), lab.clone()]),
+            None,
+        )
+        .unwrap();
+
+    // Make `resume grid` fail so grid is owed.
+    *fake.refuse.borrow_mut() = Some("grid.gateway".into());
+    let r = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![grid.clone()]), None)
+        .unwrap();
+    assert_eq!(r.sandboxes[0].outcome, ResumeOutcome::WouldNotStart);
+    *fake.refuse.borrow_mut() = None;
+
+    // Stop grid: per answers §5, grid is STILL covered and owed with why = would_not_start.
+    done(engine.stop_sandbox(&alice(), &grid, Confirm::Yes).unwrap());
+    let snap = engine.pause_state_snapshot().unwrap();
+    let grid_entry = snap.sandboxes.iter().find(|s| s.sandbox == grid).unwrap();
+    assert!(grid_entry.view.owed);
+    assert!(grid_entry.view.covered);
+    assert!(!grid_entry.view.paused);
+    assert_eq!(grid_entry.view.why, Some(NotPausedWhy::WouldNotStart));
+
+    // A later `resume lab` (with pause_all = 0) must NOT delete the host record
+    // because grid is still owed.
+    let r2 = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![lab.clone()]), None)
+        .unwrap();
+    assert_eq!(r2.sandboxes[0].outcome, ResumeOutcome::Resumed);
+    assert!(engine.state.host_pause().unwrap().is_some());
+    assert_eq!(readable_host(&r2.host).word, HostPauseWord::PartlyPaused);
+    assert_eq!(readable_host(&r2.host).owed, vec![grid]);
+}
+
+#[test]
+fn h11_would_not_stop_keeps_row_names_it_and_host_reads_partly_paused() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let a = create_sandbox(&engine, "alpha");
+    let b = create_sandbox(&engine, "beta");
+    seed_sandbox(&engine, &fake, &a, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &b, SandboxState::Running, true);
+
+    *fake.refuse_stop.borrow_mut() = Some("beta.gateway".into());
+    let report = engine
+        .pause_sandboxes(&alice(), PauseScope::All, None)
+        .unwrap();
+    assert!(report.any_failed());
+    let res_a = report.sandboxes.iter().find(|s| s.sandbox == a).unwrap();
+    let res_b = report.sandboxes.iter().find(|s| s.sandbox == b).unwrap();
+    assert_eq!(res_a.outcome, PauseOutcome::Paused);
+    assert_eq!(res_b.outcome, PauseOutcome::WouldNotStop);
+    assert!(res_b.error.is_some());
+
+    // beta keeps its row, host reads Partly paused naming beta.
+    assert!(engine.state.sandbox_pause(&b).unwrap().is_some());
+    let host = readable_host(&report.host);
+    assert_eq!(host.word, HostPauseWord::PartlyPaused);
+    assert_eq!(host.runs, vec![b.clone()]);
+
+    // Audit entry closed as failed naming beta, no unfinished entry.
+    let entries = engine.audit(None).unwrap();
+    let pause_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox pause")
+        .unwrap();
+    assert_eq!(
+        pause_entry.finished.as_ref().unwrap().outcome.result,
+        AuditResult::Failed
+    );
+    assert!(
+        pause_entry
+            .finished
+            .as_ref()
+            .unwrap()
+            .outcome
+            .message
+            .contains("beta")
+    );
+    assert!(engine.verify_audit().unwrap().unfinished.is_empty());
+}
+
+#[test]
+fn error_after_audit_begin_finishes_audit_entry_as_failed_for_pause_and_resume() {
+    // 1. Resume: inject an `installed_runtime_services` error after `audit.begin`.
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let a = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &a, SandboxState::Running, true);
+    engine
+        .pause_sandboxes(&alice(), PauseScope::All, None)
+        .unwrap();
+
+    *fake.refuse_installed.borrow_mut() = true;
+    assert!(
+        engine
+            .resume_sandboxes(&alice(), PauseScope::All, None)
+            .is_err()
+    );
+    *fake.refuse_installed.borrow_mut() = false;
+
+    let entries = engine.audit(None).unwrap();
+    let resume_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox resume")
+        .expect("resume audit entry");
+    assert_eq!(
+        resume_entry.finished.as_ref().unwrap().outcome.result,
+        AuditResult::Failed
+    );
+    assert!(engine.verify_audit().unwrap().unfinished.is_empty());
+
+    // 2. Pause: drop `sandbox_pauses` table after planning? Planning reads
+    // `sandbox_pauses`, so instead drop a trigger/check or make `begin_pause`
+    // fail via a SQLite trigger that aborts INSERT into `host_pause`!
+    let fake2 = Rc::new(FakeServices::default());
+    let (dir2, engine2) = setup_engine(&fake2);
+    let b = create_sandbox(&engine2, "beta");
+    seed_sandbox(&engine2, &fake2, &b, SandboxState::Running, true);
+
+    let conn = rusqlite::Connection::open(dir2.path().join("enclos/state.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER abort_host_pause BEFORE INSERT ON host_pause
+         BEGIN SELECT RAISE(ABORT, 'injected host_pause failure'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(
+        engine2
+            .pause_sandboxes(&alice(), PauseScope::All, None)
+            .is_err()
+    );
+    let entries2 = engine2.audit(None).unwrap();
+    let pause_entry = entries2
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox pause")
+        .expect("pause audit entry");
+    assert_eq!(
+        pause_entry.finished.as_ref().unwrap().outcome.result,
+        AuditResult::Failed
+    );
+    assert!(engine2.verify_audit().unwrap().unfinished.is_empty());
+}
+
+#[test]
+fn failed_host_read_after_work_still_returns_sandbox_report() {
+    let fake = Rc::new(FakeServices::default());
+    let (dir, engine) = setup_engine(&fake);
+    let a = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &a, SandboxState::Running, true);
+
+    // Corrupt `host_pause` during `on_stop`, after rows are written and
+    // service stops, so the post-work `read_host_pause` fails.
+    let db_path = dir.path().join("enclos/state.db");
+    *fake.on_stop.borrow_mut() = Some(Box::new(move |_| {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE host_pause SET pause_all = 99 WHERE id = 1", [])
+            .unwrap();
+    }));
+
+    let report = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![a.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert!(report.host_unreadable());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, a);
+    assert_eq!(report.sandboxes[0].outcome, PauseOutcome::Paused);
+    assert!(engine.verify_audit().unwrap().unfinished.is_empty());
+}
+
+#[test]
+fn unreadable_sandbox_pause_record_is_reported_never_not_paused() {
+    use crate::engine::Remedy;
+
+    let fake = Rc::new(FakeServices::default());
+    let (dir, engine) = setup_engine(&fake);
+    let a = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &a, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(&alice(), PauseScope::All, None)
+        .unwrap();
+
+    // Corrupt `sandbox_pauses.labels` on disk with invalid JSON.
+    let conn = rusqlite::Connection::open(dir.path().join("enclos/state.db")).unwrap();
+    conn.execute(
+        "UPDATE sandbox_pauses SET labels = 'not-json' WHERE sandbox = 'alpha'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // 1. `state check` reports unreadable pause record, does NOT flag paused
+    //    gateway as missing, and does NOT offer RecordStopped repair.
+    let findings = engine.state_check(Some(&a)).unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.what.contains("pause record cannot be read")),
+        "expected unreadable finding, got: {findings:?}"
+    );
+    assert!(
+        !findings.iter().any(|f| f.what.contains("gateway")),
+        "paused gateway must not be flagged missing: {findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| matches!(f.remedy, Remedy::Repairs(_))),
+        "must not offer automatic repair on unreadable pause record: {findings:?}"
+    );
+
+    // 2. `sandbox show` reports `SandboxPauseRead::Unreadable`, never `paused: false`.
+    let view = engine.show_sandbox(&a).unwrap();
+    assert!(
+        matches!(&view.pause, SandboxPauseRead::Unreadable(why) if why.contains("labels")),
+        "{:?}",
+        view.pause
+    );
+
+    // 3. `status` reports `SandboxPauseRead::Unreadable` and serialises `"paused": null`
+    //    with `"pause_unreadable"`, never `"paused": false`.
+    let status = engine.status(None).unwrap();
+    let st_a = status.sandboxes.iter().find(|s| s.name == a).unwrap();
+    assert!(
+        matches!(&st_a.pause, SandboxPauseRead::Unreadable(why) if why.contains("labels")),
+        "{:?}",
+        st_a.pause
+    );
+    let json_val = serde_json::to_value(st_a).unwrap();
+    assert_eq!(json_val["paused"], serde_json::Value::Null);
+    assert!(
+        json_val["pause_unreadable"]
+            .as_str()
+            .unwrap()
+            .contains("labels")
+    );
 }

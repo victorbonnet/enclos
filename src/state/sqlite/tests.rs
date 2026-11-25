@@ -1478,6 +1478,119 @@ fn host_pause_rows_survive_reopen_advance_revision_and_cascade() {
 }
 
 #[test]
+fn begin_pause_is_atomic_and_rolls_back_wholly_on_row_failure() {
+    use crate::model::audit::Actor;
+    use crate::model::pause::SandboxPauseRecord;
+
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("alpha")).unwrap();
+    store.put(&lock, &record("beta")).unwrap();
+
+    let alice = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let t0: Timestamp = "2026-11-25T12:00:00.000Z".parse().unwrap();
+    let alpha: SandboxName = "alpha".parse().unwrap();
+    let missing: SandboxName = "missing".parse().unwrap();
+
+    // Case 1: no host_pause in force yet. A failing row (foreign key for
+    // nonexistent sandbox `missing`) rolls back both `host_pause` and `alpha`.
+    let err = store
+        .begin_pause(
+            &lock,
+            true,
+            &alice,
+            t0,
+            &[
+                SandboxPauseRecord {
+                    sandbox: alpha.clone(),
+                    labels: vec!["enclos.alpha.gateway".into()],
+                    kept: vec!["enclos.alpha.proxy".into()],
+                    released: None,
+                    at: t0,
+                    by: alice.clone(),
+                },
+                SandboxPauseRecord {
+                    sandbox: missing.clone(),
+                    labels: vec!["enclos.missing.gateway".into()],
+                    kept: vec![],
+                    released: None,
+                    at: t0,
+                    by: alice.clone(),
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY") || err.to_string().contains("constraint"),
+        "{err}"
+    );
+    assert!(store.host_pause().unwrap().is_none());
+    assert!(store.sandbox_pauses().unwrap().is_empty());
+
+    // Case 2: host_pause already in force. A later begin_pause that fails on
+    // a row rolls back the revision bump, pause_all upgrade, and earlier rows.
+    let initial = store
+        .begin_pause(
+            &lock,
+            false,
+            &alice,
+            t0,
+            &[SandboxPauseRecord {
+                sandbox: alpha.clone(),
+                labels: vec!["enclos.alpha.gateway".into()],
+                kept: vec!["enclos.alpha.proxy".into()],
+                released: None,
+                at: t0,
+                by: alice.clone(),
+            }],
+        )
+        .unwrap();
+    assert!(!initial.pause_all);
+    assert_eq!(store.sandbox_pauses().unwrap().len(), 1);
+
+    let beta: SandboxName = "beta".parse().unwrap();
+    let t1: Timestamp = "2026-11-25T12:00:05.000Z".parse().unwrap();
+    assert!(
+        store
+            .begin_pause(
+                &lock,
+                true,
+                &alice,
+                t1,
+                &[
+                    SandboxPauseRecord {
+                        sandbox: beta.clone(),
+                        labels: vec!["enclos.beta.gateway".into()],
+                        kept: vec![],
+                        released: None,
+                        at: t1,
+                        by: alice.clone(),
+                    },
+                    SandboxPauseRecord {
+                        sandbox: missing,
+                        labels: vec![],
+                        kept: vec![],
+                        released: None,
+                        at: t1,
+                        by: alice.clone(),
+                    },
+                ],
+            )
+            .is_err()
+    );
+    let after = store.host_pause().unwrap().unwrap();
+    assert_eq!(after.revision, initial.revision);
+    assert!(!after.pause_all);
+    let rows = store.sandbox_pauses().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sandbox, alpha);
+}
+
+#[test]
 fn migrates_from_13_to_14_and_documented_reversal_matches_13() {
     let (_dir, store) = store();
     let conn = Connection::open(&store.db).unwrap();

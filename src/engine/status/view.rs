@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::{Serialize, Serializer};
 
 use super::{Disk, Suggestion};
-use crate::engine::pause_state::{HostPauseRead, NotPausedWhy};
+use crate::engine::pause_state::{HostPauseRead, SandboxPauseRead};
 pub use crate::engine::releases::LatestRelease;
 use crate::model::Timestamp;
 use crate::model::runtime::RuntimeKind;
@@ -86,11 +86,10 @@ pub struct SandboxStatus {
     pub name: SandboxName,
     #[serde(flatten)]
     pub state: SandboxState,
-    /// Derived pause state (from `host_pause` + `sandbox_pauses` + runtime services).
-    pub paused: bool,
-    /// Why the sandbox is not paused; present iff `!paused` and pause state is readable.
-    #[serde(rename = "why", skip_serializing_if = "Option::is_none")]
-    pub pause_why: Option<NotPausedWhy>,
+    /// Derived pause state (from `host_pause` + `sandbox_pauses` + runtime services),
+    /// or `Unreadable` when the pause record cannot be read.
+    #[serde(flatten)]
+    pub pause: SandboxPauseRead,
     pub created_at: Timestamp,
     pub runtime: Option<RuntimeStatus>,
     /// The sandbox's installed services, with the state the service

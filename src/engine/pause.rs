@@ -11,7 +11,8 @@ use serde::Serialize;
 
 use super::Engine;
 use super::pause_state::{
-    HostPauseRead, HostPauseView, SandboxPauseInput, SandboxPauseView, derive_host, derive_sandbox,
+    HostPauseRead, HostPauseView, SandboxPauseInput, SandboxPauseRead, SandboxPauseView,
+    derive_host, derive_sandbox,
 };
 use super::service::{IfUnrecorded, Unit};
 use crate::error::{Error, Result};
@@ -78,7 +79,7 @@ pub struct SandboxPauseResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PauseReport {
     pub sandboxes: Vec<SandboxPauseResult>,
-    pub host: HostPauseView,
+    pub host: HostPauseRead,
 }
 
 impl PauseReport {
@@ -86,6 +87,10 @@ impl PauseReport {
         self.sandboxes
             .iter()
             .any(|s| s.outcome == PauseOutcome::WouldNotStop)
+    }
+
+    pub fn host_unreadable(&self) -> bool {
+        matches!(self.host, HostPauseRead::Unreadable(_))
     }
 }
 
@@ -108,7 +113,7 @@ pub struct ResumeReport {
     /// `true` when no pause record was in force when resume ran.
     pub no_record: bool,
     pub sandboxes: Vec<SandboxResumeResult>,
-    pub host: HostPauseView,
+    pub host: HostPauseRead,
 }
 
 /// One sandbox's derived pause state alongside its lifecycle state.
@@ -131,6 +136,10 @@ impl ResumeReport {
         self.sandboxes
             .iter()
             .any(|s| s.outcome == ResumeOutcome::WouldNotStart)
+    }
+
+    pub fn host_unreadable(&self) -> bool {
+        matches!(self.host, HostPauseRead::Unreadable(_))
     }
 }
 
@@ -311,6 +320,9 @@ impl Engine {
             RePauseOwed {
                 row: SandboxPauseRecord,
             },
+            ClearReleased {
+                row: SandboxPauseRecord,
+            },
             AlreadyPaused {
                 labels: Vec<String>,
             },
@@ -322,6 +334,7 @@ impl Engine {
         let mut planned: Vec<(SandboxName, TargetPlan)> = Vec::with_capacity(targets.len());
         let mut any_to_stop = false;
         let mut any_repause_owed = false;
+        let mut any_membership_change = false;
 
         for name in &targets {
             let record = self.record(name)?;
@@ -339,28 +352,50 @@ impl Engine {
                 let labels: Vec<String> = rt_labels.iter().map(ToString::to_string).collect();
                 any_to_stop = true;
                 planned.push((name.clone(), TargetPlan::Stop { labels, kept }));
-            } else if let Some(ref row) = existing
-                && !row.labels.is_empty()
-                && matches!(record.state, SandboxState::Running)
-            {
+            } else if let Some(ref row) = existing {
                 if row.released.is_some() {
-                    any_repause_owed = true;
-                    planned.push((name.clone(), TargetPlan::RePauseOwed { row: row.clone() }));
-                } else {
+                    if !row.labels.is_empty() && matches!(record.state, SandboxState::Running) {
+                        any_repause_owed = true;
+                        planned.push((name.clone(), TargetPlan::RePauseOwed { row: row.clone() }));
+                    } else {
+                        any_membership_change = true;
+                        planned
+                            .push((name.clone(), TargetPlan::ClearReleased { row: row.clone() }));
+                    }
+                } else if !row.labels.is_empty() && matches!(record.state, SandboxState::Running) {
                     planned.push((
                         name.clone(),
                         TargetPlan::AlreadyPaused {
                             labels: row.labels.clone(),
                         },
                     ));
+                } else {
+                    planned.push((
+                        name.clone(),
+                        TargetPlan::NoServices {
+                            needs_empty_row: false,
+                        },
+                    ));
                 }
             } else {
-                let needs_empty_row = existing.as_ref().is_none_or(|r| r.released.is_some());
-                planned.push((name.clone(), TargetPlan::NoServices { needs_empty_row }));
+                any_membership_change = true;
+                planned.push((
+                    name.clone(),
+                    TargetPlan::NoServices {
+                        needs_empty_row: true,
+                    },
+                ));
             }
         }
 
-        let write_record = is_all || any_to_stop || any_repause_owed;
+        // When no record is in force (I13), a subset pause writes nothing unless
+        // at least one named sandbox has services to stop. When a record IS in
+        // force, membership grows to include newly named stopped sandboxes and
+        // clears `released` on previously released members.
+        let write_record = is_all
+            || any_to_stop
+            || any_repause_owed
+            || (current_host.is_some() && any_membership_change);
 
         // Open one audit entry BEFORE the first row is written.
         let subject = match &scope {
@@ -381,155 +416,164 @@ impl Engine {
         )?;
         let entry = ticket.into_entry();
 
-        let at = now();
-        let mut to_stop: Vec<(SandboxName, Vec<String>)> = Vec::new();
-        let mut results: Vec<SandboxPauseResult> = Vec::with_capacity(planned.len());
+        let mut held_lock = Some(lock);
+        let work: Result<Vec<SandboxPauseResult>> = (|| {
+            let at = now();
+            let mut to_stop: Vec<(SandboxName, Vec<String>)> = Vec::new();
+            let mut results: Vec<SandboxPauseResult> = Vec::with_capacity(planned.len());
 
-        if write_record {
-            if let Err(e) = self.state.ensure_host_pause(&lock, is_all, by, at) {
-                let _ = self
-                    .audit
-                    .finish_entry(&lock, entry, Outcome::failed(e.to_string()));
-                return Err(e.into());
-            }
-            for (name, plan) in planned {
-                let agents = self.tracked_agent_names(&name);
-                match plan {
-                    TargetPlan::Stop { labels, kept } => {
-                        let rec = SandboxPauseRecord {
-                            sandbox: name.clone(),
-                            labels: labels.clone(),
-                            kept,
-                            released: None,
-                            at,
-                            by: by.clone(),
-                        };
-                        if let Err(e) = self.state.put_sandbox_pause(&lock, &rec, now()) {
-                            let _ = self.audit.finish_entry(
-                                &lock,
-                                entry,
-                                Outcome::failed(e.to_string()),
-                            );
-                            return Err(e.into());
-                        }
-                        to_stop.push((name.clone(), labels));
-                        // Placeholder updated after pause_runtime runs outside the lock.
-                        results.push(SandboxPauseResult {
-                            sandbox: name,
-                            outcome: PauseOutcome::Paused,
-                            services: Vec::new(),
-                            agents,
-                            error: None,
-                        });
-                    }
-                    TargetPlan::RePauseOwed { mut row } => {
-                        row.released = None;
-                        row.at = at;
-                        row.by = by.clone();
-                        let labels = row.labels.clone();
-                        if let Err(e) = self.state.put_sandbox_pause(&lock, &row, now()) {
-                            let _ = self.audit.finish_entry(
-                                &lock,
-                                entry,
-                                Outcome::failed(e.to_string()),
-                            );
-                            return Err(e.into());
-                        }
-                        results.push(SandboxPauseResult {
-                            sandbox: name,
-                            outcome: PauseOutcome::Paused,
-                            services: labels,
-                            agents,
-                            error: None,
-                        });
-                    }
-                    TargetPlan::AlreadyPaused { labels } => {
-                        results.push(SandboxPauseResult {
-                            sandbox: name,
-                            outcome: PauseOutcome::Paused,
-                            services: labels,
-                            agents,
-                            error: None,
-                        });
-                    }
-                    TargetPlan::NoServices { needs_empty_row } => {
-                        if needs_empty_row {
-                            let rec = SandboxPauseRecord {
+            if write_record {
+                let mut rows_to_write: Vec<SandboxPauseRecord> = Vec::new();
+                for (name, plan) in planned {
+                    let agents = self.tracked_agent_names(&name);
+                    match plan {
+                        TargetPlan::Stop { labels, kept } => {
+                            rows_to_write.push(SandboxPauseRecord {
                                 sandbox: name.clone(),
-                                labels: Vec::new(),
-                                kept: Vec::new(),
+                                labels: labels.clone(),
+                                kept,
                                 released: None,
                                 at,
                                 by: by.clone(),
-                            };
-                            if let Err(e) = self.state.put_sandbox_pause(&lock, &rec, now()) {
-                                let _ = self.audit.finish_entry(
-                                    &lock,
-                                    entry,
-                                    Outcome::failed(e.to_string()),
-                                );
-                                return Err(e.into());
-                            }
+                            });
+                            to_stop.push((name.clone(), labels));
+                            // Placeholder updated after pause_runtime runs outside the lock.
+                            results.push(SandboxPauseResult {
+                                sandbox: name,
+                                outcome: PauseOutcome::Paused,
+                                services: Vec::new(),
+                                agents,
+                                error: None,
+                            });
                         }
-                        results.push(SandboxPauseResult {
+                        TargetPlan::RePauseOwed { mut row } => {
+                            row.released = None;
+                            row.at = at;
+                            row.by = by.clone();
+                            let labels = row.labels.clone();
+                            rows_to_write.push(row);
+                            results.push(SandboxPauseResult {
+                                sandbox: name,
+                                outcome: PauseOutcome::Paused,
+                                services: labels,
+                                agents,
+                                error: None,
+                            });
+                        }
+                        TargetPlan::ClearReleased { mut row } => {
+                            row.released = None;
+                            row.at = at;
+                            row.by = by.clone();
+                            rows_to_write.push(row);
+                            results.push(SandboxPauseResult {
+                                sandbox: name,
+                                outcome: PauseOutcome::NothingToPause,
+                                services: Vec::new(),
+                                agents,
+                                error: None,
+                            });
+                        }
+                        TargetPlan::AlreadyPaused { labels } => {
+                            results.push(SandboxPauseResult {
+                                sandbox: name,
+                                outcome: PauseOutcome::Paused,
+                                services: labels,
+                                agents,
+                                error: None,
+                            });
+                        }
+                        TargetPlan::NoServices { needs_empty_row } => {
+                            if needs_empty_row {
+                                rows_to_write.push(SandboxPauseRecord {
+                                    sandbox: name.clone(),
+                                    labels: Vec::new(),
+                                    kept: Vec::new(),
+                                    released: None,
+                                    at,
+                                    by: by.clone(),
+                                });
+                            }
+                            results.push(SandboxPauseResult {
+                                sandbox: name,
+                                outcome: PauseOutcome::NothingToPause,
+                                services: Vec::new(),
+                                agents,
+                                error: None,
+                            });
+                        }
+                    }
+                }
+                if let Some(lock_ref) = held_lock.as_ref() {
+                    self.state
+                        .begin_pause(lock_ref, is_all, by, at, &rows_to_write)?;
+                }
+            } else {
+                // Subset with no services to stop and no record in force (I13),
+                // or no membership change needed: write nothing at all.
+                for (name, plan) in planned {
+                    let agents = self.tracked_agent_names(&name);
+                    match plan {
+                        TargetPlan::AlreadyPaused { labels } => results.push(SandboxPauseResult {
+                            sandbox: name,
+                            outcome: PauseOutcome::Paused,
+                            services: labels,
+                            agents,
+                            error: None,
+                        }),
+                        _ => results.push(SandboxPauseResult {
                             sandbox: name,
                             outcome: PauseOutcome::NothingToPause,
                             services: Vec::new(),
                             agents,
                             error: None,
-                        });
+                        }),
                     }
                 }
             }
-        } else {
-            // Subset with no services to stop (I13): write nothing at all.
-            for (name, plan) in planned {
-                let agents = self.tracked_agent_names(&name);
-                match plan {
-                    TargetPlan::AlreadyPaused { labels } => results.push(SandboxPauseResult {
-                        sandbox: name,
-                        outcome: PauseOutcome::Paused,
-                        services: labels,
-                        agents,
-                        error: None,
-                    }),
-                    _ => results.push(SandboxPauseResult {
-                        sandbox: name,
-                        outcome: PauseOutcome::NothingToPause,
-                        services: Vec::new(),
-                        agents,
-                        error: None,
-                    }),
+
+            // Release the state lock before stopping services so services told to
+            // end can record their session end and remove_services can audit.
+            drop(held_lock.take());
+
+            for (name, labels) in to_stop {
+                let Some(slot) = results.iter_mut().find(|r| r.sandbox == name) else {
+                    continue;
+                };
+                match self.pause_runtime(by, &name, "for host pause") {
+                    Ok(_) => {
+                        slot.outcome = PauseOutcome::Paused;
+                        slot.services = labels;
+                    }
+                    Err(e) => {
+                        slot.outcome = PauseOutcome::WouldNotStop;
+                        slot.error = Some(e.to_string());
+                    }
                 }
             }
-        }
 
-        // Release the state lock before stopping services so services told to
-        // end can record their session end and remove_services can audit.
-        drop(lock);
+            Ok(results)
+        })();
 
-        for (name, labels) in to_stop {
-            let Some(slot) = results.iter_mut().find(|r| r.sandbox == name) else {
-                continue;
-            };
-            match self.pause_runtime(by, &name, "for host pause") {
-                Ok(_) => {
-                    slot.outcome = PauseOutcome::Paused;
-                    slot.services = labels;
-                }
-                Err(e) => {
-                    slot.outcome = PauseOutcome::WouldNotStop;
-                    slot.error = Some(e.to_string());
-                }
+        let lock = match held_lock.take() {
+            Some(l) => l,
+            None => self.state.lock()?,
+        };
+        let results = match work {
+            Ok(results) => {
+                let outcome = pause_audit_outcome(&results);
+                self.audit.finish_entry(&lock, entry, outcome)?;
+                results
             }
-        }
-
-        let lock = self.state.lock()?;
-        let outcome = pause_audit_outcome(&results);
-        self.audit.finish_entry(&lock, entry, outcome)?;
+            Err(e) => {
+                let _ = self
+                    .audit
+                    .finish_entry(&lock, entry, Outcome::failed(e.to_string()));
+                return Err(e);
+            }
+        };
         drop(lock);
 
-        let host = self.derive_host_pause()?;
+        let host = self.read_host_pause();
         Ok(PauseReport {
             sandboxes: results,
             host,
@@ -581,7 +625,7 @@ impl Engine {
                 Outcome::ok("no pause in force: nothing to resume"),
             )?;
             drop(lock);
-            let host = self.derive_host_pause()?;
+            let host = self.read_host_pause();
             return Ok(ResumeReport {
                 no_record: true,
                 sandboxes: Vec::new(),
@@ -589,236 +633,326 @@ impl Engine {
             });
         };
 
-        let targets: Vec<SandboxName> = match &scope {
-            PauseScope::All => self
-                .state
-                .sandbox_pauses()?
-                .into_iter()
-                .map(|r| r.sandbox)
-                .collect(),
-            PauseScope::Names(names) => dedup_names(names),
-        };
+        let mut held_lock = Some(lock);
+        let work: Result<Vec<SandboxResumeResult>> = (|| {
+            let targets: Vec<SandboxName> = match &scope {
+                PauseScope::All => self
+                    .state
+                    .sandbox_pauses()?
+                    .into_iter()
+                    .map(|r| r.sandbox)
+                    .collect(),
+                PauseScope::Names(names) => dedup_names(names),
+            };
 
-        enum ResumeAction {
-            Install { paused: Paused, labels: Vec<String> },
-            Done(ResumeOutcome),
-        }
+            enum ResumeAction {
+                Install { paused: Paused, labels: Vec<String> },
+                Done(ResumeOutcome),
+            }
 
-        let mut actions: Vec<(SandboxName, ResumeAction)> = Vec::with_capacity(targets.len());
-        let mut results: Vec<SandboxResumeResult> = Vec::with_capacity(targets.len());
+            let mut actions: Vec<(SandboxName, ResumeAction)> = Vec::with_capacity(targets.len());
+            let mut results: Vec<SandboxResumeResult> = Vec::with_capacity(targets.len());
 
-        for name in targets {
-            let agents = self.tracked_agent_names(&name);
-            let record = match self.state.get(&name)? {
-                Some(r) => r,
-                None => {
-                    results.push(SandboxResumeResult {
+            for name in targets {
+                let agents = self.tracked_agent_names(&name);
+                let record = match self.state.get(&name)? {
+                    Some(r) => r,
+                    None => {
+                        results.push(SandboxResumeResult {
+                            sandbox: name,
+                            outcome: ResumeOutcome::NothingToResume,
+                            services: Vec::new(),
+                            agents,
+                            error: None,
+                        });
+                        continue;
+                    }
+                };
+                let row = self.state.sandbox_pause(&name)?;
+                let installed_rt = self.installed_runtime_services(&name)?;
+                let action = match row {
+                    None => {
+                        if host_rec.pause_all {
+                            // Named sandbox created while pause_all = 1: write a
+                            // released empty row so it leaves coverage.
+                            let t = now();
+                            let rec = SandboxPauseRecord {
+                                sandbox: name.clone(),
+                                labels: Vec::new(),
+                                kept: Vec::new(),
+                                released: Some(t),
+                                at: t,
+                                by: by.clone(),
+                            };
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state.put_sandbox_pause(lock_ref, &rec, t)?;
+                            }
+                        }
+                        ResumeAction::Done(ResumeOutcome::NothingToResume)
+                    }
+                    Some(r) if r.released.is_some() => {
+                        let owed = !r.labels.is_empty() && installed_rt.is_empty();
+                        if !owed {
+                            ResumeAction::Done(ResumeOutcome::NothingToResume)
+                        } else if !matches!(record.state, SandboxState::Running) {
+                            // Stopped meanwhile: left as it was, no restart owed.
+                            let t = now();
+                            let cleared = SandboxPauseRecord {
+                                sandbox: name.clone(),
+                                labels: Vec::new(),
+                                kept: Vec::new(),
+                                released: Some(t),
+                                at: r.at,
+                                by: by.clone(),
+                            };
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state.put_sandbox_pause(lock_ref, &cleared, t)?;
+                            }
+                            ResumeAction::Done(ResumeOutcome::LeftAsItWas)
+                        } else {
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state
+                                    .release_sandbox_pause(lock_ref, &name, by, now())?;
+                            }
+                            match self.rebuild_paused(&record, &r) {
+                                Ok(paused) => ResumeAction::Install {
+                                    paused,
+                                    labels: r.labels,
+                                },
+                                Err(e) => {
+                                    results.push(SandboxResumeResult {
+                                        sandbox: name,
+                                        outcome: ResumeOutcome::WouldNotStart,
+                                        services: Vec::new(),
+                                        agents,
+                                        error: Some(format!(
+                                            "{e}. Run `enclos sandbox resume` to try again"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    Some(r) => {
+                        if r.labels.is_empty() {
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state
+                                    .release_sandbox_pause(lock_ref, &name, by, now())?;
+                            }
+                            ResumeAction::Done(ResumeOutcome::LeftAsItWas)
+                        } else if !installed_rt.is_empty() {
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state
+                                    .release_sandbox_pause(lock_ref, &name, by, now())?;
+                            }
+                            ResumeAction::Done(ResumeOutcome::NothingToResume)
+                        } else if !matches!(record.state, SandboxState::Running) {
+                            // Stopped meanwhile (e.g. `sandbox stop` while paused):
+                            // leave it stopped and clear `labels` so it is not owed.
+                            let t = now();
+                            let cleared = SandboxPauseRecord {
+                                sandbox: name.clone(),
+                                labels: Vec::new(),
+                                kept: Vec::new(),
+                                released: Some(t),
+                                at: r.at,
+                                by: by.clone(),
+                            };
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state.put_sandbox_pause(lock_ref, &cleared, t)?;
+                            }
+                            ResumeAction::Done(ResumeOutcome::LeftAsItWas)
+                        } else {
+                            // Intent-first: mark released BEFORE installing services.
+                            if let Some(lock_ref) = held_lock.as_ref() {
+                                self.state
+                                    .release_sandbox_pause(lock_ref, &name, by, now())?;
+                            }
+                            match self.rebuild_paused(&record, &r) {
+                                Ok(paused) => ResumeAction::Install {
+                                    paused,
+                                    labels: r.labels,
+                                },
+                                Err(e) => {
+                                    results.push(SandboxResumeResult {
+                                        sandbox: name,
+                                        outcome: ResumeOutcome::WouldNotStart,
+                                        services: Vec::new(),
+                                        agents,
+                                        error: Some(format!(
+                                            "{e}. Run `enclos sandbox resume` to try again"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                };
+
+                match action {
+                    ResumeAction::Done(outcome) => results.push(SandboxResumeResult {
                         sandbox: name,
-                        outcome: ResumeOutcome::NothingToResume,
+                        outcome,
                         services: Vec::new(),
                         agents,
                         error: None,
-                    });
-                    continue;
-                }
-            };
-            let row = self.state.sandbox_pause(&name)?;
-            let installed_rt = self.installed_runtime_services(&name)?;
-            let action = match row {
-                None => {
-                    if host_rec.pause_all {
-                        // Named sandbox created while pause_all = 1: write a
-                        // released empty row so it leaves coverage.
-                        let t = now();
-                        let rec = SandboxPauseRecord {
+                    }),
+                    install @ ResumeAction::Install { .. } => {
+                        results.push(SandboxResumeResult {
                             sandbox: name.clone(),
-                            labels: Vec::new(),
-                            kept: Vec::new(),
-                            released: Some(t),
-                            at: t,
-                            by: by.clone(),
-                        };
-                        if let Err(e) = self.state.put_sandbox_pause(&lock, &rec, t) {
-                            let _ = self.audit.finish_entry(
-                                &lock,
-                                entry,
-                                Outcome::failed(e.to_string()),
-                            );
-                            return Err(e.into());
-                        }
+                            outcome: ResumeOutcome::Resumed,
+                            services: Vec::new(),
+                            agents,
+                            error: None,
+                        });
+                        actions.push((name, install));
                     }
-                    ResumeAction::Done(ResumeOutcome::NothingToResume)
-                }
-                Some(r) if r.released.is_some() => {
-                    let owed = !r.labels.is_empty()
-                        && matches!(record.state, SandboxState::Running)
-                        && installed_rt.is_empty();
-                    if !owed {
-                        ResumeAction::Done(ResumeOutcome::NothingToResume)
-                    } else {
-                        if let Err(e) = self.state.release_sandbox_pause(&lock, &name, by, now()) {
-                            let _ = self.audit.finish_entry(
-                                &lock,
-                                entry,
-                                Outcome::failed(e.to_string()),
-                            );
-                            return Err(e.into());
-                        }
-                        match self.rebuild_paused(&record, &r) {
-                            Ok(paused) => ResumeAction::Install {
-                                paused,
-                                labels: r.labels,
-                            },
-                            Err(e) => {
-                                results.push(SandboxResumeResult {
-                                    sandbox: name,
-                                    outcome: ResumeOutcome::WouldNotStart,
-                                    services: Vec::new(),
-                                    agents,
-                                    error: Some(format!(
-                                        "{e}. Run `enclos sandbox resume` to try again"
-                                    )),
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                }
-                Some(r) => {
-                    // Intent-first: mark released BEFORE installing services.
-                    if let Err(e) = self.state.release_sandbox_pause(&lock, &name, by, now()) {
-                        let _ =
-                            self.audit
-                                .finish_entry(&lock, entry, Outcome::failed(e.to_string()));
-                        return Err(e.into());
-                    }
-                    if r.labels.is_empty() {
-                        ResumeAction::Done(ResumeOutcome::LeftAsItWas)
-                    } else if !installed_rt.is_empty() {
-                        ResumeAction::Done(ResumeOutcome::NothingToResume)
-                    } else if !matches!(record.state, SandboxState::Running) {
-                        ResumeAction::Done(ResumeOutcome::LeftAsItWas)
-                    } else {
-                        match self.rebuild_paused(&record, &r) {
-                            Ok(paused) => ResumeAction::Install {
-                                paused,
-                                labels: r.labels,
-                            },
-                            Err(e) => {
-                                results.push(SandboxResumeResult {
-                                    sandbox: name,
-                                    outcome: ResumeOutcome::WouldNotStart,
-                                    services: Vec::new(),
-                                    agents,
-                                    error: Some(format!(
-                                        "{e}. Run `enclos sandbox resume` to try again"
-                                    )),
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                }
-            };
-
-            match action {
-                ResumeAction::Done(outcome) => results.push(SandboxResumeResult {
-                    sandbox: name,
-                    outcome,
-                    services: Vec::new(),
-                    agents,
-                    error: None,
-                }),
-                install @ ResumeAction::Install { .. } => {
-                    results.push(SandboxResumeResult {
-                        sandbox: name.clone(),
-                        outcome: ResumeOutcome::Resumed,
-                        services: Vec::new(),
-                        agents,
-                        error: None,
-                    });
-                    actions.push((name, install));
                 }
             }
-        }
 
-        // Release lock before calling resume_runtime_inner (which takes the lock
-        // for `services start`).
-        drop(lock);
+            // Release lock before calling resume_runtime_inner (which takes the lock
+            // for `services start`).
+            drop(held_lock.take());
 
-        for (name, action) in actions {
-            let ResumeAction::Install { paused, labels } = action else {
-                continue;
-            };
-            let Some(slot) = results.iter_mut().find(|r| r.sandbox == name) else {
-                continue;
-            };
-            match self.resume_runtime_inner(by, &name, &paused) {
-                Ok(Some(_)) => {
-                    slot.outcome = ResumeOutcome::Resumed;
-                    slot.services = labels;
-                }
-                Ok(None) => {
-                    slot.outcome = ResumeOutcome::LeftAsItWas;
-                    slot.services = Vec::new();
-                }
-                Err(e) => {
-                    slot.outcome = ResumeOutcome::WouldNotStart;
-                    slot.error = Some(format!(
-                        "its {} could not start again: {e}. Run `enclos sandbox resume {name}` to try again",
-                        paused.names().join(" and ")
-                    ));
+            let mut stopped_meanwhile: Vec<SandboxName> = Vec::new();
+            for (name, action) in actions {
+                let ResumeAction::Install { paused, labels } = action else {
+                    continue;
+                };
+                let Some(slot) = results.iter_mut().find(|r| r.sandbox == name) else {
+                    continue;
+                };
+                match self.resume_runtime_inner(by, &name, &paused) {
+                    Ok(Some(_)) => {
+                        slot.outcome = ResumeOutcome::Resumed;
+                        slot.services = labels;
+                    }
+                    Ok(None) => {
+                        slot.outcome = ResumeOutcome::LeftAsItWas;
+                        slot.services = Vec::new();
+                        stopped_meanwhile.push(name);
+                    }
+                    Err(e) => {
+                        slot.outcome = ResumeOutcome::WouldNotStart;
+                        slot.error = Some(format!(
+                            "its {} could not start again: {e}. Run `enclos sandbox resume {name}` to try again",
+                            paused.names().join(" and ")
+                        ));
+                    }
                 }
             }
-        }
 
-        let lock = self.state.lock()?;
-        // Delete the whole record when no covered sandbox remains held or owed
-        // AND (scope was All, or pause_all = 0). With pause_all = 1 a
-        // `resume <name>` never deletes the record.
-        let latest_host = self.state.host_pause()?;
-        if let Some(latest_host) = latest_host {
-            let all_rows = self.state.sandbox_pauses()?;
-            let mut any_held_or_owed = false;
-            for row in &all_rows {
-                if row.released.is_none() {
-                    any_held_or_owed = true;
-                    break;
+            let lock = self.state.lock()?;
+            held_lock = Some(lock);
+            for name in stopped_meanwhile {
+                if let Some(existing) = self.state.sandbox_pause(&name)? {
+                    let t = now();
+                    let cleared = SandboxPauseRecord {
+                        sandbox: name,
+                        labels: Vec::new(),
+                        kept: Vec::new(),
+                        released: Some(t),
+                        at: existing.at,
+                        by: by.clone(),
+                    };
+                    if let Some(lock_ref) = held_lock.as_ref() {
+                        self.state.put_sandbox_pause(lock_ref, &cleared, t)?;
+                    }
                 }
-                if !row.labels.is_empty()
-                    && let Some(rec) = self.state.get(&row.sandbox)?
-                {
-                    let has_rt = !self.installed_runtime_services(&row.sandbox)?.is_empty();
-                    let derived = derive_sandbox(
-                        Some(&latest_host),
-                        SandboxPauseInput {
-                            name: &row.sandbox,
-                            state: &rec.state,
-                            has_runtime_services: has_rt,
-                            row: Some(row),
-                        },
-                    );
-                    if derived.owed {
+            }
+            // Delete the whole record when no covered sandbox remains held or owed
+            // AND (scope was All, or pause_all = 0). With pause_all = 1 a
+            // `resume <name>` never deletes the record.
+            let latest_host = self.state.host_pause()?;
+            if let Some(latest_host) = latest_host {
+                let all_rows = self.state.sandbox_pauses()?;
+                let mut any_held_or_owed = false;
+                for row in &all_rows {
+                    if row.released.is_none() {
                         any_held_or_owed = true;
                         break;
                     }
+                    if !row.labels.is_empty()
+                        && let Some(rec) = self.state.get(&row.sandbox)?
+                    {
+                        let has_rt = !self.installed_runtime_services(&row.sandbox)?.is_empty();
+                        let derived = derive_sandbox(
+                            Some(&latest_host),
+                            SandboxPauseInput {
+                                name: &row.sandbox,
+                                state: &rec.state,
+                                has_runtime_services: has_rt,
+                                row: Some(row),
+                            },
+                        );
+                        if derived.owed {
+                            any_held_or_owed = true;
+                            break;
+                        }
+                    }
+                }
+                if !any_held_or_owed
+                    && (matches!(scope, PauseScope::All) || !latest_host.pause_all)
+                    && let Some(lock_ref) = held_lock.as_ref()
+                {
+                    self.state.clear_host_pause(lock_ref)?;
                 }
             }
-            if !any_held_or_owed && (matches!(scope, PauseScope::All) || !latest_host.pause_all) {
-                self.state.clear_host_pause(&lock)?;
-            }
-        }
 
-        let outcome = resume_audit_outcome(&results);
-        self.audit.finish_entry(&lock, entry, outcome)?;
+            Ok(results)
+        })();
+
+        let lock = match held_lock.take() {
+            Some(l) => l,
+            None => self.state.lock()?,
+        };
+        let results = match work {
+            Ok(results) => {
+                let outcome = resume_audit_outcome(&results);
+                self.audit.finish_entry(&lock, entry, outcome)?;
+                results
+            }
+            Err(e) => {
+                let _ = self
+                    .audit
+                    .finish_entry(&lock, entry, Outcome::failed(e.to_string()));
+                return Err(e);
+            }
+        };
         drop(lock);
 
-        let host = self.derive_host_pause()?;
+        let host = self.read_host_pause();
         Ok(ResumeReport {
             no_record: false,
             sandboxes: results,
             host,
         })
+    }
+
+    /// Reads one sandbox's pause state for display without swallowing read
+    /// errors: returns [`SandboxPauseRead::Unreadable`] instead of guessing
+    /// `paused: false`.
+    pub(super) fn read_sandbox_pause(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+    ) -> SandboxPauseRead {
+        let host = match self.state.host_pause() {
+            Ok(h) => h,
+            Err(e) => return SandboxPauseRead::Unreadable(e.to_string()),
+        };
+        let row = match self.state.sandbox_pause(&record.name) {
+            Ok(r) => r,
+            Err(e) => return SandboxPauseRead::Unreadable(e.to_string()),
+        };
+        match self.derive_sandbox_pause(record, host.as_ref(), row.as_ref()) {
+            Ok(d) => SandboxPauseRead::Readable {
+                paused: d.paused,
+                why: d.why,
+            },
+            Err(e) => SandboxPauseRead::Unreadable(e.to_string()),
+        }
     }
 
     /// Reads the host pause state for display without failing on an unreadable

@@ -5330,6 +5330,36 @@ mod pause {
     }
 
     #[test]
+    fn null_sandboxes_returns_bad_message_and_pauses_nothing() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        // Test with a device that declared ONLY `pause` (not `pause.subset`)
+        // to prove explicit `null` never bypasses `pause.subset` as host-wide.
+        let (mut dev, _) = connect_with(&bridge, &phone, PERSON, vec![Capability::Pause]);
+
+        dev.send_raw(br#"{"v":1,"id":"p-null","type":"pause","sandboxes":null}"#);
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("p-null".into()))
+        );
+
+        dev.send_raw(br#"{"v":1,"id":"r-null","type":"resume","sandboxes":null}"#);
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("r-null".into()))
+        );
+
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
     fn not_found_refuses_whole_request_and_records_no_call() {
         let folder = tempfile::tempdir().unwrap();
         let fake = FakePausing::new(initial_state());
@@ -5676,5 +5706,141 @@ mod pause {
             dev.receive(),
             Some(ToDevice::PauseResult { of, .. }) if of.as_str() == "first"
         ));
+    }
+
+    #[test]
+    fn duplicate_names_in_subset_request_produce_one_result_row_each() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "dup-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["home".into(), "lab".into(), "home".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult { of, sandboxes, .. }) = dev.receive() else {
+            panic!("expected pause.result");
+        };
+        assert_eq!(of.as_str(), "dup-1");
+        assert_eq!(
+            sandboxes,
+            Some(vec![
+                PauseSandboxOutcome {
+                    sandbox: "home".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+                PauseSandboxOutcome {
+                    sandbox: "lab".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_when_post_work_host_read_fails() {
+        /// Seam whose `state()` fails after the first `pause()`, simulating a
+        /// host-state read failure after the pause work already finished.
+        struct UnreadableAfterPause {
+            failed_after: std::sync::atomic::AtomicBool,
+        }
+
+        impl Pausing for UnreadableAfterPause {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                if self.failed_after.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PauseError::Internal("corrupt host_pause".into()));
+                }
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(PauseActionResult {
+                    paused: false,
+                    partly: true,
+                    revision: 0,
+                    outcomes: vec![PauseSandboxOutcome {
+                        sandbox: "lab".into(),
+                        outcome: PauseOutcome::Paused,
+                    }],
+                })
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                unreachable!()
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(UnreadableAfterPause {
+            failed_after: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "unreadable-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result even when host read fails");
+        };
+        assert_eq!(of.as_str(), "unreadable-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 0);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Paused,
+            }])
+        );
     }
 }

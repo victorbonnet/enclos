@@ -20,7 +20,7 @@ pub enum NotPausedWhy {
     /// A member whose resume was asked and succeeded (or left it as it was).
     Released,
     /// A member whose resume was asked (`released` set) but its runtime
-    /// services are not installed again while its state is still `Running`.
+    /// services are not installed again.
     WouldNotStart,
     /// Covered by the pause, with runtime services still installed.
     WouldNotStop,
@@ -70,8 +70,8 @@ pub struct SandboxPauseInput<'a> {
 pub struct SandboxPauseView {
     /// Whether this sandbox has a `sandbox_pauses` row.
     pub member: bool,
-    /// Member with non-empty `labels`, `released` set, state `Running`, and
-    /// no runtime service installed (a resume that did not take).
+    /// Member with non-empty `labels`, `released` set, and no runtime service
+    /// installed (a resume that did not take; answers §5).
     pub owed: bool,
     /// Reached by the pause in force (only meaningful while a host record exists).
     pub covered: bool,
@@ -105,8 +105,7 @@ pub fn derive_sandbox(
         Some(row) => {
             let member = true;
             let has_labels = !row.labels.is_empty();
-            let owed =
-                has_labels && row.released.is_some() && is_running && !input.has_runtime_services;
+            let owed = has_labels && row.released.is_some() && !input.has_runtime_services;
             let covered = row.released.is_none() || owed;
             let paused =
                 row.released.is_none() && has_labels && is_running && !input.has_runtime_services;
@@ -221,6 +220,61 @@ impl HostPauseView {
                 } else {
                     Some(format!("Partly paused ({})", parts.join("; ")))
                 }
+            }
+        }
+    }
+}
+
+/// One sandbox's pause state as read for display (`status`, `sandbox list`,
+/// `sandbox show`). Distinguishes a readable state from an unreadable record
+/// so callers never report `paused: false` over an unreadable row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxPauseRead {
+    Readable {
+        paused: bool,
+        why: Option<NotPausedWhy>,
+    },
+    Unreadable(String),
+}
+
+impl SandboxPauseRead {
+    pub fn is_paused(&self) -> bool {
+        matches!(self, SandboxPauseRead::Readable { paused: true, .. })
+    }
+
+    pub fn why(&self) -> Option<NotPausedWhy> {
+        match self {
+            SandboxPauseRead::Readable { why, .. } => *why,
+            SandboxPauseRead::Unreadable(_) => None,
+        }
+    }
+
+    pub fn unreadable(&self) -> Option<&str> {
+        match self {
+            SandboxPauseRead::Unreadable(why) => Some(why),
+            SandboxPauseRead::Readable { .. } => None,
+        }
+    }
+}
+
+impl Serialize for SandboxPauseRead {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            SandboxPauseRead::Readable { paused, why } => {
+                let len = 1 + usize::from(!*paused && why.is_some());
+                let mut map = s.serialize_map(Some(len))?;
+                map.serialize_entry("paused", paused)?;
+                if !*paused && let Some(w) = why {
+                    map.serialize_entry("why", w)?;
+                }
+                map.end()
+            }
+            SandboxPauseRead::Unreadable(error) => {
+                let mut map = s.serialize_map(Some(2))?;
+                map.serialize_entry("paused", &Option::<bool>::None)?;
+                map.serialize_entry("pause_unreadable", error)?;
+                map.end()
             }
         }
     }
@@ -582,6 +636,27 @@ mod tests {
         );
         assert!(!dc.member && dc.covered && !dc.paused && dc.runs);
         assert_eq!(dc.why, Some(NotPausedWhy::WouldNotStop));
+    }
+
+    #[test]
+    fn owed_member_stays_covered_when_stopped() {
+        let h = host_rec(false, 302);
+        let a = sb("alpha");
+        let ra = row("alpha", &["enclos.alpha.gateway"], &[], Some(now()));
+        let input = SandboxPauseInput {
+            name: &a,
+            state: &SandboxState::Stopped,
+            has_runtime_services: false,
+            row: Some(&ra),
+        };
+        let d = derive_sandbox(Some(&h), input);
+        assert!(d.member && d.owed && d.covered && !d.paused && !d.runs);
+        assert_eq!(d.why, Some(NotPausedWhy::WouldNotStart));
+
+        let host = derive_host(Some(&h), &[input]);
+        assert_eq!(host.word, HostPauseWord::PartlyPaused);
+        assert!(host.runs.is_empty());
+        assert_eq!(host.owed, vec![a]);
     }
 
     #[test]

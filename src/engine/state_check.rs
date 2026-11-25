@@ -532,18 +532,47 @@ impl Engine {
         // A sandbox paused by `sandbox pause` intentionally has its runtime
         // services removed while its record stays `Running` (H3: recorded, not
         // inferred). Do not report those paused services as missing or the
-        // sandbox as drifted.
-        let paused_row = match (self.state.host_pause(), self.state.sandbox_pause(name)) {
+        // sandbox as drifted. If the pause record cannot be read, treat the
+        // pause state as unknown: report it, do not flag runtime services as
+        // missing, and do not offer `RecordStopped` on that evidence.
+        enum PauseCheck {
+            Paused(Vec<String>),
+            NotPaused,
+            Unreadable(String),
+        }
+        let pause_check = match (self.state.host_pause(), self.state.sandbox_pause(name)) {
+            (Err(e), _) | (_, Err(e)) => PauseCheck::Unreadable(e.to_string()),
             (Ok(Some(host)), Ok(Some(row))) => {
-                let derived = self.derive_sandbox_pause(record, Some(&host), Some(&row))?;
-                derived.paused.then_some(row)
+                match self.derive_sandbox_pause(record, Some(&host), Some(&row)) {
+                    Ok(derived) if derived.paused => PauseCheck::Paused(row.labels),
+                    Ok(_) => PauseCheck::NotPaused,
+                    Err(e) => PauseCheck::Unreadable(e.to_string()),
+                }
             }
-            _ => None,
+            (Ok(_), Ok(_)) => PauseCheck::NotPaused,
         };
-        let paused_labels: Vec<&str> = paused_row
-            .as_ref()
-            .map(|r| r.labels.iter().map(String::as_str).collect())
-            .unwrap_or_default();
+        let mut ignored_missing: Vec<String> = Vec::new();
+        match &pause_check {
+            PauseCheck::Paused(labels) => ignored_missing.extend(labels.iter().cloned()),
+            PauseCheck::Unreadable(why) => {
+                push(
+                    format!("its pause record cannot be read: {why}"),
+                    Remedy::Manual(format!(
+                        "enclos cannot tell whether sandbox {name} is paused while its pause record is unreadable; inspect state.db before repairing its services"
+                    )),
+                );
+                if let Some(kind) = record.runtime {
+                    for service in crate::runtime::adapter(kind).services() {
+                        if let Ok(label) =
+                            self.label(name, super::service::Unit::Runtime(service.name))
+                        {
+                            ignored_missing.push(label.to_string());
+                        }
+                    }
+                }
+            }
+            PauseCheck::NotPaused => {}
+        }
 
         // Services: some installed and others not, as after one's launchd
         // job or systemd unit was removed by hand; one installed that enclos
@@ -557,7 +586,9 @@ impl Engine {
         let missing: Vec<String> = expected
             .iter()
             .filter(|l| {
-                **l != holder && !installed.contains(l) && !paused_labels.contains(&l.as_str())
+                **l != holder
+                    && !installed.contains(l)
+                    && !ignored_missing.iter().any(|p| p == l.as_str())
             })
             .map(ToString::to_string)
             .collect();
@@ -659,7 +690,7 @@ impl Engine {
         if matches!(record.state, SandboxState::Running)
             && !live
             && installed.is_empty()
-            && paused_row.is_none()
+            && matches!(pause_check, PauseCheck::NotPaused)
         {
             match (scanned, escaped) {
                 (true, 0) => push(

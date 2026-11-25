@@ -194,18 +194,7 @@ impl Engine {
             list
         });
 
-        let (paused, pause_why) = match (
-            self.state.host_pause(),
-            self.state.sandbox_pause(&record.name),
-        ) {
-            (Ok(host), Ok(row)) => {
-                match self.derive_sandbox_pause(&record, host.as_ref(), row.as_ref()) {
-                    Ok(d) => (d.paused, d.why),
-                    Err(_) => (false, None),
-                }
-            }
-            _ => (false, None),
-        };
+        let pause = self.read_sandbox_pause(&record);
         Ok(SandboxStatus {
             runtime: match (record.runtime, runtime) {
                 (Some(kind), Some(rt)) => {
@@ -227,8 +216,7 @@ impl Engine {
                 _ => None,
             },
             state: record.state,
-            paused,
-            pause_why,
+            pause,
             created_at: record.created_at,
             services,
             policy_version: active,
