@@ -36,6 +36,10 @@ pub enum Error {
         "sandbox `{name}` was not stopped: a start or restart that ran meanwhile installed its services again. Run `enclos sandbox stop {name}` again to stop it"
     )]
     StartedWhileStopping { name: String },
+    /// A pause or resume carried an expected revision that no longer matches
+    /// the current host pause record (nothing changed).
+    #[error("pause state changed (expected revision {expected}, found {found}); nothing changed")]
+    PauseConflict { expected: u64, found: u64 },
     /// A sandbox marked failed, by a stop that left members running or by
     /// a command that failed, still has sessions running; `rm` waits until
     /// they are gone.
@@ -431,6 +435,7 @@ impl Error {
             | Error::SandboxRunning { .. }
             | Error::SandboxHasServices { .. }
             | Error::StartedWhileStopping { .. }
+            | Error::PauseConflict { .. }
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }

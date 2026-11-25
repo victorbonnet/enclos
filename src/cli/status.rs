@@ -36,6 +36,9 @@ pub fn run(engine: &Engine, args: StatusArgs) -> Result<u8> {
 
 fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
     if view.sandboxes.is_empty() && view.unlisted.is_empty() {
+        if let Some(line) = view.pause.summary_line() {
+            println!("{line}");
+        }
         println!(
             "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|assistant`."
         );
@@ -52,6 +55,9 @@ fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
         size(view.bytes, view.complete),
         tilde(&view.data, user_home)
     );
+    if let Some(line) = view.pause.summary_line() {
+        println!("{line}");
+    }
     let width = view
         .sandboxes
         .iter()
@@ -60,9 +66,10 @@ fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
         .map(str::len)
         .max()
         .unwrap_or(0);
+    let pause_in_force = view.pause.in_force();
     for s in &view.sandboxes {
         println!();
-        print_sandbox(s, width, now);
+        print_sandbox(s, width, now, pause_in_force);
     }
     for u in &view.unlisted {
         println!();
@@ -152,7 +159,7 @@ fn listener_lines(command: Option<&str>, listeners: &Fact<Vec<NetworkListener>>)
     lines
 }
 
-fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
+fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp, pause_in_force: bool) {
     let complete = s.disk.incomplete.is_none();
     let runtime = match &s.runtime {
         None => "no runtime".to_owned(),
@@ -172,15 +179,28 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
             text
         }
     };
+    let shown_state = if s.paused {
+        "paused".to_owned()
+    } else {
+        state_text(&s.state)
+    };
     println!(
         "{:<width$}  {:<9} {:<34} {:>9}",
         s.name.as_str(),
-        state_text(&s.state),
+        shown_state,
         runtime,
         size(s.disk.total, complete)
     );
 
     let mut facts = Vec::new();
+    if s.paused {
+        facts.push(format!(
+            "resume with `enclos sandbox resume {}` or `--all`",
+            s.name
+        ));
+    } else if pause_in_force && let Some(why) = s.pause_why {
+        facts.push(format!("not paused: {}", why.plain()));
+    }
     match &s.services {
         Fact::Known(list) if !list.is_empty() => {
             let services: Vec<String> = list

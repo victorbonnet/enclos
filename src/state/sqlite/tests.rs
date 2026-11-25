@@ -1391,3 +1391,129 @@ fn diagnostic_provenance_of_removed_log_rows_is_removed() {
     store.begin_probe(&name, &"c".repeat(64)).unwrap();
     assert_eq!(count(), 0);
 }
+
+#[test]
+fn host_pause_rows_survive_reopen_advance_revision_and_cascade() {
+    use crate::model::audit::Actor;
+    use crate::model::pause::SandboxPauseRecord;
+
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("alpha")).unwrap();
+    store.put(&lock, &record("beta")).unwrap();
+
+    let alice = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let t0: Timestamp = "2026-11-25T12:00:00.000Z".parse().unwrap();
+    let host1 = store.ensure_host_pause(&lock, false, &alice, t0).unwrap();
+    assert!(!host1.pause_all);
+    assert!(host1.revision >= t0.as_millisecond() as u64);
+
+    // Same timestamp (or earlier) still strictly advances revision.
+    let alpha: SandboxName = "alpha".parse().unwrap();
+    let rev2 = store
+        .put_sandbox_pause(
+            &lock,
+            &SandboxPauseRecord {
+                sandbox: alpha.clone(),
+                labels: vec!["enclos.alpha.gateway".into()],
+                kept: vec!["enclos.alpha.proxy".into()],
+                released: None,
+                at: t0,
+                by: alice.clone(),
+            },
+            t0,
+        )
+        .unwrap();
+    assert_eq!(rev2, host1.revision + 1);
+
+    // Upgrading to pause_all sets it to true; a subsequent subset ensure never clears it.
+    let host3 = store.ensure_host_pause(&lock, true, &alice, t0).unwrap();
+    assert!(host3.pause_all);
+    assert_eq!(host3.revision, rev2 + 1);
+    let host4 = store.ensure_host_pause(&lock, false, &alice, t0).unwrap();
+    assert!(host4.pause_all);
+    assert_eq!(host4.revision, host3.revision + 1);
+
+    // Release bumps revision and persists released timestamp.
+    let t1: Timestamp = "2026-11-25T12:00:01.000Z".parse().unwrap();
+    let rev5 = store
+        .release_sandbox_pause(&lock, &alpha, &alice, t1)
+        .unwrap();
+    assert!(rev5 > host4.revision);
+    assert!(rev5 >= t1.as_millisecond() as u64);
+
+    // Reopen store from disk: rows survive.
+    drop(lock);
+    let reopened = SqliteStateStore::new(
+        dir.path().join("state.db"),
+        dir.path().join("state.lock"),
+        Wait::Command,
+    );
+    let host_again = reopened.host_pause().unwrap().unwrap();
+    assert_eq!(host_again.revision, rev5);
+    assert!(host_again.pause_all);
+    let row_again = reopened.sandbox_pause(&alpha).unwrap().unwrap();
+    assert_eq!(row_again.labels, vec!["enclos.alpha.gateway"]);
+    assert_eq!(row_again.kept, vec!["enclos.alpha.proxy"]);
+    assert_eq!(row_again.released, Some(t1));
+
+    // Removing the sandbox cascades its sandbox_pauses row away.
+    let lock = reopened.lock().unwrap();
+    reopened.remove(&lock, &alpha).unwrap();
+    assert!(reopened.sandbox_pause(&alpha).unwrap().is_none());
+    assert!(reopened.sandbox_pauses().unwrap().is_empty());
+
+    // Clearing the host pause removes the host row; a later creation starts with a new revision.
+    reopened.clear_host_pause(&lock).unwrap();
+    assert!(reopened.host_pause().unwrap().is_none());
+    let t2: Timestamp = "2026-11-25T12:00:02.000Z".parse().unwrap();
+    let next_host = reopened
+        .ensure_host_pause(&lock, false, &alice, t2)
+        .unwrap();
+    assert!(next_host.revision > rev5);
+}
+
+#[test]
+fn migrates_from_13_to_14_and_documented_reversal_matches_13() {
+    let (_dir, store) = store();
+    let conn = Connection::open(&store.db).unwrap();
+    for sql in &schema::MIGRATIONS[..13] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 13u32).unwrap();
+    conn.execute_batch(
+        "INSERT INTO sandboxes (name, backend, state, created_at)
+             VALUES ('home', 'seatbelt', 'running', '2026-01-02T03:04:05.678Z');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let lock = store.lock().unwrap();
+    let migrated = store.migrate(&lock).unwrap();
+    assert_eq!(migrated.from, 13);
+    assert_eq!(migrated.to, 14);
+    assert_eq!(schema::current(), 14);
+
+    // Existing sandbox row is untouched.
+    let home: SandboxName = "home".parse().unwrap();
+    let rec = store.get(&home).unwrap().unwrap();
+    assert_eq!(rec.state, SandboxState::Running);
+    assert!(store.host_pause().unwrap().is_none());
+    assert!(store.sandbox_pauses().unwrap().is_empty());
+
+    // Documented reversal yields a database the 13-table schema accepts.
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE sandbox_pauses; DROP TABLE host_pause; PRAGMA user_version = 13;",
+    )
+    .unwrap();
+    let expected13 = Connection::open_in_memory().unwrap();
+    for sql in &schema::MIGRATIONS[..13] {
+        expected13.execute_batch(sql).unwrap();
+    }
+    assert_eq!(columns(&conn).unwrap(), columns(&expected13).unwrap());
+}

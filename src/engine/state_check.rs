@@ -529,6 +529,22 @@ impl Engine {
                 );
             }
         }
+        // A sandbox paused by `sandbox pause` intentionally has its runtime
+        // services removed while its record stays `Running` (H3: recorded, not
+        // inferred). Do not report those paused services as missing or the
+        // sandbox as drifted.
+        let paused_row = match (self.state.host_pause(), self.state.sandbox_pause(name)) {
+            (Ok(Some(host)), Ok(Some(row))) => {
+                let derived = self.derive_sandbox_pause(record, Some(&host), Some(&row))?;
+                derived.paused.then_some(row)
+            }
+            _ => None,
+        };
+        let paused_labels: Vec<&str> = paused_row
+            .as_ref()
+            .map(|r| r.labels.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+
         // Services: some installed and others not, as after one's launchd
         // job or systemd unit was removed by hand; one installed that enclos
         // no longer runs; installed while not recorded running.
@@ -540,7 +556,9 @@ impl Engine {
         let holder = self.label(name, super::service::Unit::Holder)?;
         let missing: Vec<String> = expected
             .iter()
-            .filter(|l| **l != holder && !installed.contains(l))
+            .filter(|l| {
+                **l != holder && !installed.contains(l) && !paused_labels.contains(&l.as_str())
+            })
             .map(ToString::to_string)
             .collect();
         if installed
@@ -636,8 +654,13 @@ impl Engine {
         // Sessions whose markers could not be looked at may still run.
         let live = open.len() > gone.len() || (!gone.is_empty() && !markers_found);
         // A process found running from its folder keeps it from being
-        // recorded stopped: something of it may still run.
-        if matches!(record.state, SandboxState::Running) && !live && installed.is_empty() {
+        // recorded stopped: something of it may still run. A paused sandbox
+        // is intentionally recorded running with its runtime services removed.
+        if matches!(record.state, SandboxState::Running)
+            && !live
+            && installed.is_empty()
+            && paused_row.is_none()
+        {
             match (scanned, escaped) {
                 (true, 0) => push(
                     "it is recorded running, and nothing of it runs".to_owned(),

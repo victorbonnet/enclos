@@ -5,6 +5,7 @@ mod acceptances;
 mod agents;
 mod log_writer;
 mod netlog;
+mod pause;
 mod policy;
 mod probe_sources;
 mod runtime_versions;
@@ -33,6 +34,7 @@ use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
+use crate::model::pause::{HostPauseRecord, SandboxPauseRecord};
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -655,6 +657,58 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Option<(RuntimeKind, RuntimeVersion)>> {
         let conn = self.open()?;
         runtime_versions::get(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
+
+    fn host_pause(&self) -> Result<Option<HostPauseRecord>> {
+        let conn = self.open()?;
+        pause::get_host(&conn).map_err(|e| self.read_err(e))
+    }
+
+    fn sandbox_pauses(&self) -> Result<Vec<SandboxPauseRecord>> {
+        let conn = self.open()?;
+        pause::list_sandboxes(&conn).map_err(|e| self.read_err(e))
+    }
+
+    fn sandbox_pause(&self, sandbox: &SandboxName) -> Result<Option<SandboxPauseRecord>> {
+        let conn = self.open()?;
+        pause::get_sandbox(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
+
+    fn ensure_host_pause(
+        &self,
+        _lock: &StateLock,
+        pause_all: bool,
+        by: &Actor,
+        at: Timestamp,
+    ) -> Result<HostPauseRecord> {
+        let mut conn = self.open()?;
+        pause::ensure_host(&mut conn, pause_all, by, at).map_err(|e| self.read_err(e))
+    }
+
+    fn put_sandbox_pause(
+        &self,
+        _lock: &StateLock,
+        rec: &SandboxPauseRecord,
+        at: Timestamp,
+    ) -> Result<u64> {
+        let mut conn = self.open()?;
+        pause::put_sandbox(&mut conn, rec, at).map_err(|e| self.read_err(e))
+    }
+
+    fn release_sandbox_pause(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        by: &Actor,
+        at: Timestamp,
+    ) -> Result<u64> {
+        let mut conn = self.open()?;
+        pause::release_sandbox(&mut conn, sandbox, by, at).map_err(|e| self.read_err(e))
+    }
+
+    fn clear_host_pause(&self, _lock: &StateLock) -> Result<()> {
+        let mut conn = self.open()?;
+        pause::clear_host(&mut conn).map_err(self.sqlite_err())
     }
 }
 

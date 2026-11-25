@@ -122,6 +122,24 @@ pub const MIGRATIONS: &[&str] = &[
         version TEXT NOT NULL,
         at      TEXT NOT NULL
     ) STRICT;",
+    // 14: host pause record and per-sandbox pause membership
+    "CREATE TABLE host_pause (
+        id        INTEGER PRIMARY KEY CHECK (id = 1),
+        revision  INTEGER NOT NULL,
+        pause_all INTEGER NOT NULL,
+        by_user   TEXT NOT NULL,
+        by_host   TEXT NOT NULL,
+        at        TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE sandbox_pauses (
+        sandbox   TEXT PRIMARY KEY REFERENCES sandboxes (name) ON DELETE CASCADE,
+        labels    TEXT NOT NULL,
+        kept      TEXT NOT NULL,
+        released  TEXT,
+        at        TEXT NOT NULL,
+        by_user   TEXT NOT NULL,
+        by_host   TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.

@@ -14,6 +14,7 @@ use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
+use crate::model::pause::{HostPauseRecord, SandboxPauseRecord};
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::runtime::{RuntimeKind, RuntimeVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
@@ -246,6 +247,43 @@ pub trait StateStore: NetLogStore {
         &self,
         sandbox: &SandboxName,
     ) -> Result<Option<(RuntimeKind, RuntimeVersion)>>;
+
+    /// The host pause record currently in force, if any.
+    fn host_pause(&self) -> Result<Option<HostPauseRecord>>;
+    /// Every `sandbox_pauses` row, ordered by sandbox name.
+    fn sandbox_pauses(&self) -> Result<Vec<SandboxPauseRecord>>;
+    /// One sandbox's `sandbox_pauses` row, if any.
+    fn sandbox_pause(&self, sandbox: &SandboxName) -> Result<Option<SandboxPauseRecord>>;
+    /// Creates or updates the `host_pause` row in one transaction. When a row
+    /// already exists, `pause_all` is OR'd (never cleared back to `false`) and
+    /// `revision` advances monotonically.
+    fn ensure_host_pause(
+        &self,
+        lock: &StateLock,
+        pause_all: bool,
+        by: &Actor,
+        at: Timestamp,
+    ) -> Result<HostPauseRecord>;
+    /// Inserts or replaces a `sandbox_pauses` row and advances `host_pause.revision`
+    /// in one transaction. Returns the new revision.
+    fn put_sandbox_pause(
+        &self,
+        lock: &StateLock,
+        rec: &SandboxPauseRecord,
+        at: Timestamp,
+    ) -> Result<u64>;
+    /// Marks a `sandbox_pauses` row released (setting `released`, `by_user`,
+    /// `by_host`) and advances `host_pause.revision` in one transaction.
+    /// Returns the new revision.
+    fn release_sandbox_pause(
+        &self,
+        lock: &StateLock,
+        sandbox: &SandboxName,
+        by: &Actor,
+        at: Timestamp,
+    ) -> Result<u64>;
+    /// Deletes the `host_pause` row and every `sandbox_pauses` row in one transaction.
+    fn clear_host_pause(&self, lock: &StateLock) -> Result<()>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections

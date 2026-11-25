@@ -81,12 +81,14 @@ impl Engine {
             eprintln!("enclos: {note}");
         }
         let suggestions = suggest(&sandboxes, now);
+        let pause = self.read_host_pause();
         Ok(StatusView {
             data: self.layout.data().to_owned(),
             bytes: sandboxes.iter().map(|s| s.disk.total).sum(),
             // A sandbox left out is left out of `bytes` too.
             complete: unlisted.is_empty() && sandboxes.iter().all(|s| s.disk.incomplete.is_none()),
             idle_days: IDLE_DAYS,
+            pause,
             sandboxes,
             unlisted,
             suggestions,
@@ -192,6 +194,18 @@ impl Engine {
             list
         });
 
+        let (paused, pause_why) = match (
+            self.state.host_pause(),
+            self.state.sandbox_pause(&record.name),
+        ) {
+            (Ok(host), Ok(row)) => {
+                match self.derive_sandbox_pause(&record, host.as_ref(), row.as_ref()) {
+                    Ok(d) => (d.paused, d.why),
+                    Err(_) => (false, None),
+                }
+            }
+            _ => (false, None),
+        };
         Ok(SandboxStatus {
             runtime: match (record.runtime, runtime) {
                 (Some(kind), Some(rt)) => {
@@ -213,6 +227,8 @@ impl Engine {
                 _ => None,
             },
             state: record.state,
+            paused,
+            pause_why,
             created_at: record.created_at,
             services,
             policy_version: active,

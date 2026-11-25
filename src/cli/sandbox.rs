@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use super::output;
 use enclos::engine::{
-    Engine, PROXY_WAIT, SandboxSpec, SandboxStarted, SandboxView, ServiceLine, StopReport,
+    Engine, HostPauseRead, HostPauseWord, PROXY_WAIT, PauseOutcome, PauseReport, PauseScope,
+    ResumeOutcome, ResumeReport, SandboxSpec, SandboxStarted, SandboxView, ServiceLine, StopReport,
     printable_line,
 };
 use enclos::error::{Result, exit};
@@ -66,6 +67,24 @@ enum SandboxVerb {
     /// Stop each sandbox, then start its services again under the active policy.
     Restart {
         #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
+    /// Pause runtime services so agents stop running, keeping sandboxes and open sessions in place.
+    Pause {
+        /// Pause every sandbox on this host.
+        #[arg(long, conflicts_with = "names", required_unless_present = "names")]
+        all: bool,
+        /// Sandboxes to pause.
+        #[arg(conflicts_with = "all", required_unless_present = "all")]
+        names: Vec<SandboxName>,
+    },
+    /// Resume runtime services stopped by `sandbox pause`.
+    Resume {
+        /// Resume every paused sandbox on this host.
+        #[arg(long, conflicts_with = "names", required_unless_present = "names")]
+        all: bool,
+        /// Sandboxes to resume.
+        #[arg(conflicts_with = "all", required_unless_present = "all")]
         names: Vec<SandboxName>,
     },
     /// Remove a stopped sandbox and its secrets, and its home unless
@@ -130,21 +149,24 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         }
         SandboxVerb::List => {
             let views = engine.list_sandboxes()?;
+            let host_pause = engine.read_host_pause();
             match output::json() {
                 true => output::emit(&json!({
                     "sandboxes": views.iter().map(list_json).collect::<Vec<_>>(),
+                    "pause": host_pause,
                 })),
-                false => print_list(&views),
+                false => print_list(&views, &host_pause),
             }
         }
         SandboxVerb::Show { name } => {
             let view = engine.show_sandbox(&name)?;
+            let host_pause = engine.read_host_pause();
             // The view first: what follows can fail, and the view is what
             // is read when state is broken. In JSON, such a failure is an
             // `error` beside the view, what was read kept and the rest left
             // null.
             if !output::json() {
-                print_show(&view);
+                print_show(&view, &host_pause);
             }
             // Agents are the runtime's: nothing to list without one.
             let agents = || -> Result<_> {
@@ -234,6 +256,22 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 |name| restart(engine, by, name, confirm),
             );
         }
+        SandboxVerb::Pause { all, names } => {
+            let scope = match all {
+                true => PauseScope::All,
+                false => PauseScope::Names(names),
+            };
+            let report = engine.pause_sandboxes(by, scope, None)?;
+            return Ok(emit_pause(&report));
+        }
+        SandboxVerb::Resume { all, names } => {
+            let scope = match all {
+                true => PauseScope::All,
+                false => PauseScope::Names(names),
+            };
+            let report = engine.resume_sandboxes(by, scope, None)?;
+            return Ok(emit_resume(&report));
+        }
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => output::show_plan(&plan),
@@ -294,22 +332,30 @@ fn state_json(s: &SandboxState) -> Value {
 
 fn list_json(v: &SandboxView) -> Value {
     let running = v.sessions.iter().filter(|s| !s.gone()).count();
-    json!({
+    let mut obj = json!({
         "name": v.record.name.to_string(),
         "backend": v.record.backend.to_string(),
         "template": v.template.to_string(),
         "policy_version": v.policy.as_ref().map(|p| p.version),
         "state": state_json(&v.record.state),
+        "paused": v.paused,
         "sessions_running": running,
         "sessions_gone": v.sessions.len() - running,
-    })
+    });
+    if !v.paused
+        && let Some(why) = v.pause_why
+    {
+        obj["why"] = json!(why);
+    }
+    obj
 }
 
 fn show_json(v: &SandboxView) -> Value {
     let r = &v.record;
-    json!({
+    let mut obj = json!({
         "name": r.name.to_string(),
         "state": state_json(&r.state),
+        "paused": v.paused,
         "backend": r.backend.to_string(),
         "template": v.template.to_string(),
         "proxy_port": r.proxy_port,
@@ -331,14 +377,23 @@ fn show_json(v: &SandboxView) -> Value {
                 "members": view.members.iter().map(|m| output::member(m.pid, &m.command)).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
-    })
+    });
+    if !v.paused
+        && let Some(why) = v.pause_why
+    {
+        obj["why"] = json!(why);
+    }
+    obj
 }
 
 /// What `sandbox create --template autonomous` says first (ADR 0058), on
 /// standard error so that it reaches a person whatever the output format.
 const AUTONOMOUS_WARNING: &str = "warning: the autonomous template lets the sandbox write wherever you can, your own files included: nothing stops it changing or removing them, and commands are not filtered, so keep backups. Anything the host later runs from a file it wrote, such as a program on your PATH, a Git hook or an app, runs outside the sandbox. It reaches any public address on any port. It still cannot read or write the sensitive paths (keys, credentials, browsers, password managers), enclos's own files or program, change your shell's startup files, or use host services. Only the Seatbelt backend builds it. Narrow it in the sandbox's policy.toml.";
 
-fn print_list(views: &[SandboxView]) {
+fn print_list(views: &[SandboxView], host_pause: &HostPauseRead) {
+    if let Some(line) = host_pause.summary_line() {
+        println!("{line}");
+    }
     if views.is_empty() {
         // `autonomous` left out on purpose: the hint should not lead a new
         // user to the template that may change their files (ADR 0058).
@@ -355,6 +410,7 @@ fn print_list(views: &[SandboxView]) {
     };
     let name = widest("NAME", |v| v.record.name.as_str());
     let template = widest("TEMPLATE", |v| v.template.as_str());
+    let pause_in_force = host_pause.in_force();
     println!(
         "{:<name$}  {:<10}  {:<template$}  {:<8}  STATE",
         "NAME", "BACKEND", "TEMPLATE", "POLICY"
@@ -374,20 +430,44 @@ fn print_list(views: &[SandboxView]) {
                 count(n, "session", "sessions")
             ),
         };
-        println!(
-            "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
-            v.record.name,
-            v.record.backend,
-            v.template,
-            policy,
+        let state_col = if v.paused {
+            format!("paused (resume: `enclos sandbox resume {}`)", v.record.name)
+        } else if pause_in_force && let Some(why) = v.pause_why {
+            format!("{} (not paused: {})", state(&v.record.state), why.plain())
+        } else {
             state(&v.record.state)
+        };
+        println!(
+            "{:<name$}  {:<10}  {:<template$}  {:<8}  {state_col}{sessions}",
+            v.record.name, v.record.backend, v.template, policy
         );
     }
 }
 
-fn print_show(v: &SandboxView) {
+fn print_show(v: &SandboxView, host_pause: &HostPauseRead) {
     let r = &v.record;
-    println!("Sandbox {}: {}", r.name, state(&r.state));
+    if v.paused {
+        println!(
+            "Sandbox {}: paused (resume with `enclos sandbox resume {}` or `--all`)",
+            r.name, r.name
+        );
+    } else {
+        println!("Sandbox {}: {}", r.name, state(&r.state));
+    }
+    match host_pause {
+        HostPauseRead::Unreadable(why) => println!("  pause state unreadable: {why}"),
+        HostPauseRead::Readable(h) if h.word != HostPauseWord::Running => {
+            if !v.paused
+                && let Some(why) = v.pause_why
+            {
+                println!("  not paused: {}", why.plain());
+            }
+            if let Some(line) = h.summary_line() {
+                println!("  host: {line}");
+            }
+        }
+        _ => {}
+    }
     println!(
         "  backend {}, template {}, proxy port {}",
         r.backend, v.template, r.proxy_port
@@ -765,6 +845,184 @@ fn member_line(pid: u32, command: &str) -> String {
     format!("    pid {pid:<7} {}", printable_line(command))
 }
 
+fn emit_pause(report: &PauseReport) -> u8 {
+    let code = if report.any_failed() {
+        exit::ERROR
+    } else {
+        exit::OK
+    };
+    if output::json() {
+        let items: Vec<Value> = report
+            .sandboxes
+            .iter()
+            .map(|s| {
+                let mut item = json!({
+                    "sandbox": s.sandbox.to_string(),
+                    "outcome": s.outcome,
+                    "services": s.services,
+                    "agents": s.agents,
+                });
+                if let Some(err) = &s.error {
+                    item["error"] = json!({
+                        "kind": "error",
+                        "exit_code": exit::ERROR,
+                        "message": err,
+                    });
+                }
+                item
+            })
+            .collect();
+        let failed = report
+            .sandboxes
+            .iter()
+            .filter(|s| s.outcome == PauseOutcome::WouldNotStop)
+            .count();
+        let doc = output::with_error(
+            json!({
+                "sandboxes": items,
+                "paused": report.host.word == HostPauseWord::Paused,
+                "partly": report.host.word == HostPauseWord::PartlyPaused,
+                "host": HostPauseRead::Readable(report.host.clone()),
+            }),
+            code,
+            || {
+                format!(
+                    "{} could not stop: see each one's error",
+                    count(failed, "sandbox", "sandboxes")
+                )
+            },
+        );
+        output::emit(&doc);
+        return code;
+    }
+
+    for s in &report.sandboxes {
+        let agents_note = match s.agents.is_empty() {
+            true => String::new(),
+            false => format!(" (agents: {})", s.agents.join(", ")),
+        };
+        match s.outcome {
+            PauseOutcome::Paused => {
+                if s.services.is_empty() {
+                    println!("Paused sandbox {}{agents_note}.", s.sandbox);
+                } else {
+                    println!(
+                        "Paused sandbox {}: stopped {}{agents_note}.",
+                        s.sandbox,
+                        s.services.join(", ")
+                    );
+                }
+            }
+            PauseOutcome::NothingToPause => {
+                println!(
+                    "Sandbox {}: nothing to pause (no runtime services installed){agents_note}.",
+                    s.sandbox
+                );
+            }
+            PauseOutcome::WouldNotStop => {
+                let err = s.error.as_deref().unwrap_or("could not stop");
+                eprintln!("error: sandbox {}: would not stop: {err}", s.sandbox);
+            }
+        }
+    }
+    match report.host.summary_line() {
+        Some(line) => println!("{line}."),
+        None => println!("Running."),
+    }
+    code
+}
+
+fn emit_resume(report: &ResumeReport) -> u8 {
+    let code = if report.any_failed() {
+        exit::ERROR
+    } else {
+        exit::OK
+    };
+    if output::json() {
+        let items: Vec<Value> = report
+            .sandboxes
+            .iter()
+            .map(|s| {
+                let mut item = json!({
+                    "sandbox": s.sandbox.to_string(),
+                    "outcome": s.outcome,
+                    "services": s.services,
+                    "agents": s.agents,
+                });
+                if let Some(err) = &s.error {
+                    item["error"] = json!({
+                        "kind": "error",
+                        "exit_code": exit::ERROR,
+                        "message": err,
+                    });
+                }
+                item
+            })
+            .collect();
+        let failed = report
+            .sandboxes
+            .iter()
+            .filter(|s| s.outcome == ResumeOutcome::WouldNotStart)
+            .count();
+        let doc = output::with_error(
+            json!({
+                "sandboxes": items,
+                "paused": report.host.word == HostPauseWord::Paused,
+                "partly": report.host.word == HostPauseWord::PartlyPaused,
+                "host": HostPauseRead::Readable(report.host.clone()),
+            }),
+            code,
+            || {
+                format!(
+                    "{} could not start: see each one's error",
+                    count(failed, "sandbox", "sandboxes")
+                )
+            },
+        );
+        output::emit(&doc);
+        return code;
+    }
+
+    if report.no_record {
+        println!("No pause in force: nothing to resume.");
+        return exit::OK;
+    }
+    for s in &report.sandboxes {
+        let agents_note = match s.agents.is_empty() {
+            true => String::new(),
+            false => format!(" (agents: {})", s.agents.join(", ")),
+        };
+        match s.outcome {
+            ResumeOutcome::Resumed => {
+                if s.services.is_empty() {
+                    println!("Resumed sandbox {}{agents_note}.", s.sandbox);
+                } else {
+                    println!(
+                        "Resumed sandbox {}: installed {}{agents_note}.",
+                        s.sandbox,
+                        s.services.join(", ")
+                    );
+                }
+            }
+            ResumeOutcome::NothingToResume => {
+                println!("Sandbox {}: nothing to resume{agents_note}.", s.sandbox);
+            }
+            ResumeOutcome::LeftAsItWas => {
+                println!("Sandbox {}: left as it was{agents_note}.", s.sandbox);
+            }
+            ResumeOutcome::WouldNotStart => {
+                let err = s.error.as_deref().unwrap_or("could not start");
+                eprintln!("error: sandbox {}: {err}", s.sandbox);
+            }
+        }
+    }
+    match report.host.summary_line() {
+        Some(line) => println!("{line}."),
+        None => println!("Running."),
+    }
+    code
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,5 +1220,63 @@ mod tests {
             "2 of the 3 sandboxes failed: see each one's error"
         );
         assert_eq!(document["error"]["exit_code"], 1);
+    }
+
+    #[test]
+    fn pause_and_resume_require_all_or_names_and_never_both() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: SandboxArgs,
+        }
+
+        // Valid forms: --all alone, or one or more names.
+        let parsed = Wrapper::try_parse_from(["sandbox", "pause", "--all"]).unwrap();
+        assert!(matches!(
+            parsed.args.verb,
+            SandboxVerb::Pause {
+                all: true,
+                ref names
+            } if names.is_empty()
+        ));
+        let parsed = Wrapper::try_parse_from(["sandbox", "pause", "alpha", "beta"]).unwrap();
+        assert!(matches!(
+            parsed.args.verb,
+            SandboxVerb::Pause {
+                all: false,
+                ref names
+            } if names.len() == 2
+        ));
+        let parsed = Wrapper::try_parse_from(["sandbox", "resume", "--all"]).unwrap();
+        assert!(matches!(
+            parsed.args.verb,
+            SandboxVerb::Resume {
+                all: true,
+                ref names
+            } if names.is_empty()
+        ));
+        let parsed = Wrapper::try_parse_from(["sandbox", "resume", "alpha"]).unwrap();
+        assert!(matches!(
+            parsed.args.verb,
+            SandboxVerb::Resume {
+                all: false,
+                ref names
+            } if names.len() == 1
+        ));
+
+        // Usage errors: neither given, or both forms together.
+        for bad in [
+            vec!["sandbox", "pause"],
+            vec!["sandbox", "pause", "--all", "alpha"],
+            vec!["sandbox", "resume"],
+            vec!["sandbox", "resume", "--all", "alpha"],
+        ] {
+            let err = Wrapper::try_parse_from(bad.clone())
+                .err()
+                .expect("should fail");
+            assert_eq!(err.exit_code(), 2, "expected usage exit code 2 for {bad:?}");
+        }
     }
 }
