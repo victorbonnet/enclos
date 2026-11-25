@@ -3147,10 +3147,12 @@ mod tests {
     /// whose text the card now holds, and the asking device's pairing is
     /// replaced, under the same id and person, by one `rekey` changes. The
     /// change of host alone would earn the notice; the old keys earn
-    /// nothing: the device id under them is sent no frame at all, neither
-    /// for the answer nor for a replay, and the runtime is not asked again.
-    /// The card is NEW_OWNER's, so no ordinary publication reaches the
-    /// device either.
+    /// nothing for the pending answer: no frame at all is sent, and the
+    /// card is NEW_OWNER's so no ordinary publication reaches the device
+    /// either. A synthetic replay with the old keys also gets nothing,
+    /// while a replay from the live re-keyed row gets only the notice
+    /// (because the host moved to NEW_OWNER), never NEW_OWNER's text, and
+    /// the runtime is not asked again.
     fn a_rekeyed_pairing_is_sent_no_answer(rekey: fn(&mut Device)) {
         let (_dir, hub, store, phone, rx) = fixture();
         let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
@@ -3167,6 +3169,9 @@ mod tests {
         hub.held_task_resumed(&store, AGENT, &connection, &sent);
         assert_eq!(drain(&rx, 300), []);
         assert_eq!(kept(&hub, &sent), notice("tap"));
+        // Replay carrying the pairing's old keys: exercises `vetted`'s key
+        // comparison on the replay leg, but cannot occur in production because
+        // the `Device` passed to `held_task_resume` always comes from the live row.
         hub.held_task_resume(
             &store,
             &phone,
@@ -3176,6 +3181,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(drain(&rx, 300), []);
+        // Replay by the re-keyed live row. In this fixture the host has moved
+        // to NEW_OWNER, so the device gets the notice for that reason alone,
+        // whatever the replay leg does with keys: this assertion cannot tell a
+        // replay that compares keys from one that does not. It only shows that
+        // a re-keyed device is never sent the new owner's text.
+        hub.held_task_resume(
+            &store,
+            &again,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let replayed = drain(&rx, 300);
+        assert_eq!(replayed, [notice("tap")]);
+        assert!(!carries_marker(&replayed));
         assert!(
             from_bridge
                 .recv_timeout(Duration::from_millis(200))
@@ -3195,6 +3216,76 @@ mod tests {
     #[test]
     fn a_pairing_whose_device_key_changed_is_sent_no_answer() {
         a_rekeyed_pairing_is_sent_no_answer(|d| d.device_key = vec![88; 32]);
+    }
+
+    /// With the host and card unchanged, the kept answer is the full result.
+    /// After re-keying the pairing under the same id and person, a stale
+    /// `Device` carrying the old keys is sent nothing (pinning `vetted`'s key
+    /// check on the replay leg), while the live re-keyed row gets the kept
+    /// full answer again. That second half pins what `docs/protocol.md` says
+    /// of a kept answer: it goes to the asking device while it is still paired
+    /// to its person, and the replay leg takes the pairing from the live row,
+    /// not from the keys the device asked with (only an answer still waiting
+    /// is held to those). Making the replay leg stricter would change the
+    /// sentence and this test together. Device ids cannot survive a re-key in
+    /// production, so neither half is reachable there today.
+    #[test]
+    fn a_replay_vouches_for_the_live_pairing_and_a_stale_one_is_sent_nothing() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        let results: Vec<_> = drain(&rx, 300)
+            .into_iter()
+            .filter(|f| matches!(f, ToDevice::HeldTaskResult { .. }))
+            .collect();
+        assert_eq!(results.len(), 1);
+        let result = results.into_iter().next().unwrap();
+        assert_ne!(result, notice("tap"));
+        assert_eq!(kept(&hub, &sent), result);
+
+        let mut again = phone.clone();
+        again.noise_key = vec![77; 32];
+        assert!(store.remove_device(&phone.id).unwrap());
+        store.add_device(&again).unwrap();
+        let paired = store.device(&phone.id).unwrap().unwrap();
+        assert_eq!(paired.person, OWNER);
+        assert_eq!(paired.noise_key, again.noise_key);
+        assert_eq!(paired.device_key, again.device_key);
+        assert_ne!(paired.noise_key, phone.noise_key);
+
+        // Stale `Device` with the old keys: fails if `vetted` stops comparing
+        // keys on the replay leg.
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), []);
+
+        // Live re-keyed row: the replay leg takes its pairing from this row,
+        // so it is sent the kept answer. Fails if the replay leg is made to
+        // hold a device to the keys it asked with.
+        hub.held_task_resume(
+            &store,
+            &again,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [result]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
     }
 
     /// Whether any of `frames` answers a resume.
