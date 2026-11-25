@@ -410,6 +410,15 @@ impl Hub {
                 plugin.closer.shutdown();
             }
         }
+        // An agent no longer served is a stranger to this run again: if it
+        // comes back, a channel that answered before is not remembered as
+        // having answered in this run (#376).
+        if !removed.is_empty() {
+            let mut answered = self.answered.lock().expect("not poisoned");
+            for agent in &removed {
+                answered.remove(agent);
+            }
+        }
         for (agents, event) in [
             (&added, "agent served"),
             (&removed, "agent no longer served"),

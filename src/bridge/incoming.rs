@@ -112,9 +112,26 @@ pub(super) fn begin(
             "longer than one message on the device leg holds",
         );
     }
-    if let Err(e) = hub.plugin(&name) {
-        let why = format!("{e}: nothing was sent; send it again once the agent can be reached");
-        return refuse(&id, AgentUnavailable, &why);
+    if let Err(failure) = hub.open_plugin(&name, crate::bridge::plugin::HELLO_TIMEOUT) {
+        match hub.hold_for_restart(store, &name, &failure, Attempt::Files) {
+            Hold::Answered => {}
+            // A message with files is not stored until all its bytes are in,
+            // so nothing may promise that it goes: a stopped or created
+            // sandbox is answered with what the bridge said before #376
+            // (#376, `docs/protocol.md`, Sending files).
+            Hold::Stopped | Hold::Restarting => {
+                let why = format!(
+                    "{}: nothing was sent; send it again once the agent can be reached",
+                    failure.why
+                );
+                return refuse(&id, AgentUnavailable, &why);
+            }
+            Hold::Fallback(why) => {
+                let why =
+                    format!("{why}: nothing was sent; send it again once the agent can be reached");
+                return refuse(&id, AgentUnavailable, &why);
+            }
+        }
     }
     if !takes_files(
         hub,

@@ -280,6 +280,22 @@ impl Engine {
         self.view(record)
     }
 
+    /// The state recorded for sandbox `name`: one read of the record
+    /// `enclos` keeps, for telling a restart from a sandbox that is stopped
+    /// (#376). Not [`Engine::status`], which probes: this reads and writes
+    /// nothing, and says so when there is no record.
+    pub fn sandbox_state(&self, name: &SandboxName) -> Result<SandboxState> {
+        if !self.layout.state_db().exists() {
+            return Err(Error::NoSuchSandbox {
+                name: name.to_string(),
+            });
+        }
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(record.state)
+    }
+
     /// The file the active policy compiles to: a session started under
     /// another one runs file and program rules the active policy no longer
     /// has. A sandbox this host cannot compile for runs nothing. Compiled in
