@@ -391,12 +391,30 @@ pub struct Window {
 }
 
 /// One hour of one agent's usage of one model through one model provider.
-struct HourRow {
-    agent: String,
-    hour: i64,
-    model: String,
-    model_provider: String,
-    counts: UsageTotal,
+#[derive(Debug, Clone, PartialEq)]
+pub struct HourRow {
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    /// Hours since the Unix epoch.
+    pub hour: i64,
+    /// Empty when not named.
+    pub model: String,
+    pub model_provider: String,
+    pub counts: UsageTotal,
+}
+
+/// The agents' usage as their runtimes recorded it, read in their
+/// sandboxes as `enclos usage` reads it (issue #366): every native chat,
+/// board work too, which no plugin reports. A
+/// window for the host's person takes each agent of `agents` from `hours`
+/// alone, in place of what its plugin reported, so that the app shows
+/// what `enclos usage` does and nothing is counted twice.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuntimeHours {
+    /// The agents (`<sandbox>/<agent>`) whose records were read.
+    pub agents: std::collections::BTreeSet<String>,
+    /// Their usage, each chat whole in the hour of its last activity.
+    pub hours: Vec<HourRow>,
 }
 
 /// A text column's value as a report named it: none when empty.
@@ -1951,9 +1969,29 @@ impl Store {
         ask: &WindowAsk<'_>,
         prices: &crate::pricing::PriceList,
     ) -> rusqlite::Result<Window> {
+        self.usage_report_with(ask, prices, None)
+    }
+
+    /// [`Store::usage_report`], with what the runtimes recorded: in a
+    /// window with `outside`, each agent `runtime` read counts its
+    /// records' hours in place of its rows here, its app conversations'
+    /// included, which its records hold too.
+    pub fn usage_report_with(
+        &self,
+        ask: &WindowAsk<'_>,
+        prices: &crate::pricing::PriceList,
+        runtime: Option<&RuntimeHours>,
+    ) -> rusqlite::Result<Window> {
         use std::collections::BTreeMap;
-        let hours: Vec<(HourRow, UsageCost)> = self
-            .usage_hours(ask.owner, ask.since, ask.outside)?
+        let mut rows = self.usage_hours(ask.owner, ask.since, ask.outside)?;
+        if ask.outside
+            && let Some(runtime) = runtime
+        {
+            let from = ask.since.max(0) / 3600;
+            rows.retain(|h| !runtime.agents.contains(&h.agent));
+            rows.extend(runtime.hours.iter().filter(|h| h.hour >= from).cloned());
+        }
+        let hours: Vec<(HourRow, UsageCost)> = rows
             .into_iter()
             .filter(|h| ask.scope.covers(&h.agent))
             .map(|h| {
@@ -4871,5 +4909,86 @@ mod tests {
         };
         assert!(main.covers("lab/main"));
         assert!(!main.covers("lab/mainly") && !main.covers("work/main"));
+    }
+
+    #[test]
+    fn the_runtimes_records_replace_an_agents_rows_for_the_hosts_person_and_no_one_else() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.conversation("c-a", "lab", "main", "alice").unwrap();
+        store.conversation("c-b", "lab", "scout", "alice").unwrap();
+        let tokens = |n| UsageTokens {
+            input: Some(n),
+            output: Some(0),
+            ..UsageTokens::default()
+        };
+        let hour = 10 * 3_600;
+        // The app chat of main, which its records hold too, and a routine
+        // its plugin reported: both replaced by what its records say.
+        store
+            .add_usage_by("c-a", "main", hour, Served::default(), 2, tokens(100))
+            .unwrap();
+        store
+            .add_agent_usage("lab/main", hour, 1, tokens(50))
+            .unwrap();
+        // scout's records were not read: its rows count as before.
+        store
+            .add_usage_by("c-b", "scout", hour, Served::default(), 1, tokens(7))
+            .unwrap();
+        let row = |agent: &str, hour, calls, input| HourRow {
+            agent: agent.into(),
+            hour,
+            model: "gpt".into(),
+            model_provider: String::new(),
+            counts: UsageTotal {
+                calls,
+                tokens: tokens(input),
+            },
+        };
+        let runtime = RuntimeHours {
+            agents: ["lab/main".to_owned(), "lab/engineer".to_owned()].into(),
+            hours: vec![
+                row("lab/main", 10, 5, 400),
+                // Board work no plugin reported.
+                row("lab/engineer", 10, 692, 2_580_000),
+                // Before the window: left out.
+                row("lab/engineer", 8, 1, 1),
+            ],
+        };
+        let ask = |outside| WindowAsk {
+            owner: Some("alice"),
+            since: 9 * 3_600,
+            outside,
+            series: Some((3_600, 0)),
+            scope: Scope::Host,
+            sum: false,
+        };
+        let prices = crate::pricing::PriceList::bundled();
+        let host = store
+            .usage_report_with(&ask(true), &prices, Some(&runtime))
+            .unwrap();
+        let calls: Vec<(&str, u64, Option<u64>)> = host
+            .agents
+            .iter()
+            .map(|(a, t, _)| (a.as_str(), t.calls, t.tokens.input))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("lab/engineer", 692, Some(2_580_000)),
+                ("lab/main", 5, Some(400)),
+                ("lab/scout", 1, Some(7)),
+            ]
+        );
+        assert_eq!(host.series[0].agent, "lab/engineer");
+        assert_eq!(host.series[0].points[0].at, 10 * 3_600);
+        // Without the calls outside the app (anyone but the host's person),
+        // the records are not used.
+        let other = store
+            .usage_report_with(&ask(false), &prices, Some(&runtime))
+            .unwrap();
+        let names: Vec<&str> = other.agents.iter().map(|(a, _, _)| a.as_str()).collect();
+        assert_eq!(names, ["lab/main", "lab/scout"]);
+        assert_eq!(other.agents[0].1.calls, 2);
     }
 }

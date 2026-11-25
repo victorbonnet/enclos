@@ -3,6 +3,7 @@
 //! opened with the agent's token.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use enclos_protocol::{
 use super::ids::new_id;
 
 /// How long the plugin has, in all, to answer the bridge's `hello`.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest `hello` the bridge reads: a few names and capabilities.
 const MAX_HELLO_BYTES: usize = 64 * 1024;
 /// How long one write to the plugin may wait for it to read: a plugin that
@@ -32,6 +33,20 @@ pub enum PluginError {
         "cannot reach the agent's app channel at {path}: {source} (is the sandbox started, and the channel set up?)"
     )]
     Connect {
+        path: String,
+        source: std::io::Error,
+    },
+    /// The path is not the channel's own socket: the socket, or the folder it
+    /// is in, is a link (`refuse_linked_folder`), or it is a file that is not
+    /// a socket, a folder, or a path this bridge cannot read
+    /// (`connect_within`, `not_a_channel`). A link is nothing a restart
+    /// explains, and neither is a path that is not a socket, so this failure
+    /// is never called one (#376). It says what `Connect` says: the person's
+    /// diagnostic does not change.
+    #[error(
+        "cannot reach the agent's app channel at {path}: {source} (is the sandbox started, and the channel set up?)"
+    )]
+    Linked {
         path: String,
         source: std::io::Error,
     },
@@ -49,6 +64,61 @@ pub enum PluginError {
     TooLong,
     #[error("the agent's app channel speaks protocol version {0}, which this bridge does not")]
     Version(u64),
+}
+
+impl PluginError {
+    /// Whether this failure is one that a runtime restart explains: the
+    /// connection could not be made, or the peer went away on it
+    /// (`BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, `NotConnected`,
+    /// `UnexpectedEof`). A read or write timeout is not one of these and falls
+    /// back through the existing diagnostic text. A send only reaches the
+    /// restart notice for a channel that answered in this bridge run and whose
+    /// sandbox is running (`Hub::hold_for_restart` asks both), so the notice is
+    /// said of an agent that answered and then went away, never of one that
+    /// refused. A plugin that answered and refused the token, that does not
+    /// speak this protocol, or that sent something unreadable says something
+    /// else about the agent, and is never called a restart. `PermissionDenied`
+    /// on connect is routed to `Linked` by `not_a_channel` before it can become
+    /// `Connect`, so it never reaches the `Connect` arm here.
+    ///
+    /// Known remainder: the attachment-file read error in
+    /// `incoming.rs::send_with_files` (`opened.read_exact`, a bridge-side file)
+    /// also arrives as `Io`; only these kinds are restart-eligible, any other
+    /// kind of it falls back, and a bridge-side `UnexpectedEof`/similar there
+    /// still reads as a restart. That is documented behaviour, not fixed here.
+    pub(super) fn may_be_restarting(&self) -> bool {
+        use std::io::ErrorKind::{
+            BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+        };
+        match self {
+            PluginError::Connect { .. } => true,
+            PluginError::Io(e) => matches!(
+                e.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+
+    /// A `hello` write that failed because the plugin had already closed the
+    /// connection: the plugin refused this bridge without reading it — the
+    /// Hermes plugin closes the connection before the `hello` when its one
+    /// bridge slot is taken. The read side says the same of a reset before a
+    /// line (`connect_within`); this is the write side of that race, and a
+    /// restart is not its explanation (#376).
+    fn closed_before_hello(self) -> PluginError {
+        match self {
+            PluginError::Io(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                PluginError::Refused
+            }
+            other => other,
+        }
+    }
 }
 
 /// What the plugin said of itself in its `hello`.
@@ -86,7 +156,7 @@ pub fn connect(
 /// [`connect`], with `wait` for the whole of the plugin's `hello`: a plugin
 /// that sends it a byte at a time, or never ends its line, is given up on
 /// once `wait` is over.
-fn connect_within(
+pub(super) fn connect_within(
     socket: &Path,
     token: &str,
     home: &str,
@@ -96,33 +166,61 @@ fn connect_within(
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
     refuse_linked_folder(socket)?;
-    let stream = UnixStream::connect(socket).map_err(|source| PluginError::Connect {
-        path: socket.display().to_string(),
-        source,
-    })?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        // A failure of the path itself — a file that is not a socket, a
+        // folder, a folder this bridge cannot read — is nothing a restart
+        // explains: it is refused as `Linked` is, and says what `Connect`
+        // says (#376).
+        Err(source) if not_a_channel(socket, &source) => {
+            return Err(PluginError::Linked {
+                path: socket.display().to_string(),
+                source,
+            });
+        }
+        Err(source) => {
+            return Err(PluginError::Connect {
+                path: socket.display().to_string(),
+                source,
+            });
+        }
+    };
+    open_on(stream, token, home, wait, deadline)
+}
+
+/// Runs the plugin `hello` exchange on an already-connected `stream`.
+fn open_on(
+    stream: UnixStream,
+    token: &str,
+    home: &str,
+    wait: Duration,
+    deadline: Instant,
+) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    write_wait(&stream, Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
         lock: Arc::new(Mutex::new(())),
     };
-    writer.send(FromBridge::Hello {
-        token: token.to_owned(),
-        capabilities: vec![
-            Capability::Questions,
-            Capability::RuntimeApprovals,
-            Capability::RuntimeApprovalScopes,
-            Capability::Abort,
-            Capability::Activity,
-            Capability::Tasks,
-            Capability::HeldTaskDetails,
-            Capability::TaskDetails,
-            Capability::Usage,
-            Capability::HeldTasks,
-            Capability::AgentUsage,
-            Capability::TaskEvents,
-        ],
-        home: ConversationId::new(home).ok(),
-    })?;
+    writer
+        .send(FromBridge::Hello {
+            token: token.to_owned(),
+            capabilities: vec![
+                Capability::Questions,
+                Capability::RuntimeApprovals,
+                Capability::RuntimeApprovalScopes,
+                Capability::Abort,
+                Capability::Activity,
+                Capability::Tasks,
+                Capability::HeldTaskDetails,
+                Capability::TaskDetails,
+                Capability::Usage,
+                Capability::HeldTasks,
+                Capability::AgentUsage,
+                Capability::TaskEvents,
+            ],
+            home: ConversationId::new(home).ok(),
+        })
+        .map_err(PluginError::closed_before_hello)?;
     let mut reader = PluginReader {
         lines: BufReader::new(stream),
         answers: writer.try_clone()?,
@@ -289,7 +387,7 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
         if let Ok(meta) = std::fs::symlink_metadata(path)
             && meta.file_type().is_symlink()
         {
-            return Err(PluginError::Connect {
+            return Err(PluginError::Linked {
                 path: socket.display().to_string(),
                 source: std::io::Error::other(format!("{} is a link, not {what}", path.display())),
             });
@@ -298,20 +396,53 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Whether a failed connection to `socket` failed because the path is not the
+/// channel's own socket — a file that is not one, a folder, or something this
+/// bridge cannot look at — rather than because no channel is listening there.
+/// A restart explains the second, never the first (`refuse_linked_folder`
+/// refuses the link, [`not_a_channel`] the rest), so the first says what
+/// `Connect` says and is never called one (#376).
+fn not_a_channel(socket: &Path, source: &std::io::Error) -> bool {
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) => !meta.file_type().is_socket(),
+        // A socket taken away as the bridge asks for it is a channel going
+        // away, which a restart explains; anything else is a path this bridge
+        // cannot look at.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Tolerates macOS's `EINVAL` from `set_{read,write}_timeout` once the peer
+/// has closed the connection; Rust's own zero-duration refusal is
+/// `InvalidInput` too, but carries no OS error and stays an error.
+fn tolerate_closed_timeout(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Sets how long a read on `stream` may wait. macOS refuses to change it
 /// (`EINVAL`) once the connection is shut both ways, which it is as soon
 /// as the plugin has closed its end: a plugin may send its `hello` and
 /// close before the bridge has read it. A read there never waits, it gets
 /// what is left and then the end, so that refusal is no failure.
 fn read_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
-    match stream.set_read_timeout(wait) {
-        // Rust's own refusal (a zero wait) is `InvalidInput` too, but
-        // carries no OS error.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_some() => {
-            Ok(())
-        }
-        other => other,
-    }
+    tolerate_closed_timeout(stream.set_read_timeout(wait))
+}
+
+/// Sets how long a write on `stream` may wait. macOS refuses to change it
+/// (`EINVAL`) once the peer has closed its end (for instance, a plugin that
+/// accepts and drops the connection because its one bridge slot is taken).
+/// The write that follows then fails with `BrokenPipe`/`ConnectionReset` and
+/// `closed_before_hello` turns it into `Refused`.
+fn write_wait(stream: &UnixStream, wait: Option<Duration>) -> std::io::Result<()> {
+    tolerate_closed_timeout(stream.set_write_timeout(wait))
 }
 
 impl PluginReader {
@@ -723,7 +854,7 @@ mod tests {
         let plugin = echo_plugin(UnixListener::bind(real.join("main.sock")).unwrap(), "t0ken");
         let linked = folder.path().join(".enclos-app");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        let Err(PluginError::Connect { source, .. }) =
+        let Err(PluginError::Linked { source, .. }) =
             connect(&linked.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
@@ -741,7 +872,7 @@ mod tests {
         let own = folder.path().join(".enclos-app");
         std::fs::create_dir(&own).unwrap();
         std::os::unix::fs::symlink(&elsewhere, own.join("main.sock")).unwrap();
-        let Err(PluginError::Connect { source, .. }) =
+        let Err(PluginError::Linked { source, .. }) =
             connect(&own.join("main.sock"), "t0ken", "home.lab.main")
         else {
             panic!("connected through a link");
@@ -763,6 +894,124 @@ mod tests {
             Err(PluginError::Refused)
         ));
         plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_hello_write_that_found_the_connection_closed_is_a_refusal() {
+        use std::io::{Error, ErrorKind};
+        // The plugin closed the connection before reading the hello: the read
+        // side says `Refused` of the same close, so does the write side.
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
+            assert!(matches!(
+                PluginError::Io(Error::from(kind)).closed_before_hello(),
+                PluginError::Refused
+            ));
+        }
+        // Anything else is left as it was: a timeout is not a restart either.
+        let timed_out = PluginError::Io(Error::from(ErrorKind::TimedOut)).closed_before_hello();
+        assert!(matches!(timed_out, PluginError::Io(_)));
+        assert!(!timed_out.may_be_restarting());
+    }
+
+    /// Deterministic companion to the racy end-to-end
+    /// `restart_tests::an_accept_and_drop_channel_is_never_called_a_restart`:
+    /// dropping the peer before `open_on` guarantees the `hello` write hits a
+    /// closed socket (`BrokenPipe`) and exercises `write_wait` +
+    /// `closed_before_hello` -> `Refused` on every run.
+    #[test]
+    fn a_hello_write_to_an_already_closed_stream_is_refused() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        let wait = Duration::from_secs(1);
+        let result = open_on(ours, "t0ken", "home.lab.main", wait, Instant::now() + wait);
+        assert!(matches!(result, Err(PluginError::Refused)));
+    }
+
+    #[test]
+    fn only_a_connection_that_failed_before_the_hello_may_be_a_restart() {
+        use std::io::{Error, ErrorKind};
+        let at = |kind| PluginError::Connect {
+            path: "/home/alice/.enclos-app/main.sock".into(),
+            source: Error::from(kind),
+        };
+        // The channel is not there, or is going away: a restart explains both.
+        assert!(at(ErrorKind::ConnectionRefused).may_be_restarting());
+        assert!(at(ErrorKind::NotFound).may_be_restarting());
+        // Only the I/O kinds a peer going away produces may be a restart;
+        // timeouts and other I/O failures fall back.
+        for (kind, expected) in [
+            (ErrorKind::BrokenPipe, true),
+            (ErrorKind::ConnectionReset, true),
+            (ErrorKind::ConnectionAborted, true),
+            (ErrorKind::NotConnected, true),
+            (ErrorKind::UnexpectedEof, true),
+            (ErrorKind::TimedOut, false),
+            (ErrorKind::InvalidInput, false),
+            (ErrorKind::PermissionDenied, false),
+            (ErrorKind::Other, false),
+        ] {
+            assert_eq!(
+                PluginError::Io(Error::from(kind)).may_be_restarting(),
+                expected,
+                "Io({kind:?})"
+            );
+        }
+        // What the plugin answered, or failed to say, is its own answer.
+        assert!(
+            !PluginError::Linked {
+                path: "p".into(),
+                source: Error::other("a link"),
+            }
+            .may_be_restarting()
+        );
+        assert!(!PluginError::Refused.may_be_restarting());
+        assert!(!PluginError::Protocol("spoke oddly".into()).may_be_restarting());
+        assert!(!PluginError::TooLong.may_be_restarting());
+        assert!(!PluginError::Version(2).may_be_restarting());
+    }
+
+    #[test]
+    fn a_file_where_the_socket_belongs_is_refused_not_called_a_restart() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        std::fs::write(&socket, b"not a socket").unwrap();
+        let Err(failed) = connect(&socket, "t0ken", "home.lab.main") else {
+            panic!("connected to a file");
+        };
+        assert!(matches!(failed, PluginError::Linked { .. }), "{failed:?}");
+        assert!(!failed.may_be_restarting(), "{failed}");
+        // The person's diagnostic is the one `Connect` gives: unchanged.
+        let said = failed.to_string();
+        assert!(
+            said.contains("cannot reach the agent's app channel at"),
+            "{said}"
+        );
+        assert!(
+            said.contains("(is the sandbox started, and the channel set up?)"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_folder_this_bridge_cannot_read_is_refused_not_called_a_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let own = folder.path().join(".enclos-app");
+        std::fs::create_dir(&own).unwrap();
+        let _plugin = UnixListener::bind(own.join("main.sock")).unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&own).is_ok() {
+            // Run as root, which reads everything.
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let failed = connect(&own.join("main.sock"), "t0ken", "home.lab.main");
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(failed) = failed else {
+            panic!("connected into a folder this bridge cannot read");
+        };
+        assert!(matches!(failed, PluginError::Linked { .. }), "{failed:?}");
+        assert!(!failed.may_be_restarting(), "{failed}");
     }
 
     #[test]
@@ -857,6 +1106,18 @@ mod tests {
         assert_eq!((&stream).read(&mut [0; 8]).unwrap(), 0);
         // A zero wait is still refused, as Rust refuses it.
         assert!(read_wait(&stream, Some(Duration::ZERO)).is_err());
+    }
+
+    #[test]
+    fn a_write_wait_on_a_closed_connection_is_no_failure() {
+        let (stream, other) = UnixStream::pair().unwrap();
+        drop(other);
+        write_wait(&stream, Some(Duration::from_secs(5))).unwrap();
+        write_wait(&stream, None).unwrap();
+        // A zero wait is still refused, as Rust refuses it (no OS error).
+        let zero = write_wait(&stream, Some(Duration::ZERO)).unwrap_err();
+        assert_eq!(zero.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(zero.raw_os_error().is_none());
     }
 
     #[test]

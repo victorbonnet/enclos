@@ -11,6 +11,17 @@ from enclos import conversations
 
 
 class NativeDeletion(unittest.IsolatedAsyncioTestCase):
+    async def test_repository_owner_uses_typed_row_and_native_cleanup(self):
+        adapter, owner, mutate, cleaned, modules = self.fixture()
+        del owner.db
+        owner.persistence = types.SimpleNamespace(sessions=types.SimpleNamespace(
+            get=Mock(return_value=types.SimpleNamespace(runtime_revision=17, runtime_generation=4))))
+        modules["session_retention"] = types.SimpleNamespace(remove_session_files=cleaned)
+        with patch.dict(sys.modules, modules), patch.object(conversations, "authority", return_value=owner), patch.object(conversations, "session_id", return_value="session"):
+            await conversations.delete(adapter, "chat", "request")
+        self.assertEqual(mutate.await_args.args[3]['expected_revision'], 17)
+        self.assertEqual(cleaned.call_count, 2)
+
     def fixture(self):
         row = {"runtime_revision": 17, "runtime_generation": 4}
         owner = types.SimpleNamespace(profile_id="/tmp/agent-profile", db=types.SimpleNamespace(get_session=Mock(return_value=row)),

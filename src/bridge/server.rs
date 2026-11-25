@@ -56,6 +56,8 @@ mod policy;
 mod questions;
 #[path = "routines.rs"]
 mod routines;
+#[path = "runtime_usage.rs"]
+mod runtime_usage;
 #[path = "served.rs"]
 mod served;
 #[path = "task_board_proxy.rs"]
@@ -74,7 +76,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
@@ -100,7 +102,7 @@ use super::groups::{
 };
 use super::ids::{new_id, random_bytes};
 use super::pace::Pace;
-use super::plugin::{PluginCloser, PluginWriter, connect};
+use super::plugin::{self, PluginCloser, PluginError, PluginWriter, connect_within};
 use super::provisioning::{Completed, Host, Operation};
 #[cfg(test)]
 use super::store::home_id;
@@ -145,6 +147,69 @@ const REFUSALS_PER_MINUTE: u32 = 10;
 
 /// The longest device name the bridge keeps.
 const NAME_CHARS: usize = 64;
+
+/// How long a conversation message waits for the channel of an agent whose
+/// runtime is being restarted, before it is answered at all (#376).
+const RESTART_WAIT: Duration = Duration::from_secs(15);
+/// How often that wait asks the channel again.
+const RESTART_POLL: Duration = Duration::from_millis(250);
+/// What a device is told when the wait ends and the channel is still away.
+pub(super) const RESTARTING: &str =
+    "The agent is restarting. Your message is kept and will be sent when it is back.";
+/// What a device is told when the sandbox is stopped, or was created and
+/// never started.
+pub(super) const STOPPED: &str = "The sandbox is stopped — start it and your message goes.";
+
+/// A failure to reach an agent's channel, with what it presumes about the
+/// agent (#376).
+pub(super) struct Unreachable {
+    /// A failure a restart explains (§1).
+    pub(super) may_be_restarting: bool,
+    /// The text the bridge answered before #376, unchanged.
+    pub(super) why: String,
+}
+
+impl std::convert::From<String> for Unreachable {
+    fn from(why: String) -> Unreachable {
+        Unreachable {
+            may_be_restarting: false,
+            why,
+        }
+    }
+}
+
+impl std::convert::From<PluginError> for Unreachable {
+    fn from(e: PluginError) -> Unreachable {
+        Unreachable {
+            may_be_restarting: e.may_be_restarting(),
+            why: e.to_string(),
+        }
+    }
+}
+
+/// Which of the two message paths is waiting (#376).
+pub(super) enum Attempt {
+    /// A chat message: stored and echoed, then given to the agent.
+    Message,
+    /// A message with files: not stored yet, only the channel is opened.
+    Files,
+}
+
+/// What a message path does after its first attempt to reach the agent
+/// failed (#376).
+pub(super) enum Hold {
+    /// The channel answered inside the wait: the message can go now.
+    Answered,
+    /// The sandbox is stopped, or was created and never started.
+    Stopped,
+    /// A running sandbox whose channel had answered in this bridge run, and
+    /// is still away when the wait ends.
+    Restarting,
+    /// Anything else: answer with this failure's own text, as before #376.
+    /// A retry can fail for a reason of its own — a wrong token, an agent
+    /// given up in the app — and that reason is what is said.
+    Fallback(String),
+}
 
 /// Who is at an address, as the transport says.
 type Whois = Arc<dyn Fn(&str) -> Result<Caller, String> + Send + Sync>;
@@ -214,6 +279,12 @@ struct Hub {
     provisioning_busy: Mutex<HashSet<String>>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, Plugin>>,
+    /// The agents whose channel answered in this bridge run, by `sandbox/name`:
+    /// a channel that answered and then went away is a runtime being started
+    /// again, not one that was never there (#376).
+    answered: Mutex<HashSet<String>>,
+    /// How long a message waits for the channel of a restarting agent.
+    restart_wait: Duration,
     routines: Mutex<routines::RoutineRequests>,
     models: Mutex<models::ModelRequests>,
     deletions: Mutex<HashMap<String, deletions::PendingDelete>>,
@@ -225,6 +296,9 @@ struct Hub {
     /// Resumes of held tasks sent to plugins, and each agent's connection.
     held_tasks: Mutex<held_tasks::HeldTaskRequests>,
     task_boards: task_boards::TaskBoards,
+    /// The last read of what the agents' runtimes recorded of their usage
+    /// (issue #366).
+    runtime_usage: runtime_usage::RuntimeUsage,
     /// Task details asked of plugins for devices.
     task_details: Mutex<task_details::TaskDetailRequests>,
     /// One lock per agent, held while its plugin connection opens, never
@@ -530,6 +604,8 @@ impl Hub {
             provisioning: None,
             provisioning_busy: Mutex::new(HashSet::new()),
             plugins: Mutex::new(HashMap::new()),
+            answered: Mutex::new(HashSet::new()),
+            restart_wait: RESTART_WAIT,
             routines: Mutex::new(Default::default()),
             models: Mutex::new(Default::default()),
             deletions: Mutex::new(HashMap::new()),
@@ -544,6 +620,7 @@ impl Hub {
             open_item_devices: Mutex::new(HashSet::new()),
             held_tasks: Mutex::new(Default::default()),
             task_boards: task_boards::TaskBoards::default(),
+            runtime_usage: Default::default(),
             task_details: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
@@ -572,6 +649,14 @@ impl Hub {
             approval_key: Some(key),
             ..self
         }
+    }
+
+    /// As this, waiting `wait` for the channel of a restarting agent, so that
+    /// a test need not wait the whole [`RESTART_WAIT`] (#376).
+    #[cfg(test)]
+    fn with_restart_wait(mut self, wait: Duration) -> Hub {
+        self.restart_wait = wait;
+        self
     }
 
     /// The agents served now: a snapshot, which a change of enclos's
@@ -825,10 +910,21 @@ impl Hub {
         Ok(true)
     }
 
-    /// The agent's plugin connection, opened if it is not; its reader runs
-    /// in a thread of its own, storing what the agent says and passing it
-    /// on to the conversation's owner.
+    /// [`Hub::open_plugin`], with the text the bridge answered before #376.
     fn plugin(self: &Arc<Hub>, agent: &str) -> Result<(), String> {
+        self.open_plugin(agent, plugin::HELLO_TIMEOUT)
+            .map_err(|failure| failure.why)
+    }
+
+    /// The agent's plugin connection, opened if it is not, waiting up to
+    /// `wait` for its `hello` and reporting what a failure presumes about the
+    /// agent (#376); its reader runs in a thread of its own, storing what the
+    /// agent says and passing it on to the conversation's owner.
+    pub(super) fn open_plugin(
+        self: &Arc<Hub>,
+        agent: &str,
+        wait: Duration,
+    ) -> Result<(), Unreachable> {
         let open = |hub: &Hub| {
             hub.plugins
                 .lock()
@@ -870,14 +966,12 @@ impl Hub {
                 )
             })?;
         let (hello, mut reader, mut writer) =
-            connect(&endpoint.socket, &endpoint.token, &home).map_err(|e| e.to_string())?;
+            connect_within(&endpoint.socket, &endpoint.token, &home, wait)?;
         // Changed while it connected: given up before anything is told of
         // this connection. Checked again below, where it counts.
         if !self.agents().contains(&endpoint) {
             writer.shutdown();
-            return Err(format!(
-                "{agent}'s app channel changed while it was being opened"
-            ));
+            return Err(format!("{agent}'s app channel changed while it was being opened").into());
         }
         if hello.capabilities.contains(&Capability::Approval)
             && let Some((sandbox, _)) = agent.split_once('/')
@@ -933,9 +1027,9 @@ impl Hub {
             // connection and ends it, or this sees the change.
             if !self.agents().contains(&endpoint) {
                 writer.shutdown();
-                return Err(format!(
-                    "{agent}'s app channel changed while it was being opened"
-                ));
+                return Err(
+                    format!("{agent}'s app channel changed while it was being opened").into(),
+                );
             }
             plugins.insert(
                 agent.to_owned(),
@@ -949,6 +1043,14 @@ impl Hub {
                     closer,
                 },
             );
+            // It answered in this bridge run: if its channel goes away now,
+            // a runtime being started again is what that means (#376). Done
+            // while `plugins` is held, so a change of the served agents cannot
+            // be undone by this insert.
+            self.answered
+                .lock()
+                .expect("not poisoned")
+                .insert(agent.to_owned());
         }
         // A plugin that no longer lists its commands: the ones it listed
         // before are offered no more.
@@ -1632,6 +1734,16 @@ impl Hub {
     /// its connection if it is not open, each with the id it was stored
     /// with: the plugin drops one it has had already.
     fn forward(self: &Arc<Hub>, store: &Store, agent: &str) -> Result<(), String> {
+        self.forward_within(store, agent, plugin::HELLO_TIMEOUT)
+            .map_err(|failure| failure.why)
+    }
+
+    fn forward_within(
+        self: &Arc<Hub>,
+        store: &Store,
+        agent: &str,
+        wait: Duration,
+    ) -> Result<(), Unreachable> {
         let (sandbox, name) = agent
             .split_once('/')
             .ok_or_else(|| format!("no agent {agent}"))?;
@@ -1639,13 +1751,13 @@ impl Hub {
         if pending.is_empty() {
             return Ok(());
         }
-        self.plugin(agent)?;
+        self.open_plugin(agent, wait)?;
         // The plugins lock is let go before writing: a write waits for the
         // plugin to read, up to the plugin leg's write timeout
         let (out, generation, takes_files, takes_images) = {
             let plugins = self.plugins.lock().expect("not poisoned");
             let Some(plugin) = plugins.get(agent) else {
-                return Err(format!("{agent}'s app channel closed"));
+                return Err(format!("{agent}'s app channel closed").into());
             };
             (
                 Arc::clone(&plugin.out),
@@ -1739,11 +1851,91 @@ impl Hub {
                 if plugins.get(agent).map(|p| p.generation) == Some(generation) {
                     plugins.remove(agent);
                 }
-                return Err(e.to_string());
+                return Err(e.into());
             }
             plugin.sent.insert(message.id);
         }
         Ok(())
+    }
+
+    /// Whether a message that could not reach its agent is a restart to wait
+    /// through, a stopped sandbox, or neither (#376). Only a connection-level
+    /// failure of a served agent whose channel answered in this bridge run,
+    /// with `Running` recorded for its sandbox, counts as a restart: a record
+    /// that cannot be read, an unknown sandbox, or a lock that does not come
+    /// free, falls back to what the bridge answered before. Nothing here
+    /// writes, and nothing here probes the sandbox.
+    pub(super) fn hold_for_restart(
+        self: &Arc<Hub>,
+        store: &Store,
+        agent: &str,
+        failure: &Unreachable,
+        attempt: Attempt,
+    ) -> Hold {
+        use crate::model::sandbox::SandboxState;
+        // The budget starts at the failed attempt itself, not after the read
+        // that follows it: the state read and every retry start inside the
+        // same 15 s (§4, A9). It bounds when a retry starts, not what that
+        // retry waits on: it can hold the per-agent `opening` lock, the
+        // plugin's write lock, or a write of `WRITE_TIMEOUT` (10 s), none of
+        // which is capped by what is left, so under contention the answer can
+        // come later. `docs/protocol.md` says so plainly.
+        let deadline = Instant::now() + self.restart_wait;
+        if !failure.may_be_restarting {
+            return Hold::Fallback(failure.why.clone());
+        }
+        let Some((sandbox, _)) = agent.split_once('/') else {
+            return Hold::Fallback(failure.why.clone());
+        };
+        let Ok(name) = sandbox.parse() else {
+            return Hold::Fallback(failure.why.clone());
+        };
+        // Read before `answered` is asked: a stopped or created sandbox is
+        // said so whether or not its channel ever answered (A3, A4), and only
+        // this read tells. A channel that never answered pays the read and
+        // then answers without waiting (A5).
+        let state =
+            match crate::engine::Engine::open(self.layout.clone(), crate::state::Wait::Command)
+                .sandbox_state(&name)
+            {
+                Ok(state) => state,
+                Err(_) => return Hold::Fallback(failure.why.clone()),
+            };
+        match state {
+            SandboxState::Stopped | SandboxState::Created => Hold::Stopped,
+            SandboxState::Running => {
+                // The guard is released here, before a retry takes the plugin
+                // locks: `open_plugin` inserts into this set while it holds
+                // `plugins`, so the two are never taken the other way round.
+                let answered = self.answered.lock().expect("not poisoned").contains(agent);
+                if !answered {
+                    return Hold::Fallback(failure.why.clone());
+                }
+                while deadline > Instant::now() {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let tried = match &attempt {
+                        Attempt::Message => {
+                            self.forward_within(store, agent, left.min(plugin::HELLO_TIMEOUT))
+                        }
+                        Attempt::Files => self.open_plugin(agent, left.min(plugin::HELLO_TIMEOUT)),
+                    };
+                    match tried {
+                        Ok(()) => return Hold::Answered,
+                        // A restart does not explain this failure, so the
+                        // retry is not called one and its own text is said at
+                        // once (§3a).
+                        Err(failed) if !failed.may_be_restarting => {
+                            return Hold::Fallback(failed.why);
+                        }
+                        Err(_) => {}
+                    }
+                    let sleep = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(sleep.min(RESTART_POLL));
+                }
+                Hold::Restarting
+            }
+            SandboxState::Failed { .. } => Hold::Fallback(failure.why.clone()),
+        }
     }
 
     /// The bridge's signature of `message` as it now goes to `agent`'s
@@ -2128,6 +2320,10 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
         sweep_incoming(&store, &hub.media());
     }
     artefacts::sweep_copies(&hub.artefact_copies());
+    // Which channels answer already: a runtime restarting before the first
+    // message is still a restart, and a channel that never answered in this
+    // run is not (#376).
+    hub.open_plugins();
     let retrying = Arc::clone(&hub);
     std::thread::spawn(move || {
         loop {
@@ -3072,8 +3268,20 @@ fn run_session(
                                 prices.override_file.display()
                             );
                         }
+                        // For the host's person, every call the agents'
+                        // runtimes recorded, as `enclos usage` shows them
+                        // (issue #366): board work too, which no plugin
+                        // reports.
+                        let runtime = match outside {
+                            true => hub.runtime_hours(&authority::device_actor(
+                                person,
+                                &device.id,
+                                Some(&message.id.to_string()),
+                            )),
+                            false => None,
+                        };
                         store
-                            .usage_report(
+                            .usage_report_with(
                                 &crate::bridge::store::WindowAsk {
                                     owner: Some(person),
                                     since,
@@ -3083,12 +3291,17 @@ fn run_session(
                                     sum: scope != crate::bridge::store::Scope::Host,
                                 },
                                 &prices.list,
+                                runtime.as_deref(),
                             )
                             .and_then(|window| {
-                                let reporters = match outside {
+                                let mut reporters = match outside {
                                     true => store.outside_reporters()?,
                                     false => Vec::new(),
                                 };
+                                // Read from its records: every call counted.
+                                if let Some(runtime) = &runtime {
+                                    reporters.extend(runtime.agents.iter().cloned());
+                                }
                                 Ok((window, reporters))
                             })
                     }
@@ -3289,7 +3502,9 @@ fn run_session(
                     Err(error) => link.send(ToDevice::Error(error))?,
                     Ok((conversation, said, card)) => {
                         // The person's message, as a `message.send` of theirs:
-                        // kept for an agent that cannot be reached yet.
+                        // kept for an agent that cannot be reached yet. The
+                        // answer is not held, and the reply is not errored, as
+                        // before #376.
                         let given = send(
                             hub,
                             store,
@@ -3297,6 +3512,7 @@ fn run_session(
                             &conversation,
                             message.id.clone(),
                             said.text,
+                            SendWait::Never,
                         );
                         let refused = match &given {
                             Ok(Some(ToDevice::Error(error)))
@@ -3611,7 +3827,15 @@ fn run_session(
                 group_turns::stop_group(hub, store, person, conversation.as_str())?;
             }
             FromDevice::MessageSend { conversation, text } => {
-                if let Some(answer) = send(hub, store, device, &conversation, message.id, text)? {
+                if let Some(answer) = send(
+                    hub,
+                    store,
+                    device,
+                    &conversation,
+                    message.id,
+                    text,
+                    SendWait::ForRestart,
+                )? {
                     // After the echo, which the outbox holds
                     drain(hub, store, link, &device.id, person, outbox, &mut sent)?;
                     link.send(answer)?;
@@ -4643,6 +4867,24 @@ fn rename(
     Ok(())
 }
 
+/// Whether a message's send waits for a restarting agent's channel (#376).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendWait {
+    /// A conversation message: up to [`RESTART_WAIT`] for the channel of an
+    /// agent whose sandbox is recorded running and whose channel answered in
+    /// this bridge run (D1).
+    ForRestart,
+    /// Not at all: a held task's answer goes as it did before #376 (A10), and
+    /// its own silence is the person's answer.
+    Never,
+}
+
+/// What the bridge answered before #376 for a message it kept but could not
+/// give to the agent: byte-identical, whatever the failure.
+fn kept(why: &str) -> String {
+    format!("{why}: the message is kept, and goes to the agent once it can be reached")
+}
+
 /// A person's message: stored once, echoed to the person's devices with
 /// its place in the order, and given to the agent's plugin, now or once it
 /// can be reached. What to answer the device, if anything.
@@ -4653,6 +4895,7 @@ fn send(
     conversation: &ConversationId,
     id: MessageId,
     text: String,
+    waits: SendWait,
 ) -> Result<Option<ToDevice>, String> {
     let person = device.person.as_str();
     if store
@@ -4771,15 +5014,25 @@ fn send(
             }),
         );
     }
-    Ok(hub.forward(store, &name).err().map(|e| {
-        ToDevice::Error(ErrorBody {
-            of: Some(id),
-            code: ErrorCode::AgentUnavailable,
-            message: format!(
-                "{e}: the message is kept, and goes to the agent once it can be reached"
-            ),
-        })
-    }))
+    let failure = match hub.forward_within(store, &name, plugin::HELLO_TIMEOUT) {
+        Ok(()) => return Ok(None),
+        Err(failure) => failure,
+    };
+    let message = if waits == SendWait::Never {
+        kept(&failure.why)
+    } else {
+        match hub.hold_for_restart(store, &name, &failure, Attempt::Message) {
+            Hold::Answered => return Ok(None),
+            Hold::Stopped => STOPPED.to_owned(),
+            Hold::Restarting => RESTARTING.to_owned(),
+            Hold::Fallback(why) => kept(&why),
+        }
+    };
+    Ok(Some(ToDevice::Error(ErrorBody {
+        of: Some(id),
+        code: ErrorCode::AgentUnavailable,
+        message,
+    })))
 }
 
 #[cfg(test)]
@@ -4802,6 +5055,7 @@ mod connection_end_tests {
     #[path = "../../artefacts_tests.rs"]
     mod artefacts_tests;
     mod incoming_tests;
+    mod restart_tests;
 
     /// A bridge on a free port of the loopback, serving `lab/main`, whose
     /// plugin listens at `<folder>/main.sock`, with the transport's WhoIs
@@ -4830,6 +5084,30 @@ mod connection_end_tests {
                 crate::layout::Layout::at(folder.join("enclos")),
                 "/unused/enclos".into(),
             ),
+        )
+    }
+
+    /// As [`bridge`], with `restart_wait` for the channel of a restarting
+    /// agent (#376), so that a test need not wait the whole [`RESTART_WAIT`].
+    fn bridge_restarting(folder: &Path, restart_wait: Duration) -> Bridge {
+        let main = vec![AgentEndpoint {
+            name: "lab/main".to_owned(),
+            runtime: "hermes".to_owned(),
+            socket: folder.join("main.sock"),
+            token: TOKEN.to_owned(),
+        }];
+        let provisioning = Host::new(
+            crate::layout::Layout::at(folder.join("enclos")),
+            "/unused/enclos".into(),
+        );
+        bridge_keyed_with_wait(
+            folder,
+            SILENCE,
+            provisioning,
+            main,
+            None,
+            None,
+            restart_wait,
         )
     }
 
@@ -4864,6 +5142,26 @@ mod connection_end_tests {
         watch: Option<AgentWatch>,
         approval_key: Option<enclos_protocol::decision::DecisionKey>,
     ) -> Bridge {
+        bridge_keyed_with_wait(
+            folder,
+            silence,
+            provisioning,
+            agents,
+            watch,
+            approval_key,
+            RESTART_WAIT,
+        )
+    }
+
+    fn bridge_keyed_with_wait(
+        folder: &Path,
+        silence: Duration,
+        provisioning: Host,
+        agents: Vec<AgentEndpoint>,
+        watch: Option<AgentWatch>,
+        approval_key: Option<enclos_protocol::decision::DecisionKey>,
+        restart_wait: Duration,
+    ) -> Bridge {
         let keys = generate_keypair().unwrap();
         let node = Arc::new(Mutex::new("n-pixel".to_owned()));
         let whois_login = Arc::new(Mutex::new(PERSON.to_owned()));
@@ -4888,7 +5186,8 @@ mod connection_end_tests {
             None,
             silence,
         )
-        .with_provisioning(provisioning);
+        .with_provisioning(provisioning)
+        .with_restart_wait(restart_wait);
         if let Some(watch) = watch {
             hub = hub.with_agent_watch(watch);
         }

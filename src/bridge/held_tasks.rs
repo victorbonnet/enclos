@@ -35,12 +35,47 @@ pub(super) struct ResumeRequest {
 struct Pending {
     device: String,
     person: String,
+    /// The asking device's pairing keys when it asked: its answer goes to
+    /// that pairing alone.
+    noise_key: Vec<u8>,
+    device_key: Vec<u8>,
     connection: String,
     original: MessageId,
     request: ResumeRequest,
     /// The runtime's revision the resume was sent at.
     sent: HeldTaskRevision,
     started: Instant,
+}
+
+/// The device that asked for a resume, as it was paired when it asked.
+#[derive(Clone, Copy)]
+struct Asker<'a> {
+    device: &'a str,
+    person: &'a str,
+    noise_key: &'a [u8],
+    device_key: &'a [u8],
+}
+
+impl<'a> Asker<'a> {
+    fn of(device: &'a Device, person: &'a str) -> Self {
+        Asker {
+            device: &device.id,
+            person,
+            noise_key: &device.noise_key,
+            device_key: &device.device_key,
+        }
+    }
+}
+
+impl Pending {
+    fn asker(&self) -> Asker<'_> {
+        Asker {
+            device: &self.device,
+            person: &self.person,
+            noise_key: &self.noise_key,
+            device_key: &self.device_key,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -127,13 +162,11 @@ fn code_name(code: ErrorCode) -> String {
         .unwrap_or_default()
 }
 
-/// The `of` of a resume's answer.
-fn answer_of(answer: &ToDevice) -> Option<MessageId> {
-    match answer {
-        ToDevice::HeldTaskResult { of, .. } => Some(of.clone()),
-        ToDevice::Error(error) => error.of.clone(),
-        _ => None,
-    }
+/// The whole answer to request `of` of a device that may not read what
+/// became of the resume: fixed, with nothing of the card, the runtime or
+/// whoever owns the card now.
+fn notice(of: &MessageId) -> ToDevice {
+    ToDevice::Error(failure(of.clone(), ErrorCode::Unconfirmed, UNCONFIRMED))
 }
 
 /// The current card owned by this person, regardless of changes to its revision.
@@ -527,7 +560,8 @@ impl Hub {
             let requests = self.held_tasks.lock().expect("not poisoned");
             if let Some(answer) = self.replayed(&requests, &rpc, &request, &original)? {
                 drop(requests);
-                self.deliver_held_device(store, &device.id, person, answer);
+                let asker = Asker::of(device, person);
+                self.deliver_held_device(store, &asker, &request, &original, answer);
                 return Ok(());
             }
             if requests.pending.contains_key(rpc.as_str()) {
@@ -596,7 +630,8 @@ impl Hub {
         // Another device thread may have claimed the same id meanwhile.
         if let Some(answer) = self.replayed(&requests, &rpc, &request, &original)? {
             drop(requests);
-            self.deliver_held_device(store, &device.id, person, answer);
+            let asker = Asker::of(device, person);
+            self.deliver_held_device(store, &asker, &request, &original, answer);
             return Ok(());
         }
         if requests.pending.contains_key(rpc.as_str()) {
@@ -637,6 +672,8 @@ impl Hub {
         let pending = Pending {
             device: device.id.clone(),
             person: person.into(),
+            noise_key: device.noise_key.clone(),
+            device_key: device.device_key.clone(),
             connection,
             original: original.clone(),
             request: request.clone(),
@@ -668,8 +705,7 @@ impl Hub {
                     ErrorCode::Unconfirmed,
                     format!("{e}. {UNCONFIRMED}"),
                 ));
-                self.complete(key, &pending, &answer);
-                self.deliver_held_device(store, &pending.device, &pending.person, answer);
+                self.finish(store, key, &pending, answer);
             }
         }
         Ok(())
@@ -707,29 +743,99 @@ impl Hub {
         }
     }
 
-    /// Sends a resume's answer to the device that asked, if it is still
-    /// paired to the same person. When the pairing cannot be read, the
-    /// connected device, which the bridge authenticated, is told only that
-    /// the outcome is not confirmed, never what the runtime answered.
-    fn deliver_held_device(&self, store: &Store, device: &str, person: &str, answer: ToDevice) {
-        let answer = match store.devices() {
-            Ok(devices) if devices.iter().any(|d| d.id == device && d.person == person) => answer,
-            Ok(_) => return,
+    /// What the device that asked may be sent of a resume's answer to its
+    /// request `original`: nothing when the device is no longer paired to
+    /// its person with the keys it asked with; all of it while its person
+    /// is the host's and the card still theirs; otherwise, or when any of
+    /// these cannot be read, only the fixed [`notice`].
+    fn vetted(
+        &self,
+        store: &Store,
+        asker: &Asker,
+        request: &ResumeRequest,
+        original: &MessageId,
+        answer: ToDevice,
+    ) -> Option<ToDevice> {
+        let Asker {
+            device,
+            person,
+            noise_key,
+            device_key,
+        } = *asker;
+        match store.device(device) {
+            Ok(paired) => {
+                if !paired.is_some_and(|d| {
+                    d.person == person && d.noise_key == noise_key && d.device_key == device_key
+                }) {
+                    return None;
+                }
+            }
+            // The connection it asked on, which the bridge authenticated and
+            // checks again before it sends anything, may still be told the
+            // outcome is not confirmed, never what it was.
             Err(e) => {
                 eprintln!("enclos app: cannot read the paired devices to answer {device}: {e}");
-                ToDevice::Error(ErrorBody {
-                    of: answer_of(&answer),
-                    code: ErrorCode::Unconfirmed,
-                    message: format!(
-                        "The bridge could not check this device's pairing. {UNCONFIRMED}"
-                    ),
-                })
+                return Some(notice(original));
+            }
+        }
+        let host = match store.host_person() {
+            Ok(host) => host.as_deref() == Some(person),
+            Err(e) => {
+                eprintln!("enclos app: cannot read the host's person to answer {device}: {e}");
+                false
             }
         };
+        let theirs = host
+            && match store.held_task(&request.agent, request.task.as_str()) {
+                Ok(card) => card.is_some_and(|card| card.owner == person),
+                Err(e) => {
+                    eprintln!(
+                        "enclos app: cannot read a held task of {} to answer {device}: {e}",
+                        request.agent
+                    );
+                    false
+                }
+            };
+        Some(if theirs { answer } else { notice(original) })
+    }
+
+    /// Sends what [`Self::vetted`] allows of a resume's answer to the
+    /// device that asked, on its live connection, if it has one.
+    fn deliver_held_device(
+        &self,
+        store: &Store,
+        asker: &Asker,
+        request: &ResumeRequest,
+        original: &MessageId,
+        answer: ToDevice,
+    ) {
+        if let Some(answer) = self.vetted(store, asker, request, original, answer) {
+            self.send_held_device(asker.device, asker.person, answer);
+        }
+    }
+
+    fn send_held_device(&self, device: &str, person: &str, answer: ToDevice) {
         if let Some((owner, sender, _)) = self.devices.lock().expect("not poisoned").get(device)
             && owner == person
         {
             let _ = sender.send(answer);
+        }
+    }
+
+    /// Ends `pending` with `answer`: what may be sent of it is kept as the
+    /// answer to a replay, the notice alone when nothing may, then sent.
+    fn finish(&self, store: &Store, key: String, pending: &Pending, answer: ToDevice) {
+        let vetted = self.vetted(
+            store,
+            &pending.asker(),
+            &pending.request,
+            &pending.original,
+            answer,
+        );
+        let kept = vetted.clone().unwrap_or_else(|| notice(&pending.original));
+        self.complete(key, pending, &kept);
+        if let Some(answer) = vetted {
+            self.send_held_device(&pending.device, &pending.person, answer);
         }
     }
 
@@ -770,13 +876,21 @@ impl Hub {
     fn record_resume(&self, store: &Store, agent: &str, pending: &Pending) -> Option<HeldTaskInfo> {
         let task = pending.request.task.as_str();
         match store.resume_held_task(agent, task, &pending.sent) {
+            // Sent to its owner's devices, whoever that is now; the asking
+            // person reads it only if it is still theirs.
             Ok(Some(change)) => {
-                let card = change.card.info.clone();
+                let card = (change.card.owner == pending.person).then(|| change.card.info.clone());
                 self.publish_held(store, vec![change]);
-                Some(card)
+                card
             }
-            // Resumed already, or held again since: the card as it is.
-            Ok(None) => store.held_task(agent, task).ok().flatten().map(|c| c.info),
+            // Resumed already, or held again since: the card as it is, if
+            // it is still the asking person's.
+            Ok(None) => store
+                .held_task(agent, task)
+                .ok()
+                .flatten()
+                .filter(|c| c.owner == pending.person)
+                .map(|c| c.info),
             Err(e) => {
                 eprintln!(
                     "enclos app: {agent}'s resumed task {task} could not be recorded yet: {e}"
@@ -786,12 +900,17 @@ impl Hub {
                     .expect("not poisoned")
                     .unrecorded
                     .insert((agent.into(), task.into(), pending.sent.clone()));
-                store.held_task(agent, task).ok().flatten().map(|c| {
-                    let mut info = c.info;
-                    info.state = HeldTaskState::Resumed;
-                    info.revision += 1;
-                    info
-                })
+                store
+                    .held_task(agent, task)
+                    .ok()
+                    .flatten()
+                    .filter(|c| c.owner == pending.person)
+                    .map(|c| {
+                        let mut info = c.info;
+                        info.state = HeldTaskState::Resumed;
+                        info.revision += 1;
+                        info
+                    })
             }
         }
     }
@@ -814,14 +933,9 @@ impl Hub {
                 of: pending.original.clone(),
                 held_task,
             },
-            None => ToDevice::Error(failure(
-                pending.original.clone(),
-                ErrorCode::Unconfirmed,
-                "The agent resumed the task, but the bridge could not read its card.",
-            )),
+            None => notice(&pending.original),
         };
-        self.complete(key, &pending, &answer);
-        self.deliver_held_device(store, &pending.device, &pending.person, answer);
+        self.finish(store, key, &pending, answer);
     }
 
     /// A confirmation that came after the resume timed out: the device was
@@ -866,8 +980,7 @@ impl Hub {
             code: error.code,
             message: error.message.chars().take(1000).collect(),
         });
-        self.complete(key, &pending, &answer);
-        self.deliver_held_device(store, &pending.device, &pending.person, answer);
+        self.finish(store, key, &pending, answer);
         true
     }
 
@@ -880,8 +993,7 @@ impl Hub {
             ErrorCode::Unconfirmed,
             format!("{why} {UNCONFIRMED}"),
         ));
-        self.complete(key, pending, &answer);
-        self.deliver_held_device(store, &pending.device, &pending.person, answer);
+        self.finish(store, key, pending, answer);
     }
 
     /// The agent's channel closed: a resume sent on it may have run.
@@ -1048,6 +1160,7 @@ mod tests {
             revision: HeldTaskRevision::new("e:7").unwrap(),
             resume: "Runs it again with a fresh retry budget.".into(),
             resumable: true,
+            waits_on: enclos_protocol::held_task::WaitsOn::Person,
             ask: None,
         }
     }
@@ -1462,6 +1575,8 @@ mod tests {
             Pending {
                 device: phone.id.clone(),
                 person: OWNER.into(),
+                noise_key: phone.noise_key.clone(),
+                device_key: phone.device_key.clone(),
                 connection: "c".into(),
                 original: MessageId::new("tap-r").unwrap(),
                 request: resume("t1", again.info.revision),
@@ -2703,5 +2818,581 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::NotAllowed);
         assert!(store.held_task(AGENT, "t1").unwrap().is_none());
+    }
+
+    // A resume's answer once the host's person, the card's owner or the
+    // asking device's pairing changed: only the fixed notice, or nothing.
+
+    const NEW_OWNER: &str = "new-owner@example.com";
+    const MARKER: &str = "SYNTHETIC-B-ONLY-MARKER";
+
+    /// The one answer a device that may no longer read the card is sent.
+    fn notice(of: &str) -> ToDevice {
+        ToDevice::Error(ErrorBody {
+            of: Some(MessageId::new(of).unwrap()),
+            code: ErrorCode::Unconfirmed,
+            message: UNCONFIRMED.into(),
+        })
+    }
+
+    /// Every frame `rx` gets, until none comes for `ms`.
+    fn drain(rx: &Receiver<ToDevice>, ms: u64) -> Vec<ToDevice> {
+        std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(ms)).ok()).collect()
+    }
+
+    /// The phone's resume `tap` of t1, sent to the runtime: the plugin, the
+    /// frames it was sent, its connection and the plugin request's id.
+    fn sent_resume(
+        hub: &Arc<Hub>,
+        store: &Store,
+        phone: &Device,
+        rx: &Receiver<ToDevice>,
+    ) -> (
+        UnixStream,
+        Receiver<Envelope<FromBridge>>,
+        String,
+        MessageId,
+    ) {
+        let (plugin, from_bridge) = reported(hub, rx);
+        hub.held_task_resume(
+            store,
+            phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        let connection = hub.held_tasks.lock().unwrap().connections[AGENT].clone();
+        (plugin, from_bridge, connection, sent)
+    }
+
+    /// A paired and connected device of the next host's person.
+    fn new_owners_device(hub: &Hub, store: &Store) -> Receiver<ToDevice> {
+        store.add_device(&device("b-phone", NEW_OWNER)).unwrap();
+        let (tx, rx) = channel();
+        hub.devices
+            .lock()
+            .unwrap()
+            .insert("b-phone".into(), (NEW_OWNER.into(), tx, 9));
+        rx
+    }
+
+    /// The host's person becomes NEW_OWNER, then the runtime reports t1
+    /// again with text that is theirs alone to read.
+    fn transfer_with_new_text(hub: &Hub, store: &Store) {
+        store.set_host(NEW_OWNER).unwrap();
+        hub.held_tasks_report(
+            store,
+            AGENT,
+            vec![HeldTask {
+                title: format!("{MARKER} title"),
+                reason: MARKER.into(),
+                revision: HeldTaskRevision::new("e:99").unwrap(),
+                ..task("t1")
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            store.held_task(AGENT, "t1").unwrap().unwrap().owner,
+            NEW_OWNER
+        );
+    }
+
+    /// Whether any of `frames` carries the next owner's text.
+    fn carries_marker(frames: &[ToDevice]) -> bool {
+        frames.iter().any(|f| format!("{f:?}").contains(MARKER))
+    }
+
+    /// Unchanged host, owner and pairing: the result reaches the asking
+    /// device, is kept, and a replay gets it again without the runtime.
+    #[test]
+    fn an_unchanged_owner_and_pairing_get_the_result_and_its_replay() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        let frames = drain(&rx, 300);
+        let result = frames.last().unwrap().clone();
+        assert!(matches!(
+            &result,
+            ToDevice::HeldTaskResult { of, held_task }
+                if of.as_str() == "tap" && held_task.state == HeldTaskState::Resumed
+                    && held_task.title == "Task t1"
+        ));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [result]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// The host's person changed, then the runtime confirmed: the former
+    /// one's device gets the fixed notice alone, never the new owner's card.
+    #[test]
+    fn a_result_after_the_hosts_person_changed_is_only_the_fixed_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        let b = new_owners_device(&hub, &store);
+        transfer_with_new_text(&hub, &store);
+        assert!(carries_marker(&drain(&b, 100)), "the new owner's card");
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// The answer kept for a replay of plugin request `sent`.
+    fn kept(hub: &Hub, sent: &MessageId) -> ToDevice {
+        hub.held_tasks
+            .lock()
+            .unwrap()
+            .completed
+            .iter()
+            .find(|(key, _, _)| key == sent.as_str())
+            .map(|(_, _, answer)| answer.clone())
+            .expect("a kept answer")
+    }
+
+    /// Held again since, by the new owner's runtime revision (`Ok(None)`):
+    /// the answer kept for a replay holds no card of theirs.
+    #[test]
+    fn the_answer_kept_after_the_hosts_person_changed_holds_no_card_of_theirs() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, _from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        transfer_with_new_text(&hub, &store);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+    }
+
+    /// Released since with the new owner's text, then confirmed
+    /// (`Ok(Some)`): the card is resumed and sent to the new owner's
+    /// devices; the former one's device gets, and keeps, only the notice.
+    #[test]
+    fn a_released_card_resumed_after_the_hosts_person_changed_goes_to_the_new_owner_alone() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        let b = new_owners_device(&hub, &store);
+        transfer_with_new_text(&hub, &store);
+        hub.held_tasks_report(&store, AGENT, vec![]).unwrap();
+        assert_eq!(state(&store, "t1"), HeldTaskState::Released);
+        drain(&b, 100);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        let theirs = drain(&b, 300);
+        assert!(theirs.iter().any(|f| matches!(
+            f,
+            ToDevice::HeldTask { held_task }
+                if held_task.state == HeldTaskState::Resumed && held_task.reason == MARKER
+        )));
+        assert!(
+            !theirs
+                .iter()
+                .any(|f| matches!(f, ToDevice::HeldTaskResult { .. } | ToDevice::Error(_))),
+            "the receipt is the asking device's alone"
+        );
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// The host's person changed at the same runtime revision, and the
+    /// confirmation cannot be written: the former one's device gets, and
+    /// keeps, only the notice; the resume is recorded later, for the new
+    /// owner's devices.
+    #[test]
+    fn a_resume_that_cannot_be_recorded_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        let b = new_owners_device(&hub, &store);
+        store.set_host(NEW_OWNER).unwrap();
+        // The new owner's text, at the runtime revision the resume was sent at.
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute(
+                "UPDATE held_tasks SET body = replace(body, 'Task t1', ?1)",
+                [MARKER],
+            )
+            .unwrap();
+        assert_eq!(
+            store.held_task(AGENT, "t1").unwrap().unwrap().info.title,
+            MARKER
+        );
+        block_writes(&hub);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        assert_eq!(state(&store, "t1"), HeldTaskState::Held, "not written yet");
+        assert_eq!(hub.held_tasks.lock().unwrap().unrecorded.len(), 1);
+        unblock_writes(&hub);
+        hub.expire_held_resumes(&store);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Resumed);
+        assert!(drain(&b, 300).iter().any(|f| matches!(
+            f,
+            ToDevice::HeldTask { held_task }
+                if held_task.state == HeldTaskState::Resumed && held_task.title == MARKER
+        )));
+        assert!(drain(&rx, 200).is_empty());
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// The runtime's refusal, written after the host's person changed:
+    /// its text reaches neither the former one's device nor its replay.
+    #[test]
+    fn a_runtime_error_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        store.set_host(NEW_OWNER).unwrap();
+        assert!(hub.held_task_error(
+            &store,
+            AGENT,
+            &connection,
+            &ErrorBody {
+                of: Some(sent.clone()),
+                code: ErrorCode::Conflict,
+                message: format!("{MARKER}: written after the change"),
+            },
+        ));
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 answered conflict"]
+        );
+    }
+
+    /// The card is no longer the asking person's, though they are still the
+    /// host's: the runtime's refusal of the resume reaches their device only
+    /// as the notice.
+    #[test]
+    fn a_runtime_error_for_a_card_now_anothers_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, _from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET owner = ?1 WHERE id = ?2",
+                [NEW_OWNER, home_id(AGENT).as_str()],
+            )
+            .unwrap();
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(OWNER));
+        assert_eq!(
+            store.held_task(AGENT, "t1").unwrap().unwrap().owner,
+            NEW_OWNER
+        );
+        assert!(hub.held_task_error(
+            &store,
+            AGENT,
+            &connection,
+            &ErrorBody {
+                of: Some(sent.clone()),
+                code: ErrorCode::Internal,
+                message: format!("{MARKER}: the runtime failed"),
+            },
+        ));
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+    }
+
+    /// While its resume is pending, the host's person changes to NEW_OWNER,
+    /// whose text the card now holds, and the asking device's pairing is
+    /// replaced, under the same id and person, by one `rekey` changes. The
+    /// change of host alone would earn the notice; the old keys earn
+    /// nothing: the device id under them is sent no frame at all, neither
+    /// for the answer nor for a replay, and the runtime is not asked again.
+    /// The card is NEW_OWNER's, so no ordinary publication reaches the
+    /// device either.
+    fn a_rekeyed_pairing_is_sent_no_answer(rekey: fn(&mut Device)) {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        // Whatever the device was sent while the card was its person's.
+        drain(&rx, 100);
+        transfer_with_new_text(&hub, &store);
+        let mut again = phone.clone();
+        rekey(&mut again);
+        assert!(store.remove_device(&phone.id).unwrap());
+        store.add_device(&again).unwrap();
+        let paired = store.device(&phone.id).unwrap().unwrap();
+        assert_eq!(paired.person, OWNER);
+        assert!(paired.noise_key != phone.noise_key || paired.device_key != phone.device_key);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(drain(&rx, 300), []);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), []);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    #[test]
+    fn a_pairing_whose_noise_key_changed_is_sent_no_answer() {
+        a_rekeyed_pairing_is_sent_no_answer(|d| d.noise_key = vec![77; 32]);
+    }
+
+    #[test]
+    fn a_pairing_whose_device_key_changed_is_sent_no_answer() {
+        a_rekeyed_pairing_is_sent_no_answer(|d| d.device_key = vec![88; 32]);
+    }
+
+    /// Whether any of `frames` answers a resume.
+    fn answers(frames: &[ToDevice]) -> bool {
+        frames
+            .iter()
+            .any(|f| matches!(f, ToDevice::HeldTaskResult { .. } | ToDevice::Error(_)))
+    }
+
+    /// `table` cannot be read once the resume was sent: whether the runtime
+    /// confirmed (`refused` false) or refused it, the asking device is sent
+    /// the notice alone, and it is what a replay gets.
+    fn an_unreadable_table_answers_only_the_notice(table: &str, refused: bool) {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, _from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        break_table(&hub, table);
+        if refused {
+            assert!(hub.held_task_error(
+                &store,
+                AGENT,
+                &connection,
+                &ErrorBody {
+                    of: Some(sent.clone()),
+                    code: ErrorCode::Conflict,
+                    message: format!("{MARKER}: the runtime refused"),
+                },
+            ));
+        } else {
+            hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        }
+        let frames = drain(&rx, 300);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| answers(std::slice::from_ref(f)))
+                .collect::<Vec<_>>(),
+            [&notice("tap")],
+            "{table}: {frames:?}"
+        );
+        assert_eq!(kept(&hub, &sent), notice("tap"), "{table}");
+    }
+
+    #[test]
+    fn a_result_when_the_paired_devices_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("devices", false);
+    }
+
+    #[test]
+    fn a_runtime_error_when_the_paired_devices_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("devices", true);
+    }
+
+    #[test]
+    fn a_result_when_the_hosts_person_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("settings", false);
+    }
+
+    #[test]
+    fn a_runtime_error_when_the_hosts_person_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("settings", true);
+    }
+
+    #[test]
+    fn a_result_when_the_card_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("held_tasks", false);
+    }
+
+    #[test]
+    fn a_runtime_error_when_the_card_cannot_be_read_is_only_the_notice() {
+        an_unreadable_table_answers_only_the_notice("held_tasks", true);
+    }
+
+    /// Answered while the asking person was the host's, then the host's
+    /// person changed: the same request again gets only the notice, and the
+    /// runtime is not asked again.
+    #[test]
+    fn a_replay_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert!(matches!(
+            drain(&rx, 300).last(),
+            Some(ToDevice::HeldTaskResult { .. })
+        ));
+        transfer_with_new_text(&hub, &store);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// No answer in time, the host's person changed: the former one's
+    /// device gets only the notice; the confirmation that comes late
+    /// resumes the card for the new owner's devices and sends the former
+    /// one's nothing; nothing reaches the runtime again.
+    #[test]
+    fn a_timeout_and_a_late_confirmation_after_the_hosts_person_changed() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        let b = new_owners_device(&hub, &store);
+        store.set_host(NEW_OWNER).unwrap();
+        for pending in hub.held_tasks.lock().unwrap().pending.values_mut() {
+            pending.started -= TIMEOUT;
+        }
+        hub.expire_held_resumes(&store);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert_eq!(state(&store, "t1"), HeldTaskState::Resumed);
+        assert!(drain(&b, 300).iter().any(|f| matches!(
+            f,
+            ToDevice::HeldTask { held_task } if held_task.state == HeldTaskState::Resumed
+        )));
+        assert!(drain(&rx, 200).is_empty());
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            [
+                "lab/main t1 requested",
+                "lab/main t1 unknown: timed out",
+                "lab/main t1 confirmed late"
+            ]
+        );
+    }
+
+    /// The agent's channel closed after the host's person changed: the
+    /// former one's device gets only the notice.
+    #[test]
+    fn a_plugin_disconnect_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, _from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        transfer_with_new_text(&hub, &store);
+        hub.held_task_disconnected(&store, AGENT, &connection);
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 unknown: disconnected"]
+        );
+    }
+
+    /// The asking device was not connected when the answer came, after the
+    /// host's person changed: nothing is sent when it connects again, and
+    /// the same request then gets only the notice, without the runtime.
+    #[test]
+    fn a_device_away_when_its_answer_came_gets_only_the_notice_when_it_asks_again() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        transfer_with_new_text(&hub, &store);
+        hub.devices.lock().unwrap().remove(&phone.id);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert!(drain(&rx, 200).is_empty());
+        let (tx, back) = channel();
+        hub.devices
+            .lock()
+            .unwrap()
+            .insert(phone.id.clone(), (OWNER.into(), tx, 2));
+        assert!(drain(&back, 300).is_empty(), "nothing on its own");
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&back, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
     }
 }

@@ -702,6 +702,7 @@ mod tests {
                             usage: Fact::Known(AgentRecords {
                                 models: vec![model("gpt", Some(83_087), vec!["input"])],
                                 top: vec![chat("small", 10), chat("big", 900_000)],
+                                hours: None,
                             }),
                         },
                         AgentUsage {
@@ -709,6 +710,7 @@ mod tests {
                             usage: Fact::Known(AgentRecords {
                                 models: Vec::new(),
                                 top: vec![chat("middle", 5_000)],
+                                hours: None,
                             }),
                         },
                         AgentUsage {
@@ -987,6 +989,7 @@ mod tests {
                 usage: Fact::Known(AgentRecords {
                     models: vec![model("gpt", Some(10), Vec::new())],
                     top: Vec::new(),
+                    hours: None,
                 }),
             }]),
             total: Some(Total {

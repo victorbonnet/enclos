@@ -38,6 +38,8 @@ const MAX_REPORT_BYTES: u64 = 1 << 20;
 /// The most models listed for one agent, and native chats in its top list.
 const MAX_MODELS: usize = 50;
 const MAX_TOP: usize = 5;
+/// The most hours listed for one agent (the reader's `MAX_HOURS`).
+const MAX_HOURS: usize = 2000;
 
 /// Token counts, each `None` when the runtime does not count it. `input`
 /// is input not read from or written to the provider's cache.
@@ -201,12 +203,32 @@ pub struct ChatUsage {
     pub tokens: Tokens,
 }
 
+/// What an agent used of one model, through one model provider, in the
+/// native chats last active in one hour: the runtime keeps no time per
+/// call, so a chat counts whole in the hour of its last activity, as it
+/// counts whole in a window (issue #366).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HourUsage {
+    /// The hour's start, Unix seconds.
+    pub at: i64,
+    /// None for an hour whose models the reader summed, past the most rows
+    /// it lists.
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub calls: Option<u64>,
+    pub tokens: Tokens,
+}
+
 /// What an agent's runtime recorded.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentRecords {
     pub models: Vec<ModelUsage>,
     /// Its native chats that used the most tokens, most first.
     pub top: Vec<ChatUsage>,
+    /// The same usage by hour, for the app's bridge: none from a reader
+    /// that does not list hours. Not part of `enclos usage`'s output.
+    #[serde(skip)]
+    pub hours: Option<Vec<HourUsage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -299,6 +321,30 @@ impl Engine {
         only: Option<&SandboxName>,
         since: Timestamp,
     ) -> Result<UsageView> {
+        self.usage_read(by, only, since, None)
+    }
+
+    /// [`Engine::usage`] of every running sandbox, for the app's bridge
+    /// (issue #366): each sandbox's reader is stopped past `limit`, and
+    /// that sandbox is "cannot tell", so a reader that does not end holds
+    /// no device up; and a signal the bridge receives meanwhile ends it
+    /// once the reader is stopped, as it would have without the read.
+    pub fn usage_of_running(
+        &self,
+        by: &Actor,
+        since: Timestamp,
+        limit: std::time::Duration,
+    ) -> Result<UsageView> {
+        self.usage_read(by, None, since, Some(limit))
+    }
+
+    fn usage_read(
+        &self,
+        by: &Actor,
+        only: Option<&SandboxName>,
+        since: Timestamp,
+        limit: Option<std::time::Duration>,
+    ) -> Result<UsageView> {
         let records = match only {
             Some(name) => vec![self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
@@ -316,7 +362,7 @@ impl Engine {
                         "not running; `enclos usage {name}` reads it, starting its proxy"
                     ))
                 }
-                Some(kind) => match self.sandbox_usage(by, &name, kind, since) {
+                Some(kind) => match self.sandbox_usage(by, &name, kind, since, limit) {
                     Ok(agents) => agents,
                     Err(e) if only.is_none() => Fact::CannotTell(e.to_string()),
                     Err(e) => return Err(e),
@@ -353,6 +399,7 @@ impl Engine {
         name: &SandboxName,
         kind: RuntimeKind,
         since: Timestamp,
+        limit: Option<std::time::Duration>,
     ) -> Result<Fact<Vec<AgentUsage>>> {
         let runtime = adapter(kind);
         let home = self.sandbox_home(name);
@@ -373,7 +420,27 @@ impl Engine {
             return Ok(Fact::NotProvided);
         };
         let _remove = Removed(report.clone());
-        let ended = self.run_exec_in_sandbox(by, name, command, "usage session")?;
+        let ended = match limit {
+            None => self.run_exec_in_sandbox(by, name, command, "usage session")?,
+            Some(limit) => {
+                let deadline = std::time::Instant::now() + limit;
+                let (ended, stopped) = self.run_exec_in_sandbox_then_signalled(
+                    by,
+                    name,
+                    command,
+                    "usage session",
+                    deadline,
+                )?;
+                if stopped {
+                    return Ok(Fact::CannotTell(format!(
+                        "{}'s usage reader did not end within {} and was stopped",
+                        kind.display_name(),
+                        super::session::spoken(limit)
+                    )));
+                }
+                ended
+            }
+        };
         if ended.exit != 0 {
             let how = match ended.signal {
                 Some(signal) => format!("was ended by signal {signal}"),
@@ -496,6 +563,20 @@ struct ReportAgent {
     models: Vec<ReportModel>,
     #[serde(default)]
     top: Vec<ReportChat>,
+    /// Absent from a reader that does not list hours.
+    #[serde(default)]
+    hours: Option<Vec<ReportHour>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportHour {
+    at: i64,
+    model: Option<String>,
+    #[serde(default)]
+    model_provider: Option<String>,
+    calls: Option<u64>,
+    tokens: Tokens,
 }
 
 #[derive(Deserialize)]
@@ -560,7 +641,10 @@ fn parse(text: &str, asked: &[RuntimeAgentName]) -> std::result::Result<Parsed, 
             return Err(format!("names agent {name} twice"));
         }
         seen.push(name);
-        if a.models.len() > MAX_MODELS || a.top.len() > MAX_TOP {
+        if a.models.len() > MAX_MODELS
+            || a.top.len() > MAX_TOP
+            || a.hours.as_ref().is_some_and(|h| h.len() > MAX_HOURS)
+        {
             return Err(format!("lists too much for agent {name}"));
         }
         let usage = match (a.error, a.found) {
@@ -577,6 +661,10 @@ fn parse(text: &str, asked: &[RuntimeAgentName]) -> std::result::Result<Parsed, 
                     .into_iter()
                     .map(chat)
                     .collect::<std::result::Result<_, _>>()?,
+                hours: a
+                    .hours
+                    .map(|h| h.into_iter().map(hour).collect())
+                    .transpose()?,
             }),
         };
         agents.push(AgentUsage {
@@ -624,6 +712,22 @@ fn model(m: ReportModel) -> std::result::Result<ModelUsage, String> {
         // Set once the whole view is read ([`priced`]).
         estimate: UsageCost::default(),
         incomplete,
+    })
+}
+
+fn hour(h: ReportHour) -> std::result::Result<HourUsage, String> {
+    if h.at < 0 || h.at % 3600 != 0 {
+        return Err("has an hour that does not start on the hour".into());
+    }
+    if Timestamp::from_second(h.at).is_err() {
+        return Err("has an hour out of range".into());
+    }
+    Ok(HourUsage {
+        at: h.at,
+        model: shown(h.model),
+        model_provider: shown(h.model_provider),
+        calls: h.calls,
+        tokens: h.tokens,
     })
 }
 
@@ -694,6 +798,32 @@ mod tests {
             r#"{{"format":1,"agents":[{{"agent":"default","found":true,"models":[{}],"top":[]}}]}}"#,
             rows.join(",")
         )
+    }
+
+    #[test]
+    fn a_readers_hours_are_kept_for_the_bridge_and_one_off_the_hour_is_refused() {
+        let text = r#"{"format":1,"agents":[{"agent":"default","found":true,"models":[],"top":[],
+            "hours":[{"at":7200,"model":"gpt","model_provider":"openai","calls":3,"tokens":{"input":10}},
+                     {"at":10800,"model":null,"calls":null,"tokens":{}}]}]}"#;
+        let Fact::Known(records) = &agents(text, &["default"])[0].usage else {
+            panic!("not known");
+        };
+        let hours = records.hours.as_ref().unwrap();
+        assert_eq!(hours.len(), 2);
+        assert_eq!(
+            (hours[0].at, hours[0].model.as_deref(), hours[0].calls),
+            (7200, Some("gpt"), Some(3))
+        );
+        assert_eq!(hours[0].model_provider.as_deref(), Some("openai"));
+        assert_eq!(hours[1].model, None);
+        // A reader that lists no hours: none, which the bridge does not use.
+        let Fact::Known(records) = &agents(REPORT, &["default", "scout"])[0].usage else {
+            panic!("not known");
+        };
+        assert_eq!(records.hours, None);
+        // An hour that does not start on the hour.
+        let off = text.replace("\"at\":7200", "\"at\":7201");
+        assert!(refused(&off).contains("on the hour"));
     }
 
     #[test]
@@ -986,6 +1116,7 @@ mod tests {
                 })
                 .collect(),
             top: Vec::new(),
+            hours: None,
         }
     }
 

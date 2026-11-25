@@ -20,6 +20,11 @@ alone where the table is missing. A chat counts whole when its last activity
 is in the window, so totals are those of chats active since then, not tokens
 spent since then.
 
+Each agent's `hours` are the same counts by the hour that holds each chat's
+last activity, model and model provider: Hermes keeps no time per call, so
+a chat is counted whole in the hour it was last active. The app's bridge
+builds its series and prices from them (issue #366).
+
 Whatever goes wrong is written into the report (`error`), never to the
 terminal: enclos sends this program's output nowhere.
 """
@@ -34,6 +39,11 @@ FORMAT = 1
 MAX_MODELS = 50
 TOP_CHATS = 5
 MAX_TEXT = 200
+# The most rows of `hours`: past them, the oldest hours are each summed in
+# one row naming no model, so the agent's totals stay whole.
+MAX_HOURS = 2000
+# The latest time enclos reads, Unix seconds (9999-12-30T22:00:00Z).
+MAX_TIME = 253402207200
 # The most a count may be: the report's counts are unsigned 64-bit.
 MAX_COUNT = 2**64 - 1
 TOKENS = ("input", "output", "cache_read", "cache_write", "reasoning")
@@ -194,7 +204,7 @@ def read_agent(path, since):
         )
         chats = db.execute(
             "SELECT s.id, {model}, {source}, {title}, s.started_at, {fields}, {actual}, {estimated}, {status}, "
-            "{provider} FROM sessions s WHERE {when} >= ?".format(
+            "{provider}, {when} FROM sessions s WHERE {when} >= ?".format(
                 model=col(chats_kept, "model", "s."),
                 source=col(chats_kept, "source", "s."),
                 title=col(chats_kept, "title", "s."),
@@ -227,6 +237,7 @@ def read_agent(path, since):
 
     kept = {f for f in FIELDS if COLUMNS[f] in chats_kept or COLUMNS[f] in rows_kept}
     models = {}
+    hours = {}
     by_chat = {}
     attributed = {}
     # A background call's row has no cost status of its own; it went through
@@ -234,6 +245,8 @@ def read_agent(path, since):
     chat_status = {row[0]: row[13] for row in chats}
     # Likewise its provider, when the row does not name one.
     chat_provider = {row[0]: provider_of(row[14]) for row in chats}
+    # The hour that holds each chat's last activity, where `hours` counts it.
+    chat_hour = {row[0]: hour_of(row[15]) for row in chats}
     for row in calls:
         sid, model = row[0], row[1]
         values = dict(zip(FIELDS, row[2:8]))
@@ -241,6 +254,7 @@ def read_agent(path, since):
         status = row[10] if row[10] is not None else chat_status.get(sid)
         provider = provider_of(row[11]) or chat_provider.get(sid)
         models.setdefault((model, provider), Sum(kept)).add(sid, values, money, status)
+        hours.setdefault((chat_hour.get(sid), model, provider), Sum(kept)).add(sid, values, money, status)
         by_chat.setdefault(sid, Sum(kept)).add(sid, values, money, status)
         seen = attributed.setdefault(sid, dict.fromkeys(FIELDS, 0) | {"money": 0.0})
         for f in FIELDS:
@@ -269,6 +283,9 @@ def read_agent(path, since):
         chat = by_chat.setdefault(sid, Sum(kept))
         if rest is not None:
             models.setdefault((model, provider_of(row[14])), Sum(kept)).add(sid, rest, rest_money, status)
+            hours.setdefault((chat_hour.get(sid), model, provider_of(row[14])), Sum(kept)).add(
+                sid, rest, rest_money, status
+            )
             chat.add(sid, rest, rest_money, status)
         listed.append(
             {
@@ -286,20 +303,80 @@ def read_agent(path, since):
     report = [s.entry(model, provider) for (model, provider), s in ordered[:MAX_MODELS]]
     if len(ordered) > MAX_MODELS:
         # The rest in one row, so the agent's totals stay whole.
-        rest = Sum(kept)
-        for _, s in ordered[MAX_MODELS - 1:]:
-            rest.chats |= s.chats
-            rest.incomplete |= s.incomplete
-            rest.known |= s.known
-            rest.statuses |= s.statuses
-            for f in FIELDS:
-                if rest.values[f] is not None and s.values[f] is not None:
-                    rest.values[f] = min(rest.values[f] + s.values[f], MAX_COUNT)
-            if s.cost is not None:
-                rest.cost = (rest.cost or 0.0) + s.cost
+        rest = merged([s for _, s in ordered[MAX_MODELS - 1:]], kept)
         report = report[: MAX_MODELS - 1] + [rest.entry("{} other models".format(len(ordered) - MAX_MODELS + 1), None)]
     listed.sort(key=lambda c: -sum(c["tokens"][t] or 0 for t in SENT))
-    return {"found": True, "models": report, "top": listed[:TOP_CHATS]}
+    return {"found": True, "models": report, "top": listed[:TOP_CHATS], "hours": by_hour(hours, kept)}
+
+
+def hour_of(when):
+    """The start of the hour that holds `when` (Unix seconds), or None."""
+    when = amount(when)
+    # Past the latest time enclos reads (year 9999), the whole report would
+    # be refused: such a chat is left out of `hours` instead.
+    if when is None or when >= MAX_TIME:
+        return None
+    return int(when // 3600) * 3600
+
+
+def merged(sums, kept):
+    """Several sums as one."""
+    out = Sum(kept)
+    for s in sums:
+        out.chats |= s.chats
+        out.incomplete |= s.incomplete
+        out.known |= s.known
+        out.statuses |= s.statuses
+        for f in FIELDS:
+            if out.values[f] is not None and s.values[f] is not None:
+                out.values[f] = min(out.values[f] + s.values[f], MAX_COUNT)
+        if s.cost is not None:
+            out.cost = (out.cost or 0.0) + s.cost
+    return out
+
+
+def by_hour(hours, kept):
+    """`hours` as the report lists them, oldest first, at most MAX_HOURS
+    rows: past them, the oldest hours are each summed in one row naming no
+    model, and, with more hours than that still, the oldest rows in one,
+    at the latest of their hours, so the agent's totals stay whole. A chat
+    with no known time is left out."""
+    keyed = {}
+    for (at, model, provider), s in hours.items():
+        if at is not None:
+            keyed.setdefault(at, []).append((model, provider, s))
+    rows = sum(len(v) for v in keyed.values())
+    for at in sorted(keyed):
+        if rows <= MAX_HOURS:
+            break
+        if len(keyed[at]) > 1:
+            rows -= len(keyed[at]) - 1
+            keyed[at] = [(None, None, merged([s for _, _, s in keyed[at]], kept))]
+    listed = []
+    for at in sorted(keyed):
+        for model, provider, s in sorted(keyed[at], key=lambda m: (str(m[0]), str(m[1]))):
+            listed.append(
+                {
+                    "at": at,
+                    "model": text(model),
+                    "model_provider": text(provider),
+                    "calls": s.value("calls"),
+                    "tokens": s.tokens(),
+                }
+            )
+    if len(listed) > MAX_HOURS:
+        cut = len(listed) - MAX_HOURS + 1
+        oldest = [s for at in sorted(keyed) for _, _, s in keyed[at]][:cut]
+        listed = [
+            {
+                "at": listed[cut - 1]["at"],
+                "model": None,
+                "model_provider": None,
+                "calls": merged(oldest, kept).value("calls"),
+                "tokens": merged(oldest, kept).tokens(),
+            }
+        ] + listed[cut:]
+    return listed
 
 
 def write(out, report):
