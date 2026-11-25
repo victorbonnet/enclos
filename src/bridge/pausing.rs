@@ -11,7 +11,8 @@ use enclos_protocol::plugin::ErrorCode;
 
 use crate::engine::pause_state::{HostPauseRead, HostPauseWord, NotPausedWhy};
 use crate::engine::{
-    Engine, PauseOutcome as EnginePauseOutcome, PauseScope, ResumeOutcome as EngineResumeOutcome,
+    Engine, PauseOutcome as EnginePauseOutcome, PauseReport, PauseScope,
+    ResumeOutcome as EngineResumeOutcome, ResumeReport,
 };
 use crate::error::Error;
 use crate::layout::Layout;
@@ -282,43 +283,7 @@ impl Pausing for HostPausing {
             .engine()
             .pause_sandboxes(by, scope, expected_revision)
             .map_err(map_error)?;
-        let outcomes = match named {
-            None => Vec::new(),
-            Some(names) => {
-                let by_name: HashMap<&str, WirePauseOutcome> = report
-                    .sandboxes
-                    .iter()
-                    .map(|r| (r.sandbox.as_str(), map_pause_outcome(r.outcome)))
-                    .collect();
-                names
-                    .iter()
-                    .map(|n| PauseSandboxOutcome {
-                        sandbox: n.to_string(),
-                        outcome: by_name
-                            .get(n.as_str())
-                            .copied()
-                            .unwrap_or(WirePauseOutcome::NothingToPause),
-                    })
-                    .collect()
-            }
-        };
-        let (paused, partly, revision) = match report.host {
-            HostPauseRead::Readable(ref h) => (
-                h.word == HostPauseWord::Paused,
-                h.word == HostPauseWord::PartlyPaused,
-                h.revision,
-            ),
-            HostPauseRead::Unreadable(ref why) => {
-                eprintln!("enclos app: pause state unreadable after pause: {why}");
-                (false, true, 0)
-            }
-        };
-        Ok(PauseActionResult {
-            paused,
-            partly,
-            revision,
-            outcomes,
-        })
+        Ok(pause_report_to_action_result(named.as_deref(), report))
     }
 
     fn resume(
@@ -335,43 +300,87 @@ impl Pausing for HostPausing {
             .engine()
             .resume_sandboxes(by, scope, expected_revision)
             .map_err(map_error)?;
-        let outcomes = match named {
-            None => Vec::new(),
-            Some(names) => {
-                let by_name: HashMap<&str, WirePauseOutcome> = report
-                    .sandboxes
-                    .iter()
-                    .map(|r| (r.sandbox.as_str(), map_resume_outcome(r.outcome)))
-                    .collect();
-                names
-                    .iter()
-                    .map(|n| PauseSandboxOutcome {
-                        sandbox: n.to_string(),
-                        outcome: by_name
-                            .get(n.as_str())
-                            .copied()
-                            .unwrap_or(WirePauseOutcome::NothingToResume),
-                    })
-                    .collect()
-            }
-        };
-        let (paused, partly, revision) = match report.host {
-            HostPauseRead::Readable(ref h) => (
-                h.word == HostPauseWord::Paused,
-                h.word == HostPauseWord::PartlyPaused,
-                h.revision,
-            ),
-            HostPauseRead::Unreadable(ref why) => {
-                eprintln!("enclos app: pause state unreadable after resume: {why}");
-                (false, true, 0)
-            }
-        };
-        Ok(PauseActionResult {
-            paused,
-            partly,
-            revision,
-            outcomes,
-        })
+        Ok(resume_report_to_action_result(named.as_deref(), report))
+    }
+}
+
+pub(crate) fn pause_report_to_action_result(
+    named: Option<&[SandboxName]>,
+    report: PauseReport,
+) -> PauseActionResult {
+    let outcomes = match named {
+        None => Vec::new(),
+        Some(names) => {
+            let by_name: HashMap<&str, WirePauseOutcome> = report
+                .sandboxes
+                .iter()
+                .map(|r| (r.sandbox.as_str(), map_pause_outcome(r.outcome)))
+                .collect();
+            names
+                .iter()
+                .map(|n| PauseSandboxOutcome {
+                    sandbox: n.to_string(),
+                    outcome: by_name
+                        .get(n.as_str())
+                        .copied()
+                        .unwrap_or(WirePauseOutcome::NothingToPause),
+                })
+                .collect()
+        }
+    };
+    let (paused, partly, revision) = map_host_pause_read(&report.host, "pause");
+    PauseActionResult {
+        paused,
+        partly,
+        revision,
+        outcomes,
+    }
+}
+
+pub(crate) fn resume_report_to_action_result(
+    named: Option<&[SandboxName]>,
+    report: ResumeReport,
+) -> PauseActionResult {
+    let outcomes = match named {
+        None => Vec::new(),
+        Some(names) => {
+            let by_name: HashMap<&str, WirePauseOutcome> = report
+                .sandboxes
+                .iter()
+                .map(|r| (r.sandbox.as_str(), map_resume_outcome(r.outcome)))
+                .collect();
+            names
+                .iter()
+                .map(|n| PauseSandboxOutcome {
+                    sandbox: n.to_string(),
+                    outcome: by_name
+                        .get(n.as_str())
+                        .copied()
+                        .unwrap_or(WirePauseOutcome::NothingToResume),
+                })
+                .collect()
+        }
+    };
+    let (paused, partly, revision) = map_host_pause_read(&report.host, "resume");
+    PauseActionResult {
+        paused,
+        partly,
+        revision,
+        outcomes,
+    }
+}
+
+fn map_host_pause_read(host: &HostPauseRead, op: &str) -> (bool, bool, u64) {
+    match host {
+        HostPauseRead::Readable(h) => (
+            h.word == HostPauseWord::Paused,
+            h.word == HostPauseWord::PartlyPaused,
+            h.revision,
+        ),
+        HostPauseRead::Unreadable(why) => {
+            eprintln!("enclos app: pause state unreadable after {op}: {why}");
+            (false, true, 0)
+        }
     }
 }
 
@@ -398,6 +407,58 @@ mod tests {
         assert_eq!(
             scope,
             PauseScope::Names(vec!["home".parse().unwrap(), "lab".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_reports_map_unreadable_host_to_partly_paused_rev_zero() {
+        use crate::engine::{SandboxPauseResult, SandboxResumeResult};
+
+        let lab: SandboxName = "lab".parse().unwrap();
+        let pause_report = PauseReport {
+            sandboxes: vec![SandboxPauseResult {
+                sandbox: lab.clone(),
+                outcome: EnginePauseOutcome::Paused,
+                services: vec!["enclos.lab.gateway".into()],
+                agents: Vec::new(),
+                error: None,
+            }],
+            host: HostPauseRead::Unreadable("corrupt host_pause".into()),
+        };
+        let pause_res =
+            pause_report_to_action_result(Some(std::slice::from_ref(&lab)), pause_report);
+        assert!(!pause_res.paused);
+        assert!(pause_res.partly);
+        assert_eq!(pause_res.revision, 0);
+        assert_eq!(
+            pause_res.outcomes,
+            vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: WirePauseOutcome::Paused,
+            }]
+        );
+
+        let resume_report = ResumeReport {
+            no_record: false,
+            sandboxes: vec![SandboxResumeResult {
+                sandbox: lab.clone(),
+                outcome: EngineResumeOutcome::Resumed,
+                services: vec!["enclos.lab.gateway".into()],
+                agents: Vec::new(),
+                error: None,
+            }],
+            host: HostPauseRead::Unreadable("corrupt sandbox_pauses".into()),
+        };
+        let resume_res = resume_report_to_action_result(Some(&[lab]), resume_report);
+        assert!(!resume_res.paused);
+        assert!(resume_res.partly);
+        assert_eq!(resume_res.revision, 0);
+        assert_eq!(
+            resume_res.outcomes,
+            vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: WirePauseOutcome::Resumed,
+            }]
         );
     }
 }

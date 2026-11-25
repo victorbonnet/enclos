@@ -1007,3 +1007,118 @@ fn unreadable_sandbox_pause_record_is_reported_never_not_paused() {
             .contains("labels")
     );
 }
+
+#[test]
+fn resume_post_work_cleanup_failure_returns_report_and_finishes_audit_failed() {
+    let fake = Rc::new(FakeServices::default());
+    let (dir, engine) = setup_engine(&fake);
+    let grid = create_sandbox(&engine, "grid");
+    let lab = create_sandbox(&engine, "lab");
+    seed_sandbox(&engine, &fake, &grid, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(
+            &alice(),
+            PauseScope::Names(vec![grid.clone(), lab.clone()]),
+            None,
+        )
+        .unwrap();
+
+    // Corrupt `lab`'s pause row so post-work `sandbox_pauses()` fails while
+    // `resume grid` is cleaning up records after installing `grid`'s service.
+    let db_path = dir.path().join("enclos/state.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE sandbox_pauses SET labels = 'not-json' WHERE sandbox = 'lab'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![grid.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert!(report.host_unreadable());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, grid);
+    assert_eq!(report.sandboxes[0].outcome, ResumeOutcome::Resumed);
+
+    // Audit entry must be finished `failed`, naming both the resumed service
+    // and the clean-up failure, with no unfinished entries left behind.
+    let entries = engine.audit(None).unwrap();
+    let resume_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox resume")
+        .expect("resume audit entry");
+    let finished = resume_entry.finished.as_ref().expect("finished audit");
+    assert_eq!(finished.outcome.result, AuditResult::Failed);
+    assert!(
+        finished.outcome.message.contains("resumed grid"),
+        "expected resumed sandbox in audit message, got: {}",
+        finished.outcome.message
+    );
+    assert!(
+        finished.outcome.message.contains("clean-up"),
+        "expected clean-up note in audit message, got: {}",
+        finished.outcome.message
+    );
+    assert!(engine.verify_audit().unwrap().unfinished.is_empty());
+
+    // `lab`'s row and `host_pause` are left untouched.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (lab_labels, lab_released): (String, Option<String>) = conn
+        .query_row(
+            "SELECT labels, released FROM sandbox_pauses WHERE sandbox = 'lab'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(lab_labels, "not-json");
+    assert!(lab_released.is_none());
+    let host_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM host_pause", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(host_count, 1);
+}
+
+#[test]
+fn pause_and_resume_audit_subjects_are_deduplicated() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let lab = create_sandbox(&engine, "lab");
+    let grid = create_sandbox(&engine, "grid");
+    seed_sandbox(&engine, &fake, &lab, SandboxState::Running, true);
+    seed_sandbox(&engine, &fake, &grid, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(
+            &alice(),
+            PauseScope::Names(vec![lab.clone(), grid.clone(), lab.clone()]),
+            None,
+        )
+        .unwrap();
+    engine
+        .resume_sandboxes(
+            &alice(),
+            PauseScope::Names(vec![lab.clone(), grid.clone(), lab.clone()]),
+            None,
+        )
+        .unwrap();
+
+    let entries = engine.audit(None).unwrap();
+    let pause_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox pause")
+        .expect("pause audit entry");
+    let resume_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox resume")
+        .expect("resume audit entry");
+    assert_eq!(pause_entry.intent.target.as_deref(), Some("lab, grid"));
+    assert_eq!(resume_entry.intent.target.as_deref(), Some("lab, grid"));
+}

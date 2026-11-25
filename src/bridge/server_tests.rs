@@ -5771,29 +5771,62 @@ mod pause {
             fn pause(
                 &self,
                 _by: &crate::model::audit::Actor,
-                _scope: PauseScope,
+                scope: PauseScope,
                 _expected_revision: Option<u64>,
             ) -> Result<PauseActionResult, PauseError> {
                 self.failed_after
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(PauseActionResult {
-                    paused: false,
-                    partly: true,
-                    revision: 0,
-                    outcomes: vec![PauseSandboxOutcome {
-                        sandbox: "lab".into(),
-                        outcome: PauseOutcome::Paused,
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::PauseReport {
+                    sandboxes: vec![crate::engine::SandboxPauseResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::PauseOutcome::Paused,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
                     }],
-                })
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt host_pause".into(),
+                    ),
+                };
+                Ok(crate::bridge::pausing::pause_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
             }
 
             fn resume(
                 &self,
                 _by: &crate::model::audit::Actor,
-                _scope: PauseScope,
+                scope: PauseScope,
                 _expected_revision: Option<u64>,
             ) -> Result<PauseActionResult, PauseError> {
-                unreachable!()
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt sandbox_pauses".into(),
+                    ),
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
             }
         }
 
@@ -5840,6 +5873,112 @@ mod pause {
             Some(vec![PauseSandboxOutcome {
                 sandbox: "lab".into(),
                 outcome: PauseOutcome::Paused,
+            }])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_when_post_work_resume_read_fails() {
+        /// Seam whose `state()` fails after `resume()`, simulating a post-work
+        /// record clean-up or host-state read failure after services were
+        /// resumed, while exercising the real `resume_report_to_action_result`
+        /// mapping for `HostPauseRead::Unreadable`.
+        struct UnreadableAfterResume {
+            failed_after: std::sync::atomic::AtomicBool,
+        }
+
+        impl Pausing for UnreadableAfterResume {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                if self.failed_after.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PauseError::Internal("corrupt sandbox_pauses".into()));
+                }
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                unreachable!()
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt sandbox_pauses".into(),
+                    ),
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(UnreadableAfterResume {
+            failed_after: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "unreadable-resume-1",
+            FromDevice::Resume {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result even when resume post-work read fails");
+        };
+        assert_eq!(of.as_str(), "unreadable-resume-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 0);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Resumed,
             }])
         );
     }

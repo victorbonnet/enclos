@@ -101,7 +101,7 @@ CREATE TABLE sandbox_pauses (
 
 The stopped labels are stored, not derived: an upgrade may change what a runtime adapter declares, and then a resume would start something the pause never stopped. `kept` is what lets a resume tell that `sandbox stop` stopped the sandbox meanwhile, moved from one process's memory into the record.
 
-**`revision`** advances on every change to the record, and is monotonic across record lifetimes: the new value is `max(previous + 1, unix milliseconds now)`, where no record presents `0`. This depends on the host's clock not running far backwards between a deletion and the next creation; a stale fence from before such a step could match a newer pause. That residual is stated, not removed.
+**`revision`** is an equality token for the fence, not a counter; a device must compare it for equality only and must never order it. It changes whenever the record changes: the new value is `max(previous + 1, unix milliseconds now)`, where no live record presents `0`, and `0` means no record is in force (including after deletion) or, after a failed read, unknown. Avoiding reuse across record lifetimes depends on the host's clock not running far backwards between a deletion and the next creation; a stale fence from before such a step could match a newer pause. That residual is stated, not removed.
 
 **Reversal.** The migration is additive. To return a database to schema 13, `DROP TABLE sandbox_pauses; DROP TABLE host_pause; PRAGMA user_version = 13;` — and `enclos init` applies migration 14 again. A pause in force is lost by it, and the services it removed stay removed.
 
@@ -116,7 +116,7 @@ The rule that decides every field: an optional field, `type` or capability does 
 - `pause` and `resume`: an optional `revision` (one fence, host-wide, for both forms) and an optional `sandboxes` (absent means every sandbox; present means exactly those names; present but empty or explicit `null` is `bad_message`; duplicate names are deduplicated in first-occurrence order). A name that is malformed is `bad_message`; a name this host has no sandbox of is `not_found`, and the whole request is refused with nothing carried out.
 - `pause.subset`: a second capability, advertised beside `pause` to the host's person only, and required of the device before it may send `sandboxes`. An older bridge that does not advertise it never receives a subset request.
 - `pause.state`: canonical, no `of`, with a row per sandbox carrying `paused`, `state` and, exactly when not paused, `why`; `by` carries only the person's name or login without device or request identifiers.
-- `pause.result`: correlated by `of`, carrying a row per named sandbox, never inferred from `pause.state`. If the host's state cannot be read back after the work completes, `pause.result` is still sent with the per-sandbox rows (`paused: false`, `partly: true`, `revision: 0`) rather than withheld as an `error`.
+- `pause.result`: correlated by `of`, carrying a row per named sandbox, never inferred from `pause.state`. If a resume's post-work record clean-up fails after services were resumed, or if the host's state cannot be read back after the work completes, `pause.result` is still sent with the per-sandbox rows (`paused: false`, `partly: true`, `revision: 0` when unreadable) rather than withheld as an `error`, and a failed clean-up closes the audit entry `failed` naming the error.
 
 ## Authority and audit
 
@@ -124,11 +124,11 @@ The CLI is the local user, as every command. The phone is the host's person on a
 
 ## Durability and truthful reporting
 
-- **A pause interrupted part-way** leaves a named pause: the host row and all member rows are written together in one transaction before services are removed, so the host reads Partly paused naming the member still running; a later pause finishes it and is idempotent. Every error path after the audit entry opens closes it `failed`; an unfinished entry remains only on a crash, which `audit verify` lists.
+- **A pause interrupted part-way** leaves a named pause: the host row and all member rows are written together in one transaction before services are removed, so the host reads Partly paused naming the member still running; a later pause finishes it and is idempotent. Every error path after the audit entry opens closes it `failed`; an unfinished entry remains only on a crash or when the state lock cannot be taken for about a minute, which `audit verify` lists.
 - **A failed pause leaves no unnamed half-state.** A name, fence, lock, database-write or audit failure writes no row. A service that will not stop leaves its member *named and covered*, the host Partly paused, and the command non-zero.
 - **A resume that fails on one sandbox** keeps that member owed and covered and exits non-zero; the members that did resume are released. The message names `enclos sandbox resume`, not `sandbox start`.
 - **Presented words.** Paused: the record says so and nothing of the host runs. Partly paused: it names what still runs and what is owed — never "paused". `Paused · nothing to pause: every sandbox is already stopped` for a host-wide pause over nothing. Never Paused while anything runs. A sandbox "runs" when its record state is `running` and it is not paused, so a running sandbox with no runtime service keeps the host Partly paused and is named with `nothing_to_pause`.
-- **Cannot tell** is said as such, never as zero, as Running, or as not paused: an unreadable `host_pause` or `sandbox_pauses` row is reported as unreadable in `status`, `sandbox list`, `sandbox show` and `state check` (which treats the pause state as unknown and does not flag paused services as missing or offer `RecordStopped`), and a failed post-work host read still returns the per-sandbox report.
+- **Cannot tell** is said as such, never as zero, as Running, or as not paused: an unreadable `host_pause` or `sandbox_pauses` row is reported as unreadable in `status`, `sandbox list`, `sandbox show` and `state check` (which treats the pause state as unknown and does not flag paused services as missing or offer `RecordStopped`), and a failed post-work record clean-up or host read still returns the per-sandbox report (with the audit entry closed `failed` on clean-up failure and the record left as it was).
 
 ## Testable invariants
 

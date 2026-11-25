@@ -22,6 +22,11 @@ use crate::model::pause::{HostPauseRecord, SandboxPauseRecord};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::runtime::adapter;
 use crate::service::ServiceLabel;
+use crate::state::{StateError, StateLock};
+
+/// Bounded lock-acquisition retries when finishing an already-opened audit
+/// entry after work has been performed (6 × 10 s ≈ 1 minute).
+const AUDIT_FINISH_LOCK_ATTEMPTS: usize = 6;
 
 /// Which sandboxes a host pause or resume targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +39,7 @@ impl PauseScope {
     fn subject(&self) -> String {
         match self {
             PauseScope::All => "all".to_owned(),
-            PauseScope::Names(names) => names
+            PauseScope::Names(names) => dedup_names(names)
                 .iter()
                 .map(SandboxName::as_str)
                 .collect::<Vec<_>>()
@@ -398,14 +403,7 @@ impl Engine {
             || (current_host.is_some() && any_membership_change);
 
         // Open one audit entry BEFORE the first row is written.
-        let subject = match &scope {
-            PauseScope::All => "all".to_owned(),
-            PauseScope::Names(_) => targets
-                .iter()
-                .map(SandboxName::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        };
+        let subject = scope.subject();
         let ticket = self.audit.begin(
             &lock,
             Intent {
@@ -556,7 +554,7 @@ impl Engine {
 
         let lock = match held_lock.take() {
             Some(l) => l,
-            None => self.state.lock()?,
+            None => self.lock_to_finish_audit()?,
         };
         let results = match work {
             Ok(results) => {
@@ -634,7 +632,7 @@ impl Engine {
         };
 
         let mut held_lock = Some(lock);
-        let work: Result<Vec<SandboxResumeResult>> = (|| {
+        let work: Result<(Vec<SandboxResumeResult>, Option<String>)> = (|| {
             let targets: Vec<SandboxName> = match &scope {
                 PauseScope::All => self
                     .state
@@ -844,73 +842,21 @@ impl Engine {
                 }
             }
 
-            let lock = self.state.lock()?;
-            held_lock = Some(lock);
-            for name in stopped_meanwhile {
-                if let Some(existing) = self.state.sandbox_pause(&name)? {
-                    let t = now();
-                    let cleared = SandboxPauseRecord {
-                        sandbox: name,
-                        labels: Vec::new(),
-                        kept: Vec::new(),
-                        released: Some(t),
-                        at: existing.at,
-                        by: by.clone(),
-                    };
-                    if let Some(lock_ref) = held_lock.as_ref() {
-                        self.state.put_sandbox_pause(lock_ref, &cleared, t)?;
-                    }
-                }
-            }
-            // Delete the whole record when no covered sandbox remains held or owed
-            // AND (scope was All, or pause_all = 0). With pause_all = 1 a
-            // `resume <name>` never deletes the record.
-            let latest_host = self.state.host_pause()?;
-            if let Some(latest_host) = latest_host {
-                let all_rows = self.state.sandbox_pauses()?;
-                let mut any_held_or_owed = false;
-                for row in &all_rows {
-                    if row.released.is_none() {
-                        any_held_or_owed = true;
-                        break;
-                    }
-                    if !row.labels.is_empty()
-                        && let Some(rec) = self.state.get(&row.sandbox)?
-                    {
-                        let has_rt = !self.installed_runtime_services(&row.sandbox)?.is_empty();
-                        let derived = derive_sandbox(
-                            Some(&latest_host),
-                            SandboxPauseInput {
-                                name: &row.sandbox,
-                                state: &rec.state,
-                                has_runtime_services: has_rt,
-                                row: Some(row),
-                            },
-                        );
-                        if derived.owed {
-                            any_held_or_owed = true;
-                            break;
-                        }
-                    }
-                }
-                if !any_held_or_owed
-                    && (matches!(scope, PauseScope::All) || !latest_host.pause_all)
-                    && let Some(lock_ref) = held_lock.as_ref()
-                {
-                    self.state.clear_host_pause(lock_ref)?;
-                }
-            }
+            let cleanup_error = self
+                .finish_resume_records(by, &scope, stopped_meanwhile, &mut held_lock)
+                .err()
+                .map(|e| e.to_string());
 
-            Ok(results)
+            Ok((results, cleanup_error))
         })();
 
         let lock = match held_lock.take() {
             Some(l) => l,
-            None => self.state.lock()?,
+            None => self.lock_to_finish_audit()?,
         };
         let results = match work {
-            Ok(results) => {
-                let outcome = resume_audit_outcome(&results);
+            Ok((results, cleanup_error)) => {
+                let outcome = resume_audit_outcome(&results, cleanup_error.as_deref());
                 self.audit.finish_entry(&lock, entry, outcome)?;
                 results
             }
@@ -929,6 +875,85 @@ impl Engine {
             sandboxes: results,
             host,
         })
+    }
+
+    /// Post-work record clean-up for [`Engine::resume_sandboxes`]: re-takes the
+    /// state lock, clears `labels`/`kept` on members found stopped meanwhile,
+    /// and deletes the host pause record when no covered sandbox remains held
+    /// or owed (and either the scope was `All` or `pause_all = 0`).
+    ///
+    /// Called after services have been installed; any error is recorded on the
+    /// audit entry without discarding the per-sandbox resume report.
+    fn finish_resume_records(
+        &self,
+        by: &Actor,
+        scope: &PauseScope,
+        stopped_meanwhile: Vec<SandboxName>,
+        held_lock: &mut Option<StateLock>,
+    ) -> Result<()> {
+        let lock = self.state.lock()?;
+        *held_lock = Some(lock);
+        for name in stopped_meanwhile {
+            if let Some(existing) = self.state.sandbox_pause(&name)? {
+                let t = now();
+                let cleared = SandboxPauseRecord {
+                    sandbox: name,
+                    labels: Vec::new(),
+                    kept: Vec::new(),
+                    released: Some(t),
+                    at: existing.at,
+                    by: by.clone(),
+                };
+                if let Some(lock_ref) = held_lock.as_ref() {
+                    self.state.put_sandbox_pause(lock_ref, &cleared, t)?;
+                }
+            }
+        }
+        // Delete the whole record when no covered sandbox remains held or owed
+        // AND (scope was All, or pause_all = 0). With pause_all = 1 a
+        // `resume <name>` never deletes the record.
+        let latest_host = self.state.host_pause()?;
+        if let Some(latest_host) = latest_host {
+            let all_rows = self.state.sandbox_pauses()?;
+            let mut any_held_or_owed = false;
+            for row in &all_rows {
+                if row.released.is_none() {
+                    any_held_or_owed = true;
+                    break;
+                }
+                if !row.labels.is_empty()
+                    && let Some(rec) = self.state.get(&row.sandbox)?
+                {
+                    let has_rt = !self.installed_runtime_services(&row.sandbox)?.is_empty();
+                    let derived = derive_sandbox(
+                        Some(&latest_host),
+                        SandboxPauseInput {
+                            name: &row.sandbox,
+                            state: &rec.state,
+                            has_runtime_services: has_rt,
+                            row: Some(row),
+                        },
+                    );
+                    if derived.owed {
+                        any_held_or_owed = true;
+                        break;
+                    }
+                }
+            }
+            if !any_held_or_owed
+                && (matches!(scope, PauseScope::All) || !latest_host.pause_all)
+                && let Some(lock_ref) = held_lock.as_ref()
+            {
+                self.state.clear_host_pause(lock_ref)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Acquires the state lock to finish an already-opened audit entry,
+    /// retrying boundedly when another command transiently holds the lock.
+    fn lock_to_finish_audit(&self) -> Result<StateLock> {
+        retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || self.state.lock())
     }
 
     /// Reads one sandbox's pause state for display without swallowing read
@@ -1090,6 +1115,22 @@ impl Engine {
     }
 }
 
+fn retry_lock<T>(
+    attempts: usize,
+    mut acquire: impl FnMut() -> std::result::Result<T, StateError>,
+) -> Result<T> {
+    let mut remaining = attempts.max(1);
+    loop {
+        match acquire() {
+            Ok(lock) => return Ok(lock),
+            Err(StateError::Locked { .. }) if remaining > 1 => {
+                remaining -= 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 fn dedup_names(names: &[SandboxName]) -> Vec<SandboxName> {
     let mut seen = Vec::with_capacity(names.len());
     for name in names {
@@ -1125,7 +1166,7 @@ fn pause_audit_outcome(results: &[SandboxPauseResult]) -> Outcome {
     }
 }
 
-fn resume_audit_outcome(results: &[SandboxResumeResult]) -> Outcome {
+fn resume_audit_outcome(results: &[SandboxResumeResult], cleanup_error: Option<&str>) -> Outcome {
     let failed: Vec<&str> = results
         .iter()
         .filter(|r| r.outcome == ResumeOutcome::WouldNotStart)
@@ -1136,17 +1177,26 @@ fn resume_audit_outcome(results: &[SandboxResumeResult]) -> Outcome {
         .filter(|r| r.outcome == ResumeOutcome::Resumed)
         .map(|r| r.sandbox.as_str())
         .collect();
-    if !failed.is_empty() {
-        return Outcome::failed(format!(
+    let base = if !failed.is_empty() {
+        format!(
             "resumed [{}]; would not start: {}",
             resumed.join(", "),
             failed.join(", ")
+        )
+    } else if resumed.is_empty() {
+        "nothing to resume".to_owned()
+    } else {
+        format!("resumed {}", resumed.join(", "))
+    };
+    if let Some(err) = cleanup_error {
+        return Outcome::failed(format!(
+            "{base}; pause record clean-up could not finish: {err}"
         ));
     }
-    if resumed.is_empty() {
-        Outcome::ok("nothing to resume")
+    if !failed.is_empty() {
+        Outcome::failed(base)
     } else {
-        Outcome::ok(format!("resumed {}", resumed.join(", ")))
+        Outcome::ok(base)
     }
 }
 
@@ -1223,5 +1273,58 @@ impl Engine {
                 error: Box::new(error),
             })?;
         self.resume_runtime(by, name, paused)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn retry_lock_retries_bounded_locked_errors_and_succeeds() {
+        let mut calls = 0;
+        let res = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+            calls += 1;
+            if calls < AUDIT_FINISH_LOCK_ATTEMPTS {
+                Err(StateError::Locked {
+                    path: PathBuf::from("state.lock"),
+                })
+            } else {
+                Ok("acquired")
+            }
+        });
+        assert_eq!(res.ok(), Some("acquired"));
+        assert_eq!(calls, AUDIT_FINISH_LOCK_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_lock_returns_locked_after_exhausting_attempts() {
+        let mut calls = 0;
+        let res: Result<()> = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+            calls += 1;
+            Err(StateError::Locked {
+                path: PathBuf::from("state.lock"),
+            })
+        });
+        assert!(matches!(res, Err(Error::State(StateError::Locked { .. }))));
+        assert_eq!(calls, AUDIT_FINISH_LOCK_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_lock_does_not_retry_non_lock_errors() {
+        let mut calls = 0;
+        let res: Result<()> = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+            calls += 1;
+            Err(StateError::NotInitialized {
+                path: PathBuf::from("state.db"),
+            })
+        });
+        assert!(matches!(
+            res,
+            Err(Error::State(StateError::NotInitialized { .. }))
+        ));
+        assert_eq!(calls, 1);
     }
 }

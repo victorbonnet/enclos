@@ -538,15 +538,16 @@ impl Engine {
         enum PauseCheck {
             Paused(Vec<String>),
             NotPaused,
-            Unreadable(String),
+            UnreadableRecord(String),
+            ServicesUnreadable(String),
         }
         let pause_check = match (self.state.host_pause(), self.state.sandbox_pause(name)) {
-            (Err(e), _) | (_, Err(e)) => PauseCheck::Unreadable(e.to_string()),
+            (Err(e), _) | (_, Err(e)) => PauseCheck::UnreadableRecord(e.to_string()),
             (Ok(Some(host)), Ok(Some(row))) => {
                 match self.derive_sandbox_pause(record, Some(&host), Some(&row)) {
                     Ok(derived) if derived.paused => PauseCheck::Paused(row.labels),
                     Ok(_) => PauseCheck::NotPaused,
-                    Err(e) => PauseCheck::Unreadable(e.to_string()),
+                    Err(e) => PauseCheck::ServicesUnreadable(e.to_string()),
                 }
             }
             (Ok(_), Ok(_)) => PauseCheck::NotPaused,
@@ -554,11 +555,30 @@ impl Engine {
         let mut ignored_missing: Vec<String> = Vec::new();
         match &pause_check {
             PauseCheck::Paused(labels) => ignored_missing.extend(labels.iter().cloned()),
-            PauseCheck::Unreadable(why) => {
+            PauseCheck::UnreadableRecord(why) => {
                 push(
                     format!("its pause record cannot be read: {why}"),
                     Remedy::Manual(format!(
                         "enclos cannot tell whether sandbox {name} is paused while its pause record is unreadable; inspect state.db before repairing its services"
+                    )),
+                );
+                if let Some(kind) = record.runtime {
+                    for service in crate::runtime::adapter(kind).services() {
+                        if let Ok(label) =
+                            self.label(name, super::service::Unit::Runtime(service.name))
+                        {
+                            ignored_missing.push(label.to_string());
+                        }
+                    }
+                }
+            }
+            PauseCheck::ServicesUnreadable(why) => {
+                push(
+                    format!(
+                        "its installed services cannot be checked to tell whether it is paused: {why}"
+                    ),
+                    Remedy::Manual(format!(
+                        "enclos cannot tell whether sandbox {name} is paused while its services cannot be queried; fix the service-manager error, then run `enclos state check {name}` again"
                     )),
                 );
                 if let Some(kind) = record.runtime {
