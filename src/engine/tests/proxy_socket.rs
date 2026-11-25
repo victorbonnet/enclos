@@ -22,6 +22,27 @@ const PROXY_FOLDER: &str = "ENCLOS_TEST_PROXY_FOLDER";
 const PROXY_SANDBOX: &str = "ENCLOS_TEST_PROXY_SANDBOX";
 const PROXY_PORT: &str = "ENCLOS_TEST_PROXY_PORT";
 const PROXY_RECORDS: &str = "ENCLOS_TEST_PROXY_RECORDS";
+const HOLD_PORT: &str = "ENCLOS_TEST_HOLD_PORT";
+const HOLD_READY: &str = "ENCLOS_TEST_HOLD_READY";
+const HOLD_STOP: &str = "ENCLOS_TEST_HOLD_STOP";
+
+/// Holds [`HOLD_PORT`] bound without listening until [`HOLD_STOP`] appears
+/// (or 60 s pass); passes at once otherwise.
+#[test]
+fn holds_a_port_when_asked() {
+    let Some(port) = std::env::var_os(HOLD_PORT) else {
+        return;
+    };
+    let port: u16 = port.to_string_lossy().parse().unwrap();
+    let ready = std::path::PathBuf::from(std::env::var_os(HOLD_READY).unwrap());
+    let stop = std::path::PathBuf::from(std::env::var_os(HOLD_STOP).unwrap());
+    let _held = bind_never_listening(port);
+    std::fs::write(&ready, "ready").unwrap();
+    let started = std::time::Instant::now();
+    while !stop.exists() && started.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 /// What [`ProxyChild`] runs: the sandbox's proxy when asked to, until
 /// killed; passes at once otherwise.
@@ -647,7 +668,7 @@ fn the_profile_of_a_start_that_took_another_port_allows_that_port_alone() {
         .start_session(
             &lock,
             &name,
-            &[std::ffi::OsString::from("/bin/true")],
+            &[std::ffi::OsString::from("/usr/bin/true")],
             Starting::Command {
                 kind: CommandKind::Exec,
                 group: Group::Own,
@@ -743,6 +764,267 @@ fn a_proxy_that_exits_while_its_port_is_free_keeps_its_port_and_fails() {
         old_port
     );
     assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn a_proxy_that_loses_all_five_tries_leaves_the_record_on_the_last_port_and_reports_the_exit() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::engine::proxy::PROXY_PORT_TRIES;
+    use crate::model::sandbox::{PORT_FIRST, PORT_LAST};
+    use crate::model::session::SessionKind;
+
+    struct HolderGuard {
+        stop: std::path::PathBuf,
+        pids: std::path::PathBuf,
+    }
+
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.stop, "stop");
+            let pids: Vec<rustix::process::Pid> = std::fs::read_to_string(&self.pids)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse::<i32>().ok())
+                .filter_map(rustix::process::Pid::from_raw)
+                .collect();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_secs(5)
+                && pids
+                    .iter()
+                    .any(|&pid| rustix::process::test_kill_process(pid).is_ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            for pid in pids {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let exe = std::env::current_exe().unwrap();
+    let runs = dir.path().join("runs");
+    let pids = dir.path().join("pids");
+    let stop = dir.path().join("stop");
+    let script = dir.path().join("lose-every-bind.sh");
+    let body = format!(
+        concat!(
+            "#!/bin/sh\n",
+            "port=\"$5\"\n",
+            "ready={ready_prefix}\"$port\"\n",
+            "{HOLD_PORT}=\"$port\" {HOLD_READY}=\"$ready\" {HOLD_STOP}={stop} ",
+            "{exe} --exact engine::tests::proxy_socket::holds_a_port_when_asked --test-threads=1 ",
+            "</dev/null >/dev/null 2>&1 &\n",
+            "echo \"$!\" >> {pids}\n",
+            "i=0\n",
+            "while [ ! -f \"$ready\" ] && [ \"$i\" -lt 200 ]; do\n",
+            "    sleep 0.05\n",
+            "    i=$((i + 1))\n",
+            "done\n",
+            "echo \"$port\" >> {runs}\n",
+            "echo \"bind failed on $port\" >&2\n",
+            "exit 1\n",
+        ),
+        ready_prefix = quote(&dir.path().join("ready-").display().to_string()),
+        HOLD_PORT = HOLD_PORT,
+        HOLD_READY = HOLD_READY,
+        HOLD_STOP = HOLD_STOP,
+        stop = quote(&stop.display().to_string()),
+        exe = quote(&exe.display().to_string()),
+        pids = quote(&pids.display().to_string()),
+        runs = quote(&runs.display().to_string()),
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = engine.with_exe(script);
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let old_port = record.proxy_port;
+
+    let holders = HolderGuard { stop, pids };
+    let lock = engine.state.lock().unwrap();
+    let err = engine.ensure_proxy(&lock, &record).unwrap_err();
+    drop(lock);
+
+    assert!(err.to_string().contains("exited"), "{err}");
+    let ports: Vec<u16> = std::fs::read_to_string(&runs)
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect();
+    assert_eq!(ports.len(), 5, "{ports:?}");
+    assert_eq!(ports.len(), PROXY_PORT_TRIES);
+    assert_eq!(ports[0], old_port);
+    let unique: HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(unique.len(), ports.len(), "{ports:?}");
+    assert!(ports.iter().all(|p| (PORT_FIRST..=PORT_LAST).contains(p)));
+    let saved_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    assert_eq!(saved_port, *ports.last().unwrap());
+    assert_ne!(saved_port, old_port);
+    assert!(!engine.proxy_runs(&name).unwrap());
+    assert!(
+        engine
+            .state
+            .sessions(&name, true)
+            .unwrap()
+            .iter()
+            .all(|s| s.kind != SessionKind::Proxy)
+    );
+    drop(holders);
+}
+
+#[test]
+fn a_start_that_cannot_take_another_port_shows_why() {
+    use crate::model::sandbox::{PORT_FIRST, PORT_LAST};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, engine, name) = on_backend(BackendKind::Seatbelt);
+    let script = write_proxy_exe(dir.path(), &engine, &name);
+    let engine = engine.with_exe(script);
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let old_port = record.proxy_port;
+
+    let lock = engine.state.lock().unwrap();
+    for port in PORT_FIRST..=PORT_LAST {
+        if port == old_port {
+            continue;
+        }
+        let mut other = record.clone();
+        other.name = format!("p{port}").parse().unwrap();
+        other.proxy_port = port;
+        engine.state.put(&lock, &other).unwrap();
+    }
+    let held = bind_never_listening(old_port);
+
+    let err = engine.ensure_proxy(&lock, &record).unwrap_err();
+    drop(lock);
+
+    let text = err.to_string();
+    assert!(text.contains("exited"), "{text}");
+    assert!(text.contains("no other port could be taken"), "{text}");
+    assert_eq!(
+        engine.state.get(&name).unwrap().unwrap().proxy_port,
+        old_port
+    );
+    assert!(!engine.proxy_runs(&name).unwrap());
+    drop(held);
+}
+
+#[test]
+fn a_policy_test_that_loses_its_port_compiles_the_profile_again_with_the_new_one() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::backend::{
+        Backend, Capabilities, CompileError, Compiled, Launch, Probe, SandboxContext, WrapError,
+    };
+    use crate::model::policy::Policy;
+    use crate::probes::OwnProbes;
+
+    struct RecordingSeatbeltBackend {
+        fake: FakeBackend,
+        seatbelt: crate::backend::seatbelt::Seatbelt,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Backend for RecordingSeatbeltBackend {
+        fn kind(&self) -> BackendKind {
+            self.fake.kind()
+        }
+        fn probe(&self) -> Probe {
+            self.fake.probe()
+        }
+        fn try_run(&self) -> Probe {
+            self.fake.try_run()
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.fake.capabilities()
+        }
+        fn compile(
+            &self,
+            policy: &Policy,
+            ctx: &SandboxContext,
+        ) -> std::result::Result<Compiled, CompileError> {
+            self.seatbelt.compile(policy, ctx)
+        }
+        fn wrap(
+            &self,
+            compiled: &std::path::Path,
+            ctx: &SandboxContext,
+            launch: &Launch,
+        ) -> std::result::Result<Command, WrapError> {
+            self.fake.wrap(compiled, ctx, launch)
+        }
+        fn own_probes(
+            &self,
+            compiled: Option<&str>,
+        ) -> std::result::Result<Box<dyn OwnProbes>, String> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(compiled.unwrap().to_owned());
+            if seen.len() == 2 {
+                return Err("stop here".into());
+            }
+            self.fake.own_probes(compiled)
+        }
+    }
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let backend = RecordingSeatbeltBackend {
+        fake: FakeBackend::available(BackendKind::Seatbelt),
+        seatbelt: crate::backend::seatbelt::Seatbelt::default(),
+        seen: Arc::clone(&seen),
+    };
+    let (dir, engine) = engine_with(vec![Box::new(backend)]);
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "home".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    let script = write_proxy_exe(dir.path(), &engine, &name);
+    let engine = engine.with_exe(script);
+    let old_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    let held = bind_never_listening(old_port);
+
+    let mut guard = RecordedProxyGuard {
+        engine: &engine,
+        name: name.clone(),
+        port: old_port,
+        stopped: false,
+    };
+    let err = engine
+        .policy_test(&alice(), &name, false, Confirm::Yes)
+        .unwrap_err();
+    let new_port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+    guard.port = new_port;
+
+    assert!(err.to_string().contains("stop here"), "{err}");
+    assert_ne!(new_port, old_port);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[0].contains(&format!("localhost:{old_port}")),
+        "{}",
+        seen[0]
+    );
+    assert!(
+        seen[1].contains(&format!("localhost:{new_port}")),
+        "{}",
+        seen[1]
+    );
+    assert!(
+        !seen[1].contains(&format!("localhost:{old_port}")),
+        "{}",
+        seen[1]
+    );
+
+    guard.end();
+    drop(held);
 }
 
 #[test]

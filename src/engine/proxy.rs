@@ -26,7 +26,7 @@ const PROXY_START: Duration = Duration::from_secs(5);
 
 /// How many candidate ports a Seatbelt proxy start tries when another program
 /// holds its port at bind time.
-const PROXY_PORT_TRIES: usize = 5;
+pub(super) const PROXY_PORT_TRIES: usize = 5;
 
 /// The sandbox's record once its proxy runs, and whether starting the proxy
 /// moved it to another port (so a profile already compiled for the old port
@@ -231,18 +231,22 @@ impl Engine {
         // Over TCP the port can be lost between the check that made it free
         // and the proxy's bind: the proxy then exits, and the start takes the
         // next free port, saves it and starts the proxy again.
-        let mut current = record.clone();
-        let mut tried = vec![current.proxy_port];
-        loop {
-            // Anything else on this port, on either loopback, would receive
-            // the sandbox's traffic.
-            let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
-            if let Some(taken) = [addr, v6]
+        // Anything else on this port, on either loopback, would receive
+        // the sandbox's traffic.
+        let check_listening = |a: SocketAddr| -> Result<()> {
+            let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, a.port()));
+            if let Some(taken) = [a, v6]
                 .into_iter()
                 .find(|a| listens(*a, Duration::from_millis(200)))
             {
-                return Err(Error::proxy_port_taken(current.name.as_str(), taken));
+                return Err(Error::proxy_port_taken(record.name.as_str(), taken));
             }
+            Ok(())
+        };
+        check_listening(addr)?;
+        let mut current = record.clone();
+        let mut tried = vec![current.proxy_port];
+        loop {
             let mut child = spawn(current.proxy_port)?;
             let exited = match self.wait_and_record_proxy(
                 lock,
@@ -258,16 +262,18 @@ impl Engine {
             // Only a bind that lost is retried: its port is still held now.
             let lost = tried.len() < PROXY_PORT_TRIES
                 && !super::loopback::free(addr, Duration::from_millis(200));
+            if !lost {
+                return Err(abandon(child, exited, "the proxy"));
+            }
             // A session still running keeps the profile and the proxy
             // variables it started with, so it would go on sending to the
             // old port, which another program holds: the sandbox stays on it
             // and the start fails until those sessions end.
-            if lost
-                && self
-                    .state
-                    .sessions(&current.name, true)?
-                    .iter()
-                    .any(|s| s.kind != SessionKind::Proxy)
+            if self
+                .state
+                .sessions(&current.name, true)?
+                .iter()
+                .any(|s| s.kind != SessionKind::Proxy)
             {
                 return Err(abandon(
                     child,
@@ -280,9 +286,22 @@ impl Engine {
                     "the proxy",
                 ));
             }
-            let Some(next) = lost.then(|| self.free_port_except(&tried).ok()).flatten() else {
-                return Err(abandon(child, exited, "the proxy"));
+            let next = match self.free_port_except(&tried) {
+                Ok(port) => port,
+                Err(why) => {
+                    return Err(abandon(
+                        child,
+                        Error::Session {
+                            what: format!("{exited}; no other port could be taken: {why}"),
+                        },
+                        "the proxy",
+                    ));
+                }
             };
+            let next_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, next));
+            if let Err(err) = check_listening(next_addr) {
+                return Err(abandon(child, err, "the proxy"));
+            }
             let old = current.proxy_port;
             tried.push(next);
             current.proxy_port = next;
@@ -291,7 +310,7 @@ impl Engine {
                 "the proxy port {old} of sandbox {} was taken by another program; using {next}",
                 current.name
             ));
-            addr = SocketAddr::from((Ipv4Addr::LOCALHOST, next));
+            addr = next_addr;
         }
     }
 
