@@ -1041,6 +1041,8 @@ fn resume_post_work_cleanup_failure_returns_report_and_finishes_audit_failed() {
         .unwrap();
     assert!(!report.any_failed());
     assert!(report.host_unreadable());
+    assert!(report.cleanup_failed());
+    assert!(report.cleanup_error.is_some());
     assert_eq!(report.sandboxes.len(), 1);
     assert_eq!(report.sandboxes[0].sandbox, grid);
     assert_eq!(report.sandboxes[0].outcome, ResumeOutcome::Resumed);
@@ -1121,4 +1123,136 @@ fn pause_and_resume_audit_subjects_are_deduplicated() {
         .expect("resume audit entry");
     assert_eq!(pause_entry.intent.target.as_deref(), Some("lab, grid"));
     assert_eq!(resume_entry.intent.target.as_deref(), Some("lab, grid"));
+}
+
+#[test]
+fn resume_cleanup_failure_over_readable_record_reads_running_and_surfaces_error() {
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+
+    // Subset pause (pause_all = false) on alpha, then stop alpha while paused.
+    let paused = engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert_eq!(readable_host(&paused.host).word, HostPauseWord::Paused);
+
+    done(engine.stop_sandbox(&alice(), &alpha, Confirm::Yes).unwrap());
+
+    // Inject a clean-up failure while host_pause and sandbox_pauses stay
+    // completely readable (the silent clean-up failure case).
+    crate::engine::pause::test_hooks::fail_next_cleanup_with(crate::error::Error::State(
+        crate::state::StateError::Locked {
+            path: std::path::PathBuf::from("state.lock"),
+        },
+    ));
+
+    let report = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert!(!report.any_failed());
+    assert!(!report.host_unreadable());
+    assert!(report.cleanup_failed());
+    assert!(report.cleanup_error.is_some());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].sandbox, alpha);
+    assert_eq!(report.sandboxes[0].outcome, ResumeOutcome::LeftAsItWas);
+
+    // Host must NOT read plain Paused when pause_all = false and nothing is
+    // covered; it reads Running while keeping the record's non-zero revision.
+    let host = readable_host(&report.host);
+    assert_eq!(host.word, HostPauseWord::Running);
+    assert_ne!(host.revision, 0);
+    assert_eq!(host.since, None);
+    assert_eq!(host.by, None);
+    assert!(!report.host.in_force());
+
+    // Audit entry is closed `failed` naming the clean-up failure.
+    let entries = engine.audit(None).unwrap();
+    let resume_entry = entries
+        .iter()
+        .rev()
+        .find(|e| e.intent.command == "sandbox resume")
+        .expect("resume audit entry");
+    let finished = resume_entry.finished.as_ref().expect("finished audit");
+    assert_eq!(finished.outcome.result, AuditResult::Failed);
+    assert!(
+        finished.outcome.message.contains("clean-up"),
+        "expected clean-up note in audit message, got: {}",
+        finished.outcome.message
+    );
+    assert!(engine.verify_audit().unwrap().unfinished.is_empty());
+
+    // Re-running resume with the reported revision cleans up the lingering record.
+    let rerun = engine
+        .resume_sandboxes(
+            &alice(),
+            PauseScope::Names(vec![alpha]),
+            Some(host.revision),
+        )
+        .unwrap();
+    assert!(!rerun.cleanup_failed());
+    let host_after = readable_host(&rerun.host);
+    assert_eq!(host_after.word, HostPauseWord::Running);
+    assert_eq!(host_after.revision, 0);
+}
+
+#[test]
+fn resume_cleanup_retries_lock_and_surfaces_lock_error_as_cleanup_error() {
+    use std::cell::Cell;
+
+    let fake = Rc::new(FakeServices::default());
+    let (_dir, engine) = setup_engine(&fake);
+    let alpha = create_sandbox(&engine, "alpha");
+    seed_sandbox(&engine, &fake, &alpha, SandboxState::Running, true);
+
+    engine
+        .pause_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+
+    // 1. Exhausted lock retries in finish_resume_records surface as
+    //    `cleanup_error` on `Ok(ResumeReport)`, not as `Err` from `resume_sandboxes`.
+    let calls = Rc::new(Cell::new(0usize));
+    let calls_ref = Rc::clone(&calls);
+    crate::engine::pause::test_hooks::set_next_cleanup_lock_hook(2, move || {
+        calls_ref.set(calls_ref.get() + 1);
+        Err(crate::state::StateError::Locked {
+            path: std::path::PathBuf::from("state.lock"),
+        })
+    });
+
+    let report = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![alpha.clone()]), None)
+        .unwrap();
+    assert_eq!(calls.get(), 2, "clean-up lock must retry boundedly");
+    assert!(!report.any_failed());
+    assert!(report.cleanup_failed());
+    assert!(report.cleanup_error.is_some());
+    assert_eq!(report.sandboxes.len(), 1);
+    assert_eq!(report.sandboxes[0].outcome, ResumeOutcome::Resumed);
+    let rev = readable_host(&report.host).revision;
+    assert_ne!(rev, 0);
+
+    // 2. Transient lock failures succeed on retry and delete the record.
+    let retry_calls = Rc::new(Cell::new(0usize));
+    let retry_ref = Rc::clone(&retry_calls);
+    crate::engine::pause::test_hooks::set_next_cleanup_lock_hook(3, move || {
+        let n = retry_ref.get() + 1;
+        retry_ref.set(n);
+        if n < 3 {
+            Err(crate::state::StateError::Locked {
+                path: std::path::PathBuf::from("state.lock"),
+            })
+        } else {
+            Ok(())
+        }
+    });
+
+    let rerun = engine
+        .resume_sandboxes(&alice(), PauseScope::Names(vec![alpha]), Some(rev))
+        .unwrap();
+    assert_eq!(retry_calls.get(), 3);
+    assert!(!rerun.cleanup_failed());
+    assert_eq!(readable_host(&rerun.host).revision, 0);
 }

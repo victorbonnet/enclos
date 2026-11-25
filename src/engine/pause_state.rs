@@ -178,7 +178,8 @@ impl HostPauseWord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPauseView {
     pub word: HostPauseWord,
-    /// `0` when no record is in force.
+    /// `0` when no record exists; non-zero with `Running` when a record
+    /// remains on disk that reaches no sandbox.
     pub revision: u64,
     pub since: Option<Timestamp>,
     pub by: Option<Actor>,
@@ -368,8 +369,12 @@ pub fn derive_host(
     let mut runs = Vec::new();
     let mut owed = Vec::new();
     let mut paused_any = false;
+    let mut covered_any = false;
     for input in sandboxes {
         let derived = derive_sandbox(Some(host), *input);
+        if derived.covered {
+            covered_any = true;
+        }
         if derived.paused {
             paused_any = true;
         }
@@ -379,6 +384,24 @@ pub fn derive_host(
         if derived.owed {
             owed.push(input.name.clone());
         }
+    }
+
+    if !host.pause_all && !covered_any {
+        let runs = sandboxes
+            .iter()
+            .filter(|s| matches!(s.state, SandboxState::Running))
+            .map(|s| s.name.clone())
+            .collect();
+        return HostPauseView {
+            word: HostPauseWord::Running,
+            revision: host.revision,
+            since: None,
+            by: None,
+            pause_all: false,
+            runs,
+            owed: Vec::new(),
+            nothing_to_pause_all: false,
+        };
     }
 
     let word = if runs.is_empty() && owed.is_empty() {
@@ -675,5 +698,81 @@ mod tests {
         );
         assert!(d.member && d.covered && !d.paused && !d.owed && !d.runs);
         assert_eq!(d.why, Some(NotPausedWhy::NothingToPause));
+    }
+
+    #[test]
+    fn pause_all_false_with_no_covered_member_reads_running_keeping_revision() {
+        let h = host_rec(false, 600);
+        let a = sb("alpha");
+        let b = sb("beta");
+        let ra = row("alpha", &[], &[], Some(now()));
+        let rb = row("beta", &["enclos.beta.gateway"], &[], Some(now()));
+        let inputs = [
+            SandboxPauseInput {
+                name: &a,
+                state: &SandboxState::Stopped,
+                has_runtime_services: false,
+                row: Some(&ra),
+            },
+            SandboxPauseInput {
+                name: &b,
+                state: &SandboxState::Running,
+                has_runtime_services: true,
+                row: Some(&rb),
+            },
+        ];
+
+        let host = derive_host(Some(&h), &inputs);
+        assert_eq!(host.word, HostPauseWord::Running);
+        assert_eq!(host.revision, 600);
+        assert_eq!(host.since, None);
+        assert_eq!(host.by, None);
+        assert!(!host.pause_all);
+        assert_eq!(host.runs, vec![b]);
+        assert!(host.owed.is_empty());
+        assert!(!host.nothing_to_pause_all);
+        assert_eq!(host.summary_line(), None);
+        assert!(!HostPauseRead::Readable(host).in_force());
+    }
+
+    #[test]
+    fn pause_all_false_with_only_stopped_released_member_reads_running() {
+        let h = host_rec(false, 601);
+        let a = sb("alpha");
+        let ra = row("alpha", &[], &[], Some(now()));
+        let input = SandboxPauseInput {
+            name: &a,
+            state: &SandboxState::Stopped,
+            has_runtime_services: false,
+            row: Some(&ra),
+        };
+        let host = derive_host(Some(&h), &[input]);
+        assert_eq!(host.word, HostPauseWord::Running);
+        assert_eq!(host.revision, 601);
+        assert!(host.runs.is_empty());
+        assert!(host.owed.is_empty());
+        assert!(!host.nothing_to_pause_all);
+        assert_eq!(host.summary_line(), None);
+        assert!(!HostPauseRead::Readable(host).in_force());
+    }
+
+    #[test]
+    fn pause_all_false_with_covered_member_remains_paused() {
+        let h = host_rec(false, 602);
+        let a = sb("alpha");
+        let ra = row("alpha", &["enclos.alpha.gateway"], &[], None);
+        let input = SandboxPauseInput {
+            name: &a,
+            state: &SandboxState::Running,
+            has_runtime_services: false,
+            row: Some(&ra),
+        };
+        let host = derive_host(Some(&h), &[input]);
+        assert_eq!(host.word, HostPauseWord::Paused);
+        assert_eq!(host.revision, 602);
+        assert!(host.since.is_some());
+        assert!(host.by.is_some());
+        assert!(!host.pause_all);
+        assert!(HostPauseRead::Readable(host).in_force());
     }
 }

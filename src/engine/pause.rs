@@ -24,9 +24,9 @@ use crate::runtime::adapter;
 use crate::service::ServiceLabel;
 use crate::state::{StateError, StateLock};
 
-/// Bounded lock-acquisition retries when finishing an already-opened audit
-/// entry after work has been performed (6 × 10 s ≈ 1 minute).
-const AUDIT_FINISH_LOCK_ATTEMPTS: usize = 6;
+/// Bounded lock-acquisition retries for post-work record clean-up and
+/// finishing an already-opened audit entry (6 × 10 s ≈ 1 minute).
+const POST_WORK_LOCK_ATTEMPTS: usize = 6;
 
 /// Which sandboxes a host pause or resume targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +119,9 @@ pub struct ResumeReport {
     pub no_record: bool,
     pub sandboxes: Vec<SandboxResumeResult>,
     pub host: HostPauseRead,
+    /// Present when post-work pause record clean-up failed after services
+    /// were resumed.
+    pub cleanup_error: Option<String>,
 }
 
 /// One sandbox's derived pause state alongside its lifecycle state.
@@ -145,6 +148,10 @@ impl ResumeReport {
 
     pub fn host_unreadable(&self) -> bool {
         matches!(self.host, HostPauseRead::Unreadable(_))
+    }
+
+    pub fn cleanup_failed(&self) -> bool {
+        self.cleanup_error.is_some()
     }
 }
 
@@ -554,7 +561,7 @@ impl Engine {
 
         let lock = match held_lock.take() {
             Some(l) => l,
-            None => self.lock_to_finish_audit()?,
+            None => self.lock_with_retry()?,
         };
         let results = match work {
             Ok(results) => {
@@ -628,6 +635,7 @@ impl Engine {
                 no_record: true,
                 sandboxes: Vec::new(),
                 host,
+                cleanup_error: None,
             });
         };
 
@@ -852,13 +860,13 @@ impl Engine {
 
         let lock = match held_lock.take() {
             Some(l) => l,
-            None => self.lock_to_finish_audit()?,
+            None => self.lock_with_retry()?,
         };
-        let results = match work {
+        let (results, cleanup_error) = match work {
             Ok((results, cleanup_error)) => {
                 let outcome = resume_audit_outcome(&results, cleanup_error.as_deref());
                 self.audit.finish_entry(&lock, entry, outcome)?;
-                results
+                (results, cleanup_error)
             }
             Err(e) => {
                 let _ = self
@@ -874,6 +882,7 @@ impl Engine {
             no_record: false,
             sandboxes: results,
             host,
+            cleanup_error,
         })
     }
 
@@ -883,7 +892,8 @@ impl Engine {
     /// or owed (and either the scope was `All` or `pause_all = 0`).
     ///
     /// Called after services have been installed; any error is recorded on the
-    /// audit entry without discarding the per-sandbox resume report.
+    /// audit entry and returned in [`ResumeReport::cleanup_error`] without
+    /// discarding the per-sandbox resume report.
     fn finish_resume_records(
         &self,
         by: &Actor,
@@ -891,7 +901,7 @@ impl Engine {
         stopped_meanwhile: Vec<SandboxName>,
         held_lock: &mut Option<StateLock>,
     ) -> Result<()> {
-        let lock = self.state.lock()?;
+        let lock = self.lock_for_cleanup()?;
         *held_lock = Some(lock);
         for name in stopped_meanwhile {
             if let Some(existing) = self.state.sandbox_pause(&name)? {
@@ -950,10 +960,27 @@ impl Engine {
         Ok(())
     }
 
-    /// Acquires the state lock to finish an already-opened audit entry,
-    /// retrying boundedly when another command transiently holds the lock.
-    fn lock_to_finish_audit(&self) -> Result<StateLock> {
-        retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || self.state.lock())
+    /// Acquires the state lock with bounded retries when another command
+    /// transiently holds it (used for post-work record clean-up and finishing
+    /// an already-opened audit entry).
+    fn lock_with_retry(&self) -> Result<StateLock> {
+        retry_lock(POST_WORK_LOCK_ATTEMPTS, || self.state.lock())
+    }
+
+    #[cfg(not(test))]
+    fn lock_for_cleanup(&self) -> Result<StateLock> {
+        self.lock_with_retry()
+    }
+
+    #[cfg(test)]
+    fn lock_for_cleanup(&self) -> Result<StateLock> {
+        if let Some(err) = test_hooks::take_cleanup_error() {
+            return Err(err);
+        }
+        if let Some((attempts, fake_acquire)) = test_hooks::take_cleanup_lock_hook() {
+            retry_lock(attempts, fake_acquire)?;
+        }
+        self.lock_with_retry()
     }
 
     /// Reads one sandbox's pause state for display without swallowing read
@@ -1277,6 +1304,44 @@ impl Engine {
 }
 
 #[cfg(test)]
+pub(super) mod test_hooks {
+    use std::cell::RefCell;
+
+    use crate::error::Error;
+    use crate::state::StateError;
+
+    type CleanupLockHook = (
+        usize,
+        Box<dyn FnMut() -> std::result::Result<(), StateError>>,
+    );
+
+    std::thread_local! {
+        static NEXT_CLEANUP_ERROR: RefCell<Option<Error>> = const { RefCell::new(None) };
+        static NEXT_CLEANUP_LOCK_HOOK: RefCell<Option<CleanupLockHook>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(in crate::engine) fn fail_next_cleanup_with(err: Error) {
+        NEXT_CLEANUP_ERROR.with(|slot| *slot.borrow_mut() = Some(err));
+    }
+
+    pub(in crate::engine) fn set_next_cleanup_lock_hook(
+        attempts: usize,
+        hook: impl FnMut() -> std::result::Result<(), StateError> + 'static,
+    ) {
+        NEXT_CLEANUP_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some((attempts, Box::new(hook))));
+    }
+
+    pub(super) fn take_cleanup_error() -> Option<Error> {
+        NEXT_CLEANUP_ERROR.with(|slot| slot.borrow_mut().take())
+    }
+
+    pub(super) fn take_cleanup_lock_hook() -> Option<CleanupLockHook> {
+        NEXT_CLEANUP_LOCK_HOOK.with(|slot| slot.borrow_mut().take())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -1285,9 +1350,9 @@ mod tests {
     #[test]
     fn retry_lock_retries_bounded_locked_errors_and_succeeds() {
         let mut calls = 0;
-        let res = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+        let res = retry_lock(POST_WORK_LOCK_ATTEMPTS, || {
             calls += 1;
-            if calls < AUDIT_FINISH_LOCK_ATTEMPTS {
+            if calls < POST_WORK_LOCK_ATTEMPTS {
                 Err(StateError::Locked {
                     path: PathBuf::from("state.lock"),
                 })
@@ -1296,26 +1361,26 @@ mod tests {
             }
         });
         assert_eq!(res.ok(), Some("acquired"));
-        assert_eq!(calls, AUDIT_FINISH_LOCK_ATTEMPTS);
+        assert_eq!(calls, POST_WORK_LOCK_ATTEMPTS);
     }
 
     #[test]
     fn retry_lock_returns_locked_after_exhausting_attempts() {
         let mut calls = 0;
-        let res: Result<()> = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+        let res: Result<()> = retry_lock(POST_WORK_LOCK_ATTEMPTS, || {
             calls += 1;
             Err(StateError::Locked {
                 path: PathBuf::from("state.lock"),
             })
         });
         assert!(matches!(res, Err(Error::State(StateError::Locked { .. }))));
-        assert_eq!(calls, AUDIT_FINISH_LOCK_ATTEMPTS);
+        assert_eq!(calls, POST_WORK_LOCK_ATTEMPTS);
     }
 
     #[test]
     fn retry_lock_does_not_retry_non_lock_errors() {
         let mut calls = 0;
-        let res: Result<()> = retry_lock(AUDIT_FINISH_LOCK_ATTEMPTS, || {
+        let res: Result<()> = retry_lock(POST_WORK_LOCK_ATTEMPTS, || {
             calls += 1;
             Err(StateError::NotInitialized {
                 path: PathBuf::from("state.db"),

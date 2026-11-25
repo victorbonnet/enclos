@@ -5822,6 +5822,7 @@ mod pause {
                     host: crate::engine::pause_state::HostPauseRead::Unreadable(
                         "corrupt sandbox_pauses".into(),
                     ),
+                    cleanup_error: None,
                 };
                 Ok(crate::bridge::pausing::resume_report_to_action_result(
                     named.as_deref(),
@@ -5880,9 +5881,9 @@ mod pause {
     #[test]
     fn bridge_sends_pause_result_when_post_work_resume_read_fails() {
         /// Seam whose `state()` fails after `resume()`, simulating a post-work
-        /// record clean-up or host-state read failure after services were
-        /// resumed, while exercising the real `resume_report_to_action_result`
-        /// mapping for `HostPauseRead::Unreadable`.
+        /// host-state read failure (`HostPauseRead::Unreadable` with
+        /// `cleanup_error: None`) after services were resumed, while exercising
+        /// the real `resume_report_to_action_result` mapping.
         struct UnreadableAfterResume {
             failed_after: std::sync::atomic::AtomicBool,
         }
@@ -5928,6 +5929,7 @@ mod pause {
                     host: crate::engine::pause_state::HostPauseRead::Unreadable(
                         "corrupt sandbox_pauses".into(),
                     ),
+                    cleanup_error: None,
                 };
                 Ok(crate::bridge::pausing::resume_report_to_action_result(
                     named.as_deref(),
@@ -5974,6 +5976,112 @@ mod pause {
         assert!(!paused);
         assert!(partly);
         assert_eq!(revision, 0);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Resumed,
+            }])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_partly_when_resume_cleanup_fails_over_readable_host() {
+        /// Seam whose `resume()` returns a `ResumeReport` with a readable
+        /// `Paused` host state and `cleanup_error: Some(...)` (the silent
+        /// clean-up failure case), exercising `resume_report_to_action_result`.
+        struct CleanupFailedAfterResume;
+
+        impl Pausing for CleanupFailedAfterResume {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                unreachable!()
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Readable(
+                        crate::engine::pause_state::HostPauseView {
+                            word: crate::engine::pause_state::HostPauseWord::Paused,
+                            revision: 77,
+                            since: None,
+                            by: None,
+                            pause_all: false,
+                            runs: Vec::new(),
+                            owed: Vec::new(),
+                            nothing_to_pause_all: false,
+                        },
+                    ),
+                    cleanup_error: Some("state lock busy".into()),
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(CleanupFailedAfterResume);
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "cleanup-fail-resume-1",
+            FromDevice::Resume {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result when resume clean-up fails");
+        };
+        assert_eq!(of.as_str(), "cleanup-fail-resume-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 77);
         assert_eq!(
             sandboxes,
             Some(vec![PauseSandboxOutcome {

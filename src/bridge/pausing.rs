@@ -361,7 +361,12 @@ pub(crate) fn resume_report_to_action_result(
                 .collect()
         }
     };
-    let (paused, partly, revision) = map_host_pause_read(&report.host, "resume");
+    let (mut paused, mut partly, revision) = map_host_pause_read(&report.host, "resume");
+    if let Some(err) = &report.cleanup_error {
+        eprintln!("enclos app: resume clean-up failed: {err}");
+        paused = false;
+        partly = true;
+    }
     PauseActionResult {
         paused,
         partly,
@@ -448,6 +453,7 @@ mod tests {
                 error: None,
             }],
             host: HostPauseRead::Unreadable("corrupt sandbox_pauses".into()),
+            cleanup_error: None,
         };
         let resume_res = resume_report_to_action_result(Some(&[lab]), resume_report);
         assert!(!resume_res.paused);
@@ -458,6 +464,46 @@ mod tests {
             vec![PauseSandboxOutcome {
                 sandbox: "lab".into(),
                 outcome: WirePauseOutcome::Resumed,
+            }]
+        );
+    }
+
+    #[test]
+    fn resume_cleanup_error_maps_to_partly_keeping_readable_revision() {
+        use crate::engine::SandboxResumeResult;
+        use crate::engine::pause_state::HostPauseView;
+
+        let lab: SandboxName = "lab".parse().unwrap();
+        let report = ResumeReport {
+            no_record: false,
+            sandboxes: vec![SandboxResumeResult {
+                sandbox: lab.clone(),
+                outcome: EngineResumeOutcome::LeftAsItWas,
+                services: Vec::new(),
+                agents: Vec::new(),
+                error: None,
+            }],
+            host: HostPauseRead::Readable(HostPauseView {
+                word: HostPauseWord::Paused,
+                revision: 42,
+                since: None,
+                by: None,
+                pause_all: false,
+                runs: Vec::new(),
+                owed: Vec::new(),
+                nothing_to_pause_all: false,
+            }),
+            cleanup_error: Some("state lock busy".into()),
+        };
+        let res = resume_report_to_action_result(Some(&[lab]), report);
+        assert!(!res.paused);
+        assert!(res.partly);
+        assert_eq!(res.revision, 42);
+        assert_eq!(
+            res.outcomes,
+            vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: WirePauseOutcome::LeftAsItWas,
             }]
         );
     }
