@@ -3,6 +3,7 @@
 //! opened with the agent's token.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -153,9 +154,14 @@ pub fn connect(
     connect_within(socket, token, home, HELLO_TIMEOUT)
 }
 
-/// [`connect`], with `wait` for the whole of the plugin's `hello`: a plugin
-/// that sends it a byte at a time, or never ends its line, is given up on
-/// once `wait` is over.
+/// How long to pause between non-blocking connect attempts when the
+/// listener's accept queue is full.
+const CONNECT_RETRY: Duration = Duration::from_millis(10);
+
+/// [`connect`], with `wait` for the connect and the whole of the plugin's
+/// `hello`: a listener with a full accept queue, or a plugin that sends its
+/// `hello` a byte at a time or never ends its line, is given up on once
+/// `wait` is over.
 pub(super) fn connect_within(
     socket: &Path,
     token: &str,
@@ -166,7 +172,7 @@ pub(super) fn connect_within(
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
     refuse_linked_folder(socket)?;
-    let stream = match UnixStream::connect(socket) {
+    let stream = match connect_until(socket, deadline, wait) {
         Ok(stream) => stream,
         // A failure of the path itself — a file that is not a socket, a
         // folder, a folder this bridge cannot read — is nothing a restart
@@ -186,6 +192,64 @@ pub(super) fn connect_within(
         }
     };
     open_on(stream, token, home, wait, deadline)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn nonblocking_unix_socket() -> std::io::Result<OwnedFd> {
+    Ok(rustix::net::socket_with(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+    )?)
+}
+
+#[cfg(target_vendor = "apple")]
+fn nonblocking_unix_socket() -> std::io::Result<OwnedFd> {
+    let fd = rustix::net::socket(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        None,
+    )?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    let flags = rustix::fs::fcntl_getfl(&fd)?;
+    rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(fd)
+}
+
+/// Connects to the Unix stream socket at `socket`, giving up at `deadline`
+/// if the listener's accept queue stays full instead of blocking without
+/// limit (`wait` is how long it was given).
+///
+/// On Linux a non-blocking Unix connect reports a full accept queue as
+/// `EAGAIN`; macOS reports a full queue differently (not tested here), so
+/// this bound matters most where it is `EAGAIN`.
+fn connect_until(socket: &Path, deadline: Instant, wait: Duration) -> std::io::Result<UnixStream> {
+    let address = rustix::net::SocketAddrUnix::new(socket)?;
+    let fd = nonblocking_unix_socket()?;
+    loop {
+        match rustix::net::connect(&fd, &address) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) if std::io::Error::from(e).kind() == std::io::ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "the channel's accept queue stayed full for {} ms",
+                            wait.as_millis()
+                        ),
+                    ));
+                }
+                std::thread::sleep(left.min(CONNECT_RETRY));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let flags = rustix::fs::fcntl_getfl(&fd)?;
+    rustix::fs::fcntl_setfl(&fd, flags.difference(rustix::fs::OFlags::NONBLOCK))?;
+    Ok(UnixStream::from(fd))
 }
 
 /// Runs the plugin `hello` exchange on an already-connected `stream`.
@@ -377,21 +441,20 @@ impl PluginCloser {
 /// to whatever listens there).
 ///
 /// The check runs before every connection attempt because every attempt goes
-/// through [`connect_within`]; the bridge's restart wait
-/// (`Hub::hold_for_restart`, up to about 60 attempts in 15 s) re-checks
-/// before each connect rather than relying on one check for the whole wait.
-/// The window between this check and `UnixStream::connect` is the same on
-/// each attempt as it was on the single attempt before #376: the wait gives
-/// a sandbox more attempts at it, not a longer window.
+/// through [`connect_within`], but the check and the connect
+/// ([`connect_until`]) are two steps. A sandbox that rewrites its own folder
+/// or socket link between them can win on one attempt — about one in three
+/// under a full-rate flip on Linux — so the number of attempts is not what
+/// bounds it.
 ///
-/// The race is accepted, not closed: closing it requires connecting through
-/// a directory descriptor opened without following links (a `/proc/self/fd`
-/// path on Linux, nothing equivalent on macOS), which is a design decision
-/// rather than a mapping and is left to its own card. If a sandbox wins the
-/// race, the bridge writes its `hello` (the agent's own token, which the
-/// sandbox already holds, and the bridge's capabilities) to the socket the
-/// link points to, and then the person's messages only if that listener
-/// answers a valid `hello`.
+/// The race is accepted, not closed. If a sandbox wins it, the exposure is
+/// one fixed `hello` (the agent's own token, which the sandbox already holds,
+/// plus the bridge's capabilities) written to a socket the sandbox could not
+/// reach itself; the person's messages follow only if that listener answers a
+/// valid `hello` with the agent's token. A directory descriptor alone would
+/// not close the race: the leaf `main.sock` stays followable, so closing it
+/// needs the peer checked after connect (its own card), not only a
+/// descriptor.
 fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     let Some(folder) = socket.parent() else {
         return Ok(());
@@ -1159,5 +1222,59 @@ mod tests {
             panic!("connected to nothing");
         };
         assert!(path.ends_with("main.sock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listener_with_a_full_accept_queue_is_given_up_on_in_time() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let addr = rustix::net::SocketAddrUnix::new(&socket).unwrap();
+        let listener = rustix::net::socket_with(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&listener, &addr).unwrap();
+        rustix::net::listen(&listener, 0).unwrap();
+
+        let mut held = Vec::new();
+        loop {
+            let client = nonblocking_unix_socket().unwrap();
+            match rustix::net::connect(&client, &addr) {
+                Ok(()) => {
+                    held.push(client);
+                    assert!(held.len() < 1024, "accept queue never filled");
+                }
+                Err(e) if std::io::Error::from(e).kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => panic!("unexpected connect error while filling queue: {e}"),
+            }
+        }
+
+        let started = Instant::now();
+        let failed = connect_within(
+            &socket,
+            "t0ken",
+            "home.lab.main",
+            Duration::from_millis(400),
+        );
+        let elapsed = started.elapsed();
+        let Err(PluginError::Connect { source, .. }) = failed else {
+            panic!(
+                "expected Connect error on full queue, got {:?}",
+                failed.map(|(hello, ..)| hello)
+            );
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::TimedOut, "{source}");
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_millis(1_500),
+            "elapsed: {elapsed:?}"
+        );
+        drop(held);
+        drop(listener);
     }
 }

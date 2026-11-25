@@ -42,7 +42,7 @@ Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a
 
 ## The plugin leg
 
-The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open. The plugin has 10 s to answer the bridge's `hello`, and 10 s to read what the bridge writes; past either, the bridge ends that connection and opens a new one on its next try, and other agents' plugins do not wait for it.
+The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open. The connect and the plugin's answer to the bridge's `hello` share 10 s, so a plugin whose accept queue stays full does not hold the agent's channel without limit (on Linux; macOS is not tested). The plugin has 10 s to read what the bridge writes; past either, the bridge ends that connection and opens a new one on its next try, and other agents' plugins do not wait for it.
 
 1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation. Optional `capabilities`, absent meaning an empty list, advertises bridge support for `questions`, `runtime_approvals`, `activity`, `tasks`, `held_tasks` and `task_events` independently.
 
