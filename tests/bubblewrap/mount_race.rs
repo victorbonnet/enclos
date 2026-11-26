@@ -130,21 +130,30 @@ fn bubblewrap_alone() -> Output {
 const AGAIN: &str = "a mount of the host changed while bubblewrap set up, so it starts again";
 
 /// How long the churn holds its mount, and how long it leaves it away: at
-/// this pace bubblewrap alone failed from under 1% (arm) to about 15% (x86)
-/// of starts on the runners, often enough to show and rarely enough that
+/// this pace bubblewrap alone failed from under 1% of starts (arm) to over
+/// 20% on one hosted x86 job, often enough to show and rarely enough that
 /// five starts in a row all fail almost never.
 const PACE: Duration = Duration::from_millis(1);
 
 /// Hard cap on the number of sessions started in one test run.
 const MAX_SESSIONS: usize = 3000;
 
-/// Hard cap on wall-clock time spent in the session loop.
+/// Cap on wall-clock time spent looking for the first session that starts
+/// again (as on main, it is not checked once one has).
 const MAX_DURATION: Duration = Duration::from_secs(240);
 
 /// Minimum number of sessions to start when the control rate is high, so
 /// both the first session (which installs the namespace holder) and
 /// subsequent sessions are exercised.
 const MIN_SESSIONS: usize = 30;
+
+/// Number of restarted sessions that is enough to stop early once at least
+/// `MIN_SESSIONS` have run.
+const ENOUGH_AGAIN: usize = 3;
+
+/// Maximum number of sessions to run once at least one session has started
+/// again.
+const MOST_ONCE_MET: usize = 150;
 
 /// Minimum number of control starts to sample: stopping at the third
 /// failure alone over-reads the rate, so take at least this many starts.
@@ -181,9 +190,9 @@ const MISS_PROB: f64 = 1e-4;
 /// of seeing zero retries. Reaching `MISS_PROB` at that rate needs 4871
 /// sessions, which exceeds `MAX_SESSIONS` and is therefore capped at
 /// `MAX_SESSIONS` (3000); `MAX_SESSIONS` and the 240 s `MAX_DURATION` limit
-/// are the hard bound. At the 5–15% control rates seen on x86 runners, this
-/// derives 733–241 sessions (ceil values below `MIN_BUDGET` are raised to
-/// 100).
+/// bound the search while no session has started again. At the 5–15%
+/// control rates seen on x86 runners, this derives 733–241 sessions (ceil
+/// values below `MIN_BUDGET` are raised to 100).
 fn session_budget(failed: usize, alone: usize) -> usize {
     if failed == 0 || alone == 0 {
         return MAX_SESSIONS;
@@ -198,6 +207,24 @@ fn session_budget(failed: usize, alone: usize) -> usize {
     } else {
         (needed as usize).clamp(MIN_BUDGET, MAX_SESSIONS)
     }
+}
+
+/// Whether to start another session, after `sessions` of them with `again`
+/// started again, `spent` into the loop, and a derived `budget` (capped at
+/// `MAX_SESSIONS`).
+///
+/// Fewer than `MIN_SESSIONS` always continues. With `again == 0`, the loop
+/// keeps going until `budget` sessions or `MAX_DURATION` is reached. Once the
+/// churn is met (`again >= 1`), this keeps main's stop rule: 30 at least, 3
+/// started again, 150 at most.
+fn more_sessions(sessions: usize, again: usize, spent: Duration, budget: usize) -> bool {
+    if sessions < MIN_SESSIONS {
+        return true;
+    }
+    if again == 0 {
+        return sessions < budget && spent < MAX_DURATION;
+    }
+    again < ENOUGH_AGAIN && sessions < MOST_ONCE_MET
 }
 
 /// Under a tmpfs mounted and taken away every millisecond under the
@@ -232,10 +259,7 @@ fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
     );
     let (mut sessions, mut again) = (0, 0);
     let began = Instant::now();
-    while sessions < budget
-        && began.elapsed() < MAX_DURATION
-        && (again == 0 || sessions < MIN_SESSIONS)
-    {
+    while more_sessions(sessions, again, began.elapsed(), budget) {
         let out = lab
             .command(&["exec", "lab", "--", "/bin/sh", "-c", &script])
             .output()
@@ -320,4 +344,56 @@ fn session_budget_scales_with_control_rate() {
     assert_eq!(session_budget(1, 3000), MAX_SESSIONS);
     assert_eq!(session_budget(3, 3), MIN_BUDGET);
     assert_eq!(session_budget(5, 3), MIN_BUDGET);
+}
+
+#[test]
+fn more_sessions_keeps_mains_stop_rule() {
+    // Fewer than MIN_SESSIONS (30) always continues, regardless of retries,
+    // elapsed time, or budget.
+    assert!(more_sessions(0, 0, Duration::ZERO, 100));
+    assert!(more_sessions(
+        MIN_SESSIONS - 1,
+        ENOUGH_AGAIN,
+        MAX_DURATION,
+        0
+    ));
+
+    // With again == 0, keep going until budget or MAX_DURATION is reached.
+    assert!(more_sessions(MIN_SESSIONS, 0, Duration::ZERO, 100));
+    assert!(more_sessions(
+        99,
+        0,
+        MAX_DURATION - Duration::from_secs(1),
+        100
+    ));
+    assert!(!more_sessions(100, 0, Duration::ZERO, 100));
+    assert!(more_sessions(MOST_ONCE_MET, 0, Duration::ZERO, 300));
+    assert!(!more_sessions(50, 0, MAX_DURATION, 300));
+    assert!(!more_sessions(
+        50,
+        0,
+        MAX_DURATION + Duration::from_secs(1),
+        300
+    ));
+
+    // With 1 or 2 restarts, continue until MOST_ONCE_MET (150) sessions.
+    assert!(more_sessions(MIN_SESSIONS, 1, Duration::ZERO, 100));
+    assert!(more_sessions(MOST_ONCE_MET - 1, 1, Duration::ZERO, 100));
+    assert!(more_sessions(MIN_SESSIONS, 2, Duration::ZERO, 100));
+    assert!(more_sessions(MOST_ONCE_MET - 1, 2, Duration::ZERO, 100));
+
+    // With ENOUGH_AGAIN (3) restarts, stop immediately at >= MIN_SESSIONS.
+    assert!(!more_sessions(
+        MIN_SESSIONS,
+        ENOUGH_AGAIN,
+        Duration::ZERO,
+        300
+    ));
+    assert!(!more_sessions(50, ENOUGH_AGAIN, Duration::ZERO, 300));
+    assert!(!more_sessions(50, ENOUGH_AGAIN + 1, Duration::ZERO, 300));
+
+    // With at least one restart, stop at MOST_ONCE_MET (150) sessions.
+    assert!(!more_sessions(MOST_ONCE_MET, 1, Duration::ZERO, 300));
+    assert!(!more_sessions(MOST_ONCE_MET, 2, Duration::ZERO, 300));
+    assert!(!more_sessions(200, 1, Duration::ZERO, 300));
 }
