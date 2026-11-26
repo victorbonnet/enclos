@@ -529,6 +529,71 @@ impl Engine {
                 );
             }
         }
+        // A sandbox paused by `sandbox pause` intentionally has its runtime
+        // services removed while its record stays `Running` (H3: recorded, not
+        // inferred). Do not report those paused services as missing or the
+        // sandbox as drifted. If the pause record cannot be read, treat the
+        // pause state as unknown: report it, do not flag runtime services as
+        // missing, and do not offer `RecordStopped` on that evidence.
+        enum PauseCheck {
+            Paused(Vec<String>),
+            NotPaused,
+            UnreadableRecord(String),
+            ServicesUnreadable(String),
+        }
+        let pause_check = match (self.state.host_pause(), self.state.sandbox_pause(name)) {
+            (Err(e), _) | (_, Err(e)) => PauseCheck::UnreadableRecord(e.to_string()),
+            (Ok(Some(host)), Ok(Some(row))) => {
+                match self.derive_sandbox_pause(record, Some(&host), Some(&row)) {
+                    Ok(derived) if derived.paused => PauseCheck::Paused(row.labels),
+                    Ok(_) => PauseCheck::NotPaused,
+                    Err(e) => PauseCheck::ServicesUnreadable(e.to_string()),
+                }
+            }
+            (Ok(_), Ok(_)) => PauseCheck::NotPaused,
+        };
+        let mut ignored_missing: Vec<String> = Vec::new();
+        match &pause_check {
+            PauseCheck::Paused(labels) => ignored_missing.extend(labels.iter().cloned()),
+            PauseCheck::UnreadableRecord(why) => {
+                push(
+                    format!("its pause record cannot be read: {why}"),
+                    Remedy::Manual(format!(
+                        "enclos cannot tell whether sandbox {name} is paused while its pause record is unreadable; inspect state.db before repairing its services"
+                    )),
+                );
+                if let Some(kind) = record.runtime {
+                    for service in crate::runtime::adapter(kind).services() {
+                        if let Ok(label) =
+                            self.label(name, super::service::Unit::Runtime(service.name))
+                        {
+                            ignored_missing.push(label.to_string());
+                        }
+                    }
+                }
+            }
+            PauseCheck::ServicesUnreadable(why) => {
+                push(
+                    format!(
+                        "its installed services cannot be checked to tell whether it is paused: {why}"
+                    ),
+                    Remedy::Manual(format!(
+                        "enclos cannot tell whether sandbox {name} is paused while its services cannot be queried; fix the service-manager error, then run `enclos state check {name}` again"
+                    )),
+                );
+                if let Some(kind) = record.runtime {
+                    for service in crate::runtime::adapter(kind).services() {
+                        if let Ok(label) =
+                            self.label(name, super::service::Unit::Runtime(service.name))
+                        {
+                            ignored_missing.push(label.to_string());
+                        }
+                    }
+                }
+            }
+            PauseCheck::NotPaused => {}
+        }
+
         // Services: some installed and others not, as after one's launchd
         // job or systemd unit was removed by hand; one installed that enclos
         // no longer runs; installed while not recorded running.
@@ -540,7 +605,11 @@ impl Engine {
         let holder = self.label(name, super::service::Unit::Holder)?;
         let missing: Vec<String> = expected
             .iter()
-            .filter(|l| **l != holder && !installed.contains(l))
+            .filter(|l| {
+                **l != holder
+                    && !installed.contains(l)
+                    && !ignored_missing.iter().any(|p| p == l.as_str())
+            })
             .map(ToString::to_string)
             .collect();
         if installed
@@ -636,8 +705,13 @@ impl Engine {
         // Sessions whose markers could not be looked at may still run.
         let live = open.len() > gone.len() || (!gone.is_empty() && !markers_found);
         // A process found running from its folder keeps it from being
-        // recorded stopped: something of it may still run.
-        if matches!(record.state, SandboxState::Running) && !live && installed.is_empty() {
+        // recorded stopped: something of it may still run. A paused sandbox
+        // is intentionally recorded running with its runtime services removed.
+        if matches!(record.state, SandboxState::Running)
+            && !live
+            && installed.is_empty()
+            && matches!(pause_check, PauseCheck::NotPaused)
+        {
             match (scanned, escaped) {
                 (true, 0) => push(
                     "it is recorded running, and nothing of it runs".to_owned(),

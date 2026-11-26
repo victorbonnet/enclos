@@ -5,6 +5,7 @@ pub mod audit;
 pub mod channel;
 pub mod limits;
 pub mod net;
+pub mod pause;
 pub mod plan;
 pub mod policy;
 pub mod runtime;

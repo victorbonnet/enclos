@@ -4906,3 +4906,1188 @@ fn only_an_fcm_token_is_kept_and_any_other_is_logged_as_refused() {
         && l.device.as_deref() == Some("d-1")
         && l.reason.as_deref() == Some("not an FCM token")));
 }
+
+mod pause {
+    use super::*;
+    use crate::bridge::pausing::{
+        PauseActionResult, PauseError, PauseStateRow, PauseStateView, Pausing,
+    };
+    use crate::bridge::server::connection_end_tests::{
+        PERSON, PhoneLink, bridge_with_pausing, connect_with, error_of, paired, paired_as,
+    };
+    use crate::engine::PauseScope;
+    use crate::model::audit::Actor;
+    use enclos_protocol::device::{
+        PAUSE, PAUSE_SUBSET, PauseOutcome, PauseSandboxOutcome, PauseWhy,
+    };
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    #[derive(Debug, Clone)]
+    struct RecordedCall {
+        verb: &'static str,
+        by: Actor,
+        scope: PauseScope,
+        expected_revision: Option<u64>,
+    }
+
+    struct FakePausing {
+        state: Mutex<PauseStateView>,
+        calls: Mutex<Vec<RecordedCall>>,
+        partial_fail: Mutex<Option<String>>,
+        /// Optional gate to hold a call in flight so single-flight can be tested.
+        gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    }
+
+    impl FakePausing {
+        fn new(state: PauseStateView) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(state),
+                calls: Mutex::new(Vec::new()),
+                partial_fail: Mutex::new(None),
+                gate: Mutex::new(None),
+            })
+        }
+
+        fn with_partial_fail(self: &Arc<Self>, sandbox: &str) {
+            *self.partial_fail.lock().unwrap() = Some(sandbox.to_owned());
+        }
+
+        fn block_next_call(self: &Arc<Self>) -> (Receiver<()>, Sender<()>) {
+            let (entered_tx, entered_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            *self.gate.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Pausing for FakePausing {
+        fn state(&self) -> Result<PauseStateView, PauseError> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn pause(
+            &self,
+            by: &Actor,
+            scope: PauseScope,
+            expected_revision: Option<u64>,
+        ) -> Result<PauseActionResult, PauseError> {
+            if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            self.calls.lock().unwrap().push(RecordedCall {
+                verb: "pause",
+                by: by.clone(),
+                scope: scope.clone(),
+                expected_revision,
+            });
+            let mut st = self.state.lock().unwrap();
+            if let Some(expected) = expected_revision
+                && expected != st.revision
+            {
+                return Err(PauseError::Conflict("stale revision".into()));
+            }
+            st.revision += 1;
+            st.by = Some(by.user.clone());
+            st.since = Some("2026-11-25T17:00:00Z".into());
+            let fail = self.partial_fail.lock().unwrap().clone();
+            let outcomes = match scope {
+                PauseScope::All => {
+                    for row in &mut st.sandboxes {
+                        row.covered = true;
+                        if fail.as_deref() == Some(row.sandbox.as_str()) {
+                            row.paused = false;
+                            row.why = Some(PauseWhy::WouldNotStop);
+                        } else {
+                            row.paused = true;
+                            row.why = None;
+                        }
+                    }
+                    Vec::new()
+                }
+                PauseScope::Names(names) => {
+                    let mut out = Vec::with_capacity(names.len());
+                    for name in &names {
+                        if let Some(row) =
+                            st.sandboxes.iter_mut().find(|r| r.sandbox == name.as_str())
+                        {
+                            row.covered = true;
+                            if fail.as_deref() == Some(name.as_str()) {
+                                row.paused = false;
+                                row.why = Some(PauseWhy::WouldNotStop);
+                                out.push(PauseSandboxOutcome {
+                                    sandbox: name.to_string(),
+                                    outcome: PauseOutcome::WouldNotStop,
+                                });
+                            } else {
+                                row.paused = true;
+                                row.why = None;
+                                out.push(PauseSandboxOutcome {
+                                    sandbox: name.to_string(),
+                                    outcome: PauseOutcome::Paused,
+                                });
+                            }
+                        }
+                    }
+                    out
+                }
+            };
+            let any_not_paused = st
+                .sandboxes
+                .iter()
+                .any(|r| !r.paused && r.state == "running");
+            st.paused = !any_not_paused;
+            st.partly = any_not_paused;
+            Ok(PauseActionResult {
+                paused: st.paused,
+                partly: st.partly,
+                revision: st.revision,
+                outcomes,
+            })
+        }
+
+        fn resume(
+            &self,
+            by: &Actor,
+            scope: PauseScope,
+            expected_revision: Option<u64>,
+        ) -> Result<PauseActionResult, PauseError> {
+            self.calls.lock().unwrap().push(RecordedCall {
+                verb: "resume",
+                by: by.clone(),
+                scope: scope.clone(),
+                expected_revision,
+            });
+            let mut st = self.state.lock().unwrap();
+            if let Some(expected) = expected_revision
+                && expected != st.revision
+            {
+                return Err(PauseError::Conflict("stale revision".into()));
+            }
+            st.revision += 1;
+            let outcomes = match scope {
+                PauseScope::All => {
+                    for row in &mut st.sandboxes {
+                        row.covered = false;
+                        row.paused = false;
+                        row.why = Some(PauseWhy::NotCovered);
+                    }
+                    st.paused = false;
+                    st.partly = false;
+                    st.since = None;
+                    st.by = None;
+                    Vec::new()
+                }
+                PauseScope::Names(names) => {
+                    let mut out = Vec::with_capacity(names.len());
+                    for name in &names {
+                        if let Some(row) =
+                            st.sandboxes.iter_mut().find(|r| r.sandbox == name.as_str())
+                        {
+                            row.covered = false;
+                            row.paused = false;
+                            row.why = Some(PauseWhy::Released);
+                            out.push(PauseSandboxOutcome {
+                                sandbox: name.to_string(),
+                                outcome: PauseOutcome::Resumed,
+                            });
+                        }
+                    }
+                    let any_paused = st.sandboxes.iter().any(|r| r.paused);
+                    st.paused = false;
+                    st.partly = any_paused;
+                    out
+                }
+            };
+            Ok(PauseActionResult {
+                paused: st.paused,
+                partly: st.partly,
+                revision: st.revision,
+                outcomes,
+            })
+        }
+    }
+
+    fn initial_state() -> PauseStateView {
+        PauseStateView {
+            paused: false,
+            partly: false,
+            since: None,
+            by: None,
+            revision: 5,
+            sandboxes: vec![
+                PauseStateRow {
+                    sandbox: "lab".into(),
+                    paused: false,
+                    covered: false,
+                    state: "running".into(),
+                    why: Some(PauseWhy::NotCovered),
+                },
+                PauseStateRow {
+                    sandbox: "home".into(),
+                    paused: false,
+                    covered: false,
+                    state: "running".into(),
+                    why: Some(PauseWhy::NotCovered),
+                },
+            ],
+        }
+    }
+
+    fn sync_collect(device: &mut PhoneLink) -> Vec<ToDevice> {
+        device.send(
+            "sync-1",
+            FromDevice::Sync {
+                since: 0,
+                open_items: false,
+            },
+        );
+        let mut got = Vec::new();
+        loop {
+            match device.receive().expect("bridge closed during sync") {
+                ToDevice::Synced { .. } => break,
+                other => got.push(other),
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn capability_offered_only_to_host_person_and_only_with_seam() {
+        // Without seam: host's person sees neither capability and requests fail not_allowed.
+        let folder = tempfile::tempdir().unwrap();
+        let no_seam = bridge_with_pausing(folder.path(), None);
+        let phone = paired(&no_seam, "n-pixel");
+        Store::open(&no_seam.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, auth) = connect_with(&no_seam, &phone, PERSON, vec![Capability::Pause]);
+        let Some(ToDevice::Authenticated { capabilities, .. }) = auth else {
+            panic!("expected authenticated");
+        };
+        assert!(!capabilities.iter().any(|c| c == PAUSE || c == PAUSE_SUBSET));
+        dev.send(
+            "p-1",
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: None,
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::NotAllowed, Some("p-1".into()))
+        );
+
+        // With seam: offered to host's person only, not to another person.
+        let folder2 = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let with_seam = bridge_with_pausing(folder2.path(), Some(fake));
+        let host_phone = paired(&with_seam, "n-pixel");
+        let guest_phone = paired_as(&with_seam, "n-pixel", "guest@example.com");
+        Store::open(&with_seam.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (_dev_host, host_auth) = connect_with(&with_seam, &host_phone, PERSON, vec![]);
+        let Some(ToDevice::Authenticated { capabilities, .. }) = host_auth else {
+            panic!("expected authenticated");
+        };
+        assert!(capabilities.iter().any(|c| c == PAUSE));
+        assert!(capabilities.iter().any(|c| c == PAUSE_SUBSET));
+
+        *with_seam.whois_login.lock().unwrap() = "guest@example.com".into();
+        let (_dev_guest, guest_auth) = connect_with(
+            &with_seam,
+            &guest_phone,
+            "guest@example.com",
+            vec![Capability::Pause],
+        );
+        let Some(ToDevice::Authenticated { capabilities, .. }) = guest_auth else {
+            panic!("expected authenticated");
+        };
+        assert!(!capabilities.iter().any(|c| c == PAUSE || c == PAUSE_SUBSET));
+    }
+
+    #[test]
+    fn non_host_person_request_returns_not_allowed() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let guest = paired_as(&bridge, "n-pixel", "guest@example.com");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        *bridge.whois_login.lock().unwrap() = "guest@example.com".into();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &guest,
+            "guest@example.com",
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "g-1",
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: None,
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::NotAllowed, Some("g-1".into()))
+        );
+        dev.send(
+            "g-2",
+            FromDevice::Resume {
+                revision: None,
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::NotAllowed, Some("g-2".into()))
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn bad_message_for_empty_over_64_invalid_name_and_undeclared_subset() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+
+        // Device that declared `pause.subset`: empty, >64, invalid SandboxName -> bad_message.
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "b-empty",
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: Some(vec![]),
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("b-empty".into()))
+        );
+
+        let too_many: Vec<String> = (0..65).map(|i| format!("sb-{i:02}")).collect();
+        dev.send(
+            "b-many",
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: Some(too_many),
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("b-many".into()))
+        );
+
+        dev.send(
+            "b-invalid",
+            FromDevice::Resume {
+                revision: None,
+                sandboxes: Some(vec!["../evil".into()]),
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("b-invalid".into()))
+        );
+
+        // Device that did NOT declare `pause.subset`: valid subset -> bad_message.
+        let phone2 = paired(&bridge, "n-pixel");
+        let (mut no_subset, _) = connect_with(&bridge, &phone2, PERSON, vec![Capability::Pause]);
+        no_subset.send(
+            "b-undeclared",
+            FromDevice::Pause {
+                revision: None,
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        assert_eq!(
+            error_of(no_subset.receive()),
+            (ErrorCode::BadMessage, Some("b-undeclared".into()))
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn null_sandboxes_returns_bad_message_and_pauses_nothing() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        // Test with a device that declared ONLY `pause` (not `pause.subset`)
+        // to prove explicit `null` never bypasses `pause.subset` as host-wide.
+        let (mut dev, _) = connect_with(&bridge, &phone, PERSON, vec![Capability::Pause]);
+
+        dev.send_raw(br#"{"v":1,"id":"p-null","type":"pause","sandboxes":null}"#);
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("p-null".into()))
+        );
+
+        dev.send_raw(br#"{"v":1,"id":"r-null","type":"resume","sandboxes":null}"#);
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::BadMessage, Some("r-null".into()))
+        );
+
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn not_found_refuses_whole_request_and_records_no_call() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "nf-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into(), "gone".into(), "home".into()]),
+            },
+        );
+        let Some(ToDevice::Error(err)) = dev.receive() else {
+            panic!("expected error");
+        };
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.of.as_ref().map(|id| id.as_str()), Some("nf-1"));
+        assert!(err.message.contains("gone"), "{}", err.message);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn stale_revision_returns_conflict_and_changes_nothing() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "c-1",
+            FromDevice::Pause {
+                revision: Some(4),
+                sandboxes: None,
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::Conflict, Some("c-1".into()))
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn subset_result_keeps_named_order_and_host_switch_has_no_rows() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        // Subset pause: rows in the exact order named ("home", "lab").
+        dev.send(
+            "sub-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["home".into(), "lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result");
+        };
+        assert_eq!(of.as_str(), "sub-1");
+        assert!(paused);
+        assert!(!partly);
+        assert_eq!(revision, 6);
+        assert_eq!(
+            sandboxes,
+            Some(vec![
+                PauseSandboxOutcome {
+                    sandbox: "home".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+                PauseSandboxOutcome {
+                    sandbox: "lab".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+            ])
+        );
+        assert!(matches!(
+            dev.receive(),
+            Some(ToDevice::PauseState {
+                paused: true,
+                partly: false,
+                revision: 6,
+                ..
+            })
+        ));
+        // Audited as device_actor(person, device, Some(request)).
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].verb, "pause");
+        assert_eq!(calls[0].expected_revision, Some(5));
+        assert!(matches!(calls[0].scope, PauseScope::Names(ref names) if names.len() == 2));
+        assert_eq!(
+            calls[0].by.user,
+            format!("{PERSON} (device {}, request sub-1)", phone.id)
+        );
+
+        // Host switch resume: rows are ABSENT.
+        dev.send(
+            "all-1",
+            FromDevice::Resume {
+                revision: Some(6),
+                sandboxes: None,
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result");
+        };
+        assert_eq!(of.as_str(), "all-1");
+        assert!(!paused);
+        assert!(!partly);
+        assert_eq!(revision, 7);
+        assert_eq!(sandboxes, None);
+        assert!(matches!(
+            dev.receive(),
+            Some(ToDevice::PauseState {
+                paused: false,
+                partly: false,
+                revision: 7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn partial_failure_is_reported_as_pause_result_with_partly() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        fake.with_partial_fail("home");
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "part-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into(), "home".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            sandboxes,
+            ..
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result");
+        };
+        assert_eq!(of.as_str(), "part-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(
+            sandboxes,
+            Some(vec![
+                PauseSandboxOutcome {
+                    sandbox: "lab".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+                PauseSandboxOutcome {
+                    sandbox: "home".into(),
+                    outcome: PauseOutcome::WouldNotStop,
+                },
+            ])
+        );
+        assert!(matches!(
+            dev.receive(),
+            Some(ToDevice::PauseState { partly: true, .. })
+        ));
+    }
+
+    #[test]
+    fn pause_state_at_sync_only_to_declaring_device_and_filtered_for_other_person() {
+        let mut st = initial_state();
+        st.partly = true;
+        st.since = Some("2026-11-25T17:00:00Z".into());
+        st.by = Some("victor".into());
+        st.sandboxes[0].covered = true;
+        st.sandboxes[0].paused = true;
+        st.sandboxes[0].why = None;
+        // st.sandboxes[1] ("home") is uncovered.
+
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(st);
+        let bridge = bridge_with_pausing(folder.path(), Some(fake));
+        let host_declaring = paired(&bridge, "n-pixel");
+        let host_older = paired(&bridge, "n-pixel");
+        let guest_declaring = paired_as(&bridge, "n-pixel", "guest@example.com");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+
+        let (mut dev_host, _) =
+            connect_with(&bridge, &host_declaring, PERSON, vec![Capability::Pause]);
+        let (mut dev_old, _) = connect_with(&bridge, &host_older, PERSON, vec![]);
+        *bridge.whois_login.lock().unwrap() = "guest@example.com".into();
+        let (mut dev_guest, _) = connect_with(
+            &bridge,
+            &guest_declaring,
+            "guest@example.com",
+            vec![Capability::Pause],
+        );
+
+        // Host person declaring `pause`: receives pause.state with BOTH sandboxes.
+        let host_frames = sync_collect(&mut dev_host);
+        let pause_frames: Vec<_> = host_frames
+            .iter()
+            .filter(|m| matches!(m, ToDevice::PauseState { .. }))
+            .collect();
+        assert_eq!(pause_frames.len(), 1);
+        let ToDevice::PauseState {
+            partly,
+            waiting,
+            sandboxes,
+            ..
+        } = pause_frames[0]
+        else {
+            unreachable!();
+        };
+        assert!(*partly);
+        assert!(waiting.is_none());
+        assert_eq!(sandboxes.len(), 2);
+
+        // Other person declaring `pause`: receives pause.state with ONLY covered rows.
+        let guest_frames = sync_collect(&mut dev_guest);
+        let guest_pause: Vec<_> = guest_frames
+            .iter()
+            .filter(|m| matches!(m, ToDevice::PauseState { .. }))
+            .collect();
+        assert_eq!(guest_pause.len(), 1);
+        let ToDevice::PauseState { sandboxes, .. } = guest_pause[0] else {
+            unreachable!();
+        };
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(sandboxes[0].sandbox, "lab");
+
+        // Older device declaring nothing: receives NO pause.state at sync, existing sync untouched.
+        let old_frames = sync_collect(&mut dev_old);
+        assert!(
+            !old_frames
+                .iter()
+                .any(|m| matches!(m, ToDevice::PauseState { .. }))
+        );
+    }
+
+    #[test]
+    fn second_request_while_one_runs_returns_conflict() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let (entered, release) = fake.block_next_call();
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+        dev.send(
+            "first",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: None,
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first pause did not start");
+        dev.send(
+            "second",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: None,
+            },
+        );
+        assert_eq!(
+            error_of(dev.receive()),
+            (ErrorCode::Conflict, Some("second".into()))
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            dev.receive(),
+            Some(ToDevice::PauseResult { of, .. }) if of.as_str() == "first"
+        ));
+    }
+
+    #[test]
+    fn duplicate_names_in_subset_request_produce_one_result_row_each() {
+        let folder = tempfile::tempdir().unwrap();
+        let fake = FakePausing::new(initial_state());
+        let bridge =
+            bridge_with_pausing(folder.path(), Some(Arc::clone(&fake) as Arc<dyn Pausing>));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "dup-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["home".into(), "lab".into(), "home".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult { of, sandboxes, .. }) = dev.receive() else {
+            panic!("expected pause.result");
+        };
+        assert_eq!(of.as_str(), "dup-1");
+        assert_eq!(
+            sandboxes,
+            Some(vec![
+                PauseSandboxOutcome {
+                    sandbox: "home".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+                PauseSandboxOutcome {
+                    sandbox: "lab".into(),
+                    outcome: PauseOutcome::Paused,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_when_post_work_host_read_fails() {
+        /// Seam whose `state()` fails after the first `pause()`, simulating a
+        /// host-state read failure after the pause work already finished.
+        struct UnreadableAfterPause {
+            failed_after: std::sync::atomic::AtomicBool,
+        }
+
+        impl Pausing for UnreadableAfterPause {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                if self.failed_after.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PauseError::Internal("corrupt host_pause".into()));
+                }
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::PauseReport {
+                    sandboxes: vec![crate::engine::SandboxPauseResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::PauseOutcome::Paused,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt host_pause".into(),
+                    ),
+                };
+                Ok(crate::bridge::pausing::pause_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt sandbox_pauses".into(),
+                    ),
+                    cleanup_error: None,
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(UnreadableAfterPause {
+            failed_after: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "unreadable-1",
+            FromDevice::Pause {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result even when host read fails");
+        };
+        assert_eq!(of.as_str(), "unreadable-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 0);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Paused,
+            }])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_when_post_work_resume_read_fails() {
+        /// Seam whose `state()` fails after `resume()`, simulating a post-work
+        /// host-state read failure (`HostPauseRead::Unreadable` with
+        /// `cleanup_error: None`) after services were resumed, while exercising
+        /// the real `resume_report_to_action_result` mapping.
+        struct UnreadableAfterResume {
+            failed_after: std::sync::atomic::AtomicBool,
+        }
+
+        impl Pausing for UnreadableAfterResume {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                if self.failed_after.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(PauseError::Internal("corrupt sandbox_pauses".into()));
+                }
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                unreachable!()
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                self.failed_after
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Unreadable(
+                        "corrupt sandbox_pauses".into(),
+                    ),
+                    cleanup_error: None,
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(UnreadableAfterResume {
+            failed_after: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "unreadable-resume-1",
+            FromDevice::Resume {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result even when resume post-work read fails");
+        };
+        assert_eq!(of.as_str(), "unreadable-resume-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 0);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Resumed,
+            }])
+        );
+    }
+
+    #[test]
+    fn bridge_sends_pause_result_partly_when_resume_cleanup_fails_over_readable_host() {
+        /// Seam whose `resume()` returns a `ResumeReport` with a readable
+        /// `Paused` host state and `cleanup_error: Some(...)` (the silent
+        /// clean-up failure case), exercising `resume_report_to_action_result`.
+        struct CleanupFailedAfterResume;
+
+        impl Pausing for CleanupFailedAfterResume {
+            fn state(&self) -> Result<PauseStateView, PauseError> {
+                Ok(initial_state())
+            }
+
+            fn pause(
+                &self,
+                _by: &crate::model::audit::Actor,
+                _scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                unreachable!()
+            }
+
+            fn resume(
+                &self,
+                _by: &crate::model::audit::Actor,
+                scope: PauseScope,
+                _expected_revision: Option<u64>,
+            ) -> Result<PauseActionResult, PauseError> {
+                let named = match scope {
+                    PauseScope::All => None,
+                    PauseScope::Names(names) => Some(names),
+                };
+                let report = crate::engine::ResumeReport {
+                    no_record: false,
+                    sandboxes: vec![crate::engine::SandboxResumeResult {
+                        sandbox: "lab".parse().unwrap(),
+                        outcome: crate::engine::ResumeOutcome::Resumed,
+                        services: vec!["enclos.lab.gateway".into()],
+                        agents: Vec::new(),
+                        error: None,
+                    }],
+                    host: crate::engine::pause_state::HostPauseRead::Readable(
+                        crate::engine::pause_state::HostPauseView {
+                            word: crate::engine::pause_state::HostPauseWord::Running,
+                            revision: 77,
+                            since: None,
+                            by: None,
+                            pause_all: false,
+                            runs: vec!["lab".parse().unwrap()],
+                            owed: Vec::new(),
+                            nothing_to_pause_all: false,
+                        },
+                    ),
+                    cleanup_error: Some("state lock busy".into()),
+                };
+                Ok(crate::bridge::pausing::resume_report_to_action_result(
+                    named.as_deref(),
+                    report,
+                ))
+            }
+        }
+
+        let folder = tempfile::tempdir().unwrap();
+        let seam = Arc::new(CleanupFailedAfterResume);
+        let bridge = bridge_with_pausing(folder.path(), Some(seam));
+        let phone = paired(&bridge, "n-pixel");
+        Store::open(&bridge.store)
+            .unwrap()
+            .set_host(PERSON)
+            .unwrap();
+        let (mut dev, _) = connect_with(
+            &bridge,
+            &phone,
+            PERSON,
+            vec![Capability::Pause, Capability::PauseSubset],
+        );
+
+        dev.send(
+            "cleanup-fail-resume-1",
+            FromDevice::Resume {
+                revision: Some(5),
+                sandboxes: Some(vec!["lab".into()]),
+            },
+        );
+        let Some(ToDevice::PauseResult {
+            of,
+            paused,
+            partly,
+            revision,
+            sandboxes,
+        }) = dev.receive()
+        else {
+            panic!("expected pause.result when resume clean-up fails");
+        };
+        assert_eq!(of.as_str(), "cleanup-fail-resume-1");
+        assert!(!paused);
+        assert!(partly);
+        assert_eq!(revision, 77);
+        assert_eq!(
+            sandboxes,
+            Some(vec![PauseSandboxOutcome {
+                sandbox: "lab".into(),
+                outcome: PauseOutcome::Resumed,
+            }])
+        );
+    }
+}

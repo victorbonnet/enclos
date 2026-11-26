@@ -48,7 +48,7 @@ enum Command {
     Doctor,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),
-    /// Create, list, show, start, stop, restart or remove sandboxes.
+    /// Create, list, show, start, stop, restart, pause, resume or remove sandboxes.
     Sandbox(cli::sandbox::SandboxArgs),
     /// Open a shell, or run a command, inside a sandbox.
     Connect(cli::connect::ConnectArgs),

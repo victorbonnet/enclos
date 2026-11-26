@@ -677,6 +677,15 @@ impl AuditLog for RefusingAudit {
         self.inner.finish(ticket, outcome)
     }
 
+    fn finish_entry(
+        &self,
+        lock: &StateLock,
+        entry: u64,
+        outcome: Outcome,
+    ) -> crate::audit::Result<()> {
+        self.inner.finish_entry(lock, entry, outcome)
+    }
+
     fn entries(&self, filter: &AuditFilter) -> crate::audit::Result<Vec<AuditEntry>> {
         self.inner.entries(filter)
     }

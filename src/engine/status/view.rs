@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Serialize, Serializer};
 
 use super::{Disk, Suggestion};
+use crate::engine::pause_state::{HostPauseRead, SandboxPauseRead};
 pub use crate::engine::releases::LatestRelease;
 use crate::model::Timestamp;
 use crate::model::runtime::RuntimeKind;
@@ -27,6 +28,8 @@ pub struct StatusView {
     pub complete: bool,
     /// Days without use after which a sandbox is suggested for removal.
     pub idle_days: i64,
+    /// Host-level pause state (or why it could not be read).
+    pub pause: HostPauseRead,
 }
 
 impl StatusView {
@@ -83,6 +86,10 @@ pub struct SandboxStatus {
     pub name: SandboxName,
     #[serde(flatten)]
     pub state: SandboxState,
+    /// Derived pause state (from `host_pause` + `sandbox_pauses` + runtime services),
+    /// or `Unreadable` when the pause record cannot be read.
+    #[serde(flatten)]
+    pub pause: SandboxPauseRead,
     pub created_at: Timestamp,
     pub runtime: Option<RuntimeStatus>,
     /// The sandbox's installed services, with the state the service

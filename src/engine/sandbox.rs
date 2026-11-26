@@ -46,6 +46,9 @@ pub struct SandboxView {
     /// Sessions not ended yet, and the sandbox's proxy, which is recorded
     /// beside them.
     pub sessions: Vec<SessionView>,
+    /// Derived pause state (from `host_pause` + `sandbox_pauses` + runtime services),
+    /// or `Unreadable` when the record cannot be read.
+    pub pause: super::pause_state::SandboxPauseRead,
 }
 
 /// A session not ended yet, as `show` prints it.
@@ -341,6 +344,7 @@ impl Engine {
                 }
             })
             .collect();
+        let pause = self.read_sandbox_pause(&record);
         Ok(SandboxView {
             record,
             template,
@@ -348,6 +352,7 @@ impl Engine {
             pending,
             policy_refused: compile_refused(&compiled),
             sessions,
+            pause,
         })
     }
 

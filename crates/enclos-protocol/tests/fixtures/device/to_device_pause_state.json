@@ -1,0 +1,1 @@
+{"v":1,"id":"ps-1","type":"pause.state","paused":false,"partly":true,"since":"2026-11-25T17:00:00Z","by":"owner@example.org (device d1, request p-1)","revision":8,"sandboxes":[{"sandbox":"lab","paused":true,"state":"running"},{"sandbox":"home","paused":false,"state":"running","why":"not_covered"}]}

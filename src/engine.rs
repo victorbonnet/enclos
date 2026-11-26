@@ -23,6 +23,7 @@ mod markers;
 mod mobile_policy;
 mod net;
 mod pause;
+pub mod pause_state;
 mod pending;
 mod policy;
 mod portable;
@@ -61,6 +62,14 @@ pub use doctor::{
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;
+pub use pause::{
+    PauseOutcome, PauseReport, PauseScope, ResumeOutcome, ResumeReport, SandboxPauseResult,
+    SandboxResumeResult,
+};
+pub use pause_state::{
+    HostPauseRead, HostPauseView, HostPauseWord, NotPausedWhy, SandboxPauseInput, SandboxPauseRead,
+    SandboxPauseView,
+};
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use portable::{AgentImportOptions, ImportedAgentExport};

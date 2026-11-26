@@ -8,6 +8,7 @@ pub mod ids;
 pub mod keys;
 pub mod pace;
 pub mod page;
+pub mod pausing;
 pub mod plugin;
 pub mod provisioning;
 pub mod push;

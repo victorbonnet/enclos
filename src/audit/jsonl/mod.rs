@@ -313,6 +313,15 @@ impl AuditLog for JsonlAuditLog {
         Ok(())
     }
 
+    fn finish_entry(&self, _lock: &StateLock, entry: u64, outcome: Outcome) -> Result<()> {
+        self.append(Body::Finish {
+            entry,
+            result: outcome.result.into(),
+            message: outcome.message,
+        })?;
+        Ok(())
+    }
+
     fn entries(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
         let (content, _torn) = self.read_all()?;
         let mut entries = Entries::default();

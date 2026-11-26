@@ -28,6 +28,13 @@ impl<'l> AuditTicket<'l> {
     pub fn entry(&self) -> u64 {
         self.entry
     }
+
+    /// Releases the lock borrow while keeping the entry number, for a command
+    /// that must drop the state lock mid-way (e.g. while stopping services)
+    /// and close the entry under a fresh lock via [`AuditLog::finish_entry`].
+    pub fn into_entry(self) -> u64 {
+        self.entry
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AuditError>;
@@ -38,6 +45,9 @@ pub trait AuditLog {
     fn begin<'l>(&self, lock: &'l StateLock, intent: Intent) -> Result<AuditTicket<'l>>;
     /// Records how the command ended, also when it failed.
     fn finish(&self, ticket: AuditTicket<'_>, outcome: Outcome) -> Result<()>;
+    /// Records how an entry opened earlier (via [`AuditTicket::into_entry`])
+    /// ended, under a freshly acquired state lock.
+    fn finish_entry(&self, _lock: &StateLock, entry: u64, outcome: Outcome) -> Result<()>;
     /// Returns the entries that match `filter`, oldest first.
     fn entries(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>>;
     /// Checks the hash chain and lists entries that never finished.

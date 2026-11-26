@@ -386,6 +386,7 @@ mod history;
 /// 0028). The stand-in gateways are `perl`.
 mod listener;
 mod mobile_policy;
+mod pause;
 mod pending;
 pub(crate) mod policy;
 mod proxy_socket;
