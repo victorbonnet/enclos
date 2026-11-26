@@ -27,6 +27,8 @@ mod task_event_tests;
 mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "artefacts.rs"]
+mod artefacts;
 #[path = "audit.rs"]
 mod audit;
 #[path = "authority.rs"]
@@ -341,6 +343,14 @@ struct Hub {
     waiting: AtomicUsize,
     /// Refusals logged per caller address in the current minute.
     refusals: Mutex<HashMap<String, (i64, u32)>>,
+    /// Artefact walk refusals already written to stderr during this bridge
+    /// run, keyed by `(sandbox, file, reason)` so repeated walks stay quiet.
+    artefact_refusals: Mutex<HashSet<String>>,
+    /// Test-only stand-in for the sharing rule ADR 0043 (proposed) will
+    /// bring: a person here is shown exactly the agents recorded for them,
+    /// whatever the bridge serves. `None` in a run.
+    #[cfg(test)]
+    audience: Mutex<Option<HashMap<String, HashSet<String>>>>,
     silence: Duration,
     /// The key the bridge signs each runtime-approval decision with (ADR
     /// 0060, proposed), which the plugin checks; without it the bridge
@@ -624,6 +634,9 @@ impl Hub {
             presentation_revisions: Mutex::new(HashMap::new()),
             waiting: AtomicUsize::new(0),
             refusals: Mutex::new(HashMap::new()),
+            artefact_refusals: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            audience: Mutex::new(None),
             silence,
             approval_key: None,
             push: None,
@@ -665,6 +678,18 @@ impl Hub {
         let mut list = agents.as_ref().clone();
         list.extend(more);
         *agents = Arc::new(served::sorted(list));
+    }
+
+    /// Shows `person` exactly `agents` and nothing else: a test's stand-in
+    /// for a narrowed sharing rule (ADR 0043, proposed). A person with no
+    /// entry keeps today's audience, every served agent.
+    #[cfg(test)]
+    fn show_to(&self, person: &str, agents: impl IntoIterator<Item = &'static str>) {
+        let mut audience = self.audience.lock().expect("not poisoned");
+        audience.get_or_insert_with(HashMap::new).insert(
+            person.to_owned(),
+            agents.into_iter().map(str::to_owned).collect(),
+        );
     }
 
     /// The hub, pushing through `pusher` as host `host`.
@@ -765,6 +790,13 @@ impl Hub {
     /// beside its database.
     fn media(&self) -> std::path::PathBuf {
         self.store_path.with_file_name(crate::layout::APP_MEDIA_DIR)
+    }
+
+    /// Where the bridge keeps per-fetch copies of sandbox artefacts: beside
+    /// its database, removed with the fetch and swept when the bridge starts.
+    fn artefact_copies(&self) -> std::path::PathBuf {
+        self.store_path
+            .with_file_name(crate::layout::APP_ARTEFACT_COPIES_DIR)
     }
 
     /// Sends `message` to every connected device of `person`.
@@ -2287,6 +2319,7 @@ fn serve_on(listener: TcpListener, hub: Arc<Hub>, retry: Duration) {
     if let Ok(store) = hub.store() {
         sweep_incoming(&store, &hub.media());
     }
+    artefacts::sweep_copies(&hub.artefact_copies());
     // Which channels answer already: a runtime restarting before the first
     // message is still a restart, and a channel that never answered in this
     // run is not (#376).
@@ -3134,6 +3167,9 @@ fn run_session(
     // The message with files being sent on this connection: dropped, with
     // its files, when the connection ends first.
     let mut upload: Option<incoming::Upload> = None;
+    // The artefact copy being fetched on this connection: dropped, removing
+    // its file, when the connection ends or another fetch starts.
+    let mut artefact_fetch: Option<artefacts::FetchCopy> = None;
     loop {
         if link.heard.elapsed() > hub.silence {
             return Err(SILENT.to_owned());
@@ -3974,6 +4010,25 @@ fn run_session(
             FromDevice::AttachmentGet { attachment, offset } => {
                 send_attachment(hub, store, link, person, &attachment, offset, message.id)?;
             }
+            FromDevice::Artefacts { sandbox } => {
+                artefacts::list(hub, link, person, &sandbox, message.id)?;
+            }
+            FromDevice::ArtefactGet {
+                sandbox,
+                artefact,
+                offset,
+            } => {
+                artefacts::get(
+                    hub,
+                    link,
+                    &mut artefact_fetch,
+                    person,
+                    &sandbox,
+                    &artefact,
+                    offset,
+                    message.id,
+                )?;
+            }
             FromDevice::PushTokenUpdate(push) => {
                 if let Some(token) = kept_token(store, &device.id, person, push) {
                     store
@@ -4141,6 +4196,11 @@ const INCOMING: &str = ".incoming";
 /// home: `.enclos-app/media`, beside its socket
 /// (`Layout::agent_app_socket`).
 const INBOX: [&str; 2] = [".enclos-app", "media"];
+
+/// Where any process of a sandbox may drop files for the bridge to publish
+/// to paired devices (ADR 0078, proposed): `.enclos-app/artefacts`, beside
+/// the plugin's `media` folder.
+const ARTEFACTS: [&str; 2] = [".enclos-app", "artefacts"];
 
 /// The sandbox home of an agent's app socket, which is
 /// `<sandbox home>/.enclos-app/<agent>.sock`.
@@ -4992,6 +5052,8 @@ mod connection_end_tests {
     const PERSON: &str = "victor@example.com";
     const TOKEN: &str = "t0ken";
 
+    #[path = "../../artefacts_tests.rs"]
+    mod artefacts_tests;
     mod incoming_tests;
     mod restart_tests;
 

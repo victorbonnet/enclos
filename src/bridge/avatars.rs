@@ -111,8 +111,22 @@ pub(super) fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToD
 impl Hub {
     /// Whether `person` is shown `agent`: the one rule `agents.list`, a
     /// photo's or a name's reading, and their broadcasts share. Every paired person sees
-    /// every listed agent until sharing (ADR 0043, proposed) narrows it.
+    /// every listed agent until sharing (ADR 0043, proposed) narrows it. A test may
+    /// narrow it for one person through the test-only `audience` stand-in, which
+    /// changes nothing in a run.
     pub(super) fn sees_agent(&self, _person: &str, agent: &str) -> bool {
+        #[cfg(test)]
+        {
+            if let Some(shown) = self
+                .audience
+                .lock()
+                .expect("not poisoned")
+                .as_ref()
+                .and_then(|by_person| by_person.get(_person))
+            {
+                return shown.contains(agent);
+            }
+        }
         self.serves(agent)
     }
 

@@ -258,6 +258,19 @@ pub enum FromDevice {
     /// `offset`: the bridge answers with one `attachment.data`.
     #[serde(rename = "attachment.get")]
     AttachmentGet { attachment: String, offset: u64 },
+    /// Lists the files in a sandbox's artefacts folder (ADR 0078, proposed):
+    /// answered with one or more `artefacts.list` frames, by a bridge whose
+    /// `authenticated` names [`ARTEFACTS`].
+    #[serde(rename = "artefacts")]
+    Artefacts { sandbox: String },
+    /// The bytes of a file in a sandbox's artefacts folder, from `offset`:
+    /// answered with one `artefact.data`.
+    #[serde(rename = "artefact.get")]
+    ArtefactGet {
+        sandbox: String,
+        artefact: String,
+        offset: u64,
+    },
     #[serde(rename = "sync")]
     Sync {
         since: i64,
@@ -300,6 +313,9 @@ pub const HELD_TASK_ANSWER: &str = "held_task.answer";
 /// The bridge takes a message with files (`message.begin`, ADR 0076,
 /// proposed), for an agent whose capabilities name `incoming_files`.
 pub const MESSAGE_BEGIN: &str = "message.begin";
+/// The bridge lists and serves a sandbox's artefacts folder (`artefacts`,
+/// `artefact.get`, ADR 0078, proposed).
+pub const ARTEFACTS: &str = "artefacts";
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "question.close",
@@ -343,6 +359,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "conversation.archive",
     "conversation.delete",
     "attachment.get",
+    ARTEFACTS,
+    "artefact.get",
     "sync",
     "push.token",
     "device.forget",
@@ -579,6 +597,28 @@ pub enum ToDevice {
         /// base64url.
         data: String,
     },
+    /// The answer to `artefacts` `of`: the files in `sandbox`'s artefacts
+    /// folder, newest first, in one or more frames that each fit a device
+    /// message; `count` is the total number of eligible files.
+    #[serde(rename = "artefacts.list")]
+    ArtefactsList {
+        of: MessageId,
+        sandbox: String,
+        count: u32,
+        files: Vec<Artefact>,
+    },
+    /// Bytes of an artefact from `offset`, at most [`ATTACHMENT_CHUNK`]:
+    /// `size` is the whole file's size and `sha256` its whole-file digest
+    /// (base64url), the same on every part of one fetch.
+    #[serde(rename = "artefact.data")]
+    ArtefactData {
+        of: MessageId,
+        artefact: String,
+        offset: u64,
+        size: u64,
+        sha256: String,
+        data: String,
+    },
     #[serde(rename = "synced")]
     Synced { seq: i64 },
     #[serde(rename = "ack")]
@@ -651,6 +691,8 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "task.detail",
     "group.state",
     "attachment.data",
+    "artefacts.list",
+    "artefact.data",
     "synced",
     "ack",
     "error",
@@ -919,6 +961,19 @@ pub struct Attachment {
     pub mime: String,
     pub name: String,
     pub size: u64,
+}
+
+/// A file in a sandbox's artefacts folder, as a device sees it before
+/// fetching it (ADR 0078, proposed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artefact {
+    /// The bridge's id for the file's name.
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// Seconds since the Unix epoch.
+    pub arrived: u64,
 }
 
 /// The most a message on the device leg may be, as it is sealed: its JSON

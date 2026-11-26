@@ -912,6 +912,7 @@ enclos connect community -- hermes ...                     # Hermes told of the 
   app-approvals.key            the key the bridge signs runtime-approval decisions (ADR 0060) and the host's person's direct messages (ADR 0077) with, `0600`, hidden from every sandbox
   app-push-key.json            the service-account key the bridge sends pushes through FCM with (ADR 0065, proposed), from `app push key`, `0600`, hidden from every sandbox
   app-media/                   the files agents sent with their messages (and those an import restores), one per attachment id; hidden from every sandbox
+  app-artefact-copies/         per-fetch copies of sandbox artefacts (ADR 0078, proposed); hidden from every sandbox, removed when the connection ends, when a second fetch starts, and swept at start
   probe-sources.db             which `policy test` runs are under way and the network log entries they made (ADR 0059), `0600`, hidden from every sandbox
   runtimes/<runtime>/<version>/  shared, read-only to every sandbox (planned; milestone 1 installs each runtime in its sandbox's home instead, ADR 0020)
   templates/                   user templates
@@ -923,7 +924,7 @@ enclos connect community -- hermes ...                     # Hermes told of the 
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
     compiled/<digest>.<ext>                 what the backend received (.sb, bwrap argv), named by its text's digest
     installers/                the runtime's installer, named by its hash, and files for the home, put there from the host; the sandbox reads, never writes them
-    home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/
+    home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/, and .enclos-app/artefacts/ (files the bridge publishes from, ADR 0078)
     logs/                      its services' output, and `enclos dashboard`'s program's
 ```
 

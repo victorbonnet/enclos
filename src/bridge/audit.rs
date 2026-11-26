@@ -198,6 +198,7 @@ mod tests {
             "usage.series",
             "usage.cost",
             "message.begin",
+            "artefacts",
             "audit",
             "held_task.board",
             "held_task.answer",
@@ -206,7 +207,7 @@ mod tests {
         ] {
             assert!(host.iter().any(|c| c == capability), "{host:?}");
         }
-        assert_eq!(host.len(), 14, "{host:?}");
+        assert_eq!(host.len(), 15, "{host:?}");
         // Every person reads the usage of their own conversations.
         assert_eq!(
             hub.capabilities("guest"),
@@ -219,7 +220,8 @@ mod tests {
                 "usage",
                 "usage.series",
                 "usage.cost",
-                "message.begin"
+                "message.begin",
+                "artefacts"
             ]
         );
         let id = || MessageId::new("audit-request").unwrap();
@@ -269,7 +271,8 @@ mod tests {
                 "usage",
                 "usage.series",
                 "usage.cost",
-                "message.begin"
+                "message.begin",
+                "artefacts"
             ]
         );
         store.set_host("alice").unwrap();
