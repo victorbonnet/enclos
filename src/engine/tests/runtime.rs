@@ -6156,9 +6156,9 @@ fn a_running_sandbox_whose_version_probe_cannot_start_keeps_its_services() {
     );
 }
 
-/// The `runtime update` audit entries for `lab`'s sandbox, as their results
-/// and messages, oldest first. An entry that never finished has none.
-fn runtime_update_rows(lab: &Lab) -> Vec<(AuditResult, String)> {
+/// The `runtime update` audit entries for `lab`'s sandbox, oldest first:
+/// `Some((result, message))` when finished, `None` when still unfinished.
+fn runtime_update_rows(lab: &Lab) -> Vec<Option<(AuditResult, String)>> {
     let target = format!("{} {}", lab.name, RuntimeKind::Hermes);
     lab.engine
         .audit(None)
@@ -6167,7 +6167,7 @@ fn runtime_update_rows(lab: &Lab) -> Vec<(AuditResult, String)> {
         .filter(|e| {
             e.intent.command == "runtime update" && e.intent.target.as_deref() == Some(&target)
         })
-        .filter_map(|e| e.finished.map(|f| (f.outcome.result, f.outcome.message)))
+        .map(|e| e.finished.map(|f| (f.outcome.result, f.outcome.message)))
         .collect()
 }
 
@@ -6241,7 +6241,11 @@ fn a_failed_step_nine_record_read_writes_exactly_one_failed_audit_row() {
     // they were. Nothing was stopped or started after the failed read.
     let after = runtime_update_rows(&lab);
     assert_eq!(after.len(), before.len() + 1, "{after:?}");
-    let (result, message) = after.last().unwrap();
+    let (result, message) = after
+        .last()
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected finished audit row: {after:?}"));
     assert_eq!(*result, AuditResult::Failed, "{after:?}");
     assert!(message.contains("to 9.9.9"), "{message}");
     assert!(
@@ -6276,7 +6280,11 @@ fn a_failed_step_nine_start_writes_exactly_one_failed_audit_row() {
 
     let after = runtime_update_rows(&lab);
     assert_eq!(after.len(), before.len() + 1, "{after:?}");
-    let (result, message) = after.last().unwrap();
+    let (result, message) = after
+        .last()
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected finished audit row: {after:?}"));
     assert_eq!(*result, AuditResult::Failed, "{after:?}");
     assert!(message.contains("to 9.9.9"), "{message}");
     assert!(
@@ -6318,12 +6326,63 @@ fn a_failed_step_nine_session_end_writes_exactly_one_failed_audit_row() {
 
     let after = runtime_update_rows(&lab);
     assert_eq!(after.len(), before.len() + 1, "{after:?}");
-    let (result, message) = after.last().unwrap();
+    let (result, message) = after
+        .last()
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected finished audit row: {after:?}"));
     assert_eq!(*result, AuditResult::Failed, "{after:?}");
     assert!(message.contains("to 9.9.9"), "{message}");
     assert!(
         message.contains("; its sessions were not ended (") && message.ends_with(')'),
         "{message}"
+    );
+}
+
+#[test]
+fn runtime_update_rows_counts_unfinished_matching_entries() {
+    use crate::model::audit::Intent;
+    let lab = Lab::new();
+    let target = format!("{} {}", lab.name, RuntimeKind::Hermes);
+
+    // One finished matching entry and one extra unfinished matching entry.
+    {
+        let lock = lab.engine.state.lock().unwrap();
+        let finished = lab
+            .engine
+            .audit
+            .begin(
+                &lock,
+                Intent {
+                    by: alice(),
+                    command: "runtime update".into(),
+                    target: Some(target.clone()),
+                },
+            )
+            .unwrap();
+        lab.engine
+            .audit
+            .finish(finished, Outcome::failed("failed once"))
+            .unwrap();
+        let _unfinished = lab
+            .engine
+            .audit
+            .begin(
+                &lock,
+                Intent {
+                    by: alice(),
+                    command: "runtime update".into(),
+                    target: Some(target),
+                },
+            )
+            .unwrap();
+    }
+
+    let rows = runtime_update_rows(&lab);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        rows,
+        vec![Some((AuditResult::Failed, "failed once".to_owned())), None]
     );
 }
 
