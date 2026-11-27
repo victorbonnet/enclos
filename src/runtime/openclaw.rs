@@ -12,8 +12,8 @@ use super::settings::{Held, SettingsFile, SettingsFinding, dotenv_line, names_a_
 use super::{
     AgentDeleteMode, AgentFacts, AppChannel, DiskPart, HomeFile, HomePath, Installer,
     ListenerPorts, NotRead, RuntimeAdapter, RuntimeAgentName, RuntimeFacts, RuntimeListener,
-    RuntimeRequirement, RuntimeService, SandboxCommand, SecretFileFormat, SecretFiles,
-    SecretTarget, ServiceName, Unreadable, ValueAt,
+    RuntimeRequirement, RuntimeService, RuntimeUpdate, SandboxCommand, SecretFileFormat,
+    SecretFiles, SecretTarget, ServiceName, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -244,6 +244,17 @@ impl RuntimeAdapter for OpenClaw {
     }
     fn endpoints(&self) -> &'static str {
         include_str!("openclaw/endpoints.toml")
+    }
+    fn update(&self) -> RuntimeUpdate {
+        RuntimeUpdate {
+            installer: true,
+            commands: vec![SandboxCommand::from_words(&[
+                "openclaw",
+                "doctor",
+                "--fix",
+                "--non-interactive",
+            ])],
+        }
     }
     fn installer(&self) -> Installer {
         Installer {

@@ -120,6 +120,14 @@ pub(super) enum Starting<'a> {
         listener: Option<&'a UnixListener>,
         reads: &'a [PathBuf],
     },
+    /// The runtime's updater, for `enclos runtime update` (ADR 0074): as an
+    /// exec session in a group of its own and in no terminal, with no input
+    /// and its stdout and stderr sent to `out` for a host pump that streams
+    /// to stderr and keeps the last 64 KiB in `logs/update.log`.
+    Update {
+        out: &'a io::PipeWriter,
+        reads: &'a [PathBuf],
+    },
     /// A service of the sandbox's runtime, for the service manager. Its
     /// proxy already runs, and its secrets are as `service_secrets` says.
     Service { service: &'a str },
@@ -136,8 +144,9 @@ impl Starting<'_> {
     /// The staged files the program reads.
     fn reads(self) -> Vec<PathBuf> {
         match self {
-            Starting::Command { reads, .. } => reads.to_vec(),
-            Starting::Dashboard { reads, .. } => reads.to_vec(),
+            Starting::Command { reads, .. }
+            | Starting::Dashboard { reads, .. }
+            | Starting::Update { reads, .. } => reads.to_vec(),
             Starting::Service { .. } => Vec::new(),
         }
     }
@@ -145,7 +154,9 @@ impl Starting<'_> {
     fn group(self) -> Group {
         match self {
             Starting::Command { group, .. } => group,
-            Starting::Dashboard { .. } | Starting::Service { .. } => Group::Own,
+            Starting::Dashboard { .. } | Starting::Update { .. } | Starting::Service { .. } => {
+                Group::Own
+            }
         }
     }
 
@@ -153,14 +164,17 @@ impl Starting<'_> {
     /// proxy and namespace holder started if need be, its runtime's service
     /// reached, and its secrets as variables.
     fn starts_as_a_command(self) -> bool {
-        matches!(self, Starting::Command { .. } | Starting::Dashboard { .. })
+        matches!(
+            self,
+            Starting::Command { .. } | Starting::Dashboard { .. } | Starting::Update { .. }
+        )
     }
 
     /// The session's kind, and its service if it is one.
     fn recorded_as(self) -> (SessionKind, Option<String>) {
         match self {
             Starting::Command { kind, .. } => (kind.into(), None),
-            Starting::Dashboard { .. } => (SessionKind::Exec, None),
+            Starting::Dashboard { .. } | Starting::Update { .. } => (SessionKind::Exec, None),
             Starting::Service { service } => (SessionKind::Service, Some(service.to_owned())),
         }
     }
@@ -170,6 +184,7 @@ impl Starting<'_> {
         match self {
             Starting::Command { .. } => "the program",
             Starting::Dashboard { .. } => "the dashboard",
+            Starting::Update { .. } => "the updater",
             Starting::Service { .. } => "the service",
         }
     }
@@ -320,7 +335,7 @@ impl Engine {
         let tmp = ctx.home.join("tmp");
         fresh_tmp(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
         let (service_port, unreachable, env, named) = match starting {
-            Starting::Command { .. } | Starting::Dashboard { .. } => {
+            Starting::Command { .. } | Starting::Dashboard { .. } | Starting::Update { .. } => {
                 // The runtime's clients reach its service on the port it
                 // holds now (ADR 0028), or the session says why it cannot.
                 let (port, unreachable) = match self.service_port(&record) {
@@ -377,11 +392,26 @@ impl Engine {
             crate::notes::say(&line);
         }
         let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;
-        if let Starting::Dashboard { log, .. } = starting {
-            output_to(&mut wrapped, log).map_err(|source| LayoutError::Io {
-                path: log.to_owned(),
-                source,
-            })?;
+        match starting {
+            Starting::Dashboard { log, .. } => {
+                output_to(&mut wrapped, log).map_err(|source| LayoutError::Io {
+                    path: log.to_owned(),
+                    source,
+                })?;
+            }
+            Starting::Update { out, .. } => {
+                let stdout = out.try_clone().map_err(|e| Error::Session {
+                    what: format!("cannot pipe updater output: {e}"),
+                })?;
+                let stderr = out.try_clone().map_err(|e| Error::Session {
+                    what: format!("cannot pipe updater output: {e}"),
+                })?;
+                wrapped
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr));
+            }
+            _ => {}
         }
         let group = starting.group();
         if group == Group::Own {
@@ -443,8 +473,12 @@ impl Engine {
                 ended_at: None,
             };
             // Running again, also after a `launch` that failed and that the
-            // service manager starts again.
-            record.state = SandboxState::Running;
+            // service manager starts again. Not for the updater's own session:
+            // a runtime update leaves the recorded state as it was, so a
+            // sandbox the person had stopped stays stopped (ADR 0074).
+            if !matches!(starting, Starting::Update { .. }) {
+                record.state = SandboxState::Running;
+            }
             session.id = self.state.start_session(lock, &session, &record)?;
             Ok((session, prepared))
         })();

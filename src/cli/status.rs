@@ -368,7 +368,7 @@ fn ago(at: Option<Timestamp>, now: Timestamp) -> String {
 }
 
 /// A path with the user's home folder written `~`.
-fn tilde(path: &Path, user_home: Option<&str>) -> String {
+pub(super) fn tilde(path: &Path, user_home: Option<&str>) -> String {
     match user_home
         .filter(|h| !h.is_empty())
         .and_then(|h| path.strip_prefix(h).ok())

@@ -3,11 +3,14 @@
 //! §8, "Starting a session").
 
 use std::ffi::OsString;
-use std::io::IsTerminal;
+use std::fs::OpenOptions;
+use std::io::{IsTerminal, PipeReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
@@ -338,6 +341,99 @@ impl Engine {
             })?;
         // Why the session could not reach its runtime's service (ADR 0028),
         // which explains a runtime's own "connection failed".
+        end.notes.extend(unreachable);
+        Ok((end, timed_out))
+    }
+
+    /// Runs `command` in the sandbox as an exec session for `enclos runtime
+    /// update` (ADR 0074): its stdout and stderr stream to this process's
+    /// stderr and its last [`UPDATE_LOG_LIMIT`] bytes are kept in `log`.
+    /// The pump thread is joined before the session's end is recorded so the
+    /// log is complete when any failure line names it.
+    pub(super) fn run_update_in_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        deadline: Option<Instant>,
+        log: &mut UpdateLog,
+    ) -> Result<(SessionEnd, bool)> {
+        let (command, reads) = command.into_parts();
+        let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
+        let (reader, writer) = std::io::pipe().map_err(|e| Error::Session {
+            what: format!("cannot open updater output pipe: {e}"),
+        })?;
+        self.wait_service_proxy(name)?;
+        let Started {
+            session,
+            mut child,
+            unreachable,
+            prepared: keep_waiting,
+        } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
+            let starting = Starting::Update {
+                out: &writer,
+                reads: &reads,
+            };
+            let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
+            // The updater failing is not the sandbox failing (F1): the sandbox
+            // was running before the update and step 9 starts its services
+            // again, so recording `Failed` here left it failed with none. This
+            // session's audit entry still closes as failed — `write` closes it
+            // with the error — and the update's own entry says why.
+            started
+        })?;
+        // Drop the parent's write end so the pump sees EOF as soon as the
+        // updater and anything it spawned exit.
+        drop(writer);
+
+        let pump = log.spawn_pump(reader);
+        let ended = AtomicBool::new(false);
+        let pgid = child.id();
+        let mut pass_on = |notes: &mut Vec<String>| {
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                ended.store(true, Ordering::Relaxed);
+            }
+            for signal in keep_waiting.received() {
+                let sent = signal_group(&session.root, pgid, signal);
+                let why = match sent {
+                    Ok(Signalled::Sent | Signalled::Gone) => continue,
+                    Ok(Signalled::NotLeader) => "the program no longer leads its group".to_owned(),
+                    Ok(Signalled::Failed(why)) => why,
+                    Err(e) => e.to_string(),
+                };
+                note(notes, format!("could not pass {} on: {why}", signal.name()));
+            }
+        };
+        let waited =
+            self.wait_session(&session, &mut child, deadline.map(|_| &ended), &mut pass_on);
+        let timed_out = ended.load(Ordering::Relaxed);
+        let why = timed_out.then_some("stopped at its time limit");
+        let mut waited = match (waited, why) {
+            (Ok(waited), _) => waited,
+            (Err(error), Some(why)) => {
+                log.finish_pump(pump);
+                let error = Error::Session {
+                    what: format!("{why}, but {error}"),
+                };
+                return Err(self.record_unended(by, "session end", &session, error));
+            }
+            (Err(error), None) => {
+                log.finish_pump(pump);
+                return Err(error);
+            }
+        };
+        if timed_out {
+            self.stop_left(&session, &mut waited);
+        }
+        log.finish_pump(pump);
+        let exit = waited.status;
+        let mut end = self
+            .finish_session_saying(by, "session end", &session, waited, why)
+            .map_err(|error| Error::WithContext {
+                what: format!("{error} (the command itself ended: {exit})"),
+                error: Box::new(error),
+            })?;
         end.notes.extend(unreachable);
         Ok((end, timed_out))
     }
@@ -818,6 +914,104 @@ pub(super) fn spoken(limit: Duration) -> String {
         0 => count(limit.as_millis() as usize, "millisecond", "milliseconds"),
         s if s % 60 == 0 => count((s / 60) as usize, "minute", "minutes"),
         s => count(s as usize, "second", "seconds"),
+    }
+}
+
+/// How much of an updater's output `logs/update.log` keeps (A7, ADR 0074).
+pub(super) const UPDATE_LOG_LIMIT: usize = 64 * 1024;
+
+/// Host-side log of `enclos runtime update`: replaces `path` at the start
+/// of the update, streams each chunk to this process's stderr, and keeps
+/// the last [`UPDATE_LOG_LIMIT`] bytes in `path` across every command the
+/// update runs.
+pub(super) struct UpdateLog {
+    path: PathBuf,
+    tail: Vec<u8>,
+    written: usize,
+}
+
+impl UpdateLog {
+    /// Creates or truncates `path` for a new update run.
+    pub(super) fn new(path: PathBuf) -> Result<UpdateLog> {
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder).map_err(|source| crate::layout::LayoutError::Io {
+                path: folder.to_owned(),
+                source,
+            })?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|source| crate::layout::LayoutError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(UpdateLog {
+            path,
+            tail: Vec::new(),
+            written: 0,
+        })
+    }
+
+    /// Spawns a thread that reads `reader` to EOF, mirrors each chunk to
+    /// stderr, and keeps the rolling tail written to `self.path`.
+    pub(super) fn spawn_pump(&mut self, mut reader: PipeReader) -> JoinHandle<(Vec<u8>, usize)> {
+        let path = self.path.clone();
+        let mut tail = std::mem::take(&mut self.tail);
+        let mut written = self.written;
+        std::thread::spawn(move || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        let _ = std::io::stderr().write_all(chunk);
+                        let _ = std::io::stderr().flush();
+                        written = written.saturating_add(n);
+                        if written <= UPDATE_LOG_LIMIT
+                            && let Some(f) = file.as_mut()
+                        {
+                            let _ = f.write_all(chunk);
+                        }
+                        if chunk.len() >= UPDATE_LOG_LIMIT {
+                            tail.clear();
+                            tail.extend_from_slice(&chunk[chunk.len() - UPDATE_LOG_LIMIT..]);
+                        } else {
+                            let excess =
+                                (tail.len() + chunk.len()).saturating_sub(UPDATE_LOG_LIMIT);
+                            if excess > 0 {
+                                tail.drain(..excess);
+                            }
+                            tail.extend_from_slice(chunk);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            drop(file);
+            if written > UPDATE_LOG_LIMIT {
+                let _ = std::fs::write(&path, &tail);
+            }
+            (tail, written)
+        })
+    }
+
+    /// Joins the pump thread so `self.path` is complete before the session's
+    /// end is recorded.
+    pub(super) fn finish_pump(&mut self, pump: JoinHandle<(Vec<u8>, usize)>) {
+        if let Ok((tail, written)) = pump.join() {
+            self.tail = tail;
+            self.written = written;
+        }
     }
 }
 

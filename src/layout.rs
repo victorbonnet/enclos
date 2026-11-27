@@ -221,6 +221,14 @@ impl Layout {
         self.sandboxes_dir().join(name)
     }
 
+    /// Where `enclos runtime update` keeps the last 64 KiB of the updater's
+    /// output (ADR 0074), which `enclos logs` tails with the rest of the
+    /// folder. The layout owns the path, so a caller can name it without
+    /// reading it off the engine, which holds the policy's secrets.
+    pub fn update_log(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("logs").join("update.log")
+    }
+
     /// Where a runtime that reads its secrets from a file finds them (ADR
     /// 0034): written as a service starts, removed by `sandbox stop` and
     /// `sandbox rm`; in the sandbox's folder, which the sandbox reads but

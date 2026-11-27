@@ -75,7 +75,9 @@ pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_di
 pub use portable::{AgentImportOptions, ImportedAgentExport};
 pub use probe::TestReport;
 pub use releases::Releases;
-pub use runtime::{INSTALL_STOP_TIME, InstallEnd};
+pub use runtime::{
+    INSTALL_STOP_TIME, InstallEnd, RunningWork, ServicesAfter, UpdateEnd, UpdatePreflight,
+};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, SandboxStarted, Unit};

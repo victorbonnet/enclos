@@ -29,6 +29,17 @@ pub struct Installer {
     pub args: Vec<String>,
 }
 
+/// The runtime's own updater, run in the sandbox by `enclos runtime update`,
+/// in order (ADR 0074).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeUpdate {
+    /// Whether the update runs the adapter's installer as served, staged as
+    /// `runtime install` stages it (ADR 0029).
+    pub installer: bool,
+    /// The runtime's own commands after it, in order.
+    pub commands: Vec<SandboxCommand>,
+}
+
 /// How a runtime consumer reads its protected secrets file. The filenames
 /// stay the layout's `.env` and `<agent>.env`; the declared format, not the
 /// extension, determines their contents.
@@ -281,6 +292,11 @@ pub trait RuntimeAdapter {
     /// `[network] allow_add` and nothing else (design §7).
     fn endpoints(&self) -> &'static str;
     fn installer(&self) -> Installer;
+    /// The runtime's own updater, run in the sandbox by `enclos runtime update`,
+    /// in order (ADR 0074).
+    fn update(&self) -> RuntimeUpdate {
+        RuntimeUpdate::default()
+    }
     /// What the install puts in the sandbox's home, for a sandbox of
     /// `backend`: a fix for a host tool goes only where that tool needs it.
     fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;

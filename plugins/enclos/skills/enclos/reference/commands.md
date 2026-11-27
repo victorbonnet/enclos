@@ -240,7 +240,7 @@ enclos state repair [OPTIONS] [SANDBOX]
 
 ### `enclos runtime`
 
-Install a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot
+Install or update a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot
 
 #### `enclos runtime install`
 
@@ -266,6 +266,16 @@ enclos runtime configure [OPTIONS] <TARGET>
 - `--channel <CHANNEL>`: A bot on this messaging channel, its token a secret the policy grants the agent; or `app`, the enclos mobile app's channel, which enclos's bridge connects to.
 - `--token-env <VAR>`: With --channel: the variable the policy grants the bot's token as; the channel's usual one (TELEGRAM_BOT_TOKEN) when left out. Hermes keeps only the usual one from the agents' commands.
 - `--allow-user <ID>`: With --channel: someone the bot answers, a Telegram user's numeric id; repeat it for each person.
+
+#### `enclos runtime update`
+
+Update the sandbox's runtime with its own updater, restarting its services around it
+
+```text
+enclos runtime update [OPTIONS] <SANDBOX>
+```
+
+- `<SANDBOX>`
 
 ### `enclos agent`
 

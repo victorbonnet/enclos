@@ -518,6 +518,123 @@ impl Engine {
         .map(Planned::Done)
     }
 
+    /// Removes every installed service of the sandbox and stops every open
+    /// session, leaving the sandbox's recorded state and its services'
+    /// secrets file as they were: for `enclos runtime update`, which starts
+    /// the services again afterwards (ADR 0074).
+    pub(super) fn stop_services_and_sessions(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+    ) -> Result<StopReport> {
+        let open = self.state.sessions(name, true)?;
+        let ran: Vec<SessionId> = match self.look_open(name, &open) {
+            Ok(look) => open
+                .iter()
+                .filter(|s| !look.is_gone(s))
+                .map(|s| s.id)
+                .collect(),
+            Err(_) => open.iter().map(|s| s.id).collect(),
+        };
+        // Services first, outside the state lock, so a runtime service told
+        // to end can record its end under the lock (as `stop_sandbox` does).
+        self.audit.check()?;
+        let services = self
+            .remove_services(by, name, "for runtime update", IfUnrecorded::Stop, &[])?
+            .into_result()?;
+        let lock = self.state.lock()?;
+        if self.state.sessions(name, true)?.is_empty() {
+            return Ok(StopReport {
+                services,
+                stopped: Vec::new(),
+                gone: Vec::new(),
+                survivors: Vec::new(),
+            });
+        }
+        let summary = |r: &StopReport| {
+            let done = match r.survivors.is_empty() {
+                true => format!(
+                    "stopped {} for runtime update",
+                    count(r.stopped.len(), "session", "sessions")
+                ),
+                false => format!(
+                    "{} left members running during runtime update",
+                    count(r.survivors.len(), "session", "sessions")
+                ),
+            };
+            format!("{done}{}", ended_gone(&r.gone))
+        };
+        self.write_holding(
+            lock,
+            by,
+            "session end",
+            Some(name.to_string()),
+            |r| crate::model::audit::Outcome::ok(summary(r)),
+            |lock| {
+                let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+                    name: name.to_string(),
+                })?;
+                if self.has_services(name)? {
+                    return Err(Error::StartedWhileStopping {
+                        name: name.to_string(),
+                    });
+                }
+                let mut report = StopReport {
+                    services: services.clone(),
+                    stopped: Vec::new(),
+                    gone: Vec::new(),
+                    survivors: Vec::new(),
+                };
+                let mut cannot_look: Option<Error> = None;
+                let sessions = self.state.sessions(name, true)?;
+                for session in &sessions {
+                    match self.stop_marked(session, GRACE, stop) {
+                        Ok(Stopped::Gone) if !ran.contains(&session.id) => {
+                            report.gone.push(session.id)
+                        }
+                        Ok(Stopped::Gone | Stopped::Clean) => report.stopped.push(session.id),
+                        Ok(Stopped::Survivors(left)) => report.survivors.push((session.id, left)),
+                        Err(e) => {
+                            cannot_look = Some(e);
+                            break;
+                        }
+                    }
+                }
+                // Keep `record.state` as it was on a clean stop (ADR 0074):
+                // the services start again afterwards and read their secrets
+                // from the existing secrets file (ADR 0034).
+                if let Some(e) = &cannot_look {
+                    record.state = SandboxState::Failed {
+                        reason: format!("stop could not look at processes: {e}"),
+                    };
+                } else if !report.survivors.is_empty() {
+                    record.state = SandboxState::Failed {
+                        reason: "members survived stop".to_owned(),
+                    };
+                }
+                let saved = self.state.end_sessions(lock, &report.ended(), &record);
+                match (cannot_look, saved) {
+                    (None, saved) => {
+                        saved?;
+                        let ended = report.ended();
+                        for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
+                            self.forget_marker(session);
+                        }
+                        Ok(report)
+                    }
+                    (Some(e), Ok(())) => Err(e),
+                    (Some(e), Err(saved)) => Err(Error::CleanupFailed {
+                        error: Box::new(e),
+                        left: format!(
+                            "sandbox {name} not marked failed, and the end of sessions {} not recorded ({saved})",
+                            join_ids(&report.ended())
+                        ),
+                    }),
+                }
+            },
+        )
+    }
+
     /// Removes a stopped sandbox: its record and history, its secrets, and
     /// its folder unless `keep_data`. Deleting data or secrets asks for
     /// confirmation first. Returns the secrets it could not remove.

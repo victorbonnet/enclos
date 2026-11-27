@@ -320,7 +320,7 @@ impl Engine {
 /// database is `store` recorded it, if that bridge runs; and why it could
 /// not be read, if it could not. A bridge that stopped or crashed left its
 /// last state behind, which says nothing now.
-fn bridge_activity(
+pub(super) fn bridge_activity(
     store: &Path,
 ) -> (
     std::collections::HashMap<String, enclos_protocol::task::Activity>,
@@ -363,6 +363,21 @@ impl Engine {
         self.versions_of(name, adapter(kind).as_ref(), releases, now())
     }
 
+    /// The version `rt` reports for sandbox `name`, read the same way
+    /// `enclos status` reads it: from the runtime's live home fact when it
+    /// provides one, else from `state.db`.
+    pub(super) fn current_version(
+        &self,
+        name: &SandboxName,
+        rt: &dyn RuntimeAdapter,
+    ) -> Fact<String> {
+        let home = self.layout.sandbox_home(name.as_str());
+        match rt.runtime_facts().version {
+            Some(at) => read_value(&home, &at, rt),
+            None => self.reported_version(name, rt),
+        }
+    }
+
     fn versions_of(
         &self,
         name: &SandboxName,
@@ -370,11 +385,7 @@ impl Engine {
         releases: &Releases,
         now: Timestamp,
     ) -> RuntimeVersions {
-        let home = self.layout.sandbox_home(name.as_str());
-        let version = match rt.runtime_facts().version {
-            Some(at) => read_value(&home, &at, rt),
-            None => self.reported_version(name, rt),
-        };
+        let version = self.current_version(name, rt);
         let latest = releases.of(self, rt, now);
         RuntimeVersions {
             outdated: outdated(&version, &latest),

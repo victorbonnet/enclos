@@ -58,7 +58,7 @@ enum Command {
     Secret(cli::secret::SecretArgs),
     /// Check enclos's records against the host, or repair what it can.
     State(cli::state::StateArgs),
-    /// Install a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot.
+    /// Install or update a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list, remove, export or import the runtime's agents.
     Agent(cli::agent::AgentArgs),
@@ -298,8 +298,8 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::accepted_unenforced(args),
         _ => Vec::new(),
     };
-    let engine =
-        Engine::open(Layout::from_env()?, writes_wait(&command)).accepting_unenforced(accepted);
+    let layout = Layout::from_env()?;
+    let engine = Engine::open(layout.clone(), writes_wait(&command)).accepting_unenforced(accepted);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
     match command {
         Command::Init => {
@@ -351,7 +351,9 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Exec(args) => cli::connect::exec(&engine, &current_actor(), confirm, args),
         Command::Secret(args) => cli::secret::run(&engine, &current_actor(), confirm, args),
         Command::State(args) => cli::state::run(&engine, &current_actor(), confirm, args),
-        Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
+        Command::Runtime(args) => {
+            cli::runtime::run(&engine, &layout, &current_actor(), confirm, args)
+        }
         Command::App(args) => cli::app::run(&engine, &current_actor(), args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),

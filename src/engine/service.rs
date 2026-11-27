@@ -129,6 +129,13 @@ impl Engine {
         self.logs_dir(name).join(format!("{}.log", unit.as_str()))
     }
 
+    /// Where `enclos runtime update` keeps the last 64 KiB of the updater's
+    /// output on the host (ADR 0074). `enclos logs` already tails every
+    /// `*.log` in this folder.
+    pub fn update_log(&self, name: &SandboxName) -> PathBuf {
+        self.layout.update_log(name.as_str())
+    }
+
     /// Makes the folder of the sandbox's logs, which a service's unit
     /// appends to: the service manager makes no folder, and does not start
     /// a unit whose log it cannot open.
