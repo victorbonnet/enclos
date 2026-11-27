@@ -7,8 +7,8 @@ route to the host. Text and unsolicited output are baseline. Typing, native
 command discovery, files, exact tool events and sandbox policy requests are negotiated
 only when their native adapters/hooks have been registered.
 
-The package is tested against **OpenClaw 2026.11.5**. The channel requires
-that release or newer and checks the native interfaces at account startup. The
+The package is tested against **OpenClaw 2026.11.10**. The channel requires
+OpenClaw 2026.11.5 or newer and checks the native interfaces at account startup. The
 SDK is experimental. This does not change enclos's installer-as-served policy.
 There are no runtime dependencies besides Node's standard library and the host's
 public `openclaw/plugin-sdk` entry points.

@@ -104,9 +104,25 @@ ENCLOS_OPENCLAW_PACKAGE=/path/to/openclaw \
 
 Without this variable, native-package tests explicitly skip. Standard transport,
 protocol, routing, files and authority tests still run. CI installs the tested
-2026.11.5 SDK package in a disposable prefix and runs the native tests too.
+2026.11.10 SDK package in a disposable prefix and runs the native tests too.
 Changing the tested runtime version requires updating and re-running the native
 contract probes; the runtime installer itself remains official/as served.
+
+To check stable OpenClaw 2026.11.10 with an explicit exact-version expectation:
+
+```sh
+ENCLOS_OPENCLAW_PACKAGE=/path/to/openclaw \
+ENCLOS_OPENCLAW_EXPECTED_VERSION=2026.11.10 \
+  node --test channels/openclaw/tests/*.test.js
+```
+
+The override must be a nonempty release version and must exactly match the
+installed package. Without it, the expectation is `TESTED_OPENCLAW` (2026.11.10).
+The explicit expectation is independent of the installed package: a different
+installed version fails the check. The same override checks the minimum,
+2026.11.5, exactly (for example `ENCLOS_OPENCLAW_EXPECTED_VERSION=2026.11.5`),
+with no change to the production minimum. This test-only override does not change the
+production minimum or known-checked releases.
 
 ## Historical combined-stack checks (superseded)
 
