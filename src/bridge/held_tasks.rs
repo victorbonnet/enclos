@@ -82,6 +82,8 @@ impl Pending {
 pub(super) struct HeldTaskRequests {
     #[cfg(test)]
     before_open: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+    #[cfg(test)]
+    before_send_failure_finish: Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     /// Each agent's current plugin connection, as `held_task_connected` saw it.
     connections: HashMap<String, String>,
     pending: HashMap<String, Pending>,
@@ -705,6 +707,19 @@ impl Hub {
                     ErrorCode::Unconfirmed,
                     format!("{e}. {UNCONFIRMED}"),
                 ));
+                #[cfg(test)]
+                {
+                    let checkpoint = self
+                        .held_tasks
+                        .lock()
+                        .expect("not poisoned")
+                        .before_send_failure_finish
+                        .take();
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.0.wait();
+                        checkpoint.1.wait();
+                    }
+                }
                 self.finish(store, key, &pending, answer);
             }
         }
@@ -3396,5 +3411,430 @@ mod tests {
                 .recv_timeout(Duration::from_millis(200))
                 .is_err()
         );
+    }
+
+    /// Writes `settings.host_person` directly without touching
+    /// `conversations.owner`, isolating the host-person check in `vetted`.
+    fn set_host_person_only(hub: &Hub, person: &str) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value = ?1 WHERE name = 'host_person'",
+                [person],
+            )
+            .unwrap();
+    }
+
+    /// Writes `conversations.owner` directly without touching
+    /// `settings.host_person`, isolating the card-owner check in `vetted`.
+    fn set_conversation_owner_only(hub: &Hub, owner: &str) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET owner = ?1 WHERE id = ?2",
+                [owner, home_id(AGENT).as_str()],
+            )
+            .unwrap();
+    }
+
+    /// Only `settings.host_person` changed while the card's conversation owner
+    /// remained the asking person: the confirmed result is replaced with the
+    /// fixed notice, kept as the notice, and replayed as the notice.
+    #[test]
+    fn a_result_when_only_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        set_host_person_only(&hub, NEW_OWNER);
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(NEW_OWNER));
+        assert_eq!(store.held_task(AGENT, "t1").unwrap().unwrap().owner, OWNER);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        let frames = drain(&rx, 300);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| answers(std::slice::from_ref(f)))
+                .collect::<Vec<_>>(),
+            [&notice("tap")],
+            "unexpected resume answer: {frames:?}"
+        );
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// Only `settings.host_person` changed while the card's conversation owner
+    /// remained the asking person: a runtime error is replaced with the fixed
+    /// notice, kept as the notice, and replayed as the notice.
+    #[test]
+    fn a_runtime_error_when_only_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        set_host_person_only(&hub, NEW_OWNER);
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(NEW_OWNER));
+        assert_eq!(store.held_task(AGENT, "t1").unwrap().unwrap().owner, OWNER);
+        assert!(hub.held_task_error(
+            &store,
+            AGENT,
+            &connection,
+            &ErrorBody {
+                of: Some(sent.clone()),
+                code: ErrorCode::Internal,
+                message: format!("{MARKER}: the runtime failed"),
+            },
+        ));
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert_eq!(kept(&hub, &sent), notice("tap"));
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// Answered while both host and card owner were the asking person, then
+    /// only `settings.host_person` changed while `conversations.owner` stayed
+    /// the original owner: replaying the request replaces the kept result with
+    /// the fixed notice.
+    #[test]
+    fn a_replay_when_only_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert!(matches!(
+            drain(&rx, 300).last(),
+            Some(ToDevice::HeldTaskResult { .. })
+        ));
+        set_host_person_only(&hub, NEW_OWNER);
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(NEW_OWNER));
+        assert_eq!(store.held_task(AGENT, "t1").unwrap().unwrap().owner, OWNER);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// Converse of `a_replay_when_only_the_hosts_person_changed_is_only_the_notice`:
+    /// answered while both host and card owner were the asking person, then
+    /// only `conversations.owner` changed while `settings.host_person` stayed
+    /// the original owner: replaying the request replaces the kept result with
+    /// the fixed notice.
+    #[test]
+    fn a_replay_when_only_the_card_owner_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert!(matches!(
+            drain(&rx, 300).last(),
+            Some(ToDevice::HeldTaskResult { .. })
+        ));
+        set_conversation_owner_only(&hub, NEW_OWNER);
+        assert_eq!(store.host_person().unwrap().as_deref(), Some(OWNER));
+        assert_eq!(
+            store.held_task(AGENT, "t1").unwrap().unwrap().owner,
+            NEW_OWNER
+        );
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// A resume passes the pre-open replay check and pauses before opening the
+    /// channel; meanwhile the same request id is sent and confirmed while the
+    /// original owner still holds the host, then the host's person changes.
+    /// When the first call resumes and hits the post-open replay check, it
+    /// delivers only the fixed notice, never the kept result or new text.
+    #[test]
+    fn a_post_open_replay_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge) = reported(&hub, &rx);
+        let connection = hub.held_tasks.lock().unwrap().connections[AGENT].clone();
+        let checkpoint = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        hub.held_tasks.lock().unwrap().before_open = Some(Arc::clone(&checkpoint));
+        let worker_hub = Arc::clone(&hub);
+        let worker_phone = phone.clone();
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &worker_phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        checkpoint.0.wait();
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let sent = plugin_frame(&from_bridge).id;
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        assert!(matches!(
+            drain(&rx, 300).last(),
+            Some(ToDevice::HeldTaskResult { .. })
+        ));
+        assert!(matches!(kept(&hub, &sent), ToDevice::HeldTaskResult { .. }));
+        transfer_with_new_text(&hub, &store);
+        checkpoint.1.wait();
+        worker.join().unwrap().unwrap();
+        let frames = drain(&rx, 300);
+        assert_eq!(frames, [notice("tap")]);
+        assert!(!carries_marker(&frames));
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 confirmed"]
+        );
+    }
+
+    /// Registers a `HeldTasks`-capable plugin whose peer socket is already
+    /// closed, with no reader thread to race `held_task_disconnected` against
+    /// `held_task_resume`'s own send-failure cleanup.
+    fn broken_plugin(hub: &Arc<Hub>, store: &Store, rx: &Receiver<ToDevice>) {
+        let endpoint = &hub.agents()[0];
+        let listener = UnixListener::bind(&endpoint.socket).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).unwrap();
+            writer
+                .write_all(&encode_line(&Envelope::new(
+                    MessageId::new("hello").unwrap(),
+                    FromPlugin::Hello {
+                        runtime: "hermes".into(),
+                        agent: "main".into(),
+                        capabilities: vec![Capability::HeldTasks],
+                    },
+                )))
+                .unwrap();
+        });
+        let (_, _reader, writer) =
+            plugin::connect(&endpoint.socket, &endpoint.token, &home_id(AGENT)).unwrap();
+        peer.join().unwrap();
+        let closer = writer.closer().unwrap();
+        hub.plugins.lock().unwrap().insert(
+            AGENT.into(),
+            Plugin {
+                capabilities: vec![Capability::HeldTasks],
+                generation: 1,
+                out: Arc::new(Mutex::new(PluginOut {
+                    writer,
+                    sent: HashSet::new(),
+                })),
+                closer,
+            },
+        );
+        hub.held_task_connected(Some(store), AGENT, "broken-conn", &[Capability::HeldTasks]);
+        hub.held_tasks_report(store, AGENT, vec![task("t1")])
+            .unwrap();
+        assert_eq!(card(next(rx)).task.as_str(), "t1");
+        assert!(matches!(next(rx), ToDevice::Message(_)));
+    }
+
+    /// Writing the resume frame to the plugin fails, and the host's person
+    /// changes before `finish` vets the send-failure answer: the I/O error
+    /// text is replaced by the fixed notice, kept as the notice, and replayed
+    /// as the notice.
+    #[test]
+    fn a_send_failure_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        broken_plugin(&hub, &store, &rx);
+        let checkpoint = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        hub.held_tasks.lock().unwrap().before_send_failure_finish = Some(Arc::clone(&checkpoint));
+        let worker_hub = Arc::clone(&hub);
+        let worker_phone = phone.clone();
+        let worker = std::thread::spawn(move || {
+            let store = worker_hub.store().unwrap();
+            worker_hub.held_task_resume(
+                &store,
+                &worker_phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t1", 0),
+            )
+        });
+        checkpoint.0.wait();
+        transfer_with_new_text(&hub, &store);
+        checkpoint.1.wait();
+        worker.join().unwrap().unwrap();
+        let rpc = rpc_id(&phone.id, OWNER, &MessageId::new("tap").unwrap());
+        let frames = drain(&rx, 300);
+        assert_eq!(frames, [notice("tap")]);
+        assert!(!carries_marker(&frames));
+        assert_eq!(kept(&hub, &rpc), notice("tap"));
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 unknown: not sent"]
+        );
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        assert_eq!(drain(&rx, 300), [notice("tap")]);
+    }
+
+    /// Writing the resume frame to the plugin fails while authority is still
+    /// valid, so the original `Unconfirmed` send-failure error is delivered
+    /// and cached. Once the host's person changes, replaying the same request
+    /// id must vet the cached error down to the fixed notice alone, with no
+    /// extra send.
+    #[test]
+    fn a_replayed_send_failure_after_the_hosts_person_changed_is_only_the_notice() {
+        let (_dir, hub, store, phone, rx) = fixture();
+        broken_plugin(&hub, &store, &rx);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let rpc = rpc_id(&phone.id, OWNER, &MessageId::new("tap").unwrap());
+        let first = drain(&rx, 300);
+        assert_eq!(first.len(), 1);
+        let original_error = &first[0];
+        assert_ne!(*original_error, notice("tap"));
+        assert!(matches!(
+            original_error,
+            ToDevice::Error(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Unconfirmed,
+                message,
+            }) if of.as_str() == "tap"
+                && message.ends_with(UNCONFIRMED)
+                && message != UNCONFIRMED
+        ));
+        assert_eq!(kept(&hub, &rpc), *original_error);
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 unknown: not sent"]
+        );
+
+        transfer_with_new_text(&hub, &store);
+        hub.held_task_resume(
+            &store,
+            &phone,
+            OWNER,
+            MessageId::new("tap").unwrap(),
+            resume("t1", 0),
+        )
+        .unwrap();
+        let replay = drain(&rx, 300);
+        assert_eq!(replay, [notice("tap")]);
+        assert!(!carries_marker(&replay));
+        assert_eq!(kept(&hub, &rpc), *original_error);
+        assert_eq!(
+            resume_lines(&store),
+            ["lab/main t1 requested", "lab/main t1 unknown: not sent"]
+        );
+        assert!(hub.held_tasks.lock().unwrap().pending.is_empty());
+    }
+
+    /// Pins pre-existing `replayed` behavior when an already-used request id
+    /// is replayed with a different `ResumeRequest` after the device was
+    /// unpaired or rekeyed: `replayed` runs before vetting and returns a
+    /// static `Conflict` carrying no card or owner content.
+    fn a_replay_with_another_request_after_pairing_change_is_conflict(
+        change_pairing: fn(&Store, &Device),
+    ) {
+        let (_dir, hub, store, phone, rx) = fixture();
+        let (_plugin, from_bridge, connection, sent) = sent_resume(&hub, &store, &phone, &rx);
+        hub.held_task_resumed(&store, AGENT, &connection, &sent);
+        drain(&rx, 300);
+        transfer_with_new_text(&hub, &store);
+        change_pairing(&store, &phone);
+        let err = hub
+            .held_task_resume(
+                &store,
+                &phone,
+                OWNER,
+                MessageId::new("tap").unwrap(),
+                resume("t2", 0),
+            )
+            .unwrap_err();
+        assert_eq!(err.of, Some(MessageId::new("tap").unwrap()));
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(err.message, "This request id names another resume.");
+        assert!(!err.message.contains(MARKER));
+        assert!(drain(&rx, 200).is_empty());
+        assert!(
+            from_bridge
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_replay_with_another_request_after_unpairing_is_conflict() {
+        a_replay_with_another_request_after_pairing_change_is_conflict(|store, phone| {
+            assert!(store.remove_device(&phone.id).unwrap());
+        });
+    }
+
+    #[test]
+    fn a_replay_with_another_request_after_rekeying_is_conflict() {
+        a_replay_with_another_request_after_pairing_change_is_conflict(|store, phone| {
+            let mut again = phone.clone();
+            again.noise_key = vec![77; 32];
+            assert!(store.remove_device(&phone.id).unwrap());
+            store.add_device(&again).unwrap();
+        });
     }
 }
