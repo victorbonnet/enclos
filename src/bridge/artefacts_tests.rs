@@ -371,11 +371,19 @@ fn a_file_name_with_a_line_break_stays_on_one_log_line() {
     std::fs::write(artefacts_dir.join("y\renclos app: other: FORGED"), b"r").unwrap();
     let not_utf8: &std::ffi::OsStr =
         std::os::unix::ffi::OsStrExt::from_bytes(b"z\xff\nenclos app: other: FORGED");
-    std::fs::write(artefacts_dir.join(not_utf8), b"z").unwrap();
+    // Some filesystems reject invalid UTF-8 at file creation with EILSEQ.
+    let created_not_utf8 = match std::fs::File::create(artefacts_dir.join(not_utf8)) {
+        Ok(_) => true,
+        Err(err) if err.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
+            eprintln!("Non-UTF-8 filename fixture rejected by the filesystem: {err}");
+            false
+        }
+        Err(err) => panic!("could not create non-UTF-8 filename fixture: {err}"),
+    };
     let seen = Mutex::new(HashSet::new());
     let (listed, log) = walk_sandbox("lab", &home, &seen);
     assert!(listed.is_empty(), "listed: {listed:?}");
-    assert_eq!(log.len(), 3, "log: {log:?}");
+    assert_eq!(log.len(), 2 + usize::from(created_not_utf8), "log: {log:?}");
     assert!(
         log.iter().all(|l| !l.contains(['\n', '\r'])),
         "a log line holds a line break: {log:?}"
@@ -390,11 +398,13 @@ fn a_file_name_with_a_line_break_stays_on_one_log_line() {
             && l.contains("y⟨U+000D⟩enclos app: other: FORGED")),
         "log: {log:?}"
     );
-    assert!(
-        log.iter().any(|l| l.starts_with("enclos app: lab: ")
-            && l.contains("z\u{FFFD}⟨U+000A⟩enclos app: other: FORGED")),
-        "log: {log:?}"
-    );
+    if created_not_utf8 {
+        assert!(
+            log.iter().any(|l| l.starts_with("enclos app: lab: ")
+                && l.contains("z\u{FFFD}⟨U+000A⟩enclos app: other: FORGED")),
+            "log: {log:?}"
+        );
+    }
 
     // Walking again logs nothing new: each refusal is still logged once.
     let (_, again) = walk_sandbox("lab", &home, &seen);
